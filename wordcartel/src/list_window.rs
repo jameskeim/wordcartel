@@ -30,7 +30,6 @@ pub(crate) fn keep_visible(selected: usize, row_count: usize, list_h: usize, scr
 }
 
 /// Wheel step: rows the viewport slides per notch, uniform across overlays (A21).
-#[allow(dead_code)] // wired in Task 2
 pub(crate) const WHEEL_STEP: usize = 3;
 
 /// Wheel notch → viewport scroll. `list_h` is the caller's effective ITEM-ROW budget (the menu
@@ -40,7 +39,6 @@ pub(crate) const WHEEL_STEP: usize = 3;
 /// enforces, including its `list_h == 0 → scroll_top = 0` reset, so wheel state never diverges
 /// from the per-frame painter at any window height. Selection is untouched; the caller drags the
 /// highlight in via `clamp_into_window`, then re-hovers. All-saturating: no height can panic.
-#[allow(dead_code)] // wired in Task 2
 pub(crate) fn wheel_scroll(down: bool, row_count: usize, list_h: usize, scroll_top: &mut usize) {
     if list_h == 0 {
         *scroll_top = 0;
@@ -58,7 +56,6 @@ pub(crate) fn wheel_scroll(down: bool, row_count: usize, list_h: usize, scroll_t
 /// `row_count == 0` or `list_h == 0` (empty window, nothing renders): leave `highlight`
 /// untouched — the position is moot until a real window exists, and this avoids the `list_h - 1`
 /// underflow. All arithmetic saturating.
-#[allow(dead_code)] // wired in Task 2
 pub(crate) fn clamp_into_window(highlight: &mut usize, scroll_top: usize, list_h: usize, row_count: usize) {
     if row_count == 0 || list_h == 0 { return; }
     let last = row_count - 1;
@@ -74,7 +71,6 @@ pub(crate) fn clamp_into_window(highlight: &mut usize, scroll_top: usize, list_h
 /// (returns `true` — the caller then re-hovers at the pointer, which overrides). `list_h` is the
 /// caller's effective item budget; name-agnostic via `&mut usize` (the menu passes `highlighted`,
 /// the others `selected`). Pure — the caller owns keep-visible and any per-overlay side effect.
-#[allow(dead_code)] // wired in Task 2
 pub(crate) fn wheel_list(down: bool, row_count: usize, list_h: usize,
     selected: &mut usize, scroll_top: &mut usize) -> bool {
     if row_count == 0 { return false; }

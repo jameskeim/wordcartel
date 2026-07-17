@@ -93,17 +93,53 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
 /// its content-linked search/diag siblings via `close_all`).
 pub(crate) fn mouse_palette(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     ctx: &crate::overlays::DispatchCtx) {
-    // `if matches!` — a `match` with a lone arm + `_ => {}` trips
-    // clippy::single_match under the deny gate (Codex plan r1).
+    // Hover: move the highlight to the row under the pointer (dedupe: only on row change; I2:
+    // off-rect leaves it as-is because the hit-tester returns None).
+    if let MouseEventKind::Moved = ev.kind {
+        let hit = editor.palette.as_ref()
+            .and_then(|p| crate::chrome_geom::palette_row_at(area, p, ev.column, ev.row));
+        if let Some(idx) = hit {
+            let ah = editor.active().view.area.1;
+            if let Some(p) = editor.palette.as_mut() {
+                if p.selected != idx {
+                    p.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, p.rows.len(), &mut p.scroll_top);
+                }
+            }
+        }
+        return;
+    }
+    // Wheel: the viewport scrolls every notch (wheel_list moves scroll_top); the SELECTION-derived
+    // side effect (window-follows-selection) fires ONLY when the row actually changes (I5 dedupe).
+    // Empty list is a total no-op (I3b).
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
         let ah = editor.active().view.area.1;
-        if let Some(p) = editor.palette.as_mut() {
-            if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
-            } else {
-                p.selected = p.selected.saturating_sub(1);
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let before = match editor.palette.as_ref() { Some(p) => p.selected, None => return };
+        let scrolled = if let Some(p) = editor.palette.as_mut() {
+            let n = p.rows.len();
+            if n == 0 { return; } // I3b: empty list is a total no-op
+            let list_h = crate::list_window::list_h_for(n, ah);
+            crate::list_window::wheel_list(down, n, list_h, &mut p.selected, &mut p.scroll_top)
+        } else { return };
+        if scrolled {
+            // Re-hover: the pointer is stationary, so pin the highlight to its row (ruling 1a).
+            if let Some(idx) = editor.palette.as_ref()
+                .and_then(|p| crate::chrome_geom::palette_row_at(area, p, ev.column, ev.row))
+            {
+                if let Some(p) = editor.palette.as_mut() { p.selected = idx; }
             }
-            crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+        }
+        // I5 dedupe: re-window from the selection ONLY when the row moved. Skips the redundant
+        // re-derive at a clamp boundary that would re-compute scroll_top FROM selection and fight
+        // the wheel. In the scroll path `after` is already in-window, so keep_overlay_visible is a
+        // no-op on scroll_top; in the short-step path it pins scroll_top for the fully-visible list.
+        let after = editor.palette.as_ref().map(|p| p.selected).unwrap_or(before);
+        if after != before {
+            let n = editor.palette.as_ref().map(|p| p.rows.len()).unwrap_or(0);
+            if let Some(p) = editor.palette.as_mut() {
+                crate::app::keep_overlay_visible(ah, after, n, &mut p.scroll_top);
+            }
         }
         return;
     }
@@ -298,16 +334,45 @@ pub(crate) fn mouse_cursor_picker(editor: &mut Editor, ev: MouseEvent, area: rat
 /// it (dir descend / file open), on a click-away closes the browser.
 pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     _ctx: &crate::overlays::DispatchCtx) {
+    if let MouseEventKind::Moved = ev.kind {
+        let hit = editor.file_browser.as_ref()
+            .and_then(|fb| crate::chrome_geom::file_browser_row_at(area, fb, ev.column, ev.row));
+        if let Some(idx) = hit {
+            let ah = editor.active().view.area.1;
+            if let Some(fb) = editor.file_browser.as_mut() {
+                if fb.selected != idx {
+                    fb.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
+                }
+            }
+        }
+        return;
+    }
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
         let ah = editor.active().view.area.1;
-        if let Some(fb) = editor.file_browser.as_mut() {
-            if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                fb.selected = (fb.selected + 1).min(fb.entries.len().saturating_sub(1));
-            } else {
-                fb.selected = fb.selected.saturating_sub(1);
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let before = match editor.file_browser.as_ref() { Some(fb) => fb.selected, None => return };
+        let scrolled = if let Some(fb) = editor.file_browser.as_mut() {
+            let n = fb.entries.len();
+            if n == 0 { return; }
+            let list_h = crate::list_window::list_h_for(n, ah);
+            crate::list_window::wheel_list(down, n, list_h, &mut fb.selected, &mut fb.scroll_top)
+        } else { return };
+        if scrolled {
+            if let Some(idx) = editor.file_browser.as_ref()
+                .and_then(|fb| crate::chrome_geom::file_browser_row_at(area, fb, ev.column, ev.row))
+            {
+                if let Some(fb) = editor.file_browser.as_mut() { fb.selected = idx; }
             }
-            crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
         }
+        let after = editor.file_browser.as_ref().map(|fb| fb.selected).unwrap_or(before);
+        if after != before {
+            let n = editor.file_browser.as_ref().map(|fb| fb.entries.len()).unwrap_or(0);
+            if let Some(fb) = editor.file_browser.as_mut() {
+                crate::app::keep_overlay_visible(ah, after, n, &mut fb.scroll_top);
+            }
+        }
+        return;
     }
     if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
         // Scoped borrows → owned hit values before any mutation.
@@ -340,15 +405,43 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
 /// heading (guarded by the stale-version check), on a click-away closes the outline.
 pub(crate) fn mouse_outline(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     _ctx: &crate::overlays::DispatchCtx) {
+    if let MouseEventKind::Moved = ev.kind {
+        let hit = editor.outline.as_ref()
+            .and_then(|o| crate::chrome_geom::outline_row_at(area, o, ev.column, ev.row));
+        if let Some(idx) = hit {
+            let ah = editor.active().view.area.1;
+            if let Some(o) = editor.outline.as_mut() {
+                if o.selected != idx {
+                    o.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, o.rows.len(), &mut o.scroll_top);
+                }
+            }
+        }
+        return;
+    }
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
         let ah = editor.active().view.area.1;
-        if let Some(o) = editor.outline.as_mut() {
-            if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                o.selected = (o.selected + 1).min(o.rows.len().saturating_sub(1));
-            } else {
-                o.selected = o.selected.saturating_sub(1);
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let before = match editor.outline.as_ref() { Some(o) => o.selected, None => return };
+        let scrolled = if let Some(o) = editor.outline.as_mut() {
+            let n = o.rows.len();
+            if n == 0 { return; }
+            let list_h = crate::list_window::list_h_for(n, ah);
+            crate::list_window::wheel_list(down, n, list_h, &mut o.selected, &mut o.scroll_top)
+        } else { return };
+        if scrolled {
+            if let Some(idx) = editor.outline.as_ref()
+                .and_then(|o| crate::chrome_geom::outline_row_at(area, o, ev.column, ev.row))
+            {
+                if let Some(o) = editor.outline.as_mut() { o.selected = idx; }
             }
-            crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+        }
+        let after = editor.outline.as_ref().map(|o| o.selected).unwrap_or(before);
+        if after != before {
+            let n = editor.outline.as_ref().map(|o| o.rows.len()).unwrap_or(0);
+            if let Some(o) = editor.outline.as_mut() {
+                crate::app::keep_overlay_visible(ah, after, n, &mut o.scroll_top);
+            }
         }
         return;
     }
@@ -396,16 +489,44 @@ pub(crate) fn mouse_outline(editor: &mut Editor, ev: MouseEvent, area: ratatui::
 /// it (via `diag_apply_selected`, which owns the stale-version guard), on a click-away closes.
 pub(crate) fn mouse_diag(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     ctx: &crate::overlays::DispatchCtx) {
+    if let MouseEventKind::Moved = ev.kind {
+        let hit = editor.diag.as_ref()
+            .and_then(|d| crate::chrome_geom::diag_row_at(area, d, ev.column, ev.row));
+        if let Some(idx) = hit {
+            let ah = editor.active().view.area.1;
+            if let Some(d) = editor.diag.as_mut() {
+                let rc = d.row_count();
+                if d.selected != idx {
+                    d.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, rc, &mut d.scroll_top);
+                }
+            }
+        }
+        return;
+    }
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
         let ah = editor.active().view.area.1;
-        if let Some(d) = editor.diag.as_mut() {
-            let rc = d.row_count();
-            if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                d.selected = (d.selected + 1).min(rc.saturating_sub(1));
-            } else {
-                d.selected = d.selected.saturating_sub(1);
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let before = match editor.diag.as_ref() { Some(d) => d.selected, None => return };
+        let scrolled = if let Some(d) = editor.diag.as_mut() {
+            let n = d.row_count();
+            if n == 0 { return; }
+            let list_h = crate::list_window::list_h_for(n, ah);
+            crate::list_window::wheel_list(down, n, list_h, &mut d.selected, &mut d.scroll_top)
+        } else { return };
+        if scrolled {
+            if let Some(idx) = editor.diag.as_ref()
+                .and_then(|d| crate::chrome_geom::diag_row_at(area, d, ev.column, ev.row))
+            {
+                if let Some(d) = editor.diag.as_mut() { d.selected = idx; }
             }
-            crate::app::keep_overlay_visible(ah, d.selected, rc, &mut d.scroll_top);
+        }
+        let after = editor.diag.as_ref().map(|d| d.selected).unwrap_or(before);
+        if after != before {
+            let n = editor.diag.as_ref().map(|d| d.row_count()).unwrap_or(0);
+            if let Some(d) = editor.diag.as_mut() {
+                crate::app::keep_overlay_visible(ah, after, n, &mut d.scroll_top);
+            }
         }
         return;
     }
@@ -930,8 +1051,10 @@ mod tests {
             "dispatched rows[scroll_top] (select_left), not rows[0] (move_left)");
     }
 
-    /// A6: 20 ScrollDown wheel events move selected to 20 and scroll the window
-    /// so the selection stays visible.
+    /// A21 T2: 20 ScrollDown notches slide the viewport by WHEEL_STEP each (through-list
+    /// wheel, not a ±1 step) and drag the highlight along with it, keeping it visible.
+    /// Pointer stays OFF the overlay rect (column 0, row 0) so no re-hover overrides the
+    /// clamp_into_window result — this isolates the pure wheel_list mechanics from I5.
     #[test]
     fn wheel_moves_selection_and_window() {
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
@@ -940,14 +1063,17 @@ mod tests {
         let mut p = crate::palette::Palette::default();
         crate::palette::rebuild_rows(&mut p, &reg, &km);
         e.palette = Some(p);
-        // 20 scroll-downs.
-        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 40, row: 12, modifiers: KeyModifiers::NONE };
+        // 20 scroll-downs, pointer off-rect.
+        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
         for _ in 0..20 {
             handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
         }
         let p = e.palette.as_ref().expect("palette still open after wheel");
-        assert_eq!(p.selected, 20, "selected moved to 20");
         let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        let max_top = p.rows.len().saturating_sub(lh);
+        let expected = (20 * crate::list_window::WHEEL_STEP).min(max_top);
+        assert_eq!(p.scroll_top, expected, "viewport slid by WHEEL_STEP per notch, clamped to max_top");
+        assert_eq!(p.selected, expected, "highlight tracks the window's lower edge (clamp_into_window)");
         assert!(p.selected.saturating_sub(p.scroll_top) < lh,
             "selection is within the visible window (selected - scroll_top < list_h)");
     }
@@ -1259,8 +1385,10 @@ mod tests {
             e.theme.name);
     }
 
-    /// A6: ScrollDown wheel on the file browser moves selected and keeps the window
-    /// visible. The unconditional `return` still prevents text-area events.
+    /// A21 T2: ScrollDown wheel on the file browser slides the viewport by WHEEL_STEP per
+    /// notch and keeps the window visible; the unconditional `return` still prevents
+    /// text-area events. Pointer stays OFF the overlay rect (column 0, row 0) so no
+    /// re-hover overrides the clamp_into_window result.
     ///
     /// TDD RED: without the wheel block (just `return`), selected stays 0.
     #[test]
@@ -1277,15 +1405,18 @@ mod tests {
         assert_eq!(total, 21, "precondition: 21 entries");
         let (reg, ex, clk, tx, km) = ctx();
         let scroll_down = MouseEvent {
-            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            kind: MouseEventKind::ScrollDown, column: 0, row: 0,
             modifiers: KeyModifiers::NONE,
         };
         for _ in 0..20 {
             handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
         }
         let fb = e.file_browser.as_ref().expect("browser must remain open");
-        assert_eq!(fb.selected, 20, "selected must be 20 after 20 scroll-downs");
         let lh = crate::list_window::list_h_for(fb.entries.len(), 24);
+        let max_top = fb.entries.len().saturating_sub(lh);
+        let expected = (20 * crate::list_window::WHEEL_STEP).min(max_top);
+        assert_eq!(fb.scroll_top, expected, "viewport slid by WHEEL_STEP per notch, clamped to max_top");
+        assert_eq!(fb.selected, expected, "highlight tracks the window's lower edge (clamp_into_window)");
         assert!(fb.selected.saturating_sub(fb.scroll_top) < lh,
             "fb wheel: selection visible (selected={}, scroll_top={}, lh={})",
             fb.selected, fb.scroll_top, lh);
@@ -1529,7 +1660,9 @@ mod tests {
         assert_eq!(crate::nav::head(&e), target_byte, "caret jumps to the clicked heading");
     }
 
-    /// A wheel event on the outline moves `selected` and keeps the window visible.
+    /// A21 T2: a wheel event on the outline slides the viewport by WHEEL_STEP per notch and
+    /// keeps the window visible. Pointer stays OFF the overlay rect (column 0, row 0) so no
+    /// re-hover overrides the clamp_into_window result.
     #[test]
     fn outline_wheel_scroll_moves_selection() {
         let text: String = (0..20).map(|i| format!("# H{i}\n\n")).collect();
@@ -1538,15 +1671,18 @@ mod tests {
         e.open_outline();
         let (reg, ex, clk, tx, km) = ctx();
         let scroll_down = MouseEvent {
-            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            kind: MouseEventKind::ScrollDown, column: 0, row: 0,
             modifiers: KeyModifiers::NONE,
         };
         for _ in 0..10 {
             handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
         }
         let o = e.outline.as_ref().expect("outline must remain open after wheel");
-        assert_eq!(o.selected, 10, "selected must be 10 after 10 scroll-downs");
         let lh = crate::list_window::list_h_for(o.rows.len(), 24);
+        let max_top = o.rows.len().saturating_sub(lh);
+        let expected = (10 * crate::list_window::WHEEL_STEP).min(max_top);
+        assert_eq!(o.scroll_top, expected, "viewport slid by WHEEL_STEP per notch, clamped to max_top");
+        assert_eq!(o.selected, expected, "highlight tracks the window's lower edge (clamp_into_window)");
         assert!(o.selected.saturating_sub(o.scroll_top) < lh,
             "outline wheel: selection visible (selected={}, scroll_top={}, lh={})",
             o.selected, o.scroll_top, lh);
@@ -2100,5 +2236,125 @@ mod tests {
         let miss = down(0, 0); // 'X' of the inserted "XX" prefix — not inside any match
         handle(&mut e, miss, &reg, &km, &ex, &clk, &tx);
         assert_eq!(e.active().document.selection, before, "non-match click leaves selection unchanged");
+    }
+
+    // -----------------------------------------------------------------------
+    // A21 Task 2: hover + through-list wheel on the four side-effect-free slots
+    // -----------------------------------------------------------------------
+
+    fn wheel_ev(down_dir: bool, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: if down_dir { MouseEventKind::ScrollDown } else { MouseEventKind::ScrollUp },
+            column: col, row, modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn palette_hover_moves_highlight_to_pointer_row() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.palette = Some(crate::palette::Palette::default());
+        let (reg, ex, clk, tx, km) = ctx();
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        assert_eq!(e.palette.as_ref().unwrap().scroll_top, 0);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::chrome_geom::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
+        // Hover the 4th visible list row (list starts at rect.y + 2).
+        handle(&mut e, moved(rect.x + 1, rect.y + 2 + 3), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.palette.as_ref().unwrap().selected, 3, "hover set highlight to the pointer row");
+    }
+
+    #[test]
+    fn palette_hover_off_rect_leaves_highlight() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.palette = Some(crate::palette::Palette::default());
+        let (reg, ex, clk, tx, km) = ctx();
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        e.palette.as_mut().unwrap().selected = 2; // a keyboard-set highlight
+        handle(&mut e, moved(0, 0), &reg, &km, &ex, &clk, &tx); // top-left, off the overlay
+        assert_eq!(e.palette.as_ref().unwrap().selected, 2, "off-rect hover leaves the highlight as-is");
+    }
+
+    #[test]
+    fn palette_wheel_scrolls_and_re_hovers() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &crate::registry::Registry::builtins(),
+            &{ let (_r, _e2, _c, _t, km) = ctx(); km });
+        e.palette = Some(p);
+        let (reg, ex, clk, tx, km) = ctx();
+        let n = e.palette.as_ref().unwrap().rows.len();
+        let list_h = crate::list_window::list_h_for(n, 24);
+        assert!(n > list_h, "precondition: palette overflows its window");
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::chrome_geom::palette_overlay_rect(area, n);
+        // Wheel down with the pointer over the top visible row → scroll by 3, re-hover pins the
+        // highlight to that top row (absolute row scroll_top).
+        handle(&mut e, wheel_ev(true, rect.x + 1, rect.y + 2), &reg, &km, &ex, &clk, &tx);
+        let p = e.palette.as_ref().unwrap();
+        assert_eq!(p.scroll_top, 3, "wheel scrolled the viewport by WHEEL_STEP");
+        assert_eq!(p.selected, p.scroll_top, "re-hover pinned the highlight to the pointer's top row");
+    }
+
+    #[test]
+    fn palette_wheel_empty_list_is_total_noop() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let mut p = crate::palette::Palette {
+            query: "zzz_no_such_command_zzz".into(), // filter to zero rows
+            ..crate::palette::Palette::default()
+        };
+        crate::palette::rebuild_rows(&mut p, &crate::registry::Registry::builtins(),
+            &{ let (_r, _e2, _c, _t, km) = ctx(); km });
+        assert!(p.rows.is_empty(), "precondition: zero rows");
+        p.scroll_top = 0; p.selected = 0;
+        e.palette = Some(p);
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, wheel_ev(true, 40, 12), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(false, 40, 12), &reg, &km, &ex, &clk, &tx);
+        let p = e.palette.as_ref().unwrap();
+        assert_eq!((p.selected, p.scroll_top), (0, 0), "empty-list wheel is a total no-op (I3b)");
+    }
+
+    #[test]
+    fn outline_hover_does_not_jump() {
+        let doc = "# A\n\ntext\n\n# B\n\nmore\n";
+        let mut e = Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_before = e.active().view.scroll;
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let n = e.outline.as_ref().unwrap().rows.len();
+        assert!(n >= 2, "precondition: two headings");
+        let rect = crate::chrome_geom::palette_overlay_rect(area, n);
+        handle(&mut e, moved(rect.x + 1, rect.y + 2 + 1), &reg, &km, &ex, &clk, &tx);
+        assert!(e.outline.is_some(), "hover keeps the outline open (no jump)");
+        assert_eq!(e.outline.as_ref().unwrap().selected, 1, "hover moved the highlight");
+        assert_eq!(e.active().view.scroll, scroll_before, "hover did NOT jump the document");
+    }
+
+    #[test]
+    fn diag_hover_does_not_apply() {
+        let mut e = Editor::new_from_text("helo world\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let d = wordcartel_core::diagnostics::Diagnostic {
+            range: 0..4, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "spelling".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("hello".into())],
+        };
+        e.open_diag(d);
+        let (reg, ex, clk, tx, km) = ctx();
+        let v0 = e.active().document.version;
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let n = e.diag.as_ref().unwrap().row_count();
+        let rect = crate::chrome_geom::palette_overlay_rect(area, n);
+        // diag list starts at rect.y + 1 (no query row).
+        handle(&mut e, moved(rect.x + 1, rect.y + 1 + 1), &reg, &km, &ex, &clk, &tx);
+        assert!(e.diag.is_some(), "hover keeps the diag overlay open (no apply)");
+        assert_eq!(e.active().document.version, v0, "hover did NOT apply a fix (buffer unchanged)");
     }
 }
