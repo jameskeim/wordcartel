@@ -1865,4 +1865,32 @@ mod tests {
         let landed = move_right(&mut e);
         assert_eq!(landed, 4, "cross-line entry lands on the raw '#' (line_start(1)+0), not on 'H'");
     }
+
+    #[test]
+    fn end_on_hung_row_resolves_caret_to_flush_row() {
+        // move_end on the hung row 0 returns the eol offset; screen_pos then resolves that offset to the
+        // flush continuation row (screen_pos reads the offset, not the Cursor row affinity).
+        let mut e = Editor::new_from_text("abcd \n", None, (4, 8));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let end = crate::nav::move_end(&mut e);
+        set_caret(&mut e, end);
+        derive::rebuild(&mut e);
+        assert_eq!(crate::nav::screen_pos(&e), Some((0, 1)),
+            "End lands the visible caret on the flush phantom row");
+    }
+
+    #[test]
+    fn trailing_space_before_eof_stacks_flush_row_above_b10_phantom_line() {
+        // "abcd \n" with the caret at EOF: B17's flush VISUAL row (line 0) and B10's phantom LOGICAL
+        // line (the trailing empty line) coexist, stacked. The caret sits on the EOF logical line,
+        // below line 0's content row AND its flush row.
+        let mut e = Editor::new_from_text("abcd \n", None, (4, 8));
+        let eof = e.active().document.buffer.len(); // 6 = start of the phantom logical line
+        set_caret(&mut e, eof);
+        derive::rebuild(&mut e);
+        assert_eq!(crate::nav::caret_line(&e), 1, "B10: EOF caret on the phantom logical line, not glued");
+        assert_eq!(crate::nav::screen_pos(&e), Some((0, 2)),
+            "EOF caret below line 0's content row AND its flush phantom row");
+    }
 }

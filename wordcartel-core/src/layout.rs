@@ -302,6 +302,7 @@ pub fn layout(
     prefix_width += reserve_cols;
 
     // Word-boundary soft-wrap (UAX #14; spec D1/D2). CodeBlock keeps grapheme wrap.
+    // B17 amends D2's prose hang (empty flush row at the margin; see the B17 design note).
     let breaks: Vec<usize> = if matches!(role, BlockRole::CodeBlock) {
         Vec::new()
     } else {
@@ -321,10 +322,13 @@ pub fn layout(
         }
         let is_ws = vg.text == " " || vg.text == "\t";
         // The hang rule is scoped OFF for CodeBlock (spec D2 as amended: in code a
-        // space/tab is data — byte-identical wrap preserved).
+        // space/tab is data — byte-identical wrap preserved). For non-CodeBlock roles, a
+        // trailing hang that reaches the margin is now paired with an appended empty flush
+        // continuation row (B17, §1a epilogue below) — the hang itself is unchanged here.
         let hang = is_ws && !matches!(role, BlockRole::CodeBlock);
-        // The overflow decision REPEATS until the current VG fits (spec D2 as amended,
-        // user-ratified from a probe-confirmed Fable Critical): a tail re-placement can
+        // The overflow decision REPEATS until the current VG fits (spec D2 (prose hang
+        // further amended by B17 — see the design note), user-ratified from a
+        // probe-confirmed Fable Critical): a tail re-placement can
         // leave the current VG still over-wide (zero-width head; no-break-before tail).
         // Each pass either advances the break point strictly or falls back at the row
         // start, where the single-grapheme guard ends the loop — termination guaranteed.
@@ -347,7 +351,8 @@ pub fn layout(
                     row_start_vg = i;
                 }
                 // A legal break strictly inside this row: end the row there and
-                // re-place the tail (break..i) onto the new row (spec D2). `placed`
+                // re-place the tail (break..i) onto the new row (spec D2, prose hang further
+                // amended by B17 — see the design note). `placed`
                 // has exactly one entry per VG (zero-widths included), so the break
                 // VG's placed index IS its VG index.
                 Some(b) => {
@@ -375,6 +380,18 @@ pub fn layout(
         col = col.saturating_add(vg.width);
     }
     row_end_col.push(col);
+    // B17 (amends spec D2): a trailing whitespace run hung AT/PAST the margin gets an empty flush
+    // continuation row, so the caret after the space lands at (next_row, prefix_width) = col 0 of the
+    // text column — real line-move feedback that the space registered, with no leading-space indent.
+    // Non-CodeBlock only: code preserves byte-identical wrap (the hang rule is already off for it, and
+    // a code-block trailing space wraps to the next row via grapheme fallback — never hangs).
+    if !matches!(role, BlockRole::CodeBlock)
+        && col >= vw
+        && placed.last().is_some_and(|p| p.text == " " || p.text == "\t")
+    {
+        row += 1;
+        row_end_col.push(prefix_width);
+    }
     let rows = row + 1;
 
     let mut visual_rows: Vec<VisualRow> =
@@ -655,13 +672,127 @@ mod tests {
     }
 
     #[test]
-    fn word_wrap_trailing_whitespace_hangs_past_edge() {
-        // vw 4: "abcd " — the space lands at col 4 (== vw) and HANGS; one row.
+    fn word_wrap_trailing_whitespace_hangs_then_breaks_to_flush_row() {
+        // B17 (amends spec D2): vw 4, "abcd " — the space still HANGS at col 4 (== vw) on row 0
+        // (Law 4: placed, not dropped), but layout appends an empty flush continuation row, so the
+        // caret after the space lands at (row 1, col 0) — feedback, with no leading-space indent.
         let (rows, map) = layout("abcd ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(map.row_end_col[0], 5, "hang: end col past vw");
-        // Law 4: the space is PLACED, never dropped.
-        assert_eq!(map.placed.len(), 5);
+        assert_eq!(rows.len(), 2, "hang-then-break appends a flush continuation row");
+        assert_eq!(map.rows, 2);
+        assert_eq!(map.row_end_col[0], 5, "space still hung past the edge on row 0");
+        assert_eq!(map.row_end_col[1], 0, "phantom row flush at prefix_width (0 here)");
+        assert_eq!(map.placed.len(), 5, "Law 4: the space is placed, never dropped");
+        assert_eq!(map.source_to_visual(5), (1, 0), "caret after the space → col 0 of the flush row");
+        assert_eq!(rows[1].display, "", "the flush row is empty");
+    }
+
+    #[test]
+    fn word_wrap_trailing_space_run_hangs_once_and_breaks() {
+        // Fork b: "abcd   " @ vw 4 — the WHOLE run hangs on row 0; ONE flush row is appended and the
+        // caret parks at (1, 0) for the entire run (extra spaces do not advance it).
+        let (rows, map) = layout("abcd   ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(map.placed.len(), 7, "all three spaces placed on row 0 (Law 4)");
+        assert_eq!(map.row_end_col[0], 7, "run hung past the edge");
+        assert_eq!(map.source_to_visual(7), (1, 0), "caret parks at col 0 of the single flush row");
+    }
+
+    #[test]
+    fn word_wrap_trailing_space_exact_fill_breaks() {
+        // Fork d: "abc " @ vw 4 — the space lands exactly AT the last cell (end col == vw == 4). The
+        // rule is "end col >= vw", so exact-fill triggers the flush row too.
+        let (rows, map) = layout("abc ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(map.row_end_col[0], 4, "space at the last cell, end col == vw");
+        assert_eq!(map.source_to_visual(4), (1, 0)); // eol = 4
+    }
+
+    #[test]
+    fn word_wrap_trailing_tab_breaks_to_flush_row() {
+        // A hung trailing TAB (width TAB_WIDTH == 4) past the margin also triggers the flush row.
+        let (rows, map) = layout("abc\t", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(map.row_end_col[0], 7, "tab hung past the edge (col 3 + width 4)");
+        assert_eq!(map.source_to_visual(4), (1, 0)); // eol = 4 ("abc\t")
+    }
+
+    #[test]
+    fn word_wrap_trailing_space_flush_row_hangs_to_prefix_width() {
+        // List item "- aaaa " @ vw 6, prefix "• " (width 2): the trailing space hangs, and the flush
+        // continuation row sits at prefix_width (col 2) — flush under the TEXT column, not screen col 0.
+        let (rows, map) = layout("- aaaa ", BlockRole::ListItem, LineRender::Concealed, 6, false, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(map.prefix_width, 2, "• + space");
+        assert_eq!(map.row_end_col[1], 2, "flush row at the hanging indent");
+        assert_eq!(map.source_to_visual(7), (1, 2)); // eol = 7 ("- aaaa ")
+    }
+
+    #[test]
+    fn word_wrap_codeblock_trailing_space_unchanged_no_flush_row() {
+        // The epilogue does NOT fire for CodeBlock (guard !matches!(role, CodeBlock)). CodeBlock
+        // disables the hang (:325) and has no break opportunities (:304-307), so a trailing space
+        // ALREADY wraps to row 1 today via grapheme fallback — B17 adds no extra row (byte-identical).
+        let (rows, map) = layout("abcd ", BlockRole::CodeBlock, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 2, "space already wrapped onto row 1 (unchanged from pre-B17)");
+        assert_eq!(map.row_end_col, vec![4, 1], "row 0 ends at vw; the space sits at (1, 0), end col 1");
+        let space = map.placed.last().unwrap();
+        assert_eq!((space.row, space.col), (1, 0), "space wrapped, not hung; no phantom row appended");
+    }
+
+    #[test]
+    fn word_wrap_codeblock_exact_fill_trailing_space_no_flush_row() {
+        // Locks the `!matches!(role, CodeBlock)` epilogue guard. Unlike the "abcd " case above (whose
+        // space wraps to col < vw, so `col >= vw` is false regardless of the guard), an EXACT-FILL
+        // CodeBlock line ending in a space has end col == vw — so only the guard stops the epilogue
+        // from firing. Without the guard this gains a phantom row (rows 2); asserting rows == 1 fails
+        // iff the guard is removed.
+        let (rows, map) = layout("abc ", BlockRole::CodeBlock, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 1, "CodeBlock: no phantom flush row even at exact-fill (guard holds)");
+        assert_eq!(map.row_end_col, vec![4], "space sits at (0, 3); row ends at vw; no appended row");
+    }
+
+    #[test]
+    fn word_wrap_whitespace_only_line_at_margin_breaks() {
+        // Fork c (uniform): a whitespace-only line that reaches the margin gains a flush row too.
+        let (rows, map) = layout("    ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(map.row_end_col[0], 4, "four spaces fill the row to the margin");
+        assert_eq!(map.source_to_visual(4), (1, 0)); // eol = 4
+    }
+
+    #[test]
+    fn word_wrap_trailing_space_within_margin_no_flush_row() {
+        // Negative: a trailing space well within the margin does NOT trigger the flush row (end col < vw).
+        let (rows, map) = layout("ab ", BlockRole::Paragraph, LineRender::Concealed, 8, false, 0);
+        assert_eq!(rows.len(), 1, "space at col 2 < vw 8 — no phantom row");
+        assert_eq!(map.row_end_col[0], 3);
+    }
+
+    #[test]
+    fn word_wrap_trailing_space_hang_interior_caret_still_pins() {
+        // The caret BEFORE the hung space (byte 4 of "abcd ") stays on the hung cell (0, 4) — render
+        // clamps it to the edge. move_left from eol lands there (the pinned hang edge).
+        let (_rows, map) = layout("abcd ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
+        assert_eq!(map.source_to_visual(4), (0, 4), "before-space caret on the hung cell");
+        let left = move_left(&map, cursor_at(&map, map.eol));
+        assert_eq!(left.offset, 4, "left from eol lands on the hung space's start");
+        assert_eq!(map.source_to_visual(left.offset), (0, 4));
+    }
+
+    #[test]
+    fn phantom_flush_row_nav_lands_on_valid_stops() {
+        // On "abcd " @ vw 4 the phantom row (row 1) is empty. A click/overshoot on it resolves to eol
+        // (empty-row branch, not a teleport); move_home/move_end on it land on a valid stop; down onto
+        // it then up preserves the source offset (Law 5 shape).
+        let (_rows, map) = layout("abcd ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
+        assert_eq!(map.visual_to_source(1, 0), map.eol);
+        assert_eq!(map.visual_to_source(1, 9), map.eol, "overshoot clamps to eol, no teleport");
+        let probe = Cursor { offset: map.visual_to_source(1, 0), row: 1, desired_col: 0 };
+        assert!(map.is_cursor_stop(move_home(&map, probe).offset));
+        assert!(map.is_cursor_stop(move_end(&map, probe).offset));
+        let down = move_down_within(&map, Cursor { offset: 0, row: 0, desired_col: 0 }).expect("row 1");
+        assert_eq!(down.row, 1);
+        assert_eq!(move_up_within(&map, down).expect("back to row 0").offset, 0);
     }
 
     #[test]
@@ -710,7 +841,8 @@ mod tests {
     #[test]
     fn word_wrap_codeblock_space_wraps_not_hangs() {
         // CodeBlock: the hang rule is OFF — a space at the edge wraps greedily,
-        // byte-identical to today (spec D2 as amended).
+        // byte-identical to today (spec D2, prose hang further amended by B17 — see the design
+        // note; the B17 epilogue does not fire for CodeBlock).
         let (rows, _) = layout("abcd x", BlockRole::CodeBlock, LineRender::Concealed, 4, false, 0);
         assert_eq!(rows[0].display, "abcd");
         assert_eq!(rows[1].display, " x");
