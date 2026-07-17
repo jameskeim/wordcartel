@@ -2667,6 +2667,42 @@ mod tests {
         assert!(transp.overlay_selected.bg.is_some(), "selected-row highlight stays visible in transparent");
     }
 
+    /// B7 seam invariant: `ChromeStyles::build` records DIM in the `sub_modifier` of every
+    /// ChromeSelected-derived selection style (so `Cell::set_style` clears an underlay's DIM) and
+    /// never leaves DIM in their `add_modifier`. `menu_norm` (dropdown-normal) MUST retain DIM in
+    /// `add_modifier` — the strip is scoped to selection, not the recede. Swept across a derived RGB
+    /// theme, terminal-ansi, and the no-color/mono theme (Depth::None).
+    #[test]
+    fn chrome_selected_styles_strip_dim_via_sub_modifier() {
+        use wordcartel_core::theme::{ChromeDisposition, CanvasMode, Depth, Theme};
+        use ratatui::style::Modifier;
+
+        // (theme, depth) sweep: derived RGB (tokyo-night), explicit terminal-ansi, mono no-color.
+        let mut tokyo = Theme::builtin("tokyo-night").unwrap();
+        tokyo.derive_chrome(ChromeDisposition::Full);
+        let cases = [
+            (tokyo,                                    Depth::Truecolor, "tokyo-night"),
+            (Theme::builtin("terminal-ansi").unwrap(), Depth::Ansi16, "terminal-ansi"),
+            (Theme::builtin("no-color").unwrap(),      Depth::None,   "no-color"),
+        ];
+        for (theme, depth, name) in cases {
+            let cs = ChromeStyles::build(&theme, depth, CanvasMode::Opaque);
+            for (label, style) in [
+                ("overlay_selected", cs.overlay_selected),
+                ("menu_open",        cs.menu_open),
+                ("menu_sel",         cs.menu_sel),
+            ] {
+                assert!(style.sub_modifier.contains(Modifier::DIM),
+                    "{name}/{label}: selection style must record DIM in sub_modifier (strip applied)");
+                assert!(!style.add_modifier.contains(Modifier::DIM),
+                    "{name}/{label}: selection style must not carry DIM in add_modifier");
+            }
+            // Guard: the strip must NOT touch the dropdown-normal recede.
+            assert!(cs.menu_norm.add_modifier.contains(Modifier::DIM),
+                "{name}: menu_norm (ChromeMuted) must keep its DIM recede — strip is selection-only");
+        }
+    }
+
     #[test]
     fn transparent_keeps_content_highlights() {
         // Content highlights (selection/search/code/diagnostics) keep their explicit bg in
