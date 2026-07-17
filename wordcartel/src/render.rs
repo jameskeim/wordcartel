@@ -187,11 +187,17 @@ impl ChromeStyles {
             compose::compose(theme, depth, &[SE::ChromeOverlay])
         };
         ChromeStyles {
-            overlay_selected: compose::compose(theme, depth, &[SE::ChromeSelected]),
+            // B7: the selected/active chrome styles are painted OVER a DIM-bearing underlay
+            // (`menu_norm`=ChromeMuted for the dropdown, `menu_closed`=Chrome for the bar).
+            // ratatui's `Cell::set_style` OR-merges add_modifiers, so a bare ChromeSelected swap
+            // leaves the underlay's DIM riding on the selected cell → washout on dark/phosphor.
+            // Record DIM in each selection style's `sub_modifier` so set_style CLEARS it. The
+            // deeper "teach compose modifier subtraction" fix is deferred to backlog H25.
+            overlay_selected: compose::compose(theme, depth, &[SE::ChromeSelected]).remove_modifier(Modifier::DIM),
             ov_query,
-            menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]).remove_modifier(Modifier::DIM),
             menu_closed:      compose::compose(theme, depth, &[SE::Chrome]),
-            menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]).remove_modifier(Modifier::DIM),
             menu_norm:        compose::compose(theme, depth, &[SE::ChromeMuted]),
             scrollbar_track:  compose::compose(theme, depth, &[SE::ChromeMuted]),
             scrollbar_thumb:  compose::compose(theme, depth, &[SE::Chrome]),
@@ -2661,6 +2667,42 @@ mod tests {
         assert!(transp.overlay_selected.bg.is_some(), "selected-row highlight stays visible in transparent");
     }
 
+    /// B7 seam invariant: `ChromeStyles::build` records DIM in the `sub_modifier` of every
+    /// ChromeSelected-derived selection style (so `Cell::set_style` clears an underlay's DIM) and
+    /// never leaves DIM in their `add_modifier`. `menu_norm` (dropdown-normal) MUST retain DIM in
+    /// `add_modifier` — the strip is scoped to selection, not the recede. Swept across a derived RGB
+    /// theme, terminal-ansi, and the no-color/mono theme (Depth::None).
+    #[test]
+    fn chrome_selected_styles_strip_dim_via_sub_modifier() {
+        use wordcartel_core::theme::{ChromeDisposition, CanvasMode, Depth, Theme};
+        use ratatui::style::Modifier;
+
+        // (theme, depth) sweep: derived RGB (tokyo-night), explicit terminal-ansi, mono no-color.
+        let mut tokyo = Theme::builtin("tokyo-night").unwrap();
+        tokyo.derive_chrome(ChromeDisposition::Full);
+        let cases = [
+            (tokyo,                                    Depth::Truecolor, "tokyo-night"),
+            (Theme::builtin("terminal-ansi").unwrap(), Depth::Ansi16, "terminal-ansi"),
+            (Theme::builtin("no-color").unwrap(),      Depth::None,   "no-color"),
+        ];
+        for (theme, depth, name) in cases {
+            let cs = ChromeStyles::build(&theme, depth, CanvasMode::Opaque);
+            for (label, style) in [
+                ("overlay_selected", cs.overlay_selected),
+                ("menu_open",        cs.menu_open),
+                ("menu_sel",         cs.menu_sel),
+            ] {
+                assert!(style.sub_modifier.contains(Modifier::DIM),
+                    "{name}/{label}: selection style must record DIM in sub_modifier (strip applied)");
+                assert!(!style.add_modifier.contains(Modifier::DIM),
+                    "{name}/{label}: selection style must not carry DIM in add_modifier");
+            }
+            // Guard: the strip must NOT touch the dropdown-normal recede.
+            assert!(cs.menu_norm.add_modifier.contains(Modifier::DIM),
+                "{name}: menu_norm (ChromeMuted) must keep its DIM recede — strip is selection-only");
+        }
+    }
+
     #[test]
     fn transparent_keeps_content_highlights() {
         // Content highlights (selection/search/code/diagnostics) keep their explicit bg in
@@ -3421,6 +3463,66 @@ mod tests {
         let cur = render_capturing_cursor(&mut ed, 40, 12);
         assert_eq!(cur, Some((0, 0)),
             "arm-3 must suppress the editor caret under a modal (B11); suppression == (0,0)");
+    }
+
+    /// B7 leak-proof: with a menu open under a DIM-bearing derived theme (tokyo-night —
+    /// both `ChromeMuted` and `Chrome` carry dim), neither the SELECTED dropdown row nor the
+    /// OPEN-category bar label may carry a leaked `Modifier::DIM`. This is the crux regression
+    /// for the chrome-selection-legibility fix and covers BOTH leak sites (spec §1.2):
+    ///   - dropdown selected row  ← `menu_norm` (ChromeMuted/DIM) underlay + `menu_sel` swap
+    ///   - open-category bar label ← `menu_closed` (Chrome/DIM) bar fill + `menu_open` swap
+    ///
+    /// First-failing on the unpatched tree (DIM leaks through ratatui's OR-merge); passes once
+    /// `ChromeStyles::build` strips DIM via `sub_modifier`.
+    #[test]
+    fn menu_selection_and_open_label_have_no_leaked_dim() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth, Theme};
+        use ratatui::layout::Rect;
+        use ratatui::style::Modifier;
+
+        // Arrange: derived RGB theme with a DIM-bearing dropdown + bar, at truecolor.
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut ed = Editor::new_from_text("hello world\n", None, (80, 12));
+        let mut theme = Theme::builtin("tokyo-night").unwrap();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
+        ed.depth = Depth::Truecolor;
+        derive::rebuild(&mut ed);
+        // Open the first category's menu (build → open:0, highlighted:0, scroll_top:0). No
+        // menu_bar_mode setup is needed: `menu_bar_rows()` returns `u16::from(bar || menu.is_some())`
+        // (editor.rs), so an open menu forces the bar to 1 row regardless of the default Auto mode —
+        // this is what makes the open-label (bar) assertion exercisable/first-failing.
+        ed.menu = Some(crate::menu::build(&reg, &km, &ed));
+
+        // Geometry, via the same helpers the painter uses (menu_area excludes the status row).
+        let menu_area = crate::chrome_geom::menu_area(Rect::new(0, 0, 80, 12));
+        let groups = ed.menu.as_ref().unwrap().groups.clone();
+        let open = ed.menu.as_ref().unwrap().open;
+        let bar = crate::chrome_geom::menu_bar_layout(menu_area, &groups);
+        let (_, label_rect) = bar[open];
+        let drop_rect = crate::chrome_geom::menu_dropdown_rect(menu_area, &groups, open)
+            .expect("open category must produce a dropdown rect");
+
+        // Act.
+        let buf = render_to_buffer(&mut ed, 80, 12);
+
+        // Assert — selected dropdown row (highlighted 0, scroll_top 0 → the top item row).
+        let sel_y = drop_rect.y;
+        let sel_x = drop_rect.x + 1; // first text cell inside the item (mirrors the highlight test)
+        assert!(
+            !buf[(sel_x, sel_y)].style().add_modifier.contains(Modifier::DIM),
+            "selected dropdown row must not carry leaked DIM at ({sel_x},{sel_y}); \
+             style={:?}", buf[(sel_x, sel_y)].style(),
+        );
+
+        // Assert — open-category bar label: no cell across its own columns may carry DIM.
+        let label_has_dim = (label_rect.x..label_rect.x + label_rect.width)
+            .any(|x| buf[(x, label_rect.y)].style().add_modifier.contains(Modifier::DIM));
+        assert!(
+            !label_has_dim,
+            "open-category bar label (row {}) must not carry leaked DIM", label_rect.y,
+        );
     }
 
     /// Test B (prompt): a hide surface.
