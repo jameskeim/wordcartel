@@ -539,6 +539,31 @@ Modal/overlay caret parked under the modal (query field shows no caret)
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
 
+### B17 — Soft-wrap trailing space at margin now wraps the caret to a flush continuation row
+<!-- item: B17 -->
+
+**SHIPPED 2026-07-16** (merge 2d6a2a3): a trailing space at the soft-wrap margin used to "hang" past the edge with
+the caret pinned to the word-end — zero visible feedback, so writers double-spaced thinking it hadn't registered. Now
+the line gains an empty "phantom" flush visual row and the caret drops to **column 0 of the next line**: the space
+visibly registers, and the continuation starts **flush at the left margin with no leading-space indent** (the
+break-space stays consumed at the boundary). Design = **shape A (phantom flush row)**: keep the space hung at the end
+of row N, append an empty row N+1 — the caret then falls out of the EXISTING `ColMap` (`source_to_visual` eol →
+(N+1, prefix_width)) with **no resolver change**. Net: a **~6-line epilogue** in `layout::layout`. Amends the
+comment-only "spec D2" hang rule.
+
+Verification: **all 7 wrap property-laws stay green UNMODIFIED** (the space stays placed → Law 4; the phantom row is
+width-0 → Law 3) — triple-confirmed (Fable + Codex walking the asserts + the reviewer re-running). Process = a
+modified-Fable-first middle-weight pipeline: Explore blast-radius → warm-Fable scope memo (which shrank the design)
+→ human brainstorm (all-A) → Codex-gated design note + plan (the plan gate caught a real cross-crate
+commit-greenness bug → re-sequenced so Task 1 is workspace-green) → per-task opus/sonnet reviews (the Task-1 opus
+reviewer caught + folded a `!CodeBlock` guard test-adequacy gap; Task-2's 3 shell tests mutation-verified
+load-bearing) → gates green (1554 tests, clippy `--workspace` clean, module_budgets 5/5, smoke 9/9) → **live tui
+repro** (margin-space → caret (0,1); flush continuation). Edge cases resolved (all-A): multi-space run, exact-fill
+(rule = end col ≥ vw), trailing tab, CodeBlock unchanged (guard now test-locked), whitespace-only line (fork-c
+uniform), ventilate moot (sentence displays content-trimmed → a negative guard), B10 non-collision (phantom VISUAL
+row vs B10 phantom LOGICAL line). Docs: `docs/superpowers/specs/2026-07-16-b17-...-design.md` + plan. Command-surface
+N/A.
+
 
 ## Theme C — document workflow
 

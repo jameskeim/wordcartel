@@ -3,7 +3,7 @@
 
 # Backlog
 
-**37 open · 61 shipped · 2 dropped**
+**36 open · 62 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -37,7 +37,6 @@ Blocking Effort P: **0**
 | B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | triage | feature | TBD |  | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) |
 | B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | triage | feature | TBD |  | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) |
 | B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | triage | feature | TBD |  | Scope::Sentence highlight window drifts from content-anchored select on indented prose |
-| B17 | Soft-wrap trailing space at margin gives no caret feedback — should wrap caret to next line, continuation flush at left margin (no leading-space indent) | triage | feature | TBD |  | Soft-wrap trailing space at margin gives no caret feedback — should wrap caret to next line, continuation flush at left margin (no leading-space indent) |
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
@@ -51,10 +50,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>61 shipped</summary>
+<details><summary>62 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| B17 | Soft-wrap trailing space at margin gives no caret feedback — should wrap caret to next line, continuation flush at left margin (no leading-space indent) | 2026-07-16 | 2d6a2a3 |
 | C6 | cut() writes register/clipboard BEFORE apply — a read-only Cut still syncs the clipboard though nothing is deleted | 2026-07-16 | 4003b6c |
 | H10 | reduce's 10-stage intercept chain boilerplate | 2026-07-16 | e5d9b42 |
 | H21 | Input-overlay dispatch table — OverlayId enum + OVERLAYS fn-ptr seam | 2026-07-16 | e5d9b42 |
