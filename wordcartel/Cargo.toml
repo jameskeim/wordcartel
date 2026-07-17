@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 repar = { path = "../../par-command/repar" }
 wordcartel-core = { path = "../wordcartel-core" }
+wordcartel-nlp = { path = "../wordcartel-nlp" }
 ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
 ratatui = "0.30"
 crossterm = "0.28"
