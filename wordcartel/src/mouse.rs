@@ -2699,13 +2699,17 @@ mod tests {
         let hit_area = crate::chrome_geom::menu_area(area);
         let (open, scroll_top) = { let m = e.menu.as_ref().unwrap(); (m.open, m.scroll_top) };
         let groups = e.menu.as_ref().unwrap().groups.clone();
-        // Only run the row assertion if the open category has ≥ 2 rows.
-        if groups.get(open).map(|g| g.1.len()).unwrap_or(0) >= 2 {
-            let drop = crate::chrome_geom::menu_dropdown_rect(hit_area, &groups, open).unwrap();
-            handle(&mut e, moved(drop.x, drop.y + 1), &reg, &km, &ex, &clk, &tx);
-            let want = crate::chrome_geom::menu_dropdown_row_at(hit_area, &groups, open, scroll_top, drop.x, drop.y + 1).unwrap();
-            assert_eq!(e.menu.as_ref().unwrap().highlighted, want, "dropdown hover set highlighted to the pointer row");
-        }
+        // Precondition, asserted loudly: the fixture must offer ≥ 2 dropdown rows or the hover
+        // assertion below would never run. If the File-menu fixture shrinks, fail here — not
+        // silently skip the thing this test exists to exercise.
+        assert!(
+            groups.get(open).map(|g| g.1.len()).unwrap_or(0) >= 2,
+            "fixture must have >=2 dropdown rows to exercise hover"
+        );
+        let drop = crate::chrome_geom::menu_dropdown_rect(hit_area, &groups, open).unwrap();
+        handle(&mut e, moved(drop.x, drop.y + 1), &reg, &km, &ex, &clk, &tx);
+        let want = crate::chrome_geom::menu_dropdown_row_at(hit_area, &groups, open, scroll_top, drop.x, drop.y + 1).unwrap();
+        assert_eq!(e.menu.as_ref().unwrap().highlighted, want, "dropdown hover set highlighted to the pointer row");
     }
 
     #[test]
@@ -2717,6 +2721,8 @@ mod tests {
         // No overlay open → the event routes to the DWELL path, not the menu slot.
         handle(&mut e, moved(2, 0), &reg, &km, &ex, &clk, &tx);
         assert!(e.menu.is_none(), "first-open stays deliberate: bar hover with no menu open does not auto-open");
+        assert!(e.mouse.menu_reveal_due.is_some(),
+            "row-0 hover with no menu open must still arm the dwell timer, not just silently drop the Moved event");
     }
 
     /// Build a menu opened on ONE category (Edit) with `n` synthetic leaves — the mouse-test
