@@ -281,21 +281,60 @@ pub(crate) fn mouse_menu(editor: &mut Editor, ev: MouseEvent, area: ratatui::lay
     }
 }
 
-/// Theme-picker mouse slot: wheel moves + previews the selection; `Down(Left)` on a row
-/// commits it, on a click-away restores the captured original theme (Esc-equivalent).
+/// Theme-picker mouse slot: hover and wheel both move + LIVE-PREVIEW the selection (decision
+/// 3A embraces hover-preview; I5 dedupes so a row that doesn't change fires no preview);
+/// `Down(Left)` on a row commits it, on a click-away restores the captured original theme
+/// (Esc-equivalent).
 pub(crate) fn mouse_theme_picker(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     _ctx: &crate::overlays::DispatchCtx) {
+    // Hover: move the highlight to the row under the pointer AND fire the live preview funnel —
+    // but ONLY when the row differs from `selected` (dedupe-on-row-change, I5; decision 3A
+    // embraces hover-preview, so the dedupe is what keeps the theme re-derive off the hot path).
+    if let MouseEventKind::Moved = ev.kind {
+        let hit = editor.theme_picker.as_ref()
+            .and_then(|tp| crate::chrome_geom::theme_picker_row_at(area, tp, ev.column, ev.row));
+        if let Some(idx) = hit {
+            let ah = editor.active().view.area.1;
+            let changed = editor.theme_picker.as_ref().is_some_and(|tp| tp.selected != idx);
+            if changed {
+                if let Some(tp) = editor.theme_picker.as_mut() {
+                    tp.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, tp.rows.len(), &mut tp.scroll_top);
+                }
+                crate::theme_cmds::preview_selected_theme(editor); // dedupe: only on row change
+            }
+        }
+        return;
+    }
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
         let ah = editor.active().view.area.1;
-        if let Some(tp) = editor.theme_picker.as_mut() {
-            if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
-            } else {
-                tp.selected = tp.selected.saturating_sub(1);
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let before = match editor.theme_picker.as_ref() { Some(tp) => tp.selected, None => return };
+        let scrolled = if let Some(tp) = editor.theme_picker.as_mut() {
+            let n = tp.rows.len();
+            if n == 0 { return; } // I3b: no step/scroll/preview on an empty list
+            let list_h = crate::list_window::list_h_for(n, ah);
+            crate::list_window::wheel_list(down, n, list_h, &mut tp.selected, &mut tp.scroll_top)
+        } else { return };
+        if scrolled {
+            // Re-hover: the pointer is stationary, so pin the highlight to its row (ruling 1a).
+            if let Some(idx) = editor.theme_picker.as_ref()
+                .and_then(|tp| crate::chrome_geom::theme_picker_row_at(area, tp, ev.column, ev.row))
+            {
+                if let Some(tp) = editor.theme_picker.as_mut() { tp.selected = idx; }
             }
-            crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
         }
-        crate::theme_cmds::preview_selected_theme(editor);
+        // I5 dedupe: re-window AND fire the preview funnel ONLY when the row actually moved —
+        // a clamp-boundary notch that leaves `selected` unchanged fires NO preview.
+        let after = editor.theme_picker.as_ref().map(|tp| tp.selected).unwrap_or(before);
+        if after != before {
+            let n = editor.theme_picker.as_ref().map(|tp| tp.rows.len()).unwrap_or(0);
+            if let Some(tp) = editor.theme_picker.as_mut() {
+                crate::app::keep_overlay_visible(ah, after, n, &mut tp.scroll_top);
+            }
+            crate::theme_cmds::preview_selected_theme(editor);
+        }
+        return;
     }
     if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
         // Scoped borrows → owned hit values before any mutation.
@@ -329,23 +368,57 @@ pub(crate) fn mouse_theme_picker(editor: &mut Editor, ev: MouseEvent, area: rata
 }
 
 /// Cursor-picker mouse slot. Fixed 7-row list, windowed like every sibling overlay (Finding 1).
-/// Wheel moves the selection ±1 (clamped), re-windows, and re-previews via the shared setter
-/// funnel; a row click selects + previews + commits; a click-away restores the captured
-/// originals and closes (Esc-equivalent). No setter bypass.
+/// Hover and wheel both move + LIVE-PREVIEW the selection via the shared setter funnel (I5
+/// dedupes so a row that doesn't change fires no preview); a row click selects + previews +
+/// commits; a click-away restores the captured originals and closes (Esc-equivalent). No
+/// setter bypass.
 pub(crate) fn mouse_cursor_picker(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     _ctx: &crate::overlays::DispatchCtx) {
+    // Hover: move the highlight to the row under the pointer AND fire the live preview funnel —
+    // but ONLY when the row differs from `selected` (dedupe-on-row-change, I5).
+    if let MouseEventKind::Moved = ev.kind {
+        let hit = editor.cursor_picker.as_ref()
+            .and_then(|cp| crate::chrome_geom::cursor_picker_row_at(area, cp, ev.column, ev.row));
+        if let Some(idx) = hit {
+            let ah = editor.active().view.area.1;
+            let changed = editor.cursor_picker.as_ref().is_some_and(|cp| cp.selected != idx);
+            if changed {
+                if let Some(cp) = editor.cursor_picker.as_mut() {
+                    cp.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
+                }
+                crate::cursor_picker::preview_selected(editor); // dedupe: only on row change
+            }
+        }
+        return;
+    }
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
         let ah = editor.active().view.area.1;
-        if let Some(cp) = editor.cursor_picker.as_mut() {
-            let last = crate::cursor_picker::ROW_ACTIONS.len().saturating_sub(1);
-            if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                cp.selected = (cp.selected + 1).min(last);
-            } else {
-                cp.selected = cp.selected.saturating_sub(1);
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let before = match editor.cursor_picker.as_ref() { Some(cp) => cp.selected, None => return };
+        let scrolled = if let Some(cp) = editor.cursor_picker.as_mut() {
+            let n = crate::cursor_picker::ROW_ACTIONS.len();
+            if n == 0 { return; } // I3b: defensive-uniform; ROW_ACTIONS is a fixed non-empty table
+            let list_h = crate::list_window::list_h_for(n, ah);
+            crate::list_window::wheel_list(down, n, list_h, &mut cp.selected, &mut cp.scroll_top)
+        } else { return };
+        if scrolled {
+            if let Some(idx) = editor.cursor_picker.as_ref()
+                .and_then(|cp| crate::chrome_geom::cursor_picker_row_at(area, cp, ev.column, ev.row))
+            {
+                if let Some(cp) = editor.cursor_picker.as_mut() { cp.selected = idx; }
             }
-            crate::app::keep_overlay_visible(ah, cp.selected, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
         }
-        crate::cursor_picker::preview_selected(editor);
+        // I5 dedupe: re-window AND fire the preview funnel ONLY when the row actually moved.
+        let after = editor.cursor_picker.as_ref().map(|cp| cp.selected).unwrap_or(before);
+        if after != before {
+            let n = crate::cursor_picker::ROW_ACTIONS.len();
+            if let Some(cp) = editor.cursor_picker.as_mut() {
+                crate::app::keep_overlay_visible(ah, after, n, &mut cp.scroll_top);
+            }
+            crate::cursor_picker::preview_selected(editor);
+        }
+        return;
     }
     if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
         // Scoped borrow → owned hit value before any mutation.
@@ -1389,8 +1462,11 @@ mod tests {
     // A6 Task 2: tp/fb mouse wheel
     // -----------------------------------------------------------------------
 
-    /// A6: ScrollDown wheel on the theme picker moves selected, keeps the window
-    /// visible, and previews the correct row (ordering pin).
+    /// A21 T4: ScrollDown wheel on the theme picker slides the viewport by WHEEL_STEP per
+    /// notch (through-list wheel, not a ±1 step) and previews the correct row. Pointer stays
+    /// OFF the overlay rect (column 0, row 0) so no re-hover overrides the clamp_into_window
+    /// result — isolates the pure wheel_list mechanics from I5 (same precedent as A21 T2's
+    /// palette/outline/file_browser fixes).
     ///
     /// TDD RED: without the wheel block (just `return`), selected stays 0 and
     /// the theme is not previewed.
@@ -1413,7 +1489,7 @@ mod tests {
         assert_eq!(lh, 15, "list_h = 15 for 20 rows on 24-row terminal");
         let (reg, ex, clk, tx, km) = ctx();
         let scroll_down = MouseEvent {
-            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            kind: MouseEventKind::ScrollDown, column: 0, row: 0,
             modifiers: KeyModifiers::NONE,
         };
         // 16 scroll-downs — pushes past the 15-row window.
@@ -1421,7 +1497,10 @@ mod tests {
             handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
         }
         let tp = e.theme_picker.as_ref().expect("picker must remain open");
-        assert_eq!(tp.selected, 16, "selected must be 16 after 16 scroll-downs");
+        let max_top = 20usize.saturating_sub(lh);
+        let expected = (16 * crate::list_window::WHEEL_STEP).min(max_top);
+        assert_eq!(tp.scroll_top, expected, "viewport slid by WHEEL_STEP per notch, clamped to max_top");
+        assert_eq!(tp.selected, expected, "highlight tracks the window's leading edge (clamp_into_window)");
         assert!(tp.selected.saturating_sub(tp.scroll_top) < lh,
             "tp wheel: selection visible (selected={}, scroll_top={}, lh={})",
             tp.selected, tp.scroll_top, lh);
@@ -1656,30 +1735,184 @@ mod tests {
         assert!(e.caret_blink, "click-away restores the original blink");
     }
 
-    /// Wheel scroll moves the cursor-picker selection (clamped at the ends), re-windows
-    /// (`scroll_top` threaded — Finding 1), and re-previews via the shared setters. Uses a
-    /// SHORT terminal so the scroll_top threading is actually exercised.
+    /// A21 T4: wheel scroll slides the cursor-picker viewport by WHEEL_STEP per notch
+    /// (`scroll_top` threaded — Finding 1) and re-previews via the shared setters. Uses a
+    /// SHORT terminal so the scroll_top threading is actually exercised. Pointer stays OFF
+    /// the overlay rect (column 0, row 0) so no re-hover overrides the clamp_into_window
+    /// result — isolates the pure wheel_list mechanics from I5 (same precedent as A21 T2's
+    /// palette/outline/file_browser fixes).
     #[test]
     fn wheel_moves_cursor_picker_selection_and_previews() {
-        use crate::config::CaretShape;
         let mut e = Editor::new_from_text("x\n", None, (60, 9)); // short — list_h_for(7, 9) == 5
         crate::derive::rebuild(&mut e);
         e.open_cursor_picker();
         assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 0,
             "initial row = 0 (F2: the picker opens on the row matching the current — Default — caret)");
         let (reg, ex, clk, tx, km) = ctx();
-        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 20, row: 4, modifiers: KeyModifiers::NONE };
+        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
         for _ in 0..6 {
             handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
         }
         let cp = e.cursor_picker.as_ref().expect("picker still open after wheel");
-        assert_eq!(cp.selected, 6, "clamped at the last row (Underline · steady)");
         let n = crate::cursor_picker::ROW_ACTIONS.len();
         let lh = crate::list_window::list_h_for(n, 9);
+        let max_top = n.saturating_sub(lh);
+        let expected = (6 * crate::list_window::WHEEL_STEP).min(max_top);
+        assert_eq!(cp.scroll_top, expected, "viewport slid by WHEEL_STEP per notch, clamped to max_top");
+        assert_eq!(cp.selected, expected, "highlight tracks the window's leading edge (clamp_into_window)");
         assert!(cp.selected.saturating_sub(cp.scroll_top) < lh,
             "selection is within the visible window (selected - scroll_top < list_h)");
-        assert_eq!(e.caret_shape, CaretShape::Underline, "wheel re-previews via the shared setter");
-        assert!(!e.caret_blink, "row 6 (Underline · steady) → blink false");
+        let (_, _, shape, blink) = crate::cursor_picker::ROW_ACTIONS[expected];
+        assert_eq!(e.caret_shape, shape, "wheel re-previews via the shared setter");
+        if let Some(b) = blink { assert_eq!(e.caret_blink, b, "row {expected}'s blink applied"); }
+    }
+
+    // -----------------------------------------------------------------------
+    // A21 Task 4: preview overlays — hover fires the preview funnel (dedupe-bounded)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cursor_picker_hover_previews_the_row() {
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_cursor_picker();
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+        // Hover row 3 (Beam · blinking) — list starts at r.y + 1 (no query row).
+        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 3, "hover set the highlight");
+        let (_, _, shape, _) = crate::cursor_picker::ROW_ACTIONS[3];
+        assert_eq!(e.caret_shape, shape, "hover fired the preview funnel (caret shape changed live)");
+    }
+
+    #[test]
+    fn cursor_picker_hover_same_row_does_not_re_preview() {
+        // A repeated Moved at the SAME row must be a no-op (dedupe I5). We prove it by mutating
+        // caret_shape out from under the picker and asserting a same-row hover does NOT restore it.
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_cursor_picker();
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx); // preview row 3
+        e.set_caret_shape(crate::config::CaretShape::Default); // tamper
+        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx); // SAME row again
+        assert_eq!(e.caret_shape, crate::config::CaretShape::Default,
+            "same-row hover did NOT re-fire the preview (dedupe on row-change)");
+    }
+
+    #[test]
+    fn cursor_picker_wheel_empty_guard_and_theme_restore() {
+        // cursor_picker has a fixed 7-row list (never empty); assert Esc-restore after a hover
+        // sweep leaves the ORIGINAL caret. open_cursor_picker captures original_shape/blink.
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let orig = e.caret_shape;
+        e.open_cursor_picker();
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+        // Sweep across rows 1,2,3.
+        for row in 1..=3u16 { handle(&mut e, moved(r.x + 1, r.y + 1 + row), &reg, &km, &ex, &clk, &tx); }
+        // Esc through the intercept restores original + closes.
+        crate::app::reduce(crate::app::Msg::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent { code: crossterm::event::KeyCode::Esc,
+                modifiers: KeyModifiers::NONE, kind: crossterm::event::KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE })),
+            &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.cursor_picker.is_none(), "Esc closed the picker");
+        assert_eq!(e.caret_shape, orig, "Esc after a hover sweep restored the original caret");
+    }
+
+    #[test]
+    fn theme_picker_wheel_empty_list_no_preview() {
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        // Filter the picker to zero rows.
+        if let Some(tp) = e.theme_picker.as_mut() {
+            tp.query = "zzz_no_theme_zzz".into();
+            crate::theme_picker::rebuild_rows(tp);
+            assert!(tp.rows.is_empty(), "precondition: zero theme rows");
+            tp.selected = 0; tp.scroll_top = 0;
+        }
+        let theme_before = e.theme.clone();
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, wheel_ev(true, 40, 12), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(false, 40, 12), &reg, &km, &ex, &clk, &tx);
+        let tp = e.theme_picker.as_ref().unwrap();
+        assert_eq!((tp.selected, tp.scroll_top), (0, 0), "empty theme list: wheel is a total no-op");
+        assert_eq!(e.theme, theme_before, "empty list fired NO preview (theme unchanged)");
+    }
+
+    #[test]
+    fn cursor_picker_wheel_boundary_notch_fires_no_preview() {
+        // I5 dedupe on the WHEEL path — MUTATION-DETECTING. Park `selected` at the BOTTOM row
+        // (6 = Underline·steady) and wheel DOWN: a true boundary (wheel_list's `.min(n-1)` keeps
+        // it at 6, so after == before). Pre-set the caret to a SENTINEL (Block) that DIFFERS from
+        // row 6's action — so a spurious re-preview would overwrite it with Underline and the test
+        // would catch it. Pointer (0,0) is off the (centered) overlay, so no re-hover interferes.
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_cursor_picker();
+        let last = crate::cursor_picker::ROW_ACTIONS.len() - 1; // 6 (Underline·steady)
+        { e.cursor_picker.as_mut().unwrap().selected = last; }
+        e.set_caret_shape(crate::config::CaretShape::Block); // sentinel ≠ row 6's Underline
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, wheel_ev(true, 0, 0), &reg, &km, &ex, &clk, &tx); // down at bottom → no move
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, last, "still at the bottom boundary");
+        assert_eq!(e.caret_shape, crate::config::CaretShape::Block,
+            "boundary wheel notch did NOT re-fire preview (sentinel Block survives; a spurious \
+             re-preview would set row 6's Underline)");
+    }
+
+    #[test]
+    fn theme_picker_wheel_boundary_notch_fires_no_preview() {
+        // I5 dedupe on the WHEEL path for the theme overlay — MUTATION-DETECTING via `previewed`.
+        // Park at the TOP row and wheel UP: a true boundary (saturating_sub keeps selected at 0,
+        // after == before). Pre-set `previewed` to a SENTINEL distinct from row 0's name — a
+        // spurious re-preview would overwrite it with Some(rows[0]). Pointer (0,0) is off the
+        // (centered) overlay, so no re-hover interferes.
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        assert!(!e.theme_picker.as_ref().unwrap().rows.is_empty(), "precondition: builtin themes present");
+        { e.theme_picker.as_mut().unwrap().selected = 0; }
+        let row0 = e.theme_picker.as_ref().unwrap().rows[0].clone();
+        let sentinel = format!("__sentinel_not_{row0}");
+        { e.theme_picker.as_mut().unwrap().previewed = Some(sentinel.clone()); }
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, wheel_ev(false, 0, 0), &reg, &km, &ex, &clk, &tx); // up at 0 → no move
+        assert_eq!(e.theme_picker.as_ref().unwrap().selected, 0, "still at the top boundary");
+        assert_eq!(e.theme_picker.as_ref().unwrap().previewed.as_deref(), Some(sentinel.as_str()),
+            "boundary wheel notch did NOT re-fire preview (sentinel in `previewed` survives; a \
+             spurious re-preview would set Some(rows[0]))");
+    }
+
+    /// N=3: hovering three DISTINCT rows fires the preview funnel EXACTLY three times — a
+    /// mutation-guarded count (not merely "at least once" or "vacuously zero"). Each hover lands
+    /// on a row whose caret shape DIFFERS from the row before it, so a missed or duplicated fire
+    /// is visible in the final shape even without an instrumented counter.
+    #[test]
+    fn cursor_picker_hover_fires_preview_exactly_once_per_row_crossed() {
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_cursor_picker();
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+        for row in [1u16, 3, 5] {
+            e.set_caret_shape(crate::config::CaretShape::Default); // tamper before each hover
+            handle(&mut e, moved(r.x + 1, r.y + 1 + row), &reg, &km, &ex, &clk, &tx);
+            let (_, _, shape, _) = crate::cursor_picker::ROW_ACTIONS[row as usize];
+            assert_eq!(e.caret_shape, shape, "hover on row {row} fired exactly once (tamper undone)");
+        }
     }
 
     // -----------------------------------------------------------------------
