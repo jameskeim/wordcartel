@@ -76,25 +76,6 @@ heading golden/pin churn across three styles. Anchors: `SHADES` (`render.rs:20`)
 (`render.rs:~665,~730`), `prefix_width` (`layout.rs:289`), `heading_level_glyph` (`theme.rs:119`),
 multi-state-option template (`registry.rs:480-510`).
 
-### B7. Selected menu-item text too light / less legible
-<!-- item: B7 -->
-
-**Observation (user):** the text of the HIGHLIGHTED (selected) menu item is too light. It "used to be dark"
-(more legible); the user suspects the E5 dimming treated all menu text uniformly, hurting the selected
-item's legibility, and asks whether the selected item should get a distinct highlight color.
-
-**Grounded (may drift) — filed as a POTENTIAL BUG (possible regression from E5, shipped this session):** the
-selected menu item uses the `ChromeSelected` face — "explicit fg/bg selection (menu item — today
-Black-on-White, NOT reverse)" (`theme.rs:37`), and `derive_chrome` marks it "inverted highlight —
-UNCHANGED" (`theme.rs:332`). On paper E5 (which receded/dimmed the `Chrome` BAR face, `5e1c2ea`) did NOT
-touch `ChromeSelected` — so if the selected text really went dark→light, the cause is subtler than a direct
-E5 edit and needs investigation. Candidates: the dropdown NORMAL items use `ChromeMuted` + DIM, and the
-selection may be drawn as a bg change that leaves the dim fg in place rather than swapping to
-`ChromeSelected`'s dark fg; or a compose-order interaction. Two directions the user raised: (a) give the
-selected item a dedicated highlight fg color; (b) at minimum restore dark, legible selected-item text.
-Anchors: `ChromeSelected` (`theme.rs:37,332`), the dropdown/selected-item render path (`render.rs` menu
-paint), `ChromeMuted` (dropdown normal), E5 (`derive_chrome` recede, `5e1c2ea`).
-
 ## Theme C — document workflow
 
 ## Theme D — configuration & persistence
@@ -419,22 +400,6 @@ path. Decide whether: (a) About is a distinct modal reusing only the splash *con
 (b) the startup splash itself becomes modal and About just re-invokes it; or (c) keep them separate
 behaviours. Leaning (a) — startup wants dismiss-on-type (don't make writers press a key to start);
 About wants dismiss-on-Esc. Same art, two dismissal policies.
-
-*(Captured 2026-07-11 via `scripts/backlog add`.)*
-
-### A16 — Format menu: drop redundant Transform entry
-<!-- item: A16 -->
-
-**Observation (user):** the `Format` menu carries a `Transform` entry that is redundant — the menu
-already exposes the underlying options list, so `Transform` duplicates a door that's already there.
-Drop the `Transform` menu row.
-
-**To ground when picked up:** confirm what the `Transform` menu row actually invokes (the
-transform-scope cycle — Reflow/Unwrap/Ventilate, C2 — vs. a submenu) and which options rows it
-overlaps with on `Format`, so removal drops only the duplicate affordance and not a unique path.
-Command-surface note: this is a **menu curation** change (law 4, menu ⊆ palette) — remove the
-`menu: Some(Format)` tag from that command, not the command itself; it stays palette-reachable.
-No behaviour or keybinding change. Pairs with the A3b curation lens.
 
 *(Captured 2026-07-11 via `scripts/backlog add`.)*
 
@@ -912,3 +877,27 @@ is already decided here so it's ready to go.
 *(Captured 2026-07-16 from the H21 final Fable gate. H7-sweep framing recorded 2026-07-16.)*
 
 
+
+### H25 — compose::face_to_ratatui is add-only — can't express modifier subtraction
+<!-- item: H25 -->
+
+**Surfaced by the chrome-selection-legibility effort (B7, Codex spec gate 2026-07-17, correcting the
+first framing).** `compose::face_to_ratatui` (`wordcartel/src/compose.rs`) is **add-only**: it does
+`add(face.dim, Modifier::DIM, s)` — emitting `Modifier::DIM` for `Some(true)` — and has **no path to
+emit a ratatui `sub_modifier`**. Consequence: a `Face`'s `dim` can never *subtract* a DIM that an
+underlay (an earlier `set_style` on the cell) already wrote. Note this is NOT "`dim = false` is
+ignored": `Theme::override_face` DOES honor `Some(false)` (`if patch.dim.is_some() { f.dim = patch.dim; }`),
+so a face's own `dim` is set correctly — but compose still can't produce a style that *clears* an
+inherited modifier. Ratatui itself supports subtraction (`Style::remove_modifier` / `sub_modifier`,
+honored by `Cell::set_style`); the gap is purely in wordcartel's compose layer.
+
+**Not a live bug today** — the B7 fix strips the leaked DIM at the `ChromeStyles::build` cache seam via
+`.remove_modifier(Modifier::DIM)` on the already-composed style, which does NOT depend on this. H25 is
+the deeper, more honest fix that B7 deliberately did NOT take (scope creep for a cosmetic bug): teach
+`face_to_ratatui` to express modifier subtraction (e.g. a `Face` clears an inherited modifier), so the
+strip needn't live at the cache seam and the model generalizes beyond DIM. Small, but touches core
+compose semantics — do it as its own considered change, not folded into a cosmetic fix. Anchors:
+`compose::face_to_ratatui` (add-only path), `Face.dim` tri-state, `override_face` (honors `Some(false)`),
+`ChromeStyles::build` (where B7 works around it). ~S.
+
+*(Captured 2026-07-17 via `scripts/backlog add`; reframed same day from the B7 Codex spec-gate correction.)*

@@ -342,6 +342,18 @@ plugin/automation input), a separate path from internal built-in commands. Likel
 Anchors: the command registry (`registry.rs`), the existing word/line delete commands in `commands/edit.rs` as
 the pattern (`editor.apply` + `settle_after_edit`), and `docs/design/command-surface-contract.md`.
 
+### A16 — Format menu: drop redundant Transform entry
+<!-- item: A16 -->
+
+**Shipped 2026-07-17** (merge `505f093`, folded into the B7 chrome-selection-legibility effort as a cheap
+ride-along). The `Format` menu carried a `Transform…` umbrella row whose discrete variants
+(reflow/unwrap/ventilate) were already on `Format` — a duplicate door. Fix: changed the `transform`
+command's registration in `registry.rs` from `Some(MenuCategory::Format)` to `None`. Menu curation only
+(command-surface law 4, menu ⊆ palette): the command stays registered and palette-reachable, the menu just
+shrinks. Ctrl-T (→ `transform`) unaffected; `transforms_are_registered_commands_in_format_category` (the six
+discrete variants) untouched; `a3b_placement_sweep_categories` flipped to expect `None`. Both final gates
+(Codex pre-merge + Fable whole-branch) confirmed no command-surface regression.
+
 ## Theme B — rendering
 
 ### B1 — Word-boundary wrap (UAX #14)
@@ -564,6 +576,24 @@ uniform), ventilate moot (sentence displays content-trimmed → a negative guard
 row vs B10 phantom LOGICAL line). Docs: `docs/superpowers/specs/2026-07-16-b17-...-design.md` + plan. Command-surface
 N/A.
 
+### B7 — Selected menu-item text too light / less legible
+<!-- item: B7 -->
+
+**Shipped 2026-07-17** (merge `505f093`). The selected menu-item text washed out on dark/phosphor themes
+(fine on light). **Root cause — corrected from the filed guess** (which suspected an E5 fg regression on
+`ChromeSelected`): it was a leaked `Modifier::DIM`. The menu dropdown underlays its rows with `ChromeMuted`
+(dim) and the menu bar underlays with `Chrome` (E5 dim); the selected row/open-label then swap to
+`ChromeSelected` (a clean fg+bg swap, no dim) — but ratatui 0.30.2's `Cell::set_style` patch OR-merges
+modifiers, so the underlay's DIM rode onto the selected row. On dark/phosphor themes the selected fg is
+dark-on-light, and DIM faded that dark fg toward the light bg → contrast collapse. **Two leak sites** (dropdown
+selected row + bar open-category label), both closed. **Fix (option B, cache-layer strip):** append
+`.remove_modifier(Modifier::DIM)` to the three `ChromeSelected`-derived fields — `menu_sel`, `menu_open`,
+`overlay_selected` — in `ChromeStyles::build` (`render.rs`); one seam, uniform across every theme source,
+and it fixes the Depth::None mono case for free. Intended side effect: light themes also lose DIM on selected
+rows (sanctioned). Process: modified-Fable-first (explore + live `snap -e` captures → warm-Fable scope memo →
+brainstorm B → Codex-gated spec/plan → 4-task TDD → two final gates GO). Two mutation-verified tests (buffer-
+level both-sites + seam-invariant sweep). Deferred deeper fix: [[H25]] (compose can't express modifier
+subtraction). Docs: `docs/superpowers/specs/2026-07-17-chrome-selection-legibility-design.md` + plan.
 
 ## Theme C — document workflow
 
