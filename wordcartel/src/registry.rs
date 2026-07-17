@@ -324,9 +324,10 @@ impl Registry {
                 crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
                 crate::editor::RenderMode::SourcePlain       => "Source" }),
             |c| run(c, Command::CycleRenderMode));
-        // transform: Format menu (A3b) — its discrete variants are all Format; View was
-        // a historical accident.
-        r.register("transform", "Transform…", Some(MenuCategory::Format), |c| {
+        // transform: palette-only (A16) — the discrete variants (reflow/unwrap/ventilate) already
+        // carry the Format door, so the Transform… umbrella row is redundant. Command stays
+        // registered + palette-reachable; Ctrl-T (input.rs/keymap.rs) is unaffected.
+        r.register("transform", "Transform…", None, |c| {
             c.editor.open_prompt(crate::prompt::Prompt::transform_chooser());
             CommandResult::Handled
         });
@@ -1472,8 +1473,10 @@ mod tests {
         let meta = |id: &str| reg.meta(reg.resolve_name(id).expect(id)).expect(id);
         assert_eq!(meta("filter").menu, Some(MenuCategory::Format),
             "filter is a text-shaping op, sibling of reflow/unwrap/ventilate");
-        assert_eq!(meta("transform").menu, Some(MenuCategory::Format),
-            "transform's discrete variants are all Format; View was a historical accident");
+        assert_eq!(meta("transform").menu, None,
+            "A16: the Transform… umbrella row is dropped from the Format menu — its discrete \
+             variants (reflow/unwrap/ventilate) already carry the Format door; the command stays \
+             registered and palette-reachable");
         for id in ["delete_word_back", "delete_word_forward", "delete_line", "delete_to_line_end"] {
             assert_eq!(meta(id).menu, None, "{id} is a keystroke-native atomic edit — palette-only");
         }
