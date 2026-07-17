@@ -1,6 +1,11 @@
-# makepkg build artifacts — keep only PKGBUILD and .SRCINFO under version control
+# makepkg build artifacts — keep only .SRCINFO under version control
 pkg/
 src/
 *.pkg.tar.zst
 *.pkg.tar.*
 *.log
+
+# PKGBUILD is untracked: makepkg's pkgver() rewrites its pkgver= line every
+# build (auto-derives from `git describe`), so tracking it means perpetual
+# working-tree churn. Kept locally, out of version control.
+PKGBUILD
