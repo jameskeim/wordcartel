@@ -434,58 +434,6 @@ high hygiene value before Effort P. Anchor: `wordcartel/src/filter.rs`
 
 *(Captured 2026-07-11 from the v0.4.0 release gate.)*
 
-### S7 — Linguistic substrate — harper-brill POS tagger + NP chunker in-process
-<!-- item: S7 -->
-
-**The in-process linguistic layer that S8 needs.** Adoption of `harper-brill` was **decided
-2026-07-12** on measured evidence (arc doc, D4).
-
-**The finding that made it possible, and it is in neither design document:** the POS backend is
-**not** `harper-core`, and it does **not** arrive via the prose-linters effort. `harper-brill` 2.5.0
-has exactly **two** direct dependencies (`harper-pos-utils`, `serde_json`) and exposes a **rule-based
-Brill POS tagger** (`tag_sentence -> Vec<Option<UPOS>>`) *and* a **noun-phrase chunker**
-(`chunk_sentence`) — the design-space doc's `Phrase` object, which it deferred as "needs real
-grammatical parsing," is a shipped crate function.
-
-**Measured on this machine 2026-07-12 (a probe crate, not an estimate):**
-
-| | harper-core (H2, ejected 2026-07-11) | **harper-brill (adopted)** |
-|---|---|---|
-| crates added | +389 | **+119 activated** |
-| binary delta | +16 MB (3×) | **+0.95 MB** |
-| GPU/tensor backends compiled | cubecl + CUDA + ROCm + wgpu | **none** — `burn` core + `ndarray` only |
-| native / FFI (`-sys`) crates | — | **zero** |
-
-⚠ **Do not re-panic on the lockfile.** It lists **491** crates including `burn-cuda`, `cubecl-hip`,
-`burn-rocm`, `cudarc` — those are *optional deps that never compile*. `default-features = false`
-does its job; the activated count is 119.
-
-**Live proof it does what the clause splitter needs:**
-
-```
-"The committee met on Tuesday because the chair insisted."
-   DET  NOUN  VERB  ADP  PROPN  SCONJ  DET  NOUN
-```
-
-`on` → **ADP** (preposition), `because` → **SCONJ** (subordinating conjunction) — precisely the
-distinction that disambiguates "for" / "so" / "yet" and turns clause-splitting from a heuristic trap
-into a principled, testable rule.
-
-**This PARTIALLY REVERSES H2**, which pushed harper out-of-process specifically to shed `burn`. The
-reversal is deliberate and justified by the numbers: a third of the crates, a sixteenth of the
-binary, no GPU stack, no FFI. Recorded in H2's archive entry so a future reader does not think we
-forgot.
-
-**⚠ MERGE GATE — not yet satisfied:** `cargo deny` / `cargo audit` has **not** been run against the
-119 new crates (neither tool was installed on the machine where this was measured). Supply-chain
-surface grows ~40% of the lockfile, and H2 rightly noted this **matters more now that Effort P has
-opened a plugin attack surface**. This check must pass before S7 merges.
-
-**Shape:** a `wordcartel-core` module producing POS tags + NP chunks over the **caret's block
-window**, **cold-path only** (command/lens-triggered — *never* per-keystroke), cached by
-`(block_span, document.version)`. Brill tagging is rule application over a trained table:
-microseconds per sentence, no tensors at inference.
-
 ### S8 — Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only
 <!-- item: S8 -->
 

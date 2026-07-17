@@ -997,14 +997,16 @@ shipped_date = "2026-07-13"
 [[item]]
 id = "S7"
 title = "Linguistic substrate — harper-brill POS tagger + NP chunker in-process"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "S"
 depends_on = ["S6"]
-hook = "ADOPTION DECIDED 2026-07-12 (measured, not assumed): harper-brill = rule-based Brill POS tagger + NP chunker, 2 direct deps, +119 activated crates, +0.95 MB binary, ZERO GPU/FFI (the lockfile's 491 + cubecl/CUDA entries are optional deps that never compile). Proven: 'because' → SCONJ vs 'on' → ADP — the exact distinction that makes clause-splitting principled. PARTIALLY REVERSES H2 (burn returns in-process, thinner: 119 vs 389 crates) — see the H2 archive note. GATE: cargo deny/audit has NOT been run against the 119 new crates; it must pass before merge. Cold-path only, block-windowed, version-cached. Arc: docs/design/prose-structure-arc.md."
-doc = "ux-backlog.md#s7"
+hook = "In-process POS-tag + NP-chunk substrate for the S8 prose lenses: new pure crate wordcartel-nlp (analyze() over harper-brill's rule-based Brill tagger + NP chunker, UAX-29 tokenization bridge, byte-aligned spans, accepted None-floor) + a synchronous pull-based per-buffer NlpStore memo reached via nlp_window_at (absolute-offset rebase, zero idle work, no timers row). Substrate-only — paints/selects/mutates nothing, command-surface N/A (A14 leaf). Partially reverses H2 (burn returns in-process, rule paths only). cargo deny clean via 3 build-tree unmaintained-advisory exceptions (paste, bincode, + CC0-1.0 license). Arc: docs/design/prose-structure-arc.md."
+doc = "backlog-archive.md#s7"
 created = "2026-07-12"
+shipped_commit = "f7c4285"
+shipped_date = "2026-07-17"
 
 [[item]]
 id = "S8"
