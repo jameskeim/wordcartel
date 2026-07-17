@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["wordcartel-core", "wordcartel"]
+members = ["wordcartel-core", "wordcartel", "wordcartel-nlp"]
 
 # Single source of truth for the app version (SemVer, pre-1.0 → 1.0.0 at Effort P).
 # Both members inherit via `version.workspace = true`; a git tag `vX.Y.Z` mirrors it and

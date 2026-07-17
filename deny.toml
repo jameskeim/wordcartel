@@ -22,12 +22,15 @@ ignore = [
     # 2026-07-11). Re-check on the next dependency-tree pass.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml build-time-only via wayland-scanner; no compatible fix available; static/trusted XML input only" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml build-time-only via wayland-scanner; no compatible fix available; static/trusted XML input only" },
+    # paste (unmaintained) — build-time proc-macro pulled via burn-ndarray in harper-pos-utils
+    # (harper-brill's tree, S7). No vulnerability, no safe upgrade, unavoidable with burn.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro pulled via burn-ndarray in harper-pos-utils; no vulnerability, no safe upgrade, unavoidable with burn" },
 ]
 
 [licenses]
-# The permissive set actually used by the post-T6 tree (287 packages; burn removed), enumerated
-# from a live `cargo deny list` / `cargo deny check licenses` run against this tree on
-# 2026-07-11 — not guessed.
+# The permissive set used by the tree. NOTE: burn RE-ENTERED the tree with S7's harper-brill
+# dep (2026-07-17), so the previously-recorded "287 packages; burn removed" count is stale —
+# re-run `cargo deny list` on the next supply-chain pass to refresh it.
 #
 # MPL-2.0 is allowed: it is weak, FILE-LEVEL copyleft — link-safe and it does not affect
 # wordcartel's own license. Used by nucleo-matcher, option-ext (via dirs), and smartstring
@@ -41,6 +44,8 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+    # tiny-keccak is CC0-1.0 (public-domain dedication; more permissive than the allowed MIT/Apache); pulled via burn's tree.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 
