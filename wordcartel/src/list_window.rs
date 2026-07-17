@@ -29,6 +29,66 @@ pub(crate) fn keep_visible(selected: usize, row_count: usize, list_h: usize, scr
     *scroll_top = (*scroll_top).min(row_count.saturating_sub(list_h));
 }
 
+/// Wheel step: rows the viewport slides per notch, uniform across overlays (A21).
+#[allow(dead_code)] // wired in Task 2
+pub(crate) const WHEEL_STEP: usize = 3;
+
+/// Wheel notch → viewport scroll. `list_h` is the caller's effective ITEM-ROW budget (the menu
+/// passes its overflow-adjusted value, not the raw dropdown height). Slide `scroll_top` by
+/// ±WHEEL_STEP, clamped to `[0, max_top]` where `max_top == 0` when `list_h == 0` (nothing
+/// renders) and `row_count.saturating_sub(list_h)` otherwise — the SAME bound `keep_visible`
+/// enforces, including its `list_h == 0 → scroll_top = 0` reset, so wheel state never diverges
+/// from the per-frame painter at any window height. Selection is untouched; the caller drags the
+/// highlight in via `clamp_into_window`, then re-hovers. All-saturating: no height can panic.
+#[allow(dead_code)] // wired in Task 2
+pub(crate) fn wheel_scroll(down: bool, row_count: usize, list_h: usize, scroll_top: &mut usize) {
+    if list_h == 0 {
+        *scroll_top = 0;
+        return;
+    }
+    let max_top = row_count.saturating_sub(list_h);
+    *scroll_top = if down { scroll_top.saturating_add(WHEEL_STEP).min(max_top) }
+                  else { scroll_top.saturating_sub(WHEEL_STEP) };
+}
+
+/// Pull `highlight` into the visible item window `[scroll_top, scroll_top + list_h)` after a
+/// wheel scroll (ruling 1a) — an active wheel gesture drags the highlight to the window edge;
+/// a no-op when it is already inside. `list_h` is the effective item budget (menu =
+/// overflow-adjusted), so the highlight can never land on the menu's reserved indicator row.
+/// `row_count == 0` or `list_h == 0` (empty window, nothing renders): leave `highlight`
+/// untouched — the position is moot until a real window exists, and this avoids the `list_h - 1`
+/// underflow. All arithmetic saturating.
+#[allow(dead_code)] // wired in Task 2
+pub(crate) fn clamp_into_window(highlight: &mut usize, scroll_top: usize, list_h: usize, row_count: usize) {
+    if row_count == 0 || list_h == 0 { return; }
+    let last = row_count - 1;
+    let lo = scroll_top.min(last);
+    let hi = scroll_top.saturating_add(list_h - 1).min(last);
+    *highlight = (*highlight).clamp(lo, hi);
+}
+
+/// One wheel notch over a windowed list — the spec §5 branch, factored so the seven overlay
+/// slots do not each repeat it. Empty list (`row_count == 0`) is a total no-op (returns false).
+/// Short list (`row_count <= list_h`, nothing to scroll) steps `selected` ±1 (returns false).
+/// Long list scrolls the viewport by `WHEEL_STEP` then drags `selected` into the new window
+/// (returns `true` — the caller then re-hovers at the pointer, which overrides). `list_h` is the
+/// caller's effective item budget; name-agnostic via `&mut usize` (the menu passes `highlighted`,
+/// the others `selected`). Pure — the caller owns keep-visible and any per-overlay side effect.
+#[allow(dead_code)] // wired in Task 2
+pub(crate) fn wheel_list(down: bool, row_count: usize, list_h: usize,
+    selected: &mut usize, scroll_top: &mut usize) -> bool {
+    if row_count == 0 { return false; }
+    if row_count <= list_h {
+        *selected = if down { selected.saturating_add(1).min(row_count.saturating_sub(1)) }
+                    else { selected.saturating_sub(1) };
+        false
+    } else {
+        wheel_scroll(down, row_count, list_h, scroll_top);
+        clamp_into_window(selected, *scroll_top, list_h, row_count);
+        true
+    }
+}
+
 /// The six list-motion keys shared by every windowed overlay (palette, theme
 /// picker, file browser, outline) — menu and diag are excluded (different nav
 /// semantics; T10).
@@ -99,5 +159,84 @@ mod tests {
         let mut top = 0;
         keep_visible(0, 0, 15, &mut top);
         assert_eq!(top, 0, "empty rows: no movement, no underflow");
+    }
+
+    #[test]
+    fn wheel_scroll_slides_by_step_and_clamps() {
+        let mut top = 0;
+        wheel_scroll(true, 100, 10, &mut top);
+        assert_eq!(top, 3, "one notch down slides by WHEEL_STEP");
+        wheel_scroll(true, 100, 10, &mut top);
+        assert_eq!(top, 6, "second notch accumulates");
+        // clamp at the tail: max_top = 100 - 10 = 90.
+        let mut top = 89;
+        wheel_scroll(true, 100, 10, &mut top);
+        assert_eq!(top, 90, "clamped to row_count - list_h, not 92");
+        // up saturates at 0.
+        let mut top = 2;
+        wheel_scroll(false, 100, 10, &mut top);
+        assert_eq!(top, 0, "up saturates at 0 (2 - 3)");
+    }
+
+    #[test]
+    fn wheel_scroll_list_h_zero_pins_to_zero() {
+        let mut top = 7;
+        wheel_scroll(true, 5, 0, &mut top);
+        assert_eq!(top, 0, "list_h == 0 → max_top 0 → scroll_top 0 (mirrors keep_visible), down");
+        let mut top = 7;
+        wheel_scroll(false, 5, 0, &mut top);
+        assert_eq!(top, 0, "list_h == 0 → 0, up (saturating)");
+    }
+
+    #[test]
+    fn clamp_into_window_pulls_highlight_to_edge() {
+        // window [3, 3+10) = [3,13); a highlight of 1 is below → pulled to 3.
+        let mut h = 1;
+        clamp_into_window(&mut h, 3, 10, 100);
+        assert_eq!(h, 3, "below window → lower edge");
+        // a highlight of 50 is above [3,13) → pulled to 12.
+        let mut h = 50;
+        clamp_into_window(&mut h, 3, 10, 100);
+        assert_eq!(h, 12, "above window → upper edge (scroll_top + list_h - 1)");
+        // already inside → unchanged.
+        let mut h = 7;
+        clamp_into_window(&mut h, 3, 10, 100);
+        assert_eq!(h, 7, "inside window → no move");
+    }
+
+    #[test]
+    fn clamp_into_window_degenerate_is_noop_no_underflow() {
+        let mut h = 4;
+        clamp_into_window(&mut h, 0, 0, 10);
+        assert_eq!(h, 4, "list_h == 0 → no-op (empty window; no underflow)");
+        let mut h = 4;
+        clamp_into_window(&mut h, 0, 5, 0);
+        assert_eq!(h, 4, "row_count == 0 → no-op");
+    }
+
+    #[test]
+    fn wheel_list_short_steps_and_long_scrolls() {
+        // short list (row_count <= list_h): steps ±1, returns false (no re-hover).
+        let (mut sel, mut top) = (0, 0);
+        let scrolled = wheel_list(true, 5, 10, &mut sel, &mut top);
+        assert!(!scrolled, "short list does not scroll");
+        assert_eq!((sel, top), (1, 0), "short list steps selection down by 1");
+        let scrolled = wheel_list(false, 5, 10, &mut sel, &mut top);
+        assert!(!scrolled, "short list up does not scroll");
+        assert_eq!((sel, top), (0, 0), "short list steps back up");
+        // long list (row_count > list_h): scrolls + drags highlight, returns true.
+        let (mut sel, mut top) = (0, 0);
+        let scrolled = wheel_list(true, 100, 10, &mut sel, &mut top);
+        assert!(scrolled, "long list scrolls");
+        assert_eq!(top, 3, "scrolled by WHEEL_STEP");
+        assert_eq!(sel, 3, "highlight dragged to the window's lower edge");
+    }
+
+    #[test]
+    fn wheel_list_empty_is_total_noop() {
+        let (mut sel, mut top) = (0, 0);
+        let scrolled = wheel_list(true, 0, 0, &mut sel, &mut top);
+        assert!(!scrolled, "empty list never scrolls");
+        assert_eq!((sel, top), (0, 0), "empty list is a total no-op, no underflow");
     }
 }
