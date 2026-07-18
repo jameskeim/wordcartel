@@ -347,6 +347,27 @@ mod tests {
         assert!(!sel.is_empty(), "a visible abortable selection (D6)");
     }
 
+    /// S8 Task 6 (integration pin): nav range-selects the WHOLE flagged span (head at start,
+    /// D6 abortable selection) — typing over it then replaces the whole span, not just the
+    /// caret position. Exercises `prose_lens_next_match` → `commands::insert_char` against a
+    /// real `Editor`, end to end.
+    #[test]
+    fn typing_replaces_the_nav_selected_match() {
+        use crate::test_support::TestClock;
+        let t = "The report was written by them.\n";
+        let mut e = crate::editor::Editor::new_from_text(t, None, (80, 24));
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive = vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        crate::lenses::prose_lens_next_match(&mut e);
+        // typing over the selection replaces the whole flagged span (D6 — abortable, then mutate by typing).
+        crate::commands::insert_char(&mut e, 'X', &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "The report X by them.\n");
+    }
+
     #[test]
     fn nav_wraps_and_noops_when_empty_or_offlens() {
         let mut e = Editor::new_from_text("no matches at all here.\n", None, (80, 24));

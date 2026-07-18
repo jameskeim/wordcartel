@@ -13,6 +13,13 @@
 //! hand-roll them.
 
 mod edit;
+// Re-export `insert_char` at `commands::` (test-only) so S8's nav→select→type integration
+// test (`lenses.rs`, `typing_replaces_the_nav_selected_match`) can drive the typed-replace
+// path directly without threading a `Command::InsertChar` through `run` — the module
+// itself stays private (`mod edit;`); only this one primitive is surfaced, test-cfg'd so
+// production code keeps using the qualified `edit::insert_char` call in `run` below.
+#[cfg(test)]
+pub(crate) use edit::insert_char;
 // `pub(crate)` (not private like `mod edit;`) so `registry.rs` — outside `commands` —
 // can reach the A14 atomic-edit handlers directly (module-structure GATE: a leaf
 // module, no `Command` enum variant, no `commands::run` arm).

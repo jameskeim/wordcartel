@@ -36,7 +36,10 @@ pub(super) fn settle_after_edit(editor: &mut Editor) -> CommandResult {
 /// `Command::InsertChar(c)` — types `c` at the caret, or replaces a non-empty
 /// selection with it (CUA). Collapsed-selection inserts use `EditKind::Type`
 /// (coalescing); the sel-replace path uses `EditKind::Other`.
-pub(super) fn insert_char(editor: &mut Editor, c: char, clock: &dyn Clock) -> CommandResult {
+///
+/// `pub(crate)` (not `pub(super)`) — re-exported at `commands::insert_char` (S8 Task 6) so the
+/// nav→select→type integration test can drive the typed-replace path directly.
+pub(crate) fn insert_char(editor: &mut Editor, c: char, clock: &dyn Clock) -> CommandResult {
     let sel = editor.active().document.selection.primary();
     if !sel.is_empty() {
         // Non-empty selection: replace it with the typed character (CUA).

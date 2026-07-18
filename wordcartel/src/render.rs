@@ -377,17 +377,25 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
     };
 
     // Compose the status line.
-    // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
-    // flush the count segment to the right and truncate the left (path/mode) to fit.
-    // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
-    // segment so Ln/Col · words does not paint over the calm canvas row.
+    // When in the normal branch (no prompt/minibuffer/search) and word_count and/or the
+    // prose-lens count is showable, flush the segment(s) to the right and truncate the
+    // left (path/mode) to fit. The prose-lens count (S8 Task 6) is a SIBLING segment to
+    // word_count — its own gate (`prose_lens_count_segment`: lens active AND
+    // `computed_for == version`), independent of the word_count view option, so it can
+    // show even when word_count is off (and vice versa).
+    // When the status row is calm-hidden (Auto idle, no message), suppress these
+    // segments so Ln/Col · … does not paint over the calm canvas row.
     let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
     let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
     let composed = if !has_overlay && !status_hidden {
-        if let Some(wc) = crate::render_status::word_count_segment(editor) {
+        let wc = crate::render_status::word_count_segment(editor);
+        let lens = crate::lenses::prose_lens_count_segment(editor);
+        if wc.is_some() || lens.is_some() {
             let caret = crate::nav::head(editor);
             let (l, c) = editor.active().document.buffer.caret_line_col(caret);
-            let right = format!("Ln {l}, Col {c} · {wc}");
+            let mut right = format!("Ln {l}, Col {c}");
+            if let Some(seg) = &lens { right.push_str(" · "); right.push_str(seg); }
+            if let Some(seg) = &wc { right.push_str(" · "); right.push_str(seg); }
             let reserve = right.chars().count() + 1;
             let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
             let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
@@ -3127,6 +3135,36 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let status = row_string(&render_to_buffer(&mut e, 60, 6), 5);
         assert!(!status.contains("Ln "), "position rides word-count; off → hidden: {status}");
+    }
+
+    /// S8 Task 6: the prose-lens count is its OWN right-side segment, gated on `computed_for
+    /// == version` (an active AND current lens) — independent of `view_opts.word_count`. It
+    /// rides the status line with word_count OFF (proving no dependency on that option) and,
+    /// when both are on, the two segments coexist without one overwriting the other.
+    #[test]
+    fn status_shows_prose_lens_count_segment_when_active_and_current() {
+        let t = "The report was written by them.\n";
+        let mut e = Editor::new_from_text(t, None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test the segment content, not calm mode
+        e.view_opts.word_count = false; // independence from word_count
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive = vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        crate::derive::rebuild(&mut e);
+        let status = row_string(&render_to_buffer(&mut e, 60, 6), 5);
+        assert!(status.contains("Ln "), "lens segment rides Ln/Col even with word_count off: {status}");
+        assert!(status.contains("Passive: 1"), "got: {status}");
+        assert!(!status.contains("words"), "word_count off — no word-count segment: {status}");
+
+        // Both on: the two segments coexist, neither overwrites the other.
+        e.view_opts.word_count = true;
+        crate::derive::rebuild(&mut e);
+        let status_both = row_string(&render_to_buffer(&mut e, 60, 6), 5);
+        assert!(status_both.contains("Passive: 1"), "lens segment survives alongside word count: {status_both}");
+        assert!(status_both.contains("words"), "word-count segment still present: {status_both}");
     }
 
     #[test]
