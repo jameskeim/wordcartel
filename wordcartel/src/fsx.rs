@@ -26,6 +26,13 @@ pub(crate) trait Fs {
     fn create_excl(&self, path: &Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>>;
     /// Best-effort mode of an existing file (Unix); `None` if absent/unreadable/off-unix.
     fn existing_mode(&self, path: &Path) -> Option<u32>;
+    /// Read at most `limit + 1` bytes from `path`. `Ok(None)` when the file exceeds
+    /// `limit`; `Err` on any IO failure. The Option/Result split is deliberate: an
+    /// over-cap file is a POLICY outcome, an unreadable file is a FAILURE, and callers
+    /// that conflate them (today's `bounded_read_opt`) cannot tell a huge document from
+    /// a permission problem.
+    #[allow(dead_code)] // C5 tasks 3-24 use this via implementors; forward reference
+    fn read_capped(&self, path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>>;
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
     /// Durably flush a directory entry. A dir that cannot be opened is NOT an error.
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
@@ -76,6 +83,14 @@ impl Fs for RealFs {
             let _ = path;
             None
         }
+    }
+    fn read_capped(&self, path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::Read as _;
+        let f = fs::File::open(path)?;
+        let mut buf = Vec::new();
+        f.take(limit + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > limit { return Ok(None); }
+        Ok(Some(buf))
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         fs::rename(from, to)
@@ -437,5 +452,59 @@ mod tests {
             "the write committed (rename succeeded); only the durability barrier failed"
         );
         assert!(tmp_litter(&dir).is_empty(), "no litter after committed write");
+    }
+
+    // ---------------------------------------------------------------------------
+    // read_capped tests
+    // ---------------------------------------------------------------------------
+
+    fn unique_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "wc-fsx-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), label));
+        std::fs::create_dir_all(&d).expect("create dir");
+        d
+    }
+
+    #[test]
+    fn read_capped_returns_bytes_within_cap() {
+        let d = unique_dir("readcap-ok");
+        let p = d.join("f.txt");
+        std::fs::write(&p, b"hello").expect("seed");
+        let got = RealFs.read_capped(&p, 1024).expect("no io error");
+        assert_eq!(got.as_deref(), Some(&b"hello"[..]));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_capped_over_cap_is_ok_none_not_err() {
+        // Over-cap must be Ok(None) — a DISTINCT outcome from an IO failure, which is the
+        // whole reason this returns Result<Option<_>> rather than Option<_>.
+        let d = unique_dir("readcap-over");
+        let p = d.join("f.txt");
+        std::fs::write(&p, b"0123456789").expect("seed");
+        let got = RealFs.read_capped(&p, 4).expect("over-cap is not an IO error");
+        assert!(got.is_none(), "over-cap yields Ok(None)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_capped_missing_is_err_not_ok_none() {
+        let d = unique_dir("readcap-missing");
+        let err = RealFs.read_capped(&d.join("nope.txt"), 1024);
+        assert!(err.is_err(), "a missing file is an IO error, not an over-cap None");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_capped_fault_is_injectable() {
+        let d = unique_dir("readcap-fault");
+        let p = d.join("f.txt");
+        std::fs::write(&p, b"x").expect("seed");
+        let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::ReadCapped);
+        let err = fs.read_capped(&p, 1024).expect_err("injected read must fail");
+        assert!(err.to_string().contains("injected: read_capped"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

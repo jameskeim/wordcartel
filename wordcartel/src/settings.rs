@@ -801,6 +801,8 @@ mod tests {
                 Err(std::io::Error::other("boom")) // io_other_error is deny — the repo idiom (fsx.rs:394+)
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn read_capped(&self, p: &std::path::Path, l: u64)
+                -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
@@ -872,6 +874,8 @@ mod tests {
                 Err(std::io::Error::other("boom"))
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn read_capped(&self, p: &std::path::Path, l: u64)
+                -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
@@ -901,6 +905,8 @@ mod tests {
                 Err(std::io::Error::other("boom"))
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn read_capped(&self, p: &std::path::Path, l: u64)
+                -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }

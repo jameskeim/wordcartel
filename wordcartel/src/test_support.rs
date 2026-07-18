@@ -59,6 +59,7 @@ pub(crate) enum FaultAt {
     Sync,
     Rename,
     SyncDir,
+    ReadCapped,
     // Not yet constructed by any test as of C5 Task 1 — a later task's remove_file
     // fault-injection test (a non-fsx module) is the first consumer. Silence the
     // dead-code lint for this deliberate forward reference rather than dropping the
@@ -124,6 +125,12 @@ impl Fs for FaultFs {
         Ok(Box::new(FaultHandle { inner, fail: self.fail }))
     }
     fn existing_mode(&self, path: &Path) -> Option<u32> { self.inner.existing_mode(path) }
+    fn read_capped(&self, path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        if matches!(self.fail, FaultAt::ReadCapped) {
+            return Err(Error::other("injected: read_capped"));
+        }
+        self.inner.read_capped(path, limit)
+    }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         if matches!(self.fail, FaultAt::Rename) {
             return Err(Error::other("injected: rename"));
