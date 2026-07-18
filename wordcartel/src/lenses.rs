@@ -448,14 +448,24 @@ mod tests {
     fn oversized_doc_cap_latches_no_rearm_loop() {
         // CRITICAL-3: an oversized doc skips WITHOUT dispatching a job, latches armed_for_version to the
         // current version so advance() will NOT re-arm on the same version, and yields a None deadline.
+        // Drives the REAL crate::app::advance() arm (mirrors
+        // app::tests::advance_arms_on_change_due_with_subscriber_version_latched) so this test FAILS if
+        // the OR-escape `due_at.is_none() ||` (Critical-3) is reintroduced into the sweep arm gate.
         use crate::jobs::{Executor, InlineExecutor};
+        use crate::test_support::TestClock;
         let big = "word ".repeat((crate::limits::LENS_MAX_SWEEP_BYTES as usize / 5) + 2); // just over 8 MiB
         let mut e = crate::editor::Editor::new_from_text(&big, None, (80, 24));
         let v = e.active().document.version;
         set_prose_lens(&mut e, Some(ProseLensCategory::Weak));
-        // Mimic the advance() arm that fired this dispatch (it sets armed_for_version = version, due_at Some).
-        e.active_mut().pos.armed_for_version = v;
-        e.active_mut().pos.due_at = Some(0);
+
+        // Drive the REAL arm: advance() must set armed_for_version = v and a debounce deadline.
+        let clk = TestClock(1_000);
+        crate::app::advance(&mut e, &clk);
+        assert_eq!(e.active().pos.armed_for_version, v, "advance() armed for this version");
+        assert!(e.active().pos.due_at.is_some(), "advance() set a debounce deadline");
+
+        // Fire the debounce — the REAL cap-skip path (dispatch_pos_sweep) runs, as timers::on_tick
+        // would once due_at elapses.
         let ex = InlineExecutor::default();
         dispatch_pos_sweep(&mut e, &ex);
         assert!(ex.drain().is_empty(), "cap path dispatches NO job");
@@ -464,11 +474,15 @@ mod tests {
         assert_eq!(e.active().pos.computed_for, None, "never computed");
         assert!(e.active().pos.in_flight_version.is_none());
         assert!(e.status_text().contains("too large"), "one-time sticky notice");
-        // The advance() arm gate would NOT re-arm on the same version (no loop).
-        let stale = e.active().pos.computed_for != Some(v);
-        let would_rearm = stale && e.active().pos.in_flight_version.is_none()
-            && e.active().pos.armed_for_version != v;
-        assert!(!would_rearm, "cap-skip must not re-arm on the same version");
+
+        // No-rearm-loop: driving the REAL advance() AGAIN at the same version/document must NOT
+        // resurrect due_at or push armed_for_version forward. If the OR-escape were reintroduced,
+        // `due_at.is_none()` (true, just cleared above) would re-arm here — this assertion catches it.
+        let clk2 = TestClock(1_050);
+        crate::app::advance(&mut e, &clk2);
+        assert_eq!(e.active().pos.due_at, None, "idle re-run at the same version must not re-arm");
+        assert_eq!(e.active().pos.armed_for_version, v, "latch holds across a second advance()");
+
         // Deadline None after the skip (due_at None) even with a converged tree + lens active → idle-free.
         let dl = crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "pos_sweep").unwrap().deadline;
         e.active_mut().reconcile.maybe_stale = false;
