@@ -759,8 +759,12 @@ fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
         }
 
         // Prose-lens highlight (S8) — composes above Search, below Diagnostics (errors
-        // stay topmost; a stylistic lens never outranks a real diagnostic).
-        if lens_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end)) {
+        // stay topmost; a stylistic lens never outranks a real diagnostic). AMENDMENT
+        // (Fable whole-branch review): suppressed on a selected glyph — on plain fg/bg
+        // Selection themes the lens bg would otherwise paint over Selection, making a
+        // nav-selected match visually indistinguishable from an unselected one (risking
+        // a surprise span-replacement). Selection styling shows through instead.
+        if !is_selected && lens_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end)) {
             let lf = editor.theme.face(SE::ProseLensMatch);
             style = style.patch(crate::compose::face_to_ratatui(&lf, editor.depth));
         }
@@ -1564,6 +1568,47 @@ mod tests {
         let buf2 = render_to_buffer(&mut e, 80, 24);
         for x in start..end {
             assert_ne!(buf2[(x as u16, 0)].style().bg, want_bg, "stale store → nothing painted at col {x}");
+        }
+    }
+
+    #[test]
+    fn prose_lens_suppressed_on_selected_match_but_not_on_others() {
+        // Fable whole-branch amendment: on a plain fg/bg-swap Selection theme (tokyo-night's
+        // Selection is `bg: SEL_BG`, no `reverse`), a nav-selected lens match must revert to
+        // Selection styling — not the ProseLensMatch bg — so the writer can SEE it's selected
+        // and doesn't accidentally overtype the whole span. A second, unselected match must
+        // still carry the lens bg (the suppression is per-glyph, not lens-wide).
+        use wordcartel_core::theme::SemanticElement::{ProseLensMatch, Selection};
+        let t = "The report was written by them today. The essay was written by us anyway.\n";
+        let mut e = Editor::new_from_text(t, None, (80, 24));
+        e.theme = wordcartel_core::theme::tokyo_night();
+        e.depth = wordcartel_core::theme::Depth::Truecolor;
+        let v = e.active().document.version;
+        let start1 = t.find("was written").unwrap();
+        let end1 = start1 + "was written".len();
+        let start2 = t[end1..].find("was written").unwrap() + end1;
+        let end2 = start2 + "was written".len();
+        e.active_mut().pos.passive = vec![
+            crate::lenses::PosMatch { start: start1, end: end1, category: crate::lenses::ProseLensCategory::Passive },
+            crate::lenses::PosMatch { start: start2, end: end2, category: crate::lenses::ProseLensCategory::Passive },
+        ];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        // Select exactly the FIRST match's span (nav-jumped-to match).
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(start1, end1);
+        crate::derive::rebuild(&mut e);
+
+        let sel_bg = crate::compose::face_to_ratatui(&e.theme.face(Selection), e.depth).bg;
+        let lens_bg = crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth).bg;
+        assert_ne!(sel_bg, lens_bg, "precondition: tokyo-night must give Selection and ProseLensMatch distinct bgs");
+        let buf = render_to_buffer(&mut e, 80, 24);
+        for x in start1..end1 {
+            assert_eq!(buf[(x as u16, 0)].style().bg, sel_bg,
+                "col {x}: the SELECTED match must show Selection bg, not ProseLensMatch bg");
+        }
+        for x in start2..end2 {
+            assert_eq!(buf[(x as u16, 0)].style().bg, lens_bg,
+                "col {x}: the UNselected second match must still carry the ProseLensMatch bg");
         }
     }
 
