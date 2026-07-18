@@ -31,6 +31,18 @@ for fuzzy ranking. **No new dependencies.**
 
 These apply to **every** task. Each task's requirements implicitly include this section.
 
+### Keystroke tests drive the real intercept
+
+Any test asserting that a key or click *reaches* something must go through the real entry point:
+`test_support::{press_key_fb, press_char_fb, press_enter_fb}` for keys,
+`mouse::mouse_file_browser` for clicks. Calling the handler directly proves the handler works,
+not that the gesture reaches it — the vacuous-guard shape this plan has had to correct repeatedly.
+
+These helpers are `pub(crate)` in `test_support` (defined in Task 12), so **each consuming test
+module needs `use crate::test_support::{…};`** — Tasks 13, 18, 21, 23 and 26 all consume them.
+`nix_privileged()` lives there too: any chmod-based unreadability test must skip loudly on it
+rather than assert a false negative under root.
+
 ### Commit trailers — verbatim, on every commit
 
 ```
@@ -841,7 +853,21 @@ pub(crate) struct FileStat {
     }
 ```
 
-5. **Add the FaultFs arm** in `test_support.rs`: add `Stat` to `FaultAt`, and:
+5. **Update EVERY `Fs` impl — repeat the sweep.** `grep -rn "impl crate::fsx::Fs for\|impl Fs for" wordcartel/src`
+   reports five: `RealFs`, `FaultFs`, and **three `impl crate::fsx::Fs for FailFs` blocks in
+   `settings.rs`** (~`:799`, `:870`, `:899`). Adding `stat` makes all three incomplete — a compile
+   blocker for the test suite. Give each a delegating body:
+
+```rust
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
+```
+
+   The sweep is repeated in each trait-extending task rather than noted once in Task 2, because a
+   note one task away is a check that does not get run — that is how this was missed the first time.
+
+6. **Add the FaultFs arm** in `test_support.rs`: add `Stat` to `FaultAt`, and:
 
 ```rust
     fn stat(&self, path: &Path) -> std::io::Result<crate::fsx::FileStat> {
@@ -852,7 +878,7 @@ pub(crate) struct FileStat {
     }
 ```
 
-6. **Run — expect green:**
+7. **Run — expect green:**
 
 ```
 cargo test -p wordcartel --lib fsx::tests::stat_
@@ -860,7 +886,7 @@ cargo test -p wordcartel --lib fsx::tests::stat_
 
 Expected: `test result: ok. 4 passed`.
 
-7. **Commit:** `feat(c5): add Fs::stat with follow/lstat split and broken-symlink detection`
+8. **Commit:** `feat(c5): add Fs::stat with follow/lstat split and broken-symlink detection`
 
 ---
 
@@ -1090,6 +1116,14 @@ Plus `FaultAt::ListDir`.
         std::fs::write(hidden.join("t.md"), b"x").expect("seed");
         std::os::unix::fs::symlink(hidden.join("t.md"), d.join("link.md")).expect("symlink");
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Root ignores mode bits, so the chain resolves and `broken` is legitimately false.
+        // Skip rather than assert the opposite.
+        if std::fs::metadata(hidden.join("t.md")).is_ok() {
+            std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).ok();
+            let _ = std::fs::remove_dir_all(&d);
+            eprintln!("skip: privileged process — chmod 000 does not restrict this test");
+            return;
+        }
 
         let l = RealFs.list_dir(&d, None).expect("the listing itself still succeeds");
         let link = l.entries.iter().find(|e| e.name == "link.md").expect("link listed");
@@ -1235,7 +1269,17 @@ fn kind_of(is_file: bool, is_dir: bool) -> EntryKind {
 }
 ```
 
-5. **Add the FaultFs arm** in `test_support.rs`: add `ListDir` to `FaultAt`, and:
+5. **Update EVERY `Fs` impl — repeat the sweep.** Same five implementors
+   (`grep -rn "impl crate::fsx::Fs for\|impl Fs for" wordcartel/src`): `RealFs`, `FaultFs`, and the
+   **three `FailFs` blocks in `settings.rs`**. Adding `list_dir` makes all three incomplete. Give
+   each a delegating body:
+
+```rust
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
+```
+
+6. **Add the FaultFs arm** in `test_support.rs`: add `ListDir` to `FaultAt`, and:
 
 ```rust
     fn list_dir(&self, path: &Path, cap: Option<usize>)
@@ -1248,7 +1292,7 @@ fn kind_of(is_file: bool, is_dir: bool) -> EntryKind {
     }
 ```
 
-6. **Add the cap constant** to `limits.rs`:
+7. **Add the cap constant** to `limits.rs`:
 
 ```rust
 /// Retention cap for ONE interactive directory listing (the picker). Enumeration is never
@@ -1257,7 +1301,7 @@ fn kind_of(is_file: bool, is_dir: bool) -> EntryKind {
 pub const MAX_DIR_ENTRIES: usize = 5_000;
 ```
 
-7. **Run — expect green:**
+8. **Run — expect green:**
 
 ```
 cargo test -p wordcartel --lib fsx::tests::list_dir fsx::tests::resolution_stats
@@ -1267,7 +1311,7 @@ Expected: `test result: ok` — the four `list_dir_*` cases plus `resolution_sta
 `list_dir_emits_a_named_entry_whose_type_cannot_be_determined`, and
 `a_permission_denied_symlink_chain_reports_broken_not_a_listing_failure`.
 
-8. **Commit:** `feat(c5): add Fs::list_dir with EntryKind classification and uncapped enumeration`
+9. **Commit:** `feat(c5): add Fs::list_dir with EntryKind classification and uncapped enumeration`
 
 ---
 
@@ -1329,27 +1373,6 @@ instead, so a future single-threaded recording double is still possible.
 
 ```rust
     #[test]
-    fn ctx_carries_an_owned_fs_that_can_cross_a_thread() {
-        // The compile-shape guard. `jobs::Job::run` is `Box<dyn FnOnce() -> JobResult + Send>`,
-        // so a BORROWED &dyn Fs cannot be captured. This asserts the Arc form is what Ctx
-        // carries — if someone "simplifies" it back to a reference, this stops compiling and
-        // the worker-side seam silently reverts to a hardcoded RealFs.
-        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
-            std::sync::Arc::new(crate::fsx::RealFs);
-        let cloned = std::sync::Arc::clone(&fs);
-        let h = std::thread::spawn(move || {
-            // Any seam call proves the handle is usable off-thread.
-            cloned.stat(std::path::Path::new("/")).is_ok()
-        });
-        assert!(h.join().expect("thread joins"), "an owned Fs handle works on a worker thread");
-    }
-```
-
-2. **Run — expect it to pass already** (it only exercises `Arc<dyn Fs>`, not `Ctx`). Then add the
-   `Ctx` half, which is what actually fails:
-
-```rust
-    #[test]
     fn ctx_fs_field_exists_and_is_clonable_into_a_closure() {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
@@ -1365,7 +1388,7 @@ instead, so a future single-threaded recording double is still possible.
     }
 ```
 
-3. **Run — expect compile failure:**
+2. **Run — expect compile failure:**
 
 ```
 cargo test -p wordcartel --lib registry::tests::ctx_fs_field
@@ -1373,7 +1396,7 @@ cargo test -p wordcartel --lib registry::tests::ctx_fs_field
 
 Expected: ``error[E0560]: struct `Ctx` has no field named `fs```.
 
-4. **Add the field to `Ctx`** in `registry.rs`:
+3. **Add the field to `Ctx`** in `registry.rs`:
 
 ```rust
 pub struct Ctx<'a> {
@@ -1389,14 +1412,14 @@ pub struct Ctx<'a> {
 }
 ```
 
-5. **Add the field to `DispatchCtx`** in `overlays.rs`:
+4. **Add the field to `DispatchCtx`** in `overlays.rs`:
 
 ```rust
     /// The filesystem seam (owned handle — the listing thread clones it in).
     pub(crate) fs: &'a std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ```
 
-6. **Build the `Arc` at the TOP of `app::run` — before config discovery, not near the executor.**
+5. **Build the `Arc` at the TOP of `app::run` — before config discovery, not near the executor.**
    Position is load-bearing: `config::config_layer_paths`, `config::load`, the startup `is_file`
    probes, `theme_resolve`, `state::load`, and the launch `file::open` all run in the FIRST part of
    `run`, well before the executor and clock are created — and Tasks 6 and 7 migrate every one of
@@ -1446,7 +1469,7 @@ pub fn run(cli: Cli) -> std::io::Result<ExitReason> {
    any `#[cfg(test)]` attribute (an attribute-based filter silently skips the rest of a file that
    has test-only imports near the top, which is how this site was missed once).
 
-7. **Thread `fs` down the whole call chain that BUILDS those contexts.** Adding the field is not
+6. **Thread `fs` down the whole call chain that BUILDS those contexts.** Adding the field is not
    enough: the functions that construct `Ctx`/`DispatchCtx` have no `fs` value in scope until it is
    passed to them, and the compiler reports those as missing-field errors with no obvious source.
    **Enumerate by SEARCH, not by recall.** Three successive hand-written versions of this list
@@ -1495,14 +1518,14 @@ versions of this list claimed completeness they did not have.
    exists: `reduce_dispatch`'s `Msg::ExportDone` arm and `prompts::intercept`'s `Msg::ExportDone` arm
    both call `apply_export_done`, and both must pass `&*ctx.fs`.
 
-8. **Fix every remaining construction site.** Run `cargo build -p wordcartel` and add
+7. **Fix every remaining construction site.** Run `cargo build -p wordcartel` and add
    `fs: std::sync::Arc::clone(&fs)` (for `Ctx`) or `fs: &fs` (for `DispatchCtx`) to each literal the
    compiler still reports — chiefly test modules, where `fs: std::sync::Arc::new(crate::fsx::RealFs)`
    is the right value. The compiler enumerates these reliably **once step 7 has given each enclosing
    function an `fs` to hand over**; without step 7 the same errors appear with no value in scope to
    satisfy them.
 
-9. **Run — expect green:**
+8. **Run — expect green:**
 
 ```
 cargo build -p wordcartel && cargo test -p wordcartel --lib registry::tests::ctx_
@@ -1510,7 +1533,7 @@ cargo build -p wordcartel && cargo test -p wordcartel --lib registry::tests::ctx
 
 Expected: build clean, `test result: ok`.
 
-10. **Commit:** `feat(c5): carry an owned Arc<dyn Fs + Send + Sync> on Ctx and DispatchCtx`
+9. **Commit:** `feat(c5): carry an owned Arc<dyn Fs + Send + Sync> on Ctx and DispatchCtx`
 
 ---
 
@@ -1646,8 +1669,11 @@ In `wordcartel/src/config.rs`'s test module:
         let (cfg, warns) = load_with_fs(&crate::fsx::RealFs, &[p.clone()]);
         assert_eq!(cfg.state.max_entries, Config::default().state.max_entries,
             "over-cap config falls back to defaults");
-        assert!(warns.iter().any(|w| w.contains("cannot read") || w.contains("too large")),
-            "over-cap must warn, not pass silently: {warns:?}");
+        // Names the OVER-CAP branch specifically. `|| w.contains("cannot read")` would let a
+        // broken read path read as a cap success — the cap could be absent and an unrelated
+        // IO failure would satisfy the assertion.
+        assert!(warns.iter().any(|w| w.contains("too large")),
+            "the warning must name the CAP, not merely any read failure: {warns:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 ```
@@ -2073,12 +2099,40 @@ In `fsx.rs`'s test module:
         // `!is_dir` is NOT "regular file". config_layer_paths, plugin discovery, and the
         // clipboard PATH search all ask `is_file()`, and a fifo answering `true` would turn
         // "skip it" into a blocking read.
+        // MUST create a real fifo. Without one, `is_file_via` implemented as `!st.is_dir` —
+        // the exact defect this test's own comment warns about — passes every assertion
+        // (file→true, dir→false, missing→Err→false). The fifo is the only case that separates
+        // the two implementations.
+        //
+        // FAIL-VERIFY: implement `is_file_via` as `matches!(fs.stat(p), Ok(st) if !st.is_dir)`,
+        // watch the fifo assertion fail.
         let d = unique_dir("isfile-fifo");
         let f = d.join("plain.txt");
         std::fs::write(&f, b"x").expect("seed");
         assert!(is_file_via(&RealFs, &f), "regular file");
         assert!(!is_file_via(&RealFs, &d), "a directory is not a file");
         assert!(!is_file_via(&RealFs, &d.join("absent")), "a missing path is false, not an error");
+        #[cfg(unix)]
+        {
+            let fifo = d.join("pipe");
+            let cs = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+                .expect("path has no interior NUL");
+            // mkfifo via libc is not available here; use the `mkfifo` binary, skipping the
+            // assertion if it is absent so the gate machine never fails on a missing tool.
+            // MANDATORY, not best-effort. An earlier version skipped this when the `mkfifo`
+            // binary was absent — which made the guard vacuous on exactly the machines
+            // lacking it, since every other assertion here passes under an `!is_dir`
+            // implementation.
+            //
+            // `libc` is already in the lock (transitively, via notify/crossterm). If it is not
+            // a DIRECT dependency, add it under `[dev-dependencies]` — a dev-only dep does not
+            // touch decision 2, which governs runtime dependencies.
+            let rc = unsafe { libc::mkfifo(cs.as_ptr(), 0o644) };
+            assert_eq!(rc, 0, "mkfifo must succeed — this IS the guard, not an optional extra");
+            assert!(!is_file_via(&RealFs, &fifo),
+                "a FIFO is NOT a regular file — the one assertion an `!is_dir` implementation \
+                 fails, and the reason this test exists");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 ```
@@ -2377,6 +2431,21 @@ pub(crate) fn delete_with_fs(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>);
         append_word_to_dict_with_fs(&crate::fsx::RealFs, &p, "beta").expect("second append");
         let got = std::fs::read_to_string(&p).expect("read back");
         assert_eq!(got, "alpha\nbeta\n", "both words present, newline-terminated, in order");
+
+        // ATOMICITY, actually observed. The assertion above passes identically under the OLD
+        // non-atomic `OpenOptions::append` + `writeln!` — appending twice produces the same
+        // bytes either way. What separates them is a FAILED write: the atomic form leaves the
+        // previous contents intact, the append form leaves a torn file.
+        //
+        // FAIL-VERIFY: restore the append implementation, watch this fail with "alpha\nbeta\ngam".
+        let ff = crate::test_support::FaultFs::new(
+            crate::test_support::FaultAt::Write { after: 3 });
+        let err = append_word_to_dict_with_fs(&ff, &p, "gamma")
+            .expect_err("an injected mid-write failure must surface");
+        let _ = err;
+        assert_eq!(std::fs::read_to_string(&p).expect("read back"), "alpha\nbeta\n",
+            "a FAILED append leaves the dictionary exactly as it was — no torn line. This is \
+             the property `atomic_replace` buys and the old append could not.");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2588,10 +2657,19 @@ pub(crate) fn delete_with_fs(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>) {
 }
 ```
 
-8. **Run — expect green:**
+8. **Update every call site of the two signatures this task changes** (ripple map rows):
+
+   * `jobs_apply::apply_export_done` gains `fs` → callers `app.rs:320` (`reduce_dispatch`'s
+     `Msg::ExportDone` arm) and `prompts.rs:50` (`intercept`'s `Msg::ExportDone` arm) both pass
+     `&*ctx.fs`; four test call sites in `jobs_apply.rs` pass `&crate::fsx::RealFs`.
+   * `prompts::resolve_prompt` gains `fs` → callers `prompts.rs:40` (`intercept`) and `mouse.rs:692`
+     (`mouse_prompt`) pass `&*ctx.fs`; ~15 test call sites across `prompts.rs`, `jobs_apply.rs`, and
+     `app.rs` pass `&crate::fsx::RealFs`.
+
+9. **Run — expect green:**
 
 ```
-cargo test -p wordcartel --lib diagnostics_run:: file:: prompts:: swap:: jobs_apply::
+cargo test -p wordcartel --lib diagnostics_run:: file:: prompts:: swap:: jobs_apply:: mouse::
 ```
 
 Expected: all pass. **These four must still pass unmodified:**
@@ -2600,7 +2678,7 @@ Expected: all pass. **These four must still pass unmodified:**
 `jobs_apply::tests::apply_export_done_rename_failure_is_a_sticky_error`,
 `jobs_apply::tests::apply_export_done_toctou_target_appeared_is_a_sticky_warning`.
 
-9. **Commit:** `refactor(c5): route durable mutations through the seam; make the dict append atomic`
+10. **Commit:** `refactor(c5): route durable mutations through the seam; make the dict append atomic`
 
 ---
 
@@ -2866,8 +2944,8 @@ follow, so a real directory whose `init.lua` is a symlink already loads today.
 ```rust
 // crate::fsx
 pub(crate) enum EntryKind { File, Dir, Other, Unknown }
-pub(crate) struct DirEntryInfo { pub name: String, pub kind: EntryKind,
-                                 pub is_symlink: bool, pub broken: bool }
+pub(crate) struct DirEntryInfo { pub name: String, pub raw_name: std::ffi::OsString,
+                                 pub kind: EntryKind, pub is_symlink: bool, pub broken: bool }
 pub(crate) struct DirListing { pub entries: Vec<DirEntryInfo>, pub total_seen: usize,
                                pub unreadable: usize }
 pub(crate) trait Fs {
@@ -3537,6 +3615,72 @@ keystroke performs no syscall. `FileEntry` takes its final shape here.
 - Modify: `wordcartel/src/file_browser.rs` (`FileEntry` reshape; `FileBrowser` gains the cache)
 - Modify: `wordcartel/src/config.rs` (`FileTypeFilter`)
 - Modify: `wordcartel/src/lib.rs` (declare the new module)
+- Modify: `wordcartel/src/test_support.rs` (the shared keystroke helpers, below)
+
+#### Shared test helpers — defined HERE, in `test_support`, reused by Tasks 13–26
+
+Every test claiming a keystroke reaches something must drive the real entry point; a direct
+call to the handler is the vacuous-guard pattern this plan has had to correct repeatedly.
+These live in `test_support` rather than in one task's `mod tests` for two reasons: helpers
+inside a `#[cfg(test)] mod tests` are not reachable from another module's tests at all, and
+`test_support` is already the crate's sanctioned home for exactly this (`press`, `key_char`,
+`install_enabled_harper`). They are `pub(crate)` and `#[cfg(test)]`-gated with the file.
+
+**They route through `crate::file_browser::intercept`, the intercept's home as of this task.
+Task 18 moves the intercept into `file_browser_intercept.rs` and updates this ONE call path** —
+noted there as an explicit step, since every keystroke test in the effort depends on it.
+
+```rust
+    /// Drive ANY key through the real intercept, exactly as `reduce` would. `press_char_fb`
+    /// and `press_enter_fb` are thin wrappers; tests needing Tab or Esc use this directly.
+    pub(crate) fn press_key_fb(e: &mut crate::editor::Editor,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        tx: &std::sync::mpsc::Sender<crate::app::Msg>, code: crossterm::event::KeyCode)
+    {
+        use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: tx, fs };
+        let ev = Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // Task 18 repoints this to `crate::file_browser_intercept::intercept`.
+        let _ = crate::file_browser::intercept(crate::app::Msg::Input(ev), e, &ctx);
+    }
+
+    /// One printable character through the intercept.
+    pub(crate) fn press_char_fb(e: &mut crate::editor::Editor,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        tx: &std::sync::mpsc::Sender<crate::app::Msg>, c: char)
+    { press_key_fb(e, fs, tx, crossterm::event::KeyCode::Char(c)); }
+
+    /// Enter through the intercept.
+    pub(crate) fn press_enter_fb(e: &mut crate::editor::Editor,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        tx: &std::sync::mpsc::Sender<crate::app::Msg>)
+    { press_key_fb(e, fs, tx, crossterm::event::KeyCode::Enter); }
+
+    /// True when the process can read a mode-000 directory (root / CAP_DAC_OVERRIDE), which
+    /// voids the premise of any chmod-based unreadability test. Tests that would otherwise
+    /// assert a false negative skip loudly on this rather than passing vacuously.
+    pub(crate) fn nix_privileged() -> bool {
+        let d = std::env::temp_dir().join(format!("wc-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        if std::fs::create_dir_all(&d).is_err() { return false; }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000));
+            let readable = std::fs::read_dir(&d).is_ok();
+            let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&d);
+            return readable;
+        }
+        #[allow(unreachable_code)] { let _ = std::fs::remove_dir_all(&d); false }
+    }
+```
 
 #### Interfaces
 
@@ -3671,10 +3815,12 @@ mod tests {
     use crate::fsx::{DirEntryInfo, EntryKind};
 
     fn e(name: &str, kind: EntryKind) -> DirEntryInfo {
-        DirEntryInfo { name: name.into(), kind, is_symlink: false, broken: false }
+        DirEntryInfo { name: name.into(), raw_name: name.into(), kind,
+                       is_symlink: false, broken: false }
     }
     fn broken(name: &str) -> DirEntryInfo {
-        DirEntryInfo { name: name.into(), kind: EntryKind::Unknown, is_symlink: true, broken: true }
+        DirEntryInfo { name: name.into(), raw_name: name.into(),
+                       kind: EntryKind::Unknown, is_symlink: true, broken: true }
     }
     fn opts(show_clutter: bool, types: FileTypeFilter, destination: bool) -> FilterOpts {
         FilterOpts { show_clutter, types, destination }
@@ -3800,13 +3946,15 @@ And in `file_browser.rs`'s test module, the cache guard:
         crate::file_browser_listing::refetch(&fs, &mut fb, o);
         assert_eq!(fs.calls.load(Ordering::Relaxed), 1, "one fetch on open");
 
-        for c in ['a', 'l', 'p'] {
-            fb.query.push(c);
-            crate::file_browser_listing::rederive(&mut fb, o);
-        }
+        // Keystrokes go through the REAL intercept — mutating `fb.query` and calling
+        // `rederive` by hand would prove nothing about the path a writer's typing takes, and
+        // would still pass if the intercept re-fetched on every character.
+        e.file_browser = Some(fb);
+        for c in ['a', 'l', 'p'] { press_char_fb(&mut e, &fs_arc, &tx, c); }
         assert_eq!(fs.calls.load(Ordering::Relaxed), 1,
-            "THREE keystrokes performed ZERO additional list_dir calls");
-        assert!(fb.entries.iter().any(|e| e.name == "alpha.md"), "and the filter still works");
+            "THREE keystrokes through the intercept performed ZERO additional list_dir calls");
+        assert!(e.file_browser.as_ref().unwrap().entries.iter().any(|x| x.name == "alpha.md"),
+            "and the filter still works");
         let _ = std::fs::remove_dir_all(&dir);
     }
 ```
@@ -4192,8 +4340,8 @@ pub(crate) fn apply_listing_done(
         // Picker #1's listing finally lands.
         let stale = crate::fsx::DirListing {
             entries: vec![crate::fsx::DirEntryInfo {
-                name: "from_a.md".into(), kind: crate::fsx::EntryKind::File,
-                is_symlink: false, broken: false }],
+                name: "from_a.md".into(), raw_name: "from_a.md".into(),
+                kind: crate::fsx::EntryKind::File, is_symlink: false, broken: false }],
             total_seen: 1, unreadable: 0,
         };
         crate::file_browser::apply_listing_done(&mut e, stale_epoch, dir_a.clone(), Ok(stale));
@@ -4207,7 +4355,15 @@ pub(crate) fn apply_listing_done(
     }
 
     #[test]
+    #[cfg(unix)]   // chmod-based unreadability is meaningless off Unix
     fn a_failed_descend_leaves_the_writer_exactly_where_they_were() {
+        // `chmod 000` does not restrict root or CAP_DAC_OVERRIDE. If the listing SUCCEEDS the
+        // premise is void — skip rather than assert an inverted result, because a test that
+        // passes for the wrong reason is worse than one that opts out loudly.
+        if nix_privileged() {
+            eprintln!("skip: privileged process — chmod 000 does not restrict this test");
+            return;
+        }
         // The hold-pending guarantee. `fb.dir` does not move on Enter — it moves only when a
         // listing for the target SUCCEEDS. So an unreadable target costs the writer nothing:
         // not their directory, not their query, not their selection.
@@ -4218,18 +4374,33 @@ pub(crate) fn apply_listing_done(
         std::fs::write(dir.join("keep.md"), b"x").expect("seed");
         let _rx = open_and_pump(&mut e, dir.clone());
 
-        // Simulate Enter on a directory whose listing will fail.
+        // Drive a REAL descend. Hand-stamping `awaiting_epoch`/`pending_dir` and calling
+        // `apply_listing_done` would test only the error arm — if `file_browser_enter`'s
+        // Descend arm moved `fb.dir`/`query` eagerly (the guarantee being claimed), that
+        // version passes.
+        //
+        // FAIL-VERIFY: make the Descend arm set `fb.dir = target` and clear `fb.query` before
+        // spawning, watch this fail on both the dir and the query assertion.
         let bad = dir.join("unreadable");
-        let epoch = {
+        std::fs::create_dir_all(&bad).expect("dir");
+        #[cfg(unix)]
+        std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("chmod 000 so the listing fails");
+        e.file_browser.as_mut().expect("open").query.push_str("ke");
+        // Select the unreadable directory and press Enter through the real intercept.
+        {
             let fb = e.file_browser.as_mut().expect("open");
-            fb.query.push_str("ke");
-            let ep = crate::file_browser::next_epoch();
-            fb.awaiting_epoch = ep;
-            fb.pending_dir = Some(bad.clone());
-            ep
-        };
-        crate::file_browser::apply_listing_done(&mut e, epoch, bad.clone(),
-            Err(std::io::Error::other("boom")));
+            fb.entries = vec![crate::file_browser::FileEntry {
+                name: "unreadable".into(), kind: crate::fsx::EntryKind::Dir,
+                is_symlink: false, broken: false }];
+            fb.selected = 0;
+        }
+        press_enter_fb(&mut e, &fs, &tx);
+        // The listing fails on its thread; pump the result the run loop would deliver.
+        pump_listing(&mut e, &rx);
+
+        #[cfg(unix)]
+        std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o755)).ok();
 
         let fb = e.file_browser.as_ref().expect("picker stays open");
         assert_eq!(fb.dir, dir, "a failed descend does NOT move the writer");
@@ -5687,6 +5858,10 @@ mod tests {
     use crate::file_browser::FileEntry;
     use crate::fsx::EntryKind;
 
+    // The shared keystroke helpers (`press_key_fb`, `press_char_fb`, `press_enter_fb`,
+    // `nix_privileged`) live in `test_support` as of Task 12 — this task's tests import them:
+    use crate::test_support::{press_key_fb, press_char_fb, press_enter_fb};
+
     fn fe(name: &str, kind: EntryKind) -> FileEntry {
         FileEntry { name: name.into(), kind, is_symlink: false, broken: false }
     }
@@ -5789,11 +5964,27 @@ mod tests {
 
     #[test]
     fn absolute_and_home_relative_fields_are_honoured() {
+        // The `~/` assertion is MANDATORY, not conditional. It was originally guarded by
+        // `if let Some(home) = dirs::home_dir()`, which meant the entire tilde-expansion
+        // branch could be missing and this test would still pass on any container without
+        // a resolvable home — a vacuous pass exactly where the interesting behaviour is.
+        // `dirs::home_dir()` reads $HOME on unix, so the test SETS it and owns the answer.
+        //
+        // FAIL-VERIFY: delete the `~/` arm from `resolve_field`, watch this fail.
         let d = tmp("resolve-abs");
         assert_eq!(resolve_field(&d, "/etc/hosts"), std::path::PathBuf::from("/etc/hosts"));
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(resolve_field(&d, "~/notes.md"), home.join("notes.md"));
-        }
+
+        let home = tmp("resolve-home");
+        let prior = std::env::var_os("HOME");
+        // Edition 2021: `set_var` is safe here (it becomes `unsafe` only in edition 2024).
+        std::env::set_var("HOME", &home);
+        let got = resolve_field(&d, "~/notes.md");
+        match prior { Some(v) => std::env::set_var("HOME", v),
+                      None    => std::env::remove_var("HOME") }
+        assert_eq!(got, home.join("notes.md"),
+            "`~/` expands against the home dir, unconditionally asserted");
+
+        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -5804,36 +5995,64 @@ mod tests {
         // The deliberate two-step overwrite gesture: highlight, Tab (see the name land and
         // the footer show the resolved target), Enter (see the overwrite-confirm). Overwrite
         // is never one accidental keystroke, and never reachable without the target visible.
-        let mut field = String::from("draft");
-        let mut cur = field.len();
-        copy_name_into_field(&mut field, &mut cur, "existing.md");
-        assert_eq!(field, "existing.md", "the name REPLACES the field content");
-        assert_eq!(cur, "existing.md".len(), "and the cursor lands at the end");
-        // `copy_name_into_field` returns nothing and touches no path — it cannot commit.
+        // Driven through the REAL intercept. Calling `copy_name_into_field` directly proves
+        // the helper works, not that Tab reaches it — and "does not commit" would rest on a
+        // comment rather than an assertion.
+        //
+        // FAIL-VERIFY: remove the `KeyCode::Tab` arm from the destination branch, watch the
+        // field assertion fail; wire Tab to `commit_destination`, watch the no-commit
+        // assertions fail.
+        let d = tmp("tab-gesture");
+        std::fs::write(d.join("existing.md"), b"x").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.file_browser = Some(crate::file_browser::FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Destination {
+                purpose: crate::file_browser::DestinationPurpose::SaveAs,
+                field: "draft".into(), field_cursor: 5,
+            },
+            listing: Vec::new(), total_seen: 0, unreadable: 0,
+            entries: vec![FileEntry { name: "existing.md".into(), kind: EntryKind::File,
+                is_symlink: false, broken: false }],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        });
+
+        press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Tab);
+
+        match &e.file_browser.as_ref().expect("picker stays open").mode {
+            crate::file_browser::BrowseMode::Destination { field, field_cursor, .. } => {
+                assert_eq!(field, "existing.md", "Tab REPLACES the field content");
+                assert_eq!(*field_cursor, "existing.md".len(), "cursor lands at the end");
+            }
+            other => panic!("still destination mode, got {other:?}"),
+        }
+        assert!(e.file_browser.is_some(), "Tab does NOT commit — the picker stays open");
+        assert!(e.pending_save_overwrite.is_none(), "and raises no overwrite-confirm");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
     fn a_click_on_a_file_in_destination_mode_copies_the_name_and_does_not_commit() {
-        // FAIL-VERIFY: make destination-mode click commit like select mode, watch this
-        // fail, then revert.
+        // THE CLICK DIVERGENCE (decision 9) — driven through the REAL mouse path.
         //
-        // THE CLICK DIVERGENCE (decision 9) — the safety property, asserted.
+        // An earlier version called `click_commit_or_copy` directly. `mouse.rs` is currently
+        // wired to `file_browser_enter`, so that test passed while a live click COMMITTED —
+        // it guarded the safety property by asserting on a function the click never reached.
         //
-        // Select mode's `Down(Left)` selects AND commits, and that stays. Destination mode's
-        // does NOT, because the stakes are asymmetric: a mis-click in select mode opens the
-        // wrong file (free to undo — close the buffer), while a mis-click in destination mode
-        // would land on the overwrite path for an existing file, and the cost of being wrong
-        // is somebody's manuscript.
-        //
-        // A future reader will notice the inconsistency between two modes of one overlay and
-        // be tempted to unify them. The inconsistency IS the safety property.
+        // FAIL-VERIFY: leave `mouse::mouse_file_browser`'s `Down(Left)` arm calling
+        // `file_browser_enter` unconditionally (i.e. do not add the mode branch), watch this
+        // fail — the picker closes and `victim.md` is overwritten.
         let d = tmp("click-divergence");
         std::fs::write(d.join("victim.md"), b"precious\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("draft\n", None, (80, 24));
-        // Construct the destination-mode browser DIRECTLY from this task's own types.
-        // `Editor::open_destination_picker` belongs to Task 21 (it carries the Save-As
-        // wiring); using it here would be a forward reference that blocks this task under
-        // TDD, since the test is written first. Everything below is produced by THIS task.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Built from THIS task's own types — `open_destination_picker` is Task 21.
         e.file_browser = Some(crate::file_browser::FileBrowser {
             dir: d.clone(), query: String::new(),
             mode: crate::file_browser::BrowseMode::Destination {
@@ -5847,7 +6066,25 @@ mod tests {
             awaiting_epoch: 0, pending_dir: None,
         });
 
-        crate::file_browser::click_commit_or_copy(&mut e);
+        // A REAL left-click on the row the painter drew, routed through the overlay mouse
+        // table exactly as `reduce` routes it.
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        // Row 0's cell, computed from the overlay rect directly. Task 20 adds
+        // `chrome_geom::file_browser_row_origin`; using it here would be a forward reference,
+        // and row 0 sits at `list_top` by construction so this needs no helper.
+        let ov = crate::chrome_geom::palette_overlay_rect(area,
+            e.file_browser.as_ref().unwrap().entries.len());
+        let (col, row) = (ov.x + 1, ov.y + 2);   // +1 border column, +2 border + query row
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+        crate::mouse::mouse_file_browser(&mut e, crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col, row, modifiers: crossterm::event::KeyModifiers::NONE,
+        }, area, &ctx);
 
         // The name landed in the FIELD…
         match &e.file_browser.as_ref().expect("picker stays open").mode {
@@ -6212,8 +6449,38 @@ pub(crate) fn rederive(fb: &mut FileBrowser, show_clutter: bool, types: FileType
 ```
 
    `Minibuffer::{insert, backspace, left, right}` become one-line delegations to these, so both
-   callers share one implementation. Add a test covering a multibyte edit (`é`, `中`, `🙂`) through
-   the destination field — the repo's existing convention for multibyte coverage.
+   callers share one implementation. Add the multibyte test — exact bodies and offsets, since
+   "covers multibyte" without asserted offsets is where UTF-8 cursor bugs hide:
+
+```rust
+    #[test]
+    fn destination_field_edits_are_utf8_codepoint_safe() {
+        // Byte lengths: 'a'=1, 'é'=2, '中'=3, '🙂'=4. Every assertion is on the BYTE cursor,
+        // because that is what a naive `cursor += 1` gets wrong.
+        let mut f = String::new();
+        let mut c = 0usize;
+        for ch in ['a', 'é', '中', '🙂'] { text_insert(&mut f, &mut c, ch); }
+        assert_eq!(f, "aé中🙂");
+        assert_eq!(c, 1 + 2 + 3 + 4, "cursor advances by UTF-8 length, not by 1 per char");
+
+        text_left(&f, &mut c);                       // back over 🙂 (4 bytes)
+        assert_eq!(c, 1 + 2 + 3);
+        text_left(&f, &mut c);                       // back over 中 (3)
+        assert_eq!(c, 1 + 2);
+        text_right(&f, &mut c);                      // forward over 中
+        assert_eq!(c, 1 + 2 + 3);
+
+        text_backspace(&mut f, &mut c);              // delete 中
+        assert_eq!(f, "aé🙂", "the codepoint BEFORE the cursor is removed whole");
+        assert_eq!(c, 1 + 2);
+
+        // Boundary: left at 0 and right at len are no-ops, never a panic or a split codepoint.
+        c = 0; text_left(&f, &mut c); assert_eq!(c, 0);
+        c = f.len(); text_right(&f, &mut c); assert_eq!(c, f.len());
+        c = 0; text_backspace(&mut f, &mut c);
+        assert_eq!(f, "aé🙂", "backspace at 0 is a no-op");
+    }
+```
 
 7. **Move the intercept** into `file_browser_intercept.rs` and branch on mode. Destination mode
    routes printable characters, `Backspace`, `Left`/`Right`, and `Event::Paste` into the **field**
@@ -6225,6 +6492,12 @@ pub(crate) fn rederive(fb: &mut FileBrowser, show_clutter: bool, types: FileType
    task depends on nothing later. Each field edit calls
    `file_browser_listing::rederive(fb, editor.files_show_clutter, editor.files_type_filter)` — the
    destination flag comes from `fb.mode`, not from the caller.
+
+   **Repoint the shared test helper in the same step.** `test_support::press_key_fb` (Task 12)
+   calls `crate::file_browser::intercept`; change that one line to
+   `crate::file_browser_intercept::intercept`. Every keystroke test in Tasks 12–26 goes through
+   it, so leaving it behind fails the build loudly rather than silently — but it is named here
+   because "move a function" is exactly the change that forgets its test-only caller.
 
 8. **Add the click divergence** in `file_browser.rs` and wire it to `mouse.rs`:
 
@@ -6477,6 +6750,12 @@ pub(crate) enum ExtVerdict { Defaulted(std::path::PathBuf),
 /// The footer line for destination mode: the absolute resolved target AFTER extension
 /// policy, plus an inline existence note. `None` in select mode or with an empty field.
 pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option<String>;
+
+// crate::chrome_geom — the inverse of `file_browser_row_at`, so tests (and any future
+// caller) can address the cell the painter drew a given row at without duplicating the
+// geometry. Single-sourced with `file_browser_list_h` below.
+pub(crate) fn file_browser_row_origin(area: ratatui::layout::Rect, fb: &FileBrowser,
+    row_index: usize) -> (u16, u16);
 ```
 
 #### Steps
@@ -6512,6 +6791,25 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
         }
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains("exists"), "an existing target is disclosed inline: {line}");
+
+        // RESOLUTION must be visible before commit, not discovered in a confirm dialog. If
+        // `footer_target` skipped `resolve_write_destination`, it would echo the symlink path
+        // and both assertions above would still pass.
+        //
+        // FAIL-VERIFY: drop the `resolve_write_destination` call from `footer_target`, watch
+        // this fail — the footer shows `link.md` instead of the target.
+        #[cfg(unix)]
+        {
+            std::fs::write(d.join("real-target.md"), b"x").expect("seed");
+            std::os::unix::fs::symlink(d.join("real-target.md"), d.join("link.md"))
+                .expect("symlink");
+            if let BrowseMode::Destination { field, field_cursor, .. } = &mut fb.mode {
+                *field = "link.md".into(); *field_cursor = field.len();
+            }
+            let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
+            assert!(line.contains("real-target.md"),
+                "the footer names the RESOLVED write target, not the link the writer typed: {line}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -6584,8 +6882,56 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
    `list_top = r.y + 2` and `list_h` from `list_window::list_h_for`; if the footer consumes a row,
    the list interior shrinks and the hit-test must use the same reduced height the painter used.
    Single-source it: add a `pub(crate) fn file_browser_list_h(area: Rect, fb: &FileBrowser) -> u16`
-   in `chrome_geom.rs` that both the painter and `file_browser_row_at` call. Add a test asserting a
-   click on the last visible row maps to the entry the painter drew there in **destination** mode.
+   in `chrome_geom.rs` that both the painter and `file_browser_row_at` call. Add this test — an assertion that the two agree at the boundary the footer moved:
+
+```rust
+    #[test]
+    fn hit_testing_and_the_painter_agree_on_the_last_row_in_destination_mode() {
+        // The footer consumes a row from the block's bottom edge, so the list interior
+        // shrinks. If `file_browser_row_at` kept the old height, a click on the last visible
+        // row would select the row BELOW the one drawn there — off-by-one on a surface where
+        // the next keystroke can commit a write.
+        //
+        // FAIL-VERIFY: leave `file_browser_row_at` computing its own height instead of
+        // calling `file_browser_list_h`, watch this fail.
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let mut fb = FileBrowser {
+            dir: std::env::temp_dir(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs, field: "x".into(), field_cursor: 1 },
+            listing: Vec::new(), total_seen: 0, unreadable: 0,
+            entries: (0..12).map(|i| FileEntry {
+                name: format!("f{i:02}.md"), kind: crate::fsx::EntryKind::File,
+                is_symlink: false, broken: false }).collect(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let list_h = crate::chrome_geom::file_browser_list_h(area, &fb) as usize;
+        assert!(list_h > 0 && list_h < fb.entries.len(),
+            "precondition: the list is windowed, so a last visible row exists");
+        let last = list_h - 1;
+        let (col, row) = crate::chrome_geom::file_browser_row_origin(area, &fb, last);
+        assert_eq!(crate::chrome_geom::file_browser_row_at(area, &fb, col, row), Some(last),
+            "a click on the cell the painter drew row {last} at must select row {last}");
+        // And one row further down is OUTSIDE the list — that cell belongs to the footer.
+        assert_eq!(crate::chrome_geom::file_browser_row_at(area, &fb, col, row + 1), None,
+            "the row below the last entry is the footer, not a selectable entry");
+        fb.selected = last;
+    }
+```
+
+   **What this guard covers, and what it does not** — following the model of Task 4's
+   syscall-economy test, which discloses its own boundary:
+
+   *Covers:* a regression where `file_browser_row_at` stops calling `file_browser_list_h` and
+   recomputes its own height, so hit-testing and the windowing disagree about how many rows fit.
+   The `row + 1 → None` assertion is what catches it.
+
+   *Does NOT cover:* the painter drawing the list at different coordinates entirely. This compares
+   geometry against geometry — `file_browser_row_at` against `file_browser_row_origin` — not against
+   a rendered frame. Closing that would need a `TestBackend` render and a scrape of the drawn rows,
+   which the e2e journey (Task 26) exercises end-to-end. Stated because a test named "the painter
+   agrees" that never invokes the painter reads as more coverage than it is.
 
 5. **Run — expect green:**
 
@@ -6743,7 +7089,13 @@ pub fn open_save_as(editor: &mut Editor,
             crate::file_browser::DestinationPurpose::SaveAs,
             std::env::temp_dir(), String::new());
 
-        crate::file_browser::cancel_destination(&mut e); // the Esc path
+        // Driven through the REAL intercept. Calling `cancel_destination` directly is the
+        // pattern this very task's commit-arm comment condemns: Task 18 ships a plain
+        // `editor.file_browser = None` Esc arm that THIS task must replace, and a direct call
+        // passes whether or not that replacement happened.
+        //
+        // FAIL-VERIFY: leave Task 18's plain Esc arm in place, watch the drain assertions fail.
+        press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Esc);
 
         assert!(e.file_browser.is_none(), "Esc closes the picker");
         assert!(e.pending_save_as.is_none(), "and clears the armed action");
@@ -7050,7 +7402,12 @@ pub(crate) fn commit_destination(
                         editor.open_prompt(crate::prompt::Prompt::export_overwrite(
                             &editor.pending_export.as_ref().expect("just set").target));
                     } else {
-                        crate::export::do_export(editor, &ext, &resolved, msg_tx, false, fs);
+                        // NOTE: `do_export` gains its `fs` parameter in Task 22. Until that
+                        // lands, this arm calls the CURRENT arity
+                        // (`do_export(editor, &ext, &resolved, msg_tx, false)`); Task 22
+                        // adds the argument here as part of threading the seam into the
+                        // export worker. Stated so this task compiles standalone.
+                        crate::export::do_export(editor, &ext, &resolved, msg_tx, false);
                     }
                 }
             }
@@ -7121,7 +7478,6 @@ pub(crate) fn perform_block_write(editor: &mut crate::editor::Editor,
     // round. A test named end-to-end that skips the entry point reads as coverage while
     // proving only that a function it hand-called works.
 
-    /// Drive one key through the real intercept, exactly as `reduce` would.
     fn press_enter(e: &mut Editor, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
         ex: &dyn crate::jobs::Executor, clk: &dyn wordcartel_core::history::Clock,
         tx: &std::sync::mpsc::Sender<crate::app::Msg>)
@@ -7214,8 +7570,14 @@ pub(crate) fn perform_block_write(editor: &mut crate::editor::Editor,
         // Assert the DISPATCH specifically — an `|| status contains "export"` fallback would
         // pass on any export-ish status message, including a failure, proving nothing about
         // whether Enter reached the commit arm.
-        let dispatched = rx.try_iter().any(|m| matches!(m,
-            crate::app::Msg::ExportDone { ref target, .. } if target == &d.join("notes.html")));
+        // BOUNDED RECEIVE, not `try_iter()`: `do_export` spawns a thread, so an immediate
+        // drain races it and the test would pass or fail on scheduling. Same discipline the
+        // listing tests use.
+        let dispatched = std::iter::from_fn(|| rx.recv_timeout(
+                std::time::Duration::from_secs(5)).ok())
+            .take(4)
+            .any(|m| matches!(m,
+                crate::app::Msg::ExportDone { ref target, .. } if target == &d.join("notes.html")));
         assert!(dispatched,
             "Enter on the pre-seeded picker must dispatch an ExportDone for notes.html \
              (status was {:?})", e.status_text());
@@ -7558,7 +7920,10 @@ pub(crate) struct RecentRow {
 pub(crate) fn rows_from(session: &crate::state::SessionState, fs: &dyn crate::fsx::Fs)
     -> Vec<RecentRow>;
 
-pub(crate) fn open_recent(editor: &mut crate::editor::Editor, fs: &dyn crate::fsx::Fs);
+pub(crate) fn open_recent(editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>);
+pub(crate) fn ranked_paths(session: &crate::state::SessionState) -> Vec<std::path::PathBuf>;
 ```
 
 #### Steps
@@ -7569,6 +7934,7 @@ pub(crate) fn open_recent(editor: &mut crate::editor::Editor, fs: &dyn crate::fs
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::press_char_fb;
 
     #[test]
     fn rows_are_seq_ranked_and_missing_files_stay_visible_but_unavailable() {
@@ -7650,7 +8016,142 @@ pub(crate) fn open_recent(editor: &mut crate::editor::Editor, fs: &dyn crate::fs
 }
 ```
 
-4. **Declare the module** in `lib.rs` and add `Editor::open_recents`.
+4. **Compute availability off the UI thread.** The spec puts the existence check on the listing
+   thread — a recents list spanning a hung network mount would otherwise block the input loop on
+   `is_file_via` for every row, which is the exact hazard §6.3 exists to prevent. `open_recent`
+   therefore spawns, exactly like a directory listing, and the rows arrive via the existing
+   `Msg::ListingDone` epoch discipline:
+
+```rust
+pub(crate) fn open_recent(editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>)
+{
+    let session = match crate::swap::state_dir() {
+        Ok(dir) => crate::state::load_in_with_fs(&**fs, &dir),
+        Err(_) => crate::state::SessionState::default(),
+    };
+    // Paths and seq ranking are pure — computed here. Only the per-row `is_file` probe,
+    // which touches the filesystem once per entry, goes to the thread.
+    let paths = ranked_paths(&session);
+    if paths.is_empty() {
+        editor.set_status(crate::status::StatusKind::Info, "No recent files");
+        return;
+    }
+    editor.open_recents_pending(paths.clone());       // shows rows immediately, availability TBD
+    let epoch = crate::file_browser::next_epoch();
+    if let Some(fb) = editor.file_browser.as_mut() { fb.awaiting_epoch = epoch; }
+    let fs = std::sync::Arc::clone(fs);
+    let tx = msg_tx.clone();
+    std::thread::spawn(move || {
+        let rows: Vec<RecentRow> = paths.into_iter()
+            .map(|path| { let available = crate::fsx::is_file_via(&*fs, &path);
+                          RecentRow { path, available } })
+            .collect();
+        let _ = tx.send(crate::app::Msg::RecentsProbed { epoch, rows });
+    });
+}
+```
+
+   with a `Msg::RecentsProbed { epoch, rows }` arm delegating to
+   `recents::apply_recents_probed(e, epoch, rows)` — named and shaped after
+   `file_browser::apply_listing_done`, since it has the identical stale-epoch obligation:
+
+```rust
+/// Apply a completed availability probe. Discards a stale epoch — a probe for a recents
+/// list the writer has already closed and reopened must never re-mark the CURRENT rows.
+///
+/// Re-marks IN PLACE rather than calling `open_recents` again. Reopening would run
+/// `close_all`, reset `query` to empty, and reset `selected` — so a probe landing a beat
+/// after the writer started typing would wipe their filter and move their cursor. The probe
+/// carries availability and nothing else; it must change availability and nothing else.
+pub(crate) fn apply_recents_probed(editor: &mut crate::editor::Editor, epoch: u64,
+    rows: Vec<RecentRow>)
+{
+    let Some(fb) = editor.file_browser.as_mut() else { return };
+    if fb.awaiting_epoch != epoch { return; }
+    let unavailable: std::collections::HashSet<String> = rows.iter()
+        .filter(|r| !r.available)
+        .map(|r| r.path.to_string_lossy().into_owned())
+        .collect();
+    for entry in fb.entries.iter_mut() {
+        if unavailable.contains(&entry.name) { entry.kind = crate::fsx::EntryKind::Unknown; }
+    }
+}
+```
+
+   **Three consumers of the extended shapes must be updated in this task:**
+
+   * `Msg`'s hand-written exhaustive `Debug` impl in `app.rs` gains
+     `Msg::RecentsProbed { epoch, rows } => write!(f, "RecentsProbed({epoch}, {} rows)", rows.len())`
+     — the same non-exhaustive-match defect `ListingDone` had in Task 13.
+   * `reduce_dispatch` gains the dispatch arm beside `Msg::ListingDone`.
+   * **`BrowseMode::filter_text` (Task 18) matches only `Select` and `Destination`** — adding
+     `Recents` makes it non-exhaustive. Its `Recents` arm returns `query`, like `Select`:
+
+```rust
+    pub fn filter_text<'a>(&'a self, query: &'a str) -> &'a str {
+        match self {
+            BrowseMode::Select | BrowseMode::Recents => query,
+            BrowseMode::Destination { field, .. } => field,
+        }
+    }
+```
+
+   **Test the probe path.** This is the newest concurrency surface in the effort, and it has the
+   same stale-epoch hazard `apply_listing_done` has — with none of its coverage until now. The
+   test drives `apply_recents_probed` directly for the epoch discipline (the thread itself is
+   just a `map` over `is_file_via`, and spawning it would make the test scheduling-dependent for
+   no added coverage), and asserts the pre-probe state that proves the open did not block.
+
+```rust
+    #[test]
+    fn recents_open_unblocked_and_a_stale_probe_never_re_marks_the_rows() {
+        // Two properties in one arrangement because they share it:
+        //  (a) OPENING shows every row selectable immediately — the writer never waits on one
+        //      `stat` per row, which is the whole reason the probe is off-thread (§6.3).
+        //  (b) A STALE probe is DISCARDED. Without the epoch check, a slow probe for a list
+        //      the writer already closed and reopened would re-mark the CURRENT rows with the
+        //      PREVIOUS list's availability — rows greying out for the wrong files.
+        //
+        // FAIL-VERIFY (two): (a) make `open_recents_pending` probe inline with `is_file_via`
+        // and mark rows `Unknown` — the pre-probe assertion fails; (b) delete the
+        // `epoch != fb.awaiting_epoch` guard from the arm — the stale assertion fails.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let gone = std::path::PathBuf::from("/nonexistent/ch1.md");
+        e.open_recents_pending(vec![gone.clone()]);
+
+        // (a) Pre-probe: shown, and selectable — NOT yet marked unavailable.
+        let fb = e.file_browser.as_ref().expect("the picker opened");
+        assert_eq!(fb.entries.len(), 1, "the row is on screen before any probe lands");
+        assert_eq!(fb.entries[0].kind, crate::fsx::EntryKind::File,
+            "availability is UNKNOWN-but-optimistic pre-probe, so the open never blocked");
+        let live_epoch = fb.awaiting_epoch;
+
+        // (b) A probe stamped with a DIFFERENT epoch must change nothing.
+        crate::recents::apply_recents_probed(&mut e, live_epoch.wrapping_sub(1),
+            vec![crate::recents::RecentRow { path: gone.clone(), available: false }]);
+        assert_eq!(e.file_browser.as_ref().unwrap().entries[0].kind,
+            crate::fsx::EntryKind::File, "a STALE probe is discarded, not applied");
+
+        // (c) A live probe re-marks availability and NOTHING ELSE. The writer types while the
+        // probe is in flight; when it lands their filter and cursor must survive. This is why
+        // the arm re-marks in place instead of calling `open_recents` again — that path runs
+        // `close_all` and resets `query`, silently eating the keystrokes they just made.
+        //
+        // FAIL-VERIFY: implement the arm as `editor.open_recents(rows)`, watch the query
+        // assertion fail while the availability one still passes.
+        e.file_browser.as_mut().unwrap().query.push_str("ch1");
+        crate::recents::apply_recents_probed(&mut e, live_epoch,
+            vec![crate::recents::RecentRow { path: gone, available: false }]);
+        let fb = e.file_browser.as_ref().unwrap();
+        assert_eq!(fb.entries[0].kind, crate::fsx::EntryKind::Unknown,
+            "the LIVE probe marks the row unavailable");
+        assert_eq!(fb.query, "ch1", "and leaves the in-flight filter the writer typed intact");
+    }
+```
+
+5. **Declare the module** in `lib.rs` and add `Editor::open_recents`.
 
    **Recents is a third `BrowseMode` variant, explicitly.** An earlier draft encoded "this is
    recents" as `listing.is_empty() && !entries.is_empty()` plus an early return in `rederive`. The
@@ -7677,6 +8178,16 @@ pub enum BrowseMode {
    list, not clear it** — the failure mode the rejected guard would have shipped.
 
 ```rust
+    /// Open the recents picker with availability NOT yet probed — every row starts `File`
+    /// (selectable) and is re-marked when `Msg::RecentsProbed` lands. Splitting this from
+    /// `open_recents` is what lets the probe run off-thread: the writer sees their list
+    /// immediately instead of waiting on one `stat` per row.
+    pub fn open_recents_pending(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.open_recents(paths.into_iter()
+            .map(|path| crate::recents::RecentRow { path, available: true })
+            .collect());
+    }
+
     /// Present recents through the existing picker. Rows become `FileEntry` values, so nav,
     /// fuzzy ranking, windowing, mouse hover, and the painter all work unchanged.
     ///
@@ -7716,13 +8227,50 @@ pub enum BrowseMode {
    `workspace::open_as_new_buffer`, inheriting the dirty-guard and resume behaviour. An unavailable
    row hits `EnterOutcome::Refuse` and sets the Sticky Warning — no special-casing.
 
-5. **Run — expect green:**
+6. **Add the narrowing test** — the property that justified `BrowseMode::Recents` over the rejected
+   implicit-state guard, and which nothing currently covers:
+
+```rust
+    #[test]
+    fn typing_narrows_the_recents_list_rather_than_clearing_it() {
+        // THE reason `Recents` is an explicit variant. The rejected design used an early
+        // return in `rederive`, which preserved the rows but could not FILTER them — typing
+        // would have silently done nothing. This is the assertion that would have caught it.
+        //
+        // FAIL-VERIFY (two, because there are two ways to break this): (a) make `rederive`'s
+        // Recents arm return early instead of ranking — all four rows survive the filter;
+        // (b) drop the printable-char arm from `file_browser_intercept`'s Recents branch —
+        // the query never fills and all four survive. The keystroke goes through the REAL
+        // intercept via `press_char_fb`: pushing to `fb.query` and calling `rederive` by hand
+        // proves the ranker works, NOT that typing reaches it, and (b) would pass vacuously.
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        e.open_recents(vec![
+            RecentRow { path: "/w/chapter-one.md".into(), available: true },
+            RecentRow { path: "/w/chapter-two.md".into(), available: true },
+            RecentRow { path: "/w/notes.md".into(),       available: true },
+            RecentRow { path: "/w/outline.md".into(),     available: false },
+        ]);
+        assert_eq!(e.file_browser.as_ref().expect("open").entries.len(), 4, "precondition");
+
+        for c in "chapter".chars() { press_char_fb(&mut e, &fs, &tx, c); }
+
+        let names: Vec<String> = e.file_browser.as_ref().unwrap()
+            .entries.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(names.len(), 2, "the list NARROWED, it did not clear or stay whole: {names:?}");
+        assert!(names.iter().all(|n| n.contains("chapter")), "{names:?}");
+    }
+```
+
+7. **Run — expect green:**
 
 ```
-cargo test -p wordcartel --lib recents::
+cargo test -p wordcartel --lib recents:: file_browser_listing::
 ```
 
-6. **Commit:** `feat(c5): add open_recent sourced from the LRU session store`
+8. **Commit:** `feat(c5): add open_recent sourced from the LRU session store`
 
 ---
 
@@ -7743,7 +8291,10 @@ cargo test -p wordcartel --lib recents::
 // crate::recents — the handler `open_recent` dispatches to. It EXISTS before this task
 // registers a command against it; an earlier draft had the registration first, which would
 // not compile.
-pub(crate) fn open_recent(editor: &mut crate::editor::Editor, fs: &dyn crate::fsx::Fs);
+pub(crate) fn open_recent(editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>);
+pub(crate) fn ranked_paths(session: &crate::state::SessionState) -> Vec<std::path::PathBuf>;
 
 // crate::config
 pub enum FileTypeFilter { Documents, All }
@@ -7848,7 +8399,9 @@ cargo test -p wordcartel --lib registry::tests::c5_commands_register_before_plug
 
 ```rust
         r.register("open_recent", "Open Recent\u{2026}", Some(MenuCategory::File), |c| {
-            crate::recents::open_recent(c.editor, &*c.fs);
+            // Async form (Task 23): the availability probe runs off-thread, so this needs the
+            // owned Arc and the sender, not a borrowed `&dyn Fs`.
+            crate::recents::open_recent(c.editor, &c.fs, &c.msg_tx);
             CommandResult::Handled
         });
         // C5 filter toggles — set-per-state primitives (palette-only) + one stateful
@@ -7893,10 +8446,20 @@ have is worse than none. Replace with a pointer to the real constraint: **`plugi
 6. **Run — expect green:**
 
 ```
-cargo test -p wordcartel --lib registry:: settings:: palette:: menu:: keymap::
+cargo test -p wordcartel --lib registry:: settings:: palette:: menu:: keymap:: overlays::
 ```
 
+`overlays::` is in the list deliberately. Spec §13.4 says C5 inherits the H21 guardrails
+"unchanged by not adding an `OverlayId` variant" — that premise holds (C5 adds no variant; it
+reuses the FileBrowser overlay). But *inheriting* them is not the same as *running* them, and C5
+adds real state to that overlay: destination mode's field, the `Recents` variant, new key arms.
+`overlays::tests::every_overlay_consumes_moved_without_panic_or_data_loss` is precisely the guard
+for a motion event reaching that new state — and A21's lesson was that motion regressions do not
+announce themselves.
+
 Expected: `test result: ok`, including
+`overlays::tests::render_order_is_exactly_the_frame_overlays`,
+`overlays::tests::every_overlay_consumes_moved_without_panic_or_data_loss`,
 `settings::tests::every_persisted_setting_has_a_command`,
 `palette::tests::palette_is_exhaustive_over_the_registry`,
 `palette::tests::palette_is_exhaustive_over_a_plugin_loaded_registry`,
@@ -7984,9 +8547,14 @@ pub id: Option<String>,
         let b = DocumentId::mint();
         assert_ne!(a, b, "two ids minted back-to-back differ (the counter component)");
         assert_eq!(a.to_hex().len(), 16, "16 hex digits");
-        let e = Editor::new_from_text("x\n", None, (80, 24));
+        // Stability across a MUTATION, not across two reads of the same expression — the
+        // latter is true unconditionally for a Copy field and asserts nothing.
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let id = e.active().document.id;
-        assert_eq!(id, e.active().document.id, "stable across reads");
+        e.active_mut().document.version += 1;
+        e.active_mut().document.saved_version = Some(e.active().document.version);
+        assert_eq!(e.active().document.id, id,
+            "the id is minted once and survives edits/saves — it is not re-minted per version");
     }
 
     // in state.rs
@@ -8019,7 +8587,8 @@ seq = 1
     }
 
     #[test]
-    fn swap_header_with_an_id_round_trips_and_old_readers_skip_it() {
+    fn swap_header_with_an_id_round_trips() {   // renamed: no old reader is exercised here;
+        // backward compatibility is covered by `pre_c5_swap_without_an_id_line_still_parses`.
         let h = SwapHeader {
             realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(b"x"), version: 1, ts_ms: 5, pid: 9,
@@ -8034,7 +8603,35 @@ seq = 1
 
 2. **Run — expect compile failures** (`DocumentId` and the `id` fields do not exist).
 
-3. **Add `DocumentId`** to `editor.rs`:
+3. **Make the two field additions non-breaking BEFORE adding the field.** `StateEntry` and
+   `SwapHeader` each gain `id: Option<String>`, which breaks every existing struct literal —
+   `state.rs`, `session_restore.rs`, `swap.rs`, `prompts.rs`, plus literals this plan adds in Tasks
+   17 and 23. Enumerating them is the third instance of the shared-type-field class
+   (`DirEntryInfo::raw_name` was the last), so fix it structurally instead:
+
+```rust
+// state.rs — StateEntry already has #[serde(default)]; add the derive and it composes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StateEntry { /* … existing fields …, */ pub id: Option<String> }
+
+// swap.rs
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SwapHeader { /* … existing fields …, */ pub id: Option<String> }
+```
+
+   Then convert every existing literal to functional-update form **once**:
+
+```rust
+    StateEntry { cursor: 3, scroll: 0, mtime: 1, size: 2, seq: 1, ..Default::default() }
+    SwapHeader { realpath: None, content_hash: h, version: 1, ts_ms: 5, pid: 9,
+                 ..Default::default() }
+```
+
+   After this, a future field addition costs nothing at any construction site. Do this migration
+   first; the `id` field lands on top of it. **This is the structural answer to a class that has now
+   cost three rounds** — enumerating literals a fourth time would just defer it again.
+
+4. **Add `DocumentId`** to `editor.rs`:
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8064,7 +8661,7 @@ impl DocumentId {
 
 Add `pub id: DocumentId` to `Document`, minted in its constructors.
 
-4. **Stamp it.** `StateEntry` gains `#[serde(default, skip_serializing_if = "Option::is_none")] pub
+5. **Stamp it.** `StateEntry` gains `#[serde(default, skip_serializing_if = "Option::is_none")] pub
    id: Option<String>`, populated by `persist_session` from the active document. `SwapHeader` gains
    `pub id: Option<String>`; `serialize` emits `id: {}` using `opt_str`, and `parse` gains an
    `"id" => id = if v == "-" { None } else { Some(v.to_string()) }` arm.
@@ -8073,7 +8670,7 @@ Add `pub id: DocumentId` to `Document`, minted in its constructors.
 > follow identity across routes or restarts. That is the ratified scope — §12.6 records what S3 must
 > specify to make the id load-bearing.
 
-5. **Assert the id is actually WIRED, not merely parseable.** The four tests above cover minting
+6. **Assert the id is actually WIRED, not merely parseable.** The four tests above cover minting
    and round-tripping; every one of them passes with the stamping entirely unimplemented. These two
    close that:
 
@@ -8112,7 +8709,7 @@ Add `pub id: DocumentId` to `Document`, minted in its constructors.
     }
 ```
 
-6. **Run — expect green:**
+7. **Run — expect green:**
 
 ```
 cargo test -p wordcartel --lib editor:: state:: swap:: session_restore::
@@ -8121,7 +8718,7 @@ cargo test -p wordcartel --lib editor:: state:: swap:: session_restore::
 Expected: `test result: ok`, including all four id tests. Every existing swap round-trip test must
 still pass.
 
-7. **Commit:** `feat(c5): mint and stamp a DocumentId without keying anything on it`
+8. **Commit:** `feat(c5): mint and stamp a DocumentId without keying anything on it`
 
 ---
 
@@ -8143,10 +8740,22 @@ still pass.
 
 ```rust
 // crate::swap
-/// Count the recovery artifacts DELIBERATELY kept because they may hold unsaved work.
-/// Visibility only — `cleanable_recovery_files` is untouched.
-pub(crate) fn kept_recoverable_count(fs: &dyn crate::fsx::Fs, dir: &Path,
-    protected: &std::collections::HashSet<PathBuf>) -> usize;
+/// The recovery artifacts DELIBERATELY kept because they may hold unsaved work, with the
+/// identifying detail the spec requires: the realpath the swap recorded, and when it was
+/// written. Both come from the parsed `SwapHeader` that `swap_is_cleanable` already reads.
+///
+/// Visibility only — `cleanable_recovery_files` and its fail-closed rules are untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeptRecoverable { pub realpath: String, pub ts_ms: u64 }
+
+pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
+    protected: &std::collections::HashSet<PathBuf>) -> Vec<KeptRecoverable>;
+
+// crate::prompts — `raise_clean_recovery` is `(editor, files)` in the tree: no seam handle,
+// no dir. The kept list is computed by the CALLER (`open_clean_recovery`, which already has
+// both) and passed in, rather than recomputed here.
+fn raise_clean_recovery(editor: &mut crate::editor::Editor,
+    files: Vec<std::path::PathBuf>, kept: Vec<crate::swap::KeptRecoverable>);
 ```
 
 #### Steps
@@ -8160,15 +8769,27 @@ pub(crate) fn kept_recoverable_count(fs: &dyn crate::fsx::Fs, dir: &Path,
         // A diverged swap holds content NOT on disk at its recorded realpath — it is the
         // MOST recoverable object in the state dir, not the least. It must never be swept;
         // C5 adds visibility only, so a writer can go extract or explicitly discard it.
-        let dir = unique_dir("kept-count");
-        let (p_ok, sp_ok) = make_doc_with_swap_in(&dir, "same\n", "same\n", DEAD_PID);
-        let (p_bad, sp_bad) = make_doc_with_swap_in(&dir, "file\n", "UNSAVED\n", DEAD_PID);
+        // Scan the dir the fixtures actually live in. `make_doc_with_swap` writes to
+        // `swap_path(...)` — the process state dir — so scanning a fresh `unique_dir` would
+        // have measured an empty directory and asserted about swaps that were never in it.
+        let dir = state_dir().expect("state dir");
+        let (p_ok, sp_ok) = make_doc_with_swap("same\n", "same\n", DEAD_PID);
+        let (p_bad, sp_bad) = make_doc_with_swap("file\n", "UNSAVED\n", DEAD_PID);
         let protected = std::collections::HashSet::new();
         let cleanable = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &protected);
-        let kept = kept_recoverable_count(&crate::fsx::RealFs, &dir, &protected);
+        let kept = kept_recoverable(&crate::fsx::RealFs, &dir, &protected);
         assert!(cleanable.contains(&sp_ok), "the valueless swap is still offered");
         assert!(!cleanable.contains(&sp_bad), "the diverged swap is still NEVER offered");
-        assert_eq!(kept, 1, "and the diverged one is COUNTED so the writer knows it exists");
+        // CONTAINMENT, not an exact count: the shared state dir may hold unrelated diverged
+        // swaps from other tests or a prior real session, and `kept.len() == 1` would fail
+        // for reasons that have nothing to do with this behaviour.
+        let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
+        let mine = kept.iter().find(|k| k.realpath.contains(&real_bad))
+            .expect("the diverged one is reported so the writer knows it exists");
+        assert!(!kept.iter().any(|k| k.realpath.contains(
+                &std::fs::canonicalize(&p_ok).expect("canon").display().to_string())),
+            "and the valueless one is NOT reported as kept");
+        assert!(mine.ts_ms > 0, "and it carries the timestamp");
         for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8219,7 +8840,10 @@ pub(crate) fn kept_recoverable_count(fs: &dyn crate::fsx::Fs, dir: &Path,
             d.clone(), "chapter one.html".into());
         h.pump_listing();
         h.key(KeyCode::Enter);
-        assert!(h.drained_msgs().iter().any(|m| matches!(m,
+        // BOUNDED wait, not an immediate drain: `do_export` spawns a thread, so reading the
+        // channel the instant after Enter races it and this assertion would pass or fail on
+        // scheduling. Mirrors T21's `export_commits_end_to_end_from_enter_through`.
+        assert!(h.await_msg(4, |m| matches!(m,
             crate::app::Msg::ExportDone { target, .. } if target == &d.join("chapter one.html"))),
             "Enter-through dispatches the export for the seeded target");
 
@@ -8234,21 +8858,53 @@ pub(crate) fn kept_recoverable_count(fs: &dyn crate::fsx::Fs, dir: &Path,
             "a successful Save-As names where the bytes went: {status}");
 
         // 5. REOPEN via recents — the rescue path.
-        let rows = crate::recents::rows_from(&crate::state::load(), &*h.fs);
-        assert!(rows.iter().any(|r| r.path.ends_with("chapter one v2.md")),
-            "the just-saved document appears in recents, ranked by seq");
+        //
+        // Built from a session store this test OWNS. `crate::state::load()` would read the
+        // developer's real `$XDG_STATE_HOME` — the journey never persists a session, so the
+        // assertion would depend on ambient machine state and could pass or fail for reasons
+        // nothing to do with C5.
+        // Driven through the real COMMAND, then the real Enter — `rows_from` alone would pass
+        // with a broken `open_recent`, a broken Enter arm, or missing registry wiring.
+        let before = h.editor.borrow().active().document.path.clone();
+        h.editor.borrow_mut().active_mut().document.path = None;   // a different buffer
+        h.dispatch_command("open_recent");
+        h.pump_recents();
+        assert!(h.editor.borrow().file_browser.is_some(), "the command opened the recents picker");
+        {
+            let e = h.editor.borrow();
+            let fb = e.file_browser.as_ref().unwrap();
+            let idx = fb.entries.iter().position(|r| r.name.ends_with("chapter one v2.md"))
+                .expect("the just-saved document is listed, ranked by seq");
+            drop(e);
+            h.editor.borrow_mut().file_browser.as_mut().unwrap().selected = idx;
+        }
+        h.key(KeyCode::Enter);
+        assert_eq!(h.editor.borrow().active().document.path, before,
+            "Enter on a recents row REOPENS that document — the buffer actually changed");
 
         let _ = std::fs::remove_dir_all(&d);
     }
 ```
 
 The journey needs three small `Harness` additions, all mechanical: an `fs` field (the `Arc` built
-once), a `pump_listing()` that drains one `Msg::ListingDone` into `apply_listing_done`, and a
-`drained_msgs()` accessor so step 3 can assert on the dispatch. `drain_jobs()` already exists.
+once), a `pump_listing()` that drains one `Msg::ListingDone` into `apply_listing_done`, and an
+`await_msg()` predicate wait so step 3 can assert on a dispatch that crosses a thread boundary.
+`drain_jobs()` already exists.
+
+```rust
+    /// Waits up to 5s for each of at most `n` messages, returning true as soon as one
+    /// satisfies `pred`. A plain `try_iter()` drain would race any thread-spawning
+    /// dispatch (`do_export`) and make the assertion scheduling-dependent.
+    fn await_msg(&self, n: usize, pred: impl Fn(&crate::app::Msg) -> bool) -> bool {
+        std::iter::from_fn(|| self.rx.recv_timeout(std::time::Duration::from_secs(5)).ok())
+            .take(n)
+            .any(|m| pred(&m))
+    }
+```
 
 2. **Run — expect failure**, then implement.
 
-3. **Add `kept_recoverable_count`** to `swap.rs` — it reuses `recovery_file_is_cleanable`'s inverse
+3. **Add `kept_recoverable`** to `swap.rs` — it reuses `recovery_file_is_cleanable`'s inverse
    over the same enumeration. **`cleanable_recovery_files`, `swap_is_cleanable`,
    `recovery_path_still_cleanable`, and their fail-closed rules are untouched**; this only counts.
 
@@ -8266,10 +8922,26 @@ pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
     protected: &std::collections::HashSet<PathBuf>) -> Vec<KeptRecoverable>;
 ```
 
+   `open_clean_recovery` — which holds `fs` and the state dir — computes both lists and passes
+   them down; `raise_clean_recovery` only formats:
+
+```rust
+pub fn open_clean_recovery(editor: &mut crate::editor::Editor, fs: &dyn crate::fsx::Fs) {
+    let (files, kept) = match crate::swap::state_dir() {
+        Ok(dir) => {
+            let protected = crate::swap::open_swap_paths(editor);
+            (crate::swap::cleanable_recovery_files(fs, &dir, &protected),
+             crate::swap::kept_recoverable(fs, &dir, &protected))
+        }
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+    raise_clean_recovery(editor, files, kept);
+}
+```
+
    and the modal appends one line per kept entry beneath the delete count:
 
 ```rust
-    let kept = crate::swap::kept_recoverable(fs, &dir, &protected);
     let mut msg = format!("Delete {n} recovery file(s)?");
     if !kept.is_empty() {
         msg.push_str(&format!(
@@ -8284,9 +8956,32 @@ pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
     }
 ```
 
-   Assert it: a diverged swap produces a modal message containing **its recorded realpath**, and the
-   delete count excludes it. **FAIL-VERIFY:** drop the `kept` block, watch the assertion on the
-   realpath fail.
+   Assert it — with a body, like every other task:
+
+```rust
+    #[test]
+    fn the_clean_recovery_modal_names_kept_recoverable_files() {
+        // FAIL-VERIFY: drop the `kept` block from the message, watch the realpath assertion fail.
+        let dir = state_dir().expect("state dir");
+        let (p_ok, sp_ok)   = make_doc_with_swap("same\n", "same\n", DEAD_PID);   // valueless
+        let (p_bad, sp_bad) = make_doc_with_swap("file\n", "UNSAVED\n", DEAD_PID); // diverged
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+
+        crate::prompts::open_clean_recovery(&mut e, &crate::fsx::RealFs);
+
+        let p = e.prompt.as_ref().expect("a confirm prompt is raised");
+        let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
+        assert!(p.message.contains(&real_bad),
+            "the modal must NAME the kept file by its recorded realpath: {:?}", p.message);
+        assert!(p.message.to_lowercase().contains("unsaved work"),
+            "and say why it is being kept: {:?}", p.message);
+        assert!(!e.pending_clean.contains(&sp_bad),
+            "the diverged swap is NEVER queued for deletion — the no-data-loss guarantee");
+        assert!(e.pending_clean.contains(&sp_ok), "the valueless one still is");
+        let _ = dir;
+        for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
+    }
+```
 
 5. **Run the full gates:**
 
@@ -8334,7 +9029,7 @@ Walked section by section. Every requirement maps to a task; no gaps found.
 | §11.2 quit-drain hazard | 21 |
 | §11.3 diverged-orphan visibility | 26 |
 | §12 `DocumentId` | 25 |
-| §13 command-surface conformance + registration order | 23 |
+| §13 command-surface conformance + registration order | 24 |
 | §14 all asserted invariants | distributed as tabulated above |
 
 **Placeholder scan:** no "TBD", no "similar to Task N", no "add appropriate error handling". Every
