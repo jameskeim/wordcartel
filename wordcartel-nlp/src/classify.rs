@@ -33,18 +33,19 @@ fn is_skip(u: Option<UPOS>) -> bool { matches!(u, Some(UPOS::ADV) | Some(UPOS::P
 /// put/set/cut/read/let/hit): favors recall on real prose over the rare pseudo-cleft FP.
 const IRREGULAR_PARTICIPLES: &[&str] = &[
     "begun", "bent", "bled", "born", "borne", "bought", "bound", "bred", "brought", "built", "burnt",
-    "cast", "caught", "chosen", "clung", "come", "crept", "cut", "dealt", "done", "drawn", "driven", "drunk",
-    "dug", "dwelt", "eaten", "fallen", "fed", "felt", "fled", "flung", "forbidden", "forgiven", "forgotten",
-    "forsaken", "fought", "found", "frozen", "given", "gone", "ground", "grown", "heard", "held", "hidden",
-    "hit", "hung", "hurt", "kept", "knelt", "known", "laid", "lain", "leapt", "learnt", "led", "left", "lent",
-    "let", "lit", "lost", "made", "meant", "met", "mistaken", "overcome", "overtaken", "paid", "proven", "put",
-    "quit", "read", "ridden", "risen", "run", "rung", "said", "sat", "seen", "sent", "set", "shaken", "shed",
-    "shone", "shot", "shown", "shrunk", "shut", "slain", "slept", "slid", "slit", "smelt", "sold", "sought",
-    "sped", "spelt", "spent", "spilt", "split", "spoken", "spread", "sprung", "spun", "spat", "stolen", "stood",
-    "stridden", "struck", "strung", "stuck", "stung", "stunk", "strove", "sung", "sunk", "sworn", "swept", "swum",
-    "swung", "taken", "taught", "thought", "thrown", "thrust", "told", "torn", "trodden", "understood",
-    "undertaken", "upheld", "upset", "withdrawn", "withheld", "withstood", "woken", "won", "worn", "woven",
-    "wept", "wound", "written", "wrung",
+    "cast", "caught", "chosen", "clung", "come", "crept", "cut", "dealt", "done", "drawn", "driven",
+    "drunk", "dug", "dwelt", "eaten", "fallen", "fed", "felt", "fled", "flung", "forbidden", "forgiven",
+    "forgotten", "forsaken", "fought", "found", "frozen", "given", "gone", "ground", "grown", "heard",
+    "held", "hidden", "hit", "hung", "hurt", "kept", "knelt", "known", "laid", "lain", "leapt", "learnt",
+    "led", "left", "lent", "let", "lit", "lost", "made", "meant", "met", "mistaken", "overcome",
+    "overtaken", "paid", "proven", "put", "quit", "read", "ridden", "risen", "run", "rung", "said", "sat",
+    "seen", "sent", "set", "shaken", "shed", "shone", "shot", "shown", "shrunk", "shut", "slain", "slept",
+    "slid", "slit", "smelt", "sold", "sought", "spat", "sped", "spelt", "spent", "spilt", "split",
+    "spoken", "spread", "sprung", "spun", "stolen", "stood", "stridden", "strove", "struck", "strung",
+    "stuck", "stung", "stunk", "sung", "sunk", "swept", "sworn", "swum", "swung", "taken", "taught",
+    "thought", "thrown", "thrust", "told", "torn", "trodden", "understood", "undertaken", "upheld",
+    "upset", "wept", "withdrawn", "withheld", "withstood", "woken", "won", "worn", "wound", "woven",
+    "written", "wrung",
 ];
 
 /// Is `surface` a plausible past-participle surface form (regular `-ed` OR in the irregular list)?
@@ -243,5 +244,27 @@ mod tests {
         for t in ["", "   ", "café", "🙂 was", "was", "is is is", "The café was frozen."] {
             let _ = classify(&analyze(t), t);
         }
+    }
+
+    // ---- CRITICAL: IRREGULAR_PARTICIPLES must stay sorted — binary_search's precondition ----
+    #[test]
+    fn irregular_participles_sorted() {
+        assert!(IRREGULAR_PARTICIPLES.windows(2).all(|w| w[0] <= w[1]),
+            "IRREGULAR_PARTICIPLES must be sorted for binary_search");
+    }
+
+    // Regression: these irregular participles were previously unreachable via binary_search
+    // because the array was unsorted (silently wrong — no passive match at all).
+    #[test] fn passive_irregular_wept()  { assert!(has("The tears were wept.", "were wept", Passive)); }
+    #[test] fn passive_irregular_swept() { assert!(has("He was swept away by the crowd.", "was swept", Passive)); }
+
+    // ---- MINOR: a genuinely separate later be-form in the same sentence is NOT wrongly
+    // suppressed by min_trigger (already-correct behavior — previously untested) ----
+    #[test] fn separate_be_forms_both_fire() {
+        let t = "The door was closed and the window was opened.";
+        assert!(has(t, "was closed", Passive));
+        assert!(has(t, "was opened", Passive));
+        let ms: Vec<_> = classify(&analyze(t), t).into_iter().filter(|m| m.category == Passive).collect();
+        assert_eq!(ms.len(), 2, "two independent passive matches, got {ms:?}");
     }
 }
