@@ -123,6 +123,8 @@ pub enum SemanticElement {
     DiagSpelling,
     /// Grammar-diagnostic underline.
     DiagGrammar,
+    /// A prose-lens flagged token (S8).
+    ProseLensMatch,
     /// Dimmed/unfocused text (e.g. a pane losing focus).
     FocusDim,
     /// The glyph marking a folded region.
@@ -248,6 +250,7 @@ struct ThemeFaces {
     heading: [Face; 6], block_quote: Face, code_block: Face, list_marker: Face, thematic_break: Face,
     front_matter: Face, comment: Face, selection: Face, marked_block: Face,
     search_match: Face, search_current: Face, diag_spelling: Face, diag_grammar: Face,
+    prose_lens_match: Face,
     focus_dim: Face, fold_marker: Face, wrap_guide: Face,
     chrome: Face, chrome_reverse: Face, chrome_selected: Face, chrome_muted: Face,
     chrome_overlay: Face, chrome_accent: Face,
@@ -287,6 +290,7 @@ impl Theme {
             MarkedBlock => self.faces.marked_block,
             SearchMatch => self.faces.search_match, SearchCurrent => self.faces.search_current,
             DiagSpelling => self.faces.diag_spelling, DiagGrammar => self.faces.diag_grammar,
+            ProseLensMatch => self.faces.prose_lens_match,
             FocusDim => self.faces.focus_dim, FoldMarker => self.faces.fold_marker, WrapGuide => self.faces.wrap_guide,
             Chrome => self.faces.chrome, ChromeReverse => self.faces.chrome_reverse,
             ChromeSelected => self.faces.chrome_selected, ChromeMuted => self.faces.chrome_muted,
@@ -505,6 +509,7 @@ impl Theme {
             MarkedBlock => &mut self.faces.marked_block,
             SearchMatch => &mut self.faces.search_match, SearchCurrent => &mut self.faces.search_current,
             DiagSpelling => &mut self.faces.diag_spelling, DiagGrammar => &mut self.faces.diag_grammar,
+            ProseLensMatch => &mut self.faces.prose_lens_match,
             FocusDim => &mut self.faces.focus_dim, FoldMarker => &mut self.faces.fold_marker,
             WrapGuide => &mut self.faces.wrap_guide,
             Chrome => &mut self.faces.chrome, ChromeReverse => &mut self.faces.chrome_reverse,
@@ -624,6 +629,8 @@ pub fn default() -> Theme {
             search_current: modface(None, false, false, false, false, true),
             diag_spelling: Face { underline: Some(true), underline_color: Some(Color::Red), ..Face::default() },
             diag_grammar:  Face { underline: Some(true), underline_color: Some(Color::Blue), ..Face::default() },
+            // prose-lens flagged token: bg-tint (SearchMatch template) on a distinct hue.
+            prose_lens_match: Face { bg: Some(Color::Blue), fg: Some(Color::White), ..Face::default() },
             focus_dim: Face { fg: Some(Color::DarkGray), ..Face::default() },   // today: DarkGray
             fold_marker: Face { fg: Some(Color::DarkGray), ..Face::default() },
             wrap_guide: Face { fg: Some(Color::DarkGray), ..Face::default() },
@@ -695,6 +702,9 @@ pub fn tokyo_night() -> Theme {
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(RED), ..Face::default() },
             diag_grammar:  Face { underline: Some(true), underline_color: Some(BLUE), ..Face::default() },
+            // prose-lens flagged token: bg-tint (SearchMatch template), MAGENTA hue keeps it
+            // distinct from SearchMatch's YELLOW bg.
+            prose_lens_match: Face { bg: Some(MAGENTA), fg: Some(BG), ..Face::default() },
             focus_dim: Face { fg: Some(COMMENT), dim: Some(true), ..Face::default() },
             fold_marker: Face { fg: Some(DARK3), ..Face::default() },
             wrap_guide: Face { fg: Some(SEL_BG), ..Face::default() },
@@ -755,6 +765,8 @@ pub fn terminal_ansi() -> Theme {
             search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(Color::Red), ..Face::default() },
             diag_grammar:  Face { underline: Some(true), underline_color: Some(Color::Blue), ..Face::default() },
+            // prose-lens flagged token: bg-tint (SearchMatch template), Blue bg on Black fg.
+            prose_lens_match: Face { bg: Some(Color::Blue), fg: Some(Color::Black), ..Face::default() },
             focus_dim: Face { fg: Some(Color::DarkGray), ..Face::default() },
             fold_marker: Face { fg: Some(Color::DarkGray), ..Face::default() },
             wrap_guide: Face { fg: Some(Color::DarkGray), ..Face::default() },
@@ -928,6 +940,9 @@ fn blue_jeans(name: &str, r: BjRoles) -> Theme {
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(r.diag_spell), ..Face::default() },
             diag_grammar:  Face { underline: Some(true), underline_color: Some(r.diag_grammar), ..Face::default() },
+            // prose-lens flagged token: bg-tint (SearchMatch template) — reuse the mark-bg role,
+            // a hue distinct from the search-bg role, on the theme's own fg for contrast.
+            prose_lens_match: Face { bg: Some(r.mark_bg), fg: Some(r.fg), ..Face::default() },
             focus_dim: Face { fg: Some(r.focus_dim), dim: Some(true), ..Face::default() },
             fold_marker: Face { fg: Some(r.fold_marker), ..Face::default() },
             wrap_guide: Face { fg: Some(r.wrap_guide), ..Face::default() },
@@ -1039,6 +1054,9 @@ pub fn from_base16(name: &str, p: BasePalette) -> Theme {
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(b[0x8]), ..Face::default() },
             diag_grammar:  Face { underline: Some(true), underline_color: Some(b[0xD]), ..Face::default() },
+            // prose-lens flagged token: bg-tint (SearchMatch template) — blue slot, distinct from
+            // search_match's yellow (0xA) bg.
+            prose_lens_match: Face { bg: Some(b[0x0D]), fg: Some(b[0x00]), ..Face::default() },
             focus_dim: Face { fg: Some(b[0x3]), dim: Some(true), ..Face::default() },
             fold_marker: Face { fg: Some(b[0x3]), ..Face::default() },
             wrap_guide: Face { fg: Some(b[0x2]), ..Face::default() },
@@ -1068,7 +1086,8 @@ pub fn element_from_key(key: &str) -> Option<SemanticElement> {
         "thematic_break" => ThematicBreak, "front_matter" => FrontMatter, "comment" => Comment,
         "selection" => Selection, "marked_block" => MarkedBlock,
         "search_match" => SearchMatch, "search_current" => SearchCurrent,
-        "diag_spelling" => DiagSpelling, "diag_grammar" => DiagGrammar, "focus_dim" => FocusDim,
+        "diag_spelling" => DiagSpelling, "diag_grammar" => DiagGrammar,
+        "prose_lens_match" => ProseLensMatch, "focus_dim" => FocusDim,
         "fold_marker" => FoldMarker, "wrap_guide" => WrapGuide,
         "chrome" => Chrome, "chrome_reverse" => ChromeReverse,
         "chrome_selected" => ChromeSelected, "chrome_muted" => ChromeMuted,
@@ -1155,6 +1174,7 @@ fn mono_faces() -> ThemeFaces {
         search_current: m(true, false, false, false, true),
         diag_spelling: m(true, false, true, false, false),        // bold+underline
         diag_grammar:  m(false, true, true, false, false),        // italic+underline (I7: distinct from spelling)
+        prose_lens_match: m(true, true, true, false, false),      // bold+italic+underline (S8)
         focus_dim: Face { dim: Some(true), ..Face::default() },
         fold_marker: Face::default(), wrap_guide: Face::default(),
         chrome: Face { dim: Some(true), ..Face::default() },
@@ -1194,6 +1214,9 @@ pub fn phosphor(name: &str, hue: Color) -> Theme {
         search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
         diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
         diag_grammar:  Face { underline: Some(true), underline_color: Some(shade(hue, 4)), ..Face::default() },
+        // prose-lens flagged token: bg-tint (SearchMatch template) — a different shade pairing
+        // (shade 3 bg / shade 0 fg) keeps it distinct from search_match's (shade 2 bg / shade 0 fg).
+        prose_lens_match: Face { bg: Some(shade(hue, 3)), fg: Some(shade(hue, 0)), ..Face::default() },
         focus_dim: Face { fg: Some(shade(hue, 1)), dim: Some(true), ..Face::default() },
         fold_marker: s(1), wrap_guide: s(1),
         // chrome/selected/muted/overlay/accent: all-None sentinels — derive_chrome fills them (I4-A).
@@ -1316,7 +1339,8 @@ mod tests {
         // their cue is a glyph/placement added in plan ②/chrome task).
         let cued = [SemanticElement::Strong, SemanticElement::Emphasis, SemanticElement::Code,
                     SemanticElement::Link, SemanticElement::Strikethrough, SemanticElement::FrontMatter,
-                    SemanticElement::Comment, SemanticElement::Selection, SemanticElement::SearchMatch];
+                    SemanticElement::Comment, SemanticElement::Selection, SemanticElement::SearchMatch,
+                    SemanticElement::ProseLensMatch];
         for el in cued {
             let f = t.face(el);
             assert!(f.bold.unwrap_or(false) || f.italic.unwrap_or(false) || f.underline.unwrap_or(false)
@@ -1342,15 +1366,15 @@ mod tests {
         assert!(ALL_ELEMENTS.contains(&SemanticElement::MarkedBlock));
     }
 
-    const ALL_ELEMENTS: [SemanticElement; 34] = {
+    const ALL_ELEMENTS: [SemanticElement; 35] = {
         use SemanticElement::*;
         [Text, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
          Heading(1), Heading(2), Heading(3), Heading(4), Heading(5), Heading(6),
          BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection, MarkedBlock,
-         SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide,
+         SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, ProseLensMatch, FocusDim, FoldMarker, WrapGuide,
          Chrome, ChromeReverse, ChromeSelected, ChromeMuted, ChromeOverlay, ChromeAccent]
     };
-    // 34 = Text + 6 inline + 6 heading + 4 block + 4 (fm/comment/sel/marked-block) + 7 overlay + 6 chrome.
+    // 35 = Text + 6 inline + 6 heading + 4 block + 4 (fm/comment/sel/marked-block) + 7 overlay + 6 chrome + 1 prose-lens.
     // This is the totality proof — the count must equal the SemanticElement variant count
     // (Heading collapsed to its 6 levels). The `face_is_total` loop visits every one.
     #[test]
@@ -1472,7 +1496,7 @@ mod tests {
             | Heading(_) | BlockQuote | CodeBlock | ListMarker | ThematicBreak
             | FrontMatter | Comment | FocusDim | FoldMarker | WrapGuide      => FgRequired,
             DiagSpelling | DiagGrammar                                        => UnderlineColorRequired,
-            Selection | MarkedBlock | SearchMatch                             => Highlight,
+            Selection | MarkedBlock | SearchMatch | ProseLensMatch            => Highlight,
             SearchCurrent                                                     => Modifier,
             Chrome | ChromeReverse | ChromeSelected | ChromeMuted | ChromeOverlay
             | ChromeAccent                                                     => Exempt,
@@ -2209,6 +2233,7 @@ mod tests {
                 selection: Face::default(), marked_block: Face::default(),
                 search_match: Face::default(), search_current: Face::default(),
                 diag_spelling: Face::default(), diag_grammar: Face::default(),
+                prose_lens_match: Face::default(),
                 focus_dim: Face::default(), fold_marker: Face::default(), wrap_guide: Face::default(),
                 chrome: Face::default(), chrome_reverse: Face { reverse: Some(true), ..Face::default() },
                 chrome_selected: Face::default(), chrome_muted: Face::default(),

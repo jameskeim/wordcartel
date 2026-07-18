@@ -2221,7 +2221,7 @@ mod tests {
         //   ChromeAccent=reverse+bold (glyph-bearing prompt-active status — I3/D2).
         let cued = [Emphasis, Strong, StrongEmphasis, Code, CodeBlock, Link, Strikethrough,
                     Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar,
-                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted, ChromeAccent];
+                    ProseLensMatch, FocusDim, ChromeReverse, ChromeSelected, ChromeMuted, ChromeAccent];
         for t in cue_themes() {
             for el in cued {
                 let f = t.face(el);
@@ -2260,6 +2260,12 @@ mod tests {
             assert_ne!(t.face(Emphasis), t.face(Strong), "{}: Emphasis vs Strong", t.name);
             assert_ne!(t.face(Strong), t.face(StrongEmphasis), "{}: Strong vs StrongEmphasis", t.name);
             assert_ne!(t.face(Emphasis), t.face(StrongEmphasis), "{}: Emphasis vs StrongEmphasis", t.name);
+            // S8: ProseLensMatch must be distinguishable from every same-context overlay face.
+            assert_ne!(t.face(ProseLensMatch), t.face(Selection), "{}: ProseLensMatch vs Selection", t.name);
+            assert_ne!(t.face(ProseLensMatch), t.face(SearchMatch), "{}: ProseLensMatch vs SearchMatch", t.name);
+            assert_ne!(t.face(ProseLensMatch), t.face(DiagSpelling), "{}: ProseLensMatch vs DiagSpelling", t.name);
+            assert_ne!(t.face(ProseLensMatch), t.face(DiagGrammar), "{}: ProseLensMatch vs DiagGrammar", t.name);
+            assert_ne!(t.face(ProseLensMatch), t.face(MarkedBlock), "{}: ProseLensMatch vs MarkedBlock", t.name);
         }
     }
 
