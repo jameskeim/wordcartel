@@ -344,99 +344,27 @@ mod tests {
         assert!(RealFs.sync_dir(&missing).is_ok(), "un-openable dir must be swallowed to Ok");
     }
 
+    #[test]
+    fn fault_fs_is_reachable_from_test_support() {
+        // The promotion guard: FaultFs must live in test_support so other modules' tests can
+        // inject it. A rename/move back into this file's private test mod breaks this line.
+        let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Rename);
+        let dir = std::env::temp_dir().join(format!("wc-faultfs-promo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("t.txt");
+        let err = atomic_replace(&fs, &target, b"x", WriteOpts {
+            mode: ModePolicy::Fixed(0o600), dir_fsync: false,
+        }).expect_err("injected rename must fail");
+        assert!(err.to_string().contains("injected: rename"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---------------------------------------------------------------------------
     // FaultFs harness — fault-injectable Fs/WriteSync for durability tests
+    // (promoted to `test_support`, C5 Task 1, so other modules can inject faults too).
     // ---------------------------------------------------------------------------
 
-    use std::io::{Error, ErrorKind};
-
-    // Note: no `Remove` variant. `remove_file` is only ever called by TempGuard::drop on a
-    // pre-rename early return — which is itself caused by the ONE injected fault — so the
-    // single-fault model can never make the cleanup-remove ALSO fail. The remove path IS still
-    // exercised (and must succeed) in every pre-rename fault test, where it is what makes the
-    // no-litter assertion hold.
-    #[derive(Clone, Copy, Debug)]
-    enum FaultAt {
-        Create,
-        Write { after: usize },
-        SetMode,
-        Flush,
-        Sync,
-        Rename,
-        SyncDir,
-    }
-
-    struct FaultFs {
-        inner: RealFs,
-        fail: FaultAt,
-    }
-
-    // A write handle that may inject a partial-write or a set_mode/flush/sync failure.
-    // Owns its injected config by value (the boxed handle is `'static`, so it cannot
-    // borrow from the FaultFs).
-    struct FaultHandle {
-        inner: Box<dyn WriteSync>,
-        fail: FaultAt,
-    }
-
-    impl WriteSync for FaultHandle {
-        fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-            if let FaultAt::Write { after } = self.fail {
-                // Write `after` real bytes to the temp, then fail with ENOSPC-like error.
-                let n = after.min(buf.len());
-                self.inner.write_all(&buf[..n])?;
-                return Err(Error::new(ErrorKind::WriteZero, "injected: storage full"));
-            }
-            self.inner.write_all(buf)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            if matches!(self.fail, FaultAt::Flush) {
-                return Err(Error::other("injected: flush"));
-            }
-            self.inner.flush()
-        }
-        fn set_mode(&self, mode: u32) -> std::io::Result<()> {
-            if matches!(self.fail, FaultAt::SetMode) {
-                return Err(Error::other("injected: set_mode"));
-            }
-            self.inner.set_mode(mode)
-        }
-        fn sync_all(&self) -> std::io::Result<()> {
-            if matches!(self.fail, FaultAt::Sync) {
-                return Err(Error::other("injected: fsync"));
-            }
-            self.inner.sync_all()
-        }
-    }
-
-    impl Fs for FaultFs {
-        fn create_excl(&self, path: &Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>> {
-            if matches!(self.fail, FaultAt::Create) {
-                return Err(Error::other("injected: create"));
-            }
-            let inner = self.inner.create_excl(path, mode)?;
-            Ok(Box::new(FaultHandle { inner, fail: self.fail }))
-        }
-        fn existing_mode(&self, path: &Path) -> Option<u32> { self.inner.existing_mode(path) }
-        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            if matches!(self.fail, FaultAt::Rename) {
-                return Err(Error::other("injected: rename"));
-            }
-            self.inner.rename(from, to)
-        }
-        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
-            if matches!(self.fail, FaultAt::SyncDir) {
-                return Err(Error::other("injected: sync_dir"));
-            }
-            self.inner.sync_dir(dir)
-        }
-        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-            // No injection: cleanup-remove must succeed for the no-litter assertion to hold
-            // under every pre-rename fault. (See the FaultAt note — Remove is unreachable as
-            // a *second* fault.)
-            self.inner.remove_file(path)
-        }
-    }
+    use crate::test_support::{FaultAt, FaultFs};
 
     // Helper: run atomic_replace with one injected fault over a freshly-seeded target.
     fn run_fault(
@@ -447,7 +375,7 @@ mod tests {
         let dir = private_dir(label);
         let target = dir.join("doc.txt");
         fs::write(&target, b"ORIGINAL-CONTENTS\n").expect("seed original");
-        let fs_impl = FaultFs { inner: RealFs, fail };
+        let fs_impl = FaultFs::new(fail);
         let res = atomic_replace(&fs_impl, &target, b"NEW-CONTENTS-LONGER\n", opts);
         (dir, target, res)
     }
