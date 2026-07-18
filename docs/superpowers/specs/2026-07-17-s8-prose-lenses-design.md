@@ -175,9 +175,13 @@ Let `surface = &text[T.range]` (the live buffer slice), `first = surface.chars()
 - **Passive** match range = `(be_form.range.start, T.range.end)` — the WHOLE be..participle span
   (D-passive-edge (iii)).
 - **Weak** match range = `be_form.range` (the be token only).
-- The `None` + lowercase guard excludes capitalized-unknown false positives: "It was **Fred**." tags PROPN →
-  Weak; "It was **Zed**." (unknown proper name) has an uppercase first char → falls through to Weak, NOT
-  Passive. "The item was **defenestrated**." (defenestrated/None, lowercase, `-ed`) → Passive.
+- The `None` + lowercase guard excludes capitalized-unknown false positives from the Passive lens: "It was
+  **Fred**." tags PROPN → Weak; "It was **Zed**." (a `None`-tagged unknown proper name, uppercase first char)
+  does NOT satisfy the None-row's lowercase+morphology condition, so it → **SILENT (no match)**, NOT Passive.
+  (Note: a `None`-tagged non-participle target — whether uppercase like "Zed" or lowercase without `-ed`/an
+  irregular-participle spelling like "zorgle" — is left SILENT, a deliberate conservative miss; the Weak lens
+  only fires on a target the tagger actually classified as ADJ/NOUN/PROPN/etc.) "The item was
+  **defenestrated**." (defenestrated/None, lowercase, `-ed`) → Passive.
 
 ### 5.1.3 Disjoint by construction
 
@@ -220,6 +224,13 @@ Grounded on the probe corpus (§10). **Misses (false negatives), by design:**
 - Get-passives ("got promoted") — out of scope by the be-form definition.
 - Comma-broken chains ("was, in fact, wrong") — the comma (PUNCT, not in SKIP) ends the scan → SILENT.
 - Attributive mis-tags ("the **left** side" → left/VERB) miss the adjective lens but never false-flag.
+- Asterisk-adorned be-forms ("`**was** written`") — unlike underscores (S7 strips leading/trailing `_` runs
+  from a word token), the `*` splits into its own token that is neither a be-form nor in SKIP, so it lands as
+  the scan target and the passive goes SILENT. Conservative; no false flag.
+- Locative/adverbial copulas ("It **is here**.", "They **were there**.") — "here"/"there" tag `ADV`, which is
+  in SKIP, so the scan runs past them to the terminal PUNCT → SILENT. The Weak lens therefore misses locative
+  copulas whose complement is an adverb, while "It was **in** the room." (in/ADP → Weak) still flags.
+  Conservative; no false flag.
 
 **False positives (passive), rare constructions:**
 - Headless relative "What it **was changed** everything" (finite past adjacent to clause-final be).
@@ -389,6 +400,17 @@ One new `SemanticElement::ProseLensMatch` (variant #35). Composition, grounded i
 row_spans_placed`: base ladder → MarkedBlock → Selection → Search → **ProseLensMatch** → Diagnostics (last).
 The ProseLens face applies BETWEEN Search and Diag — diagnostics stay topmost (errors-you-fix outrank
 habits-you-consider; both can co-occur in Review mode).
+
+**AMENDMENT (2026-07-17, ratified after the final Fable whole-branch review): the lens highlight is
+SUPPRESSED on glyphs inside the active selection.** The original order above paints `ProseLensMatch` OVER
+`Selection`, so on the 14 colored themes whose Selection face is a plain fg/bg swap (no surviving modifier —
+tokyo-night, catppuccin, gruvbox, solarized, rosépine, flexoki, blue-jeans variants), a nav-range-selected
+match rendered pixel-identical to any other highlighted match, leaving D6's "visible abortable selection"
+(§3, D-act) invisible on those themes — a surprise-span-replace risk. Fix: in `row_spans_placed`, apply the
+`ProseLensMatch` patch ONLY to glyphs NOT within the current selection. Effect: the currently-selected
+(nav-jumped) match reverts to normal Selection styling — visibly a selection on every theme, and distinct
+from the other lens-highlighted matches — while all UNselected matches still show the lens highlight.
+Diagnostics remain topmost. This satisfies D6 across all themes and is the visual precedence going forward.
 
 - **Color mode:** a bg-tint highlight drawing the eye TO the token (the `SearchMatch` template — a themed
   `bg`, contrast-safe `fg`), one legibility profile. Applied via `style.patch(face_to_ratatui(&face, depth))`
