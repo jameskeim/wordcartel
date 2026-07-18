@@ -940,9 +940,12 @@ fn blue_jeans(name: &str, r: BjRoles) -> Theme {
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(r.diag_spell), ..Face::default() },
             diag_grammar:  Face { underline: Some(true), underline_color: Some(r.diag_grammar), ..Face::default() },
-            // prose-lens flagged token: bg-tint (SearchMatch template) — reuse the mark-bg role,
-            // a hue distinct from the search-bg role, on the theme's own fg for contrast.
-            prose_lens_match: Face { bg: Some(r.mark_bg), fg: Some(r.fg), ..Face::default() },
+            // prose-lens flagged token: bg-tint (SearchMatch template) — the denim/link hue, DISTINCT
+            // from mark_bg (== search_bg in this palette; reusing it made a lens over a marked block
+            // pixel-identical to the marked block itself, since Face::patch only overrides Some
+            // fields). Mirrors from_base16's reuse of its blue slot as a prose-lens bg. `fg: r.bg`
+            // (not r.fg) for contrast-safe text against the mid-tone link hue in all three variants.
+            prose_lens_match: Face { bg: Some(r.link), fg: Some(r.bg), ..Face::default() },
             focus_dim: Face { fg: Some(r.focus_dim), dim: Some(true), ..Face::default() },
             fold_marker: Face { fg: Some(r.fold_marker), ..Face::default() },
             wrap_guide: Face { fg: Some(r.wrap_guide), ..Face::default() },
@@ -1537,6 +1540,29 @@ mod tests {
                     FaceReq::Exempt => {} // chrome — supplied by the elevation ladder
                 }
             }
+        }
+    }
+
+    #[test]
+    fn prose_lens_bg_distinct_from_marked_block_in_color_themes() {
+        // Regression guard (Task 2 fix round 1): a ProseLensMatch highlight can paint on top of a
+        // MarkedBlock (paint order MarkedBlock → Selection → Search → ProseLensMatch →
+        // Diagnostics — a lens can be active inside a marked block). Because Face::patch only
+        // overrides Some fields, if prose_lens_match reuses marked_block's bg verbatim the lens
+        // silently vanishes into the marked block. Caught for real in blue_jeans(), which reused
+        // r.mark_bg with no distinguishing modifier — the other 5 colored constructors already
+        // picked a distinct bg. Guard every RGB builtin (same "colored" filter as the completeness
+        // contract above) so this class can't regress on this or any future theme.
+        for name in Theme::builtin_names() {
+            let t = Theme::builtin(name).unwrap();
+            if !matches!(t.base_bg, Color::Rgb { .. }) { continue; } // skip the 3 non-Rgb themes
+            let lens = t.face(SemanticElement::ProseLensMatch);
+            let marked = t.face(SemanticElement::MarkedBlock);
+            assert_ne!(
+                lens.bg, marked.bg,
+                "{name}: ProseLensMatch.bg must differ from MarkedBlock.bg — a lens over a \
+                 marked block would otherwise render pixel-identical to the bare marked block"
+            );
         }
     }
 
