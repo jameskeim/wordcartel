@@ -3,6 +3,7 @@
 //! store lives in the same module but is wired to the worker in Task 4. POS matches stay OUT of the
 //! Diagnostic contract by construction (this is not a DiagSource).
 use crate::editor::Editor;
+use crate::jobs::{Executor, Job, JobKind, JobResult, ResultClass};
 pub use wordcartel_nlp::ProseLensCategory;
 
 /// One flagged span + its lens category. `start/end` (not `Range`) so `PosMatch` stays `Copy`.
@@ -152,6 +153,112 @@ pub fn prose_lens_prev_match(editor: &mut Editor) {
     nav_to(editor, start, end);
 }
 
+// ---------------------------------------------------------------------------
+// S8 Task 4 — the doc-wide async sweep that FILLS the store. Near-copy of
+// `reconcile::dispatch_reconcile`; rides the `jobs.rs` worker.
+// ---------------------------------------------------------------------------
+
+/// Debounce before a settled buffer is swept. Slightly longer than reconcile's 150 ms so the block
+/// tree (which the prose-range enumeration reads) settles first.
+pub const POS_SWEEP_DEBOUNCE_MS: u64 = 300;
+
+/// A sweep is due if a lens is active, the tree has converged, nothing is in flight, and the debounce
+/// deadline has passed. Gated identically in the timers deadline fn (idle-free / A3 anti-spin).
+pub fn pos_sweep_due(editor: &Editor, now: u64) -> bool {
+    editor.active().view.prose_lens.is_some()
+        && !editor.active().reconcile.maybe_stale        // tree converged (correction #4)
+        && editor.active().pos.in_flight_version.is_none()
+        && matches!(editor.active().pos.due_at, Some(t) if now >= t)
+}
+
+/// Enumerate prose-PARAGRAPH byte ranges (role_at == Paragraph) from the block tree — the sweep must
+/// NOT analyze code fences / headings / front matter / tables (correction #4). Walks the block tree
+/// (`BlockTree::top_level` + recursion into containers) and keeps each block whose role is Paragraph.
+/// A list-item/blockquote paragraph has a higher-precedence role (`role_at` returns ListItem/BlockQuote
+/// there, `block_tree.rs role_precedence`), so it is naturally excluded — consistent with
+/// `ventilate::prose_block_at`, which the S7/lens paint window uses. `TextBuffer` has NO `len_lines()`
+/// (verified — buffer.rs), so this walks BLOCKS, not lines.
+fn prose_paragraph_ranges(editor: &Editor) -> Vec<(usize, usize)> {
+    use wordcartel_core::block_tree::Block;
+    use wordcartel_core::style::BlockRole;
+    let blocks = editor.active().document.blocks();
+    let mut out = Vec::new();
+    fn walk(blocks: &wordcartel_core::block_tree::BlockTree, b: &Block, out: &mut Vec<(usize, usize)>) {
+        if b.children.is_empty() {
+            // Leaf: keep it iff its role resolves to Paragraph (excludes code/heading/rule/etc.).
+            if blocks.role_at(b.span.start) == BlockRole::Paragraph {
+                out.push((b.span.start, b.span.end));
+            }
+        } else {
+            for c in &b.children { walk(blocks, c, out); }
+        }
+    }
+    for b in blocks.top_level() { walk(blocks, b, &mut out); }
+    out
+}
+
+/// Snapshot the active buffer + dispatch the doc-wide POS sweep (near-copy of `dispatch_reconcile`).
+/// Oversized docs (> `LENS_MAX_SWEEP_BYTES`) are skipped WITHOUT dispatching a job — the CRITICAL-3
+/// latch (see `PosStore::armed_for_version`'s doc comment) pins `armed_for_version` so `advance()`
+/// cannot re-arm on the same version, giving at most one skip + one sticky notice per version.
+pub fn dispatch_pos_sweep(editor: &mut Editor, ex: &dyn Executor) {
+    let b = editor.active();
+    let buffer_id = b.id;
+    let version = b.document.version;
+    if b.document.buffer.len() as u64 > crate::limits::LENS_MAX_SWEEP_BYTES {
+        editor.active_mut().pos.due_at = None;
+        editor.active_mut().pos.armed_for_version = version;
+        editor.set_status_full(crate::status::StatusKind::Warning,
+            "document too large for prose lenses — sweep skipped",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        return;
+    }
+    let ranges = prose_paragraph_ranges(editor);
+    let rope = editor.active().document.buffer.snapshot();  // O(1)
+    editor.active_mut().pos.in_flight_version = Some(version);
+    editor.active_mut().pos.due_at = None;
+
+    let job = Job {
+        buffer_id, class: ResultClass::BufferLocal, version, kind: JobKind::PosSweep,
+        run: Box::new(move || {
+            let mut adverbs = Vec::new(); let mut adjectives = Vec::new();
+            let mut passive = Vec::new(); let mut weak = Vec::new();
+            for (ps, pe) in ranges {
+                // snapshot() returns ropey::Rope (verified — buffer.rs); slice by BYTE via
+                // byte_slice (NOT .slice, which is char-indexed) then to_string for analyze's &str.
+                let slice = rope.byte_slice(ps..pe).to_string();
+                let sentences = wordcartel_nlp::analyze(&slice);
+                for m in wordcartel_nlp::classify(&sentences, &slice) {
+                    let pm = PosMatch { start: ps + m.range.start, end: ps + m.range.end, category: m.category };
+                    match m.category {
+                        ProseLensCategory::Adverbs => adverbs.push(pm),
+                        ProseLensCategory::Adjectives => adjectives.push(pm),
+                        ProseLensCategory::Passive => passive.push(pm),
+                        ProseLensCategory::Weak => weak.push(pm),
+                    }
+                }
+            }
+            for v in [&mut adverbs, &mut adjectives, &mut passive, &mut weak] {
+                v.sort_by_key(|m| m.start);
+            }
+            JobResult {
+                buffer_id, class: ResultClass::BufferLocal, version, kind: JobKind::PosSweep,
+                merge: Box::new(move |editor: &mut Editor| {
+                    if let Some(b) = editor.by_id_mut(buffer_id) {
+                        if b.document.version == version {   // version-discard INSIDE the merge
+                            b.pos.adverbs = adverbs; b.pos.adjectives = adjectives;
+                            b.pos.passive = passive; b.pos.weak = weak;
+                            b.pos.computed_for = Some(version);
+                        }
+                        b.pos.in_flight_version = None;      // clear regardless
+                    }
+                }),
+            }
+        }),
+    };
+    ex.dispatch(job);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +373,105 @@ mod tests {
         assert_eq!(window_matches(&ms, 10).iter().map(|m| m.start).collect::<Vec<_>>(), vec![0]);
         // hi = 0 → empty slice.
         assert!(window_matches(&ms, 0).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // S8 Task 4: the doc-wide sweep — converge, version-discard, prose-only, cap latch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sweep_fills_store_and_marks_computed_for() {
+        use crate::jobs::{Executor, InlineExecutor};
+        let mut e = crate::editor::Editor::new_from_text("The report was written by them.\n", None, (80, 24));
+        let v = e.active().document.version;
+        set_prose_lens(&mut e, Some(ProseLensCategory::Passive));
+        let ex = InlineExecutor::default();
+        dispatch_pos_sweep(&mut e, &ex);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert_eq!(e.active().pos.computed_for, Some(v));
+        assert_eq!(e.active().pos.passive.len(), 1, "one passive found doc-wide");
+        assert!(e.active().pos.in_flight_version.is_none());
+    }
+
+    #[test]
+    fn sweep_discards_when_version_advanced() {
+        use crate::jobs::{Executor, InlineExecutor};
+        let mut e = crate::editor::Editor::new_from_text("The report was written.\n", None, (80, 24));
+        set_prose_lens(&mut e, Some(ProseLensCategory::Passive));
+        let ex = InlineExecutor::default();
+        dispatch_pos_sweep(&mut e, &ex);
+        e.active_mut().document.version += 1;   // edit lands before merge
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert_ne!(e.active().pos.computed_for, Some(e.active().document.version - 1));
+        assert!(e.active().pos.computed_for.is_none() || e.active().pos.computed_for != Some(e.active().document.version));
+        assert!(e.active().pos.in_flight_version.is_none(), "in-flight cleared even on discard");
+    }
+
+    #[test]
+    fn sweep_is_prose_only_code_fence_is_not_flagged() {
+        use crate::jobs::{Executor, InlineExecutor};
+        // "is" inside a fenced code block must NOT be classified.
+        let t = "Para one is here.\n\n```\nthis is code\n```\n";
+        let mut e = crate::editor::Editor::new_from_text(t, None, (80, 24));
+        crate::derive::rebuild(&mut e);   // build the block tree
+        set_prose_lens(&mut e, Some(ProseLensCategory::Weak));
+        let ex = InlineExecutor::default();
+        dispatch_pos_sweep(&mut e, &ex);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        // The paragraph's "is" is weak; the code fence's "is" is not in any match.
+        let code_is = t.rfind("is code").unwrap();
+        assert!(!e.active().pos.weak.iter().any(|m| m.start <= code_is && code_is < m.end),
+            "code-fence 'is' must not be flagged");
+    }
+
+    #[test]
+    fn no_lens_active_arms_no_pos_sweep_deadline() {
+        // idle-free: with no lens active, the pos_sweep subsystem yields None even with a past-due arm.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let dl = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "pos_sweep").unwrap().deadline;
+        e.active_mut().pos.due_at = Some(0);              // armed, past due
+        assert_eq!((dl())(&e, 10_000), None, "no lens → None (no wake)");
+        // lens on + converged tree + not in flight → the armed deadline reappears (gate is load-bearing).
+        set_prose_lens(&mut e, Some(ProseLensCategory::Passive));
+        e.active_mut().reconcile.maybe_stale = false;
+        assert_eq!((dl())(&e, 10_000), Some(0), "lens on + converged → armed deadline live");
+        // in-flight gate:
+        e.active_mut().pos.in_flight_version = Some(1);
+        assert_eq!((dl())(&e, 10_000), None, "in-flight → None");
+        e.active_mut().pos.in_flight_version = None;
+        // tree-stale gate:
+        e.active_mut().reconcile.maybe_stale = true;
+        assert_eq!((dl())(&e, 10_000), None, "tree not converged → None");
+    }
+
+    #[test]
+    fn oversized_doc_cap_latches_no_rearm_loop() {
+        // CRITICAL-3: an oversized doc skips WITHOUT dispatching a job, latches armed_for_version to the
+        // current version so advance() will NOT re-arm on the same version, and yields a None deadline.
+        use crate::jobs::{Executor, InlineExecutor};
+        let big = "word ".repeat((crate::limits::LENS_MAX_SWEEP_BYTES as usize / 5) + 2); // just over 8 MiB
+        let mut e = crate::editor::Editor::new_from_text(&big, None, (80, 24));
+        let v = e.active().document.version;
+        set_prose_lens(&mut e, Some(ProseLensCategory::Weak));
+        // Mimic the advance() arm that fired this dispatch (it sets armed_for_version = version, due_at Some).
+        e.active_mut().pos.armed_for_version = v;
+        e.active_mut().pos.due_at = Some(0);
+        let ex = InlineExecutor::default();
+        dispatch_pos_sweep(&mut e, &ex);
+        assert!(ex.drain().is_empty(), "cap path dispatches NO job");
+        assert_eq!(e.active().pos.due_at, None, "due_at cleared");
+        assert_eq!(e.active().pos.armed_for_version, v, "latched to this version");
+        assert_eq!(e.active().pos.computed_for, None, "never computed");
+        assert!(e.active().pos.in_flight_version.is_none());
+        assert!(e.status_text().contains("too large"), "one-time sticky notice");
+        // The advance() arm gate would NOT re-arm on the same version (no loop).
+        let stale = e.active().pos.computed_for != Some(v);
+        let would_rearm = stale && e.active().pos.in_flight_version.is_none()
+            && e.active().pos.armed_for_version != v;
+        assert!(!would_rearm, "cap-skip must not re-arm on the same version");
+        // Deadline None after the skip (due_at None) even with a converged tree + lens active → idle-free.
+        let dl = crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "pos_sweep").unwrap().deadline;
+        e.active_mut().reconcile.maybe_stale = false;
+        assert_eq!((dl)(&e, 10_000), None, "deadline None after the one skip");
     }
 }

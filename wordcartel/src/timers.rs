@@ -137,6 +137,16 @@ fn reconcile_deadline(e: &Editor, _now: u64) -> Option<u64> {
         e.active().reconcile.due_at } else { None }
 }
 
+/// Prose-lens sweep deadline — same A3 shape as reconcile, plus a lens-active gate and a
+/// tree-converged gate (the enumeration reads document.blocks()). None with no lens active → idle-free.
+fn pos_sweep_deadline(e: &Editor, _now: u64) -> Option<u64> {
+    if e.active().view.prose_lens.is_some()
+        && e.active().pos.in_flight_version.is_none()
+        && !e.active().reconcile.maybe_stale {
+        e.active().pos.due_at
+    } else { None }
+}
+
 /// on_change debounce (P3 §6): the content-settled deadline, GATED on a subscriber so it is zero-cost
 /// when no plugin uses on_change (proportional-to-work). Edge-armed by an edit (like reconcile),
 /// self-clearing on fire — stays inside the idle-free law.
@@ -155,7 +165,7 @@ fn plugin_timer_deadline(e: &Editor, _now: u64) -> Option<u64> {
 
 /// The timed-subsystem table. Order = the run loop's historical fold order
 /// (documented fire order): swap, save-quit, scrollbar-fade, menu-dwell,
-/// scrollbar-dwell, status-dwell, diagnostics, reconcile, on_change, plugin_timer.
+/// scrollbar-dwell, status-dwell, diagnostics, reconcile, pos_sweep, on_change, plugin_timer.
 pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "swap",         deadline: swap_deadline },
     TimedSubsystem { name: "save_quit",    deadline: sq_deadline },
@@ -165,6 +175,7 @@ pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "status_dwell", deadline: status_dwell_deadline },
     TimedSubsystem { name: "diagnostics",  deadline: diag_deadline },
     TimedSubsystem { name: "reconcile",    deadline: reconcile_deadline },
+    TimedSubsystem { name: "pos_sweep",    deadline: pos_sweep_deadline },
     TimedSubsystem { name: "on_change",    deadline: on_change_deadline },
     TimedSubsystem { name: "plugin_timer", deadline: plugin_timer_deadline },
 ];
@@ -207,6 +218,10 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     // Dispatch a block-tree reconcile if due.
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
         crate::reconcile::dispatch_reconcile(editor, ex);
+    }
+    // Dispatch the doc-wide prose-lens (POS) sweep if due (S8 Task 4).
+    if crate::lenses::pos_sweep_due(editor, now) {
+        crate::lenses::dispatch_pos_sweep(editor, ex);
     }
     // Fire the debounced on_change event if due (P3 §3g) — cold Tick path only, never the hot
     // edit path; `advance` only ever sets the `Option`, this is the sole place it fires.

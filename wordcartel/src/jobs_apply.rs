@@ -146,6 +146,16 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
                 b.reconcile.maybe_stale = false;
             }
         }
+        JobKind::PosSweep => {
+            // A panicked sweep (upstream harper residual) is deterministic for this text — clear
+            // in-flight and leave computed_for behind so we do NOT re-arm and retry every debounce
+            // (mirrors Reparse).
+            if let Some(b) = editor.by_id_mut(buffer_id) {
+                b.pos.in_flight_version = None;
+                // computed_for untouched: the next edit bumps document.version, so advance() re-arms
+                // exactly once per edit (never a tight loop on the same version).
+            }
+        }
         #[cfg(test)]
         JobKind::CoalesceProbe => {
             editor.set_status_full(crate::status::StatusKind::Error, format!("job failed (internal error: {msg})"),
@@ -873,6 +883,22 @@ mod tests {
         }, &mut e);
         assert!(e.status_text().contains("swap failed"));
         assert_sticky_error_survives_info(&mut e);
+    }
+
+    /// S8 Task 4: a panicked `PosSweep` clears `in_flight_version` WITHOUT re-arming (mirrors the
+    /// `Reparse` panic-arm shape; `computed_for` is left untouched deliberately — see the arm's
+    /// doc comment — so `advance()`'s `armed_for_version != version` gate never retries the same
+    /// version in a loop).
+    #[test]
+    fn panicked_pos_sweep_clears_in_flight_no_retry_loop() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().pos.in_flight_version = Some(0);
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::PosSweep, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.active().pos.in_flight_version.is_none(), "panic clears in-flight");
     }
 
     #[test]

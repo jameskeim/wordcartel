@@ -12,6 +12,7 @@ pub enum JobKind {
     Save,      // one-shot, user-initiated: always applies
     SwapWrite, // one-shot housekeeping: always applies (status only)
     Reparse,   // coalescible background block-tree reconcile; version-checked in merge
+    PosSweep,  // coalescible background POS sweep; version-checked in merge
     #[cfg(test)]
     CoalesceProbe, // test-only stand-in for a future coalescible kind
 }
@@ -66,7 +67,7 @@ pub fn is_stale(r: &JobResult, editor: &Editor) -> bool {
                 #[cfg(not(test))]
                 let _ = b;
                 match r.kind {
-                    JobKind::Save | JobKind::SwapWrite | JobKind::Reparse => false,
+                    JobKind::Save | JobKind::SwapWrite | JobKind::Reparse | JobKind::PosSweep => false,
                     #[cfg(test)]
                     JobKind::CoalesceProbe => r.version != b.document.version,
                 }
