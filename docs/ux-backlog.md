@@ -434,45 +434,6 @@ high hygiene value before Effort P. Anchor: `wordcartel/src/filter.rs`
 
 *(Captured 2026-07-11 from the v0.4.0 release gate.)*
 
-### S8 — Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only
-<!-- item: S8 -->
-
-**The genuinely novel half of the arc** — and the payoff for S7's substrate.
-
-**The lenses.** Every adverb dimmed. Every passive construction (`AUX` + participle `VERB`)
-underlined. Every nominalization flagged. Composable with S4's objects: *select every sentence
-containing a passive.*
-
-**This is what harper-ls fundamentally CANNOT give us**, and the distinction is the point:
-`harper-ls` flags **errors** — things that are *wrong*. These are **stylistic X-rays of prose that is
-already correct**, which is what revision actually consists of. No amount of LSP-seam design gets
-here; the wire carries diagnostics (ranges, messages, code actions), never a parse. (See the arc doc
-§5: the linters effort is *independent* of this one — different engine, different process model,
-different latency budget, no shared code.)
-
-**The objects it unlocks.** `Phrase` — the chunker's noun phrases, near-free once S7 lands. `Clause`
-— POS-informed, and *only* POS-informed: the design-space doc's rule-based splitter ("split at
-`, ; : —` and at conjunctions") **collapses on real prose**, because the Oxford comma fires mid-list,
-"for" is usually a preposition, "so" an intensifier, "yet" an adverb. With UPOS the rule becomes
-principled: a clause-comma is followed by a conjunction + subject NP + finite verb; a list-comma is
-not. Ships behind a **measured precision gate** on a hand-labeled corpus of real prose.
-
-**⚖ THE LAW OF THIS ARC — the reason both objects are SELECT-ONLY:**
-
-> **A linguistic analysis may COLOR, and it may SELECT. It may never MUTATE text without a visible
-> selection the writer can see and abort.**
-
-Brill is trained on newswire; the chunker on treebanks. On fiction, fragments, dialect, verse, and
-dialogue they **will** mistag. A wrong *highlight* is noise the writer ignores. A wrong
-*transposition* is a corrupted manuscript, and the writer never trusts the tool again. (Clause
-transpose additionally needs **capitalization repair** — swap "I went home, but she stayed" and you
-get a lowercase sentence start — which the design-space doc never mentions. That alone is a separate,
-later decision.)
-
-**Nothing here is on by default** (arc doc, D7). This is *revision* machinery; if it intrudes on
-drafting it becomes the thing writers hate about Word, and it violates the project's top priority.
-The E7 precedent governs: the cost lands in the summoned view.
-
 ### E8 — Lens — the unifying view surface (layout vs style axes; plugin-registerable)
 <!-- item: E8 -->
 

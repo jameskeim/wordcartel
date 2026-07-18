@@ -1010,15 +1010,17 @@ shipped_date = "2026-07-17"
 
 [[item]]
 id = "S8"
-title = "Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only"
-status = "needs-design"
+title = "Prose lenses — POS-driven stylistic X-rays (4-lens spine)"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "S"
 depends_on = ["S7"]
-hook = "The genuinely novel half. Every adverb dimmed; every passive (AUX + participle) underlined; nominalizations flagged; 'select every sentence containing a passive'. This is what harper-ls CANNOT give — it flags ERRORS; these are stylistic X-rays of CORRECT prose, which is what revision needs. Then Phrase (the chunker's NPs) and Clause (POS-informed: CCONJ/SCONJ/ADP disambiguates for/so/yet) — SELECT-ONLY. THE LAW: a linguistic analysis may COLOR and may SELECT; it may never MUTATE without a visible, abortable selection (Brill is newswire-trained; it WILL mistag fiction/dialect/verse). Arc: docs/design/prose-structure-arc.md."
-doc = "ux-backlog.md#s8"
+hook = "SHIPPED — the reusable prose-lens spine + four lenses. Single-active stylistic X-rays (Adverbs / Adjectives / Passive voice / Weak verbs) over the writer's prose: highlight-to-locate paint (ProseLensMatch, suppressed on the selected match so it stays visibly abortable — D6), a live doc-wide count ('Passive: N'), and range-select nav (jump → select the flagged span → type replaces it). Passive/Weak are a disjoint partition of 'to be' usage (be + participle → passive; be + copular complement → weak); surface-matched be-forms, skip-set scan, ~150-word irregular-participle list. Built on S7's substrate as a parallel POS-typed pipeline (doc-wide PosSweep riding jobs.rs; POS kept OUT of the Diagnostic type); cold-path, zero work at rest. THE LAW (D6): analysis may COLOR + SELECT, never MUTATE without a visible abortable selection. DEFERRED to S9: Phrase (chunker NPs) + Clause (POS-informed clause-splitting, D5 select-only behind a measured precision gate). Arc: docs/design/prose-structure-arc.md."
+doc = "backlog-archive.md#s8"
 created = "2026-07-12"
+shipped_commit = "1570ea8"
+shipped_date = "2026-07-18"
 
 [[item]]
 id = "E8"

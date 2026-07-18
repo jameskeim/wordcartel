@@ -2273,3 +2273,52 @@ window**, **cold-path only** (command/lens-triggered — *never* per-keystroke),
 `(block_span, document.version)`. Brill tagging is rule application over a trained table:
 microseconds per sentence, no tensors at inference.
 
+
+### S8 — Prose lenses — POS-driven stylistic X-rays (4-lens spine)
+<!-- item: S8 -->
+
+*SHIPPED 2026-07-18 (`1570ea8`). Delivered the reusable prose-lens spine + four lenses (Adverbs /
+Adjectives / Passive / Weak): highlight-to-locate paint, a live doc-wide count, and range-select nav,
+built on S7's substrate as a parallel POS-typed pipeline (doc-wide `PosSweep`; POS kept out of the
+`Diagnostic` type). The participle-detection risk was retired in grounding (UPOS carries no tense
+feature, but the shipped dict + adjacency recover it). **Phrase (chunker NPs) + Clause (POS-informed
+clause-splitting, D5 select-only behind a measured precision gate) were DEFERRED to S9** — the triage
+capture below predates that split and describes the full original scope. Spec:
+`docs/superpowers/specs/2026-07-17-s8-prose-lenses-design.md`.*
+
+**The genuinely novel half of the arc** — and the payoff for S7's substrate.
+
+**The lenses.** Every adverb dimmed. Every passive construction (`AUX` + participle `VERB`)
+underlined. Every nominalization flagged. Composable with S4's objects: *select every sentence
+containing a passive.*
+
+**This is what harper-ls fundamentally CANNOT give us**, and the distinction is the point:
+`harper-ls` flags **errors** — things that are *wrong*. These are **stylistic X-rays of prose that is
+already correct**, which is what revision actually consists of. No amount of LSP-seam design gets
+here; the wire carries diagnostics (ranges, messages, code actions), never a parse. (See the arc doc
+§5: the linters effort is *independent* of this one — different engine, different process model,
+different latency budget, no shared code.)
+
+**The objects it unlocks.** `Phrase` — the chunker's noun phrases, near-free once S7 lands. `Clause`
+— POS-informed, and *only* POS-informed: the design-space doc's rule-based splitter ("split at
+`, ; : —` and at conjunctions") **collapses on real prose**, because the Oxford comma fires mid-list,
+"for" is usually a preposition, "so" an intensifier, "yet" an adverb. With UPOS the rule becomes
+principled: a clause-comma is followed by a conjunction + subject NP + finite verb; a list-comma is
+not. Ships behind a **measured precision gate** on a hand-labeled corpus of real prose.
+
+**⚖ THE LAW OF THIS ARC — the reason both objects are SELECT-ONLY:**
+
+> **A linguistic analysis may COLOR, and it may SELECT. It may never MUTATE text without a visible
+> selection the writer can see and abort.**
+
+Brill is trained on newswire; the chunker on treebanks. On fiction, fragments, dialect, verse, and
+dialogue they **will** mistag. A wrong *highlight* is noise the writer ignores. A wrong
+*transposition* is a corrupted manuscript, and the writer never trusts the tool again. (Clause
+transpose additionally needs **capitalization repair** — swap "I went home, but she stayed" and you
+get a lowercase sentence start — which the design-space doc never mentions. That alone is a separate,
+later decision.)
+
+**Nothing here is on by default** (arc doc, D7). This is *revision* machinery; if it intrudes on
+drafting it becomes the thing writers hate about Word, and it violates the project's top priority.
+The E7 precedent governs: the cost lands in the summoned view.
+
