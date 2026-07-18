@@ -386,8 +386,8 @@ invariant the code no longer has is worse than no comment.
 
 ## 3. Resolved decisions (human-ratified — do not re-litigate)
 
-From brainstorming (forks F1–F4), the six post-report decisions, and the three ratified against this
-spec's §16/§17 — all settled:
+From brainstorming (forks F1–F4), the six post-report decisions (1–6), the three ratified against this
+spec's §16/§17 (7–9), and three ratified during the spec-gate rounds (10–12) — all settled:
 
 - **F1 = C.** Picker for C5's transactional moments; tree belongs to S2.
 - **F2 = C.** Full unification of in-process FS access **within four named operation classes** —
