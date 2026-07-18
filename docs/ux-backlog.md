@@ -810,3 +810,27 @@ compose semantics — do it as its own considered change, not folded into a cosm
 `ChromeStyles::build` (where B7 works around it). ~S.
 
 *(Captured 2026-07-17 via `scripts/backlog add`; reframed same day from the B7 Codex spec-gate correction.)*
+
+### S10 — Prose objects — Phrase/Clause select-only + D5 clause-splitting
+<!-- item: S10 -->
+
+**The arc tail — deferred from S8.** S8 (prose lenses, shipped 2026-07-18) delivered the reusable
+prose-lens spine + the four flag-word/pattern lenses. This item is the scope the S8 spec
+(`docs/superpowers/specs/2026-07-17-s8-prose-lenses-design.md`) explicitly carved off to a follow-on —
+the spec calls it "S9" throughout, but that id was already taken by an unrelated item, so it is filed
+here as **S10** (the spec's "S9" references are nominal — they mean this).
+
+**Scope (both SELECT-ONLY — arc law D6: analysis may COLOR + SELECT, never MUTATE without a visible
+abortable selection):**
+- **`Phrase` object** — the chunker's noun-phrase runs. The substrate already exists: `TokenTag.np`
+  (from `wordcartel_nlp::analyze`) flags NP membership per token; S8 stored it but paints/selects nothing
+  with it. This item turns NP runs into a selectable object (select the current/next noun phrase).
+- **`Clause` object — D5 clause-splitting.** POS-informed clause boundaries (CCONJ / SCONJ / ADP
+  disambiguate the coordinator vs subordinator vs preposition senses of for/so/yet), exposed as a
+  selectable object. **D5 THE LAW:** clause splitting ships SELECT-ONLY behind a **measured precision
+  gate** — Brill is newswire-trained and WILL mistag fiction / dialect / verse, so it must never mutate,
+  only select, and only after its precision is measured on real prose (mirror the S4/D5 stance).
+
+**Reuse:** builds directly on S8 — the `PosStore` + `PosSweep` substrate, the range-select nav pattern
+(`prose_lens_next_match`), and the `wordcartel-nlp` classifier surface. Not yet designed; graduates to
+the gated pipeline (brainstorm → spec → gates → plan → build) when picked up.

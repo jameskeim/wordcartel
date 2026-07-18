@@ -3,7 +3,7 @@
 
 # Backlog
 
-**33 open · 67 shipped · 2 dropped**
+**34 open · 67 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -43,6 +43,7 @@ Blocking Effort P: **0**
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
 | PC | Lower-fit / principled plugin candidates | watch | research | TBD |  | Post-P: AI continuation (plugin-only on principle), book design, genre benchmarking. |
+| S10 | Prose objects — Phrase/Clause select-only + D5 clause-splitting | triage | feature | TBD |  | The arc tail DEFERRED from S8 (spec 2026-07-17-s8-prose-lenses; the spec's 'S9' refs mean THIS item — id S9 was already taken). Build on S8's prose-lens spine + wordcartel-nlp classifier: a Phrase object (the chunker's NP runs — np flags already stored on TokenTag) and a Clause object (POS-informed clause-splitting; CCONJ/SCONJ/ADP disambiguates for/so/yet), both SELECT-ONLY. D5 THE LAW: POS-informed clause splitting is SELECT-ONLY behind a MEASURED precision gate (Brill is newswire-trained; it WILL mistag fiction/dialect/verse — so ship as selection, never mutation, and gate on measured precision). Reuses S8's PosStore/sweep substrate + the range-select nav pattern. Arc: docs/design/prose-structure-arc.md. |
 | S9 | In-lens editing feel — refine caret/motion/reflow inside the ventilate lens | triage | feature | TBD |  | In-lens editing feel — refine caret/motion/reflow inside the ventilate lens |
 
 ## Shipped
