@@ -6,6 +6,9 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+mod classify;
+pub use classify::{classify, ClassifiedMatch, ProseLensCategory};
+
 /// The Universal POS tagset, re-exported from `harper-brill` (no newtype — it is the
 /// standard UD tagset and never enters `wordcartel-core`; S8 maps it to its own theme
 /// `SemanticElement` in the shell).
