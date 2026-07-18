@@ -150,6 +150,22 @@ Each clause is a category, not a site, so new code is classified by reading them
   probe is a process-liveness question wearing a path.
 - **(f) Test code.** Excluded by the rule itself; restated here because the enforcement test must
   strip it.
+- **(g) Executable-availability probes on `$PATH`.** `clipboard::clip_env_from_process`'s
+  `dir.join(bin).is_file()` sweep asks *"is this helper binary installed"* — the same question
+  `export::probe_pandoc` answers by spawning `pandoc --version`, just answered more cheaply. It is
+  capability detection, not access to the writer's documents, and the answer feeds provider
+  selection rather than any read or write.
+
+  Added as its own clause rather than stretched under (e): a binary on `$PATH` genuinely *is* a
+  file, so (e)'s "path syntax for something that is not a file" does not honestly cover it. The
+  distinguishing property is the **question being asked**, not the object.
+
+  It also cannot be migrated without redesigning an unrelated API: `ClipEnv::present` is a bare
+  `fn(&str) -> bool` field and `on_path` is a nested `fn`, neither of which can capture an injected
+  `fs`; converting to a boxed closure would ripple through every `ClipEnv` literal (~10 in tests
+  alone). Restructuring the clipboard provider API around a rule it is not about would be the wrong
+  trade — but note that is the *corroborating* reason, not the justification. The justification is
+  that the probe is out of the rule's subject matter.
 
 Anything matching the rule and matching **no clause** is in scope. That is the whole definition. A
 call site added next year is classified by reading the above — no list to consult, nothing to keep in
@@ -368,7 +384,7 @@ harmless.)
 |---|---|
 | Content reads | `file::open`, `file::bounded_read_opt`, `config::load`, `theme_resolve::resolve_theme`, `state::load_in`, `swap::read_swap_capped`, `swap::read_file_capped_bytes`, the `app.rs` startup override/mask reads, `plugin::load::discover`'s per-candidate read |
 | Listings | `file_browser::rebuild_entries`, `file_browser_enter`'s readability probe, `swap::cleanable_recovery_files`, `swap::find_orphan_scratch_swap_in`, `plugin::load::discover`'s scan |
-| Metadata probes | `save::fingerprint`, `state::file_identity`, `file::save_atomic`'s `symlink_metadata` refusal, the `target.exists()` checks in `prompts::save_as_submit` / `block_write_submit` / `export::run_export` / `jobs_apply::apply_export_done`, `export::run_pandoc`'s `tmp.exists()`, **`config::config_layer_paths`' `is_file()` probes**, **`plugin::load::discover`'s `init.is_file()`**, **the `app::run` startup probes** (override, `--config` mask, CLI path, and the `was_new_file` `!p.exists()`), **`clipboard::clip_env_from_process`'s PATH search** (`dir.join(bin).is_file()`) |
+| Metadata probes | `save::fingerprint`, `state::file_identity`, `file::save_atomic`'s `symlink_metadata` refusal, the `target.exists()` checks in `prompts::save_as_submit` / `block_write_submit` / `export::run_export` / `jobs_apply::apply_export_done`, `export::run_pandoc`'s `tmp.exists()`, **`config::config_layer_paths`' `is_file()` probes**, **`plugin::load::discover`'s `init.is_file()`**, **the `app::run` startup probes** (override, `--config` mask, CLI path, and the `was_new_file` `!p.exists()`) |
 | Durable mutations | `fsx::atomic_replace` (already), `diagnostics_run::append_word_to_dict`, `jobs_apply::apply_export_done`'s rename, `prompts::resolve_prompt`'s `CleanRecovery` / `Recover` / `DiscardSwap` deletes, `swap::delete` |
 
 The **bolded** metadata probes are the ones a previous draft's census omitted. They are in scope by the
@@ -941,8 +957,8 @@ documents, applied to an app artifact; it is a deliberate change, not a side eff
 
 **`is_file` is a distinct field, not `!is_dir`.** §2.3's rule puts `Path::is_file()` probes in scope —
 `config::config_layer_paths`' walk-up search, `plugin::load::discover`'s `init.is_file()`, the
-`app::run` startup probes, and `clipboard::clip_env_from_process`'s PATH search
-(`dir.join(bin).is_file()`). A caller cannot reconstruct `is_file()` from the size/time/dir/link
+`app::run` startup probes. (`clipboard::clip_env_from_process`'s PATH sweep is exempt under
+clause (g) — executable availability, not document access.) A caller cannot reconstruct `is_file()` from the size/time/dir/link
 fields alone without assuming `!is_dir` means "file," which is **wrong** for fifos, sockets, block and
 character devices, and symlinks pointing at any of them. On a system where a config path is a fifo,
 that assumption turns a correct "not a regular file, skip it" into an attempt to read, which blocks.
@@ -1589,8 +1605,17 @@ Details:
   list. (Existence is checked via the seam's `stat`, on the listing thread, not inline.)
 - Selecting an entry routes through the same open path as the browser
   (`workspace::open_as_new_buffer`), inheriting the dirty-guard and resume behavior.
-- Recents is a *source* for the picker, not a fourth mode: it presents a flat list with the same nav,
-  filter, and rendering. Fuzzy ranking applies to the path strings.
+- Recents is a third `BrowseMode` variant — `Select | Destination | Recents` — reusing the picker's
+  nav, ranking, windowing, mouse, and painter wholesale. Rows are **synthesized** from the session
+  store rather than read from a directory, so no listing thread is spawned and `..` is not shown;
+  `rederive`'s `Recents` arm fuzzy-ranks the rows themselves.
+
+  **Amended (plan-gate round 3).** This section previously called recents "a source for the picker,
+  not a fourth mode", and the plan encoded it as an implicit state pattern —
+  `listing.is_empty() && !entries.is_empty()` plus an early return. The gate rejected that: the early
+  return preserved the rows but could not NARROW them, so typing would have silently failed to
+  filter. An explicit variant was recommended, ratified, and implemented; this text is the spec
+  catching up to that decision.
 - **Favorites are explicitly deferred** (decision 3, §2.2).
 
 ---
