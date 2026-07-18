@@ -364,7 +364,7 @@ mod tests {
         crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
         crate::lenses::prose_lens_next_match(&mut e);
         // typing over the selection replaces the whole flagged span (D6 — abortable, then mutate by typing).
-        crate::commands::insert_char(&mut e, 'X', &TestClock(0));
+        crate::commands::run(crate::commands::Command::InsertChar('X'), &mut e, &TestClock(0));
         assert_eq!(e.active().document.buffer.to_string(), "The report X by them.\n");
     }
 
