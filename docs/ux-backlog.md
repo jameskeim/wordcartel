@@ -834,3 +834,40 @@ abortable selection):**
 **Reuse:** builds directly on S8 — the `PosStore` + `PosSweep` substrate, the range-select nav pattern
 (`prose_lens_next_match`), and the `wordcartel-nlp` classifier surface. Not yet designed; graduates to
 the gated pipeline (brainstorm → spec → gates → plan → build) when picked up.
+
+### H26 — fs-chokepoint guard: use-tree parsing for full soundness
+<!-- item: H26 -->
+
+C5 ships `wordcartel/tests/fs_chokepoint.rs`, a merge gate that fails the build when production code
+reaches the filesystem outside the seam. It is a **textual scanner over three detection layers** —
+import-gating (`use std::fs…`), fully-qualified `std::fs::` paths, and the closed std-defined set of
+filesystem-touching inherent `Path` methods in both dot-call and UFCS spellings. C5's spec states its
+coverage as an explicit Caught / Not-caught pair rather than claiming soundness.
+
+**The gap.** Three import spellings evade layer 1 and are documented as accepted limits:
+
+- nested grouped imports — `use std::{fs::File as StdFile};`
+- renamed-in-group imports — `use std::{fs::{self as filesystem, OpenOptions as OO}};`
+- leading-root paths — `use ::std::fs;`
+
+Each enables a bare short-form call (`filesystem::write(…)`) that no specified layer sees. Closing
+them properly requires **parsing `use` trees** rather than matching text — a dev-dependency (`syn`
+or equivalent) plus real parsing logic in a test.
+
+**Why it was deferred, not overlooked.** Weighed during C5's spec gate (2026-07-18) and declined as
+disproportionate: the gate exists to catch the realistic regression — someone mid-effort reaches for
+`fs::read_to_string` and writes an ordinary import — and the gap spellings are ones nobody produces
+by accident. Adding a parser dependency also cuts against C5's zero-new-dependencies decision. The
+scanner's own self-check plants one evasion per detection route, so the layers that exist are proven
+to work; what is unproven is only the undisclosed-spelling case.
+
+**Note the boundary that is NOT part of this item.** fd-originated `fs::File` (`From<OwnedFd>`,
+`FromRawFd`) is outside the chokepoint rule by design, not by scanner weakness — the rule governs
+reaching the filesystem *by path*, and a descriptor names no path. If a future effort starts doing
+fd-based filesystem work, the **rule** needs widening, not the scanner.
+
+**When it becomes worth doing:** if a real bypass ever lands via one of the three spellings, or if
+the seam's guarantees start carrying weight they do not today (a plugin FS API, sandboxing, an
+audit requirement). Absent that, the honest-limits gate is the better trade.
+
+*(Captured 2026-07-18 during C5's spec gate.)*

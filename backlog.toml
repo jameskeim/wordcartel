@@ -1323,3 +1323,14 @@ depends_on = ["S8"]
 hook = "The arc tail DEFERRED from S8 (spec 2026-07-17-s8-prose-lenses; the spec's 'S9' refs mean THIS item — id S9 was already taken). Build on S8's prose-lens spine + wordcartel-nlp classifier: a Phrase object (the chunker's NP runs — np flags already stored on TokenTag) and a Clause object (POS-informed clause-splitting; CCONJ/SCONJ/ADP disambiguates for/so/yet), both SELECT-ONLY. D5 THE LAW: POS-informed clause splitting is SELECT-ONLY behind a MEASURED precision gate (Brill is newswire-trained; it WILL mistag fiction/dialect/verse — so ship as selection, never mutation, and gate on measured precision). Reuses S8's PosStore/sweep substrate + the range-select nav pattern. Arc: docs/design/prose-structure-arc.md."
 doc = "ux-backlog.md#s10"
 created = "2026-07-18"
+
+[[item]]
+id = "H26"
+title = "fs-chokepoint guard: use-tree parsing for full soundness"
+status = "triage"
+kind = "feature"
+size = "TBD"
+theme = "H"
+hook = "fs-chokepoint guard: use-tree parsing for full soundness"
+doc = "ux-backlog.md#h26"
+created = "2026-07-18"
