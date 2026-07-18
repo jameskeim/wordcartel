@@ -146,6 +146,16 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
                 b.reconcile.maybe_stale = false;
             }
         }
+        JobKind::PosSweep => {
+            // A panicked sweep (upstream harper residual) is deterministic for this text — clear
+            // in-flight and leave computed_for behind so we do NOT re-arm and retry every debounce
+            // (mirrors Reparse).
+            if let Some(b) = editor.by_id_mut(buffer_id) {
+                b.pos.in_flight_version = None;
+                // computed_for untouched: the next edit bumps document.version, so advance() re-arms
+                // exactly once per edit (never a tight loop on the same version).
+            }
+        }
         #[cfg(test)]
         JobKind::CoalesceProbe => {
             editor.set_status_full(crate::status::StatusKind::Error, format!("job failed (internal error: {msg})"),
@@ -873,6 +883,55 @@ mod tests {
         }, &mut e);
         assert!(e.status_text().contains("swap failed"));
         assert_sticky_error_survives_info(&mut e);
+    }
+
+    /// S8 Task 4: a panicked `PosSweep` clears `in_flight_version` WITHOUT re-arming (mirrors the
+    /// `Reparse` panic-arm shape; `computed_for` is left untouched deliberately — see the arm's
+    /// doc comment — so `advance()`'s `armed_for_version != version` gate never retries the same
+    /// version in a loop). The fixture models the REAL post-arm-then-dispatch state (armed_for_version
+    /// pinned to the in-flight version, NOT `PosStore::default()`'s `u64::MAX` sentinel) and then
+    /// drives the REAL `crate::app::advance()` to prove the no-retry-loop property end to end: this
+    /// test FAILS if the panic arm ever reset `armed_for_version` (which would re-open the gate and
+    /// retry the deterministically-panicking sweep every debounce tick).
+    #[test]
+    fn panicked_pos_sweep_clears_in_flight_no_retry_loop() {
+        use crate::editor::Editor;
+        use crate::test_support::TestClock;
+        let mut e = Editor::new_from_text("The report was written.\n", None, (80, 24));
+        let id = e.active().id;
+        let v = e.active().document.version;
+
+        // Model the REAL state just before the worker panics: a lens is active, and advance() +
+        // dispatch_pos_sweep have already armed and dispatched THIS version (armed_for_version == v,
+        // in_flight_version == Some(v), due_at cleared by the dispatch, computed_for still empty).
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        e.active_mut().pos.armed_for_version = v;
+        e.active_mut().pos.in_flight_version = Some(v);
+        e.active_mut().pos.due_at = None;
+        e.active_mut().pos.computed_for = None;
+
+        // Simulate the worker panic through the REAL panic-cleanup path.
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: v, kind: crate::jobs::JobKind::PosSweep, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.active().pos.in_flight_version.is_none(), "panic clears in-flight");
+        assert_ne!(e.active().pos.computed_for, Some(v), "computed_for left behind — never marked done");
+
+        // No-retry-loop: driving the REAL advance() again at the SAME version must NOT re-arm —
+        // armed_for_version is still pinned to v, so `armed_for_version != version` is false and
+        // due_at stays None. This is the property that breaks if the panic arm reset armed_for_version.
+        let clk = TestClock(1_000);
+        crate::app::advance(&mut e, &clk);
+        assert_eq!(e.active().pos.due_at, None, "no re-arm at the same version — no retry loop");
+        assert_eq!(e.active().pos.armed_for_version, v, "latch holds across the panic");
+
+        // Not permanently wedged: a real edit bumps the version, and advance() re-arms normally.
+        e.active_mut().document.version += 1;
+        let new_v = e.active().document.version;
+        let clk2 = TestClock(1_050);
+        crate::app::advance(&mut e, &clk2);
+        assert!(e.active().pos.due_at.is_some(), "a new edit version re-arms the sweep");
+        assert_eq!(e.active().pos.armed_for_version, new_v, "re-armed for the new version");
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub const DIAG_MAX_SEND_BYTES: u64 = 8 * 1024 * 1024;
 /// more is refused with an `io::Error` before any allocation — never a capacity-overflow panic.
 pub const LSP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// S8 — cap on the document size a background prose-lens (POS) sweep will analyze. Mirrors
+/// `DIAG_MAX_SEND_BYTES`: proportional-to-work discipline, not a correctness need — an over-cap
+/// document skips the sweep with a status and no in-flight state (see `lenses::dispatch_pos_sweep`).
+pub const LENS_MAX_SWEEP_BYTES: u64 = 8 * 1024 * 1024;
+
 /// P1 plugin registration caps (bounded-memory LAW — interned ids/labels are permanent leaks
 /// that `set_memory_limit` does not bound; checked on the raw Lua String BEFORE interning).
 pub const PLUGIN_MAX_COMMANDS_PER_PLUGIN: usize = 256;

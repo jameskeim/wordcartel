@@ -283,6 +283,12 @@ impl Harness {
         let w = buf.area().width;
         (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::DIM)).collect()
     }
+    /// The background color painted at cell `(x, y)` — mirrors `render.rs`'s
+    /// `prose_lens_paints_flagged_span_between_search_and_diag` test idiom, so the S8 e2e
+    /// journey can pin the SAME `ProseLensMatch` bg through the full harness loop.
+    fn cell_bg(&self, x: u16, y: u16) -> Option<ratatui::style::Color> {
+        self.term.backend().buffer()[(x, y)].style().bg
+    }
 
     /// Drive the REAL search Msg sequence through `step` (Ctrl+F opens, typing `needle` inserts and
     /// recomputes live — `search_ui::intercept`'s text-insert arm calls `search_sync` after every
@@ -1644,6 +1650,122 @@ fn journey_chrome_zen_toggle() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("chrome = \"zen\""),
         "overrides file must carry '[theme] chrome = \"zen\"';\ngot:\n{text}");
+}
+
+// ---------------------------------------------------------------------------
+// S8 Task 7 — the prose-lens e2e capstone: real command surface + real sweep
+// (advance/Tick debounce) + real paint + real nav-then-type + idle-free off.
+// ---------------------------------------------------------------------------
+
+/// The S8 capstone journey. Drives the REAL loop throughout — no hand-set `pos` store state:
+/// the Passive lens is activated via the real `prose_lens_passive` registry command, the store is
+/// filled by driving `Tick`s past `POS_SWEEP_DEBOUNCE_MS` (the real debounce-arm-in-`advance()` →
+/// dispatch-in-`on_tick()` → merge-in-`ex.drain()` sequence, InlineExecutor so it is synchronous),
+/// the count segment and the paint are read off the real rendered `TestBackend`, navigation goes
+/// through the real `prose_lens_next_match` command, the edit goes through the real
+/// `commands::run(Command::InsertChar(..))` funnel, the re-sweep after the edit is driven through
+/// the real reconcile-then-sweep debounce chain (the sweep's `pos_sweep_due` gate requires the
+/// block tree to have CONVERGED — `!reconcile.maybe_stale` — so a Local edit's reconcile debounce
+/// must fire first), and turning the lens off goes through the real `prose_lens_off` command, with
+/// a final idle-free assertion against the real `timers::SUBSYSTEMS` "pos_sweep" deadline fn.
+#[test]
+fn journey_prose_lens_passive_paints_navigates_counts() {
+    use crate::registry::{Ctx, CommandId};
+    use wordcartel_core::theme::SemanticElement::ProseLensMatch;
+
+    let text = "The report was written by them.\n";
+    let mut h = Harness::new(text, None, (80, 24));
+
+    // Byte offsets of "was written" == screen columns on row 0 (plain 80-col paragraph, no
+    // ventilation/wrap/prefix glyph — the same idiom `render.rs`'s S8 paint test relies on).
+    let start = text.find("was written").expect("fixture contains the passive phrase");
+    let end = start + "was written".len();
+
+    // 1) Activate the Passive lens via the REAL palette-only set command (contract Rule 8).
+    {
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        h.reg.dispatch(CommandId("prose_lens_passive"), &mut ctx);
+    }
+    assert_eq!(h.editor.borrow().active().view.prose_lens, Some(crate::lenses::ProseLensCategory::Passive),
+        "prose_lens_passive must set the active buffer's lens");
+
+    // 2) Drive the REAL sweep. The first Tick's `advance()` edge-arms the debounce (no sweep has
+    // run yet — no honest count on screen); a Tick at/after the debounce dispatches + merges the
+    // sweep synchronously (InlineExecutor).
+    h.tick();
+    assert!(h.editor.borrow().active().pos.due_at.is_some(), "the pos-sweep debounce must be armed");
+    assert!(!h.screen_contains("Passive:"), "no honest count before the debounce elapses:\n{:#?}", h.screen());
+    h.advance_ms(crate::lenses::POS_SWEEP_DEBOUNCE_MS);
+    h.tick();
+
+    // 3) The count segment renders the real sweep result, and the flagged span PAINTS on row 0.
+    assert!(h.screen_contains("Passive: 1"),
+        "count segment must show the real sweep result:\n{:#?}", h.screen());
+    let want_bg = {
+        let e = h.editor.borrow();
+        crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth).bg
+    };
+    for x in start as u16..end as u16 {
+        assert_eq!(h.cell_bg(x, 0), want_bg, "col {x}: flagged span must carry the ProseLensMatch bg");
+    }
+    assert_ne!(h.cell_bg(0, 0), want_bg, "'T' at col 0 (outside the span) must not carry the bg");
+
+    // 4) `prose_lens_next_match` (the real nav command) range-selects the whole flagged span,
+    // head at the span start (C-9).
+    {
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        h.reg.dispatch(CommandId("prose_lens_next_match"), &mut ctx);
+    }
+    {
+        let e = h.editor.borrow();
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (start, end), "nav must range-select the whole flagged span");
+        assert_eq!(sel.head, start, "head-at-start (C-9)");
+    }
+
+    // 5) Typing over the selection replaces the whole flagged span (D6) — through the real
+    // `commands::run(Command::InsertChar(..))` funnel.
+    {
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        crate::commands::run(crate::commands::Command::InsertChar('X'), &mut e, &clock);
+    }
+    assert_eq!(h.doc_text(), "The report X by them.\n", "typing must replace the whole flagged span");
+
+    // 6) Drive the sweep again through the real loop. The edit is Local (`maybe_stale` → true),
+    // so the pos sweep will not fire until the reconcile debounce converges the tree: Tick arms
+    // both debounces (version-latched), a Tick at the reconcile debounce fires the reconcile and
+    // converges the tree, and a further Tick at the pos-sweep debounce re-sweeps.
+    h.tick(); // arms reconcile.due_at (+150ms) and pos.due_at (+300ms)
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS);
+    h.tick(); // fires the reconcile — tree converges (maybe_stale -> false)
+    h.advance_ms(crate::lenses::POS_SWEEP_DEBOUNCE_MS - crate::reconcile::RECONCILE_DEBOUNCE_MS);
+    h.tick(); // fires the re-sweep now that the tree has converged
+    assert!(h.screen_contains("Passive: 0"),
+        "the count must update once the edit removed the only passive:\n{:#?}", h.screen());
+
+    // 7) Cycle the lens to Off via the real command; paint + count vanish AND no pos_sweep timer
+    // is armed afterward — the idle-free arc law (A3) holds once the lens is off.
+    {
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        h.reg.dispatch(CommandId("prose_lens_off"), &mut ctx);
+    }
+    h.tick();
+    assert!(!h.screen_contains("Passive:"), "count segment must vanish once the lens is off:\n{:#?}", h.screen());
+    for x in 0u16..80 {
+        assert_ne!(h.cell_bg(x, 0), want_bg,
+            "col {x}: no glyph on row 0 may carry the ProseLensMatch bg once the lens is off");
+    }
+    let dl = crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "pos_sweep")
+        .expect("pos_sweep subsystem registered").deadline;
+    assert_eq!((dl)(&h.editor.borrow(), h.now), None,
+        "idle-free: no pos_sweep wake armed once the lens is off");
 }
 
 #[test]

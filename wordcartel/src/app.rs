@@ -416,6 +416,28 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
             editor.on_change_due = Some(now.saturating_add(crate::reconcile::RECONCILE_DEBOUNCE_MS));
         }
     }
+    // Prose-lens sweep debounce (S8): arm ONLY when a lens is active and the store is stale for the
+    // current version. The gate is `armed_for_version != version` (NOT reconcile's
+    // `due_at.is_none() || armed_for_version != version` escape) — this arms EXACTLY ONCE per version and
+    // never re-arms once armed/dispatched, which is what latches the oversized-doc cap-skip (CRITICAL-3):
+    // the cap path returns without an in-flight job, so only the `armed_for_version` pin stops a re-arm
+    // loop. `armed_for_version` is sentinel-initialized to `u64::MAX` (PosStore::default), so a fresh
+    // buffer (version 0) still arms (MAX != 0). A real edit bumps the version → the gate re-opens. Cost is
+    // exactly zero when no lens is active (the `is_some()` guard short-circuits before any field read).
+    {
+        let now = clock.now_ms();
+        let b = editor.active_mut();
+        if b.view.prose_lens.is_some() {
+            let stale = b.pos.computed_for != Some(b.document.version);
+            let arm = stale
+                && b.pos.in_flight_version.is_none()
+                && b.pos.armed_for_version != b.document.version;
+            if arm {
+                b.pos.due_at = Some(now.saturating_add(crate::lenses::POS_SWEEP_DEBOUNCE_MS));
+                b.pos.armed_for_version = b.document.version;
+            }
+        }
+    }
 }
 
 /// Prepare the editor for the FIRST frame drawn OUTSIDE the reduce loop (startup /

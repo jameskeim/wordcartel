@@ -115,6 +115,25 @@ mod tests {
         assert_eq!(crate::render_status::word_count_segment(&e), None);
     }
 
+    /// S8 Task 6: the prose-lens count segment (`lenses::prose_lens_count_segment`) rides the
+    /// status line as its own right-side segment, gated on `computed_for == version` (an active
+    /// AND current lens) — independent of `word_count_segment`'s own gate, so it composes into
+    /// the right-side status string whether or not `view_opts.word_count` is on.
+    #[test]
+    fn prose_lens_count_segment_shown_when_active_and_current() {
+        let mut e = Editor::new_from_text("The report was written here.\n", None, (80, 24));
+        let v = e.active().document.version;
+        e.active_mut().pos.passive = vec![crate::lenses::PosMatch {
+            start: 4, end: 21, category: crate::lenses::ProseLensCategory::Passive,
+        }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        assert_eq!(crate::lenses::prose_lens_count_segment(&e), Some("Passive: 1".to_string()));
+        // stale (version bumped without a re-sweep) → suppressed, not shown.
+        e.active_mut().document.version += 1;
+        assert_eq!(crate::lenses::prose_lens_count_segment(&e), None, "stale store suppresses the segment");
+    }
+
     #[test]
     fn status_line_shows_buffer_index_and_count() {
         let mut e = crate::editor::Editor::new_from_text("a\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
