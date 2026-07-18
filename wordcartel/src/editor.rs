@@ -125,6 +125,10 @@ pub struct View {
     /// LOOKUP) and to supply the `ps` (`paragraph_range_at` start) byte ORIGIN. Verbatim blocks get
     /// NO entry.
     pub vent_blocks: BTreeMap<usize, crate::ventilate::VentBlock>,
+    /// S8 — per-buffer active prose lens (Adverbs/Adjectives/Passive/Weak), or `None` (off). A lens
+    /// is into THIS writing, so it does not follow other buffers — mirrors `ventilate`'s per-buffer
+    /// scoping (§F5 precedent).
+    pub prose_lens: Option<crate::lenses::ProseLensCategory>,
 }
 
 /// 9a: a persistent marked block — a half-open `[start, end)` byte range that
@@ -164,6 +168,8 @@ pub struct Buffer {
     pub reconcile: crate::reconcile::ReconcileStore,
     /// per-buffer linguistic-substrate memo (S7) — filled on demand by `nlp::nlp_window_at`.
     pub nlp: crate::nlp::NlpStore,
+    /// per-buffer prose-lens POS-match store (S8) — filled by the doc-wide sweep worker (Task 4).
+    pub pos: crate::lenses::PosStore,
     // 5g: per-buffer fold state
     pub folds: crate::fold::FoldState,
     /// Memoized fold view, keyed by (blocks_generation, folds.epoch). Interior
@@ -225,6 +231,7 @@ impl Buffer {
             ventilate: false,
             line_layouts: BTreeMap::new(),
             vent_blocks: BTreeMap::new(),
+            prose_lens: None,
         };
         Buffer {
             id,
@@ -245,6 +252,7 @@ impl Buffer {
             diagnostics: crate::diagnostics_run::DiagStore::new(),
             reconcile: crate::reconcile::ReconcileStore::default(),
             nlp: crate::nlp::NlpStore::default(),
+            pos: crate::lenses::PosStore::default(),
             folds: crate::fold::FoldState::default(),
             fold_view_cache: std::cell::RefCell::new(None),
             last_reconciled_generation: None,

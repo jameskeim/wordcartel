@@ -559,6 +559,25 @@ impl Registry {
             CommandResult::Handled
         });
 
+        // Prose lenses (S8) — Rule 8: 5 palette-only set primitives + one stateful cycle rep; the
+        // shared setter is lenses::set_prose_lens (Law 6). Per-buffer state on View. A14: no
+        // Command variant, no commands::run arm — thin delegations into the lenses leaf.
+        r.register("prose_lens_adverbs",    "Prose Lens: Adverbs",    None, |c| { crate::lenses::set_prose_lens(c.editor, Some(crate::lenses::ProseLensCategory::Adverbs)); CommandResult::Handled });
+        r.register("prose_lens_adjectives", "Prose Lens: Adjectives", None, |c| { crate::lenses::set_prose_lens(c.editor, Some(crate::lenses::ProseLensCategory::Adjectives)); CommandResult::Handled });
+        r.register("prose_lens_passive",    "Prose Lens: Passive",    None, |c| { crate::lenses::set_prose_lens(c.editor, Some(crate::lenses::ProseLensCategory::Passive)); CommandResult::Handled });
+        r.register("prose_lens_weak",       "Prose Lens: Weak",       None, |c| { crate::lenses::set_prose_lens(c.editor, Some(crate::lenses::ProseLensCategory::Weak)); CommandResult::Handled });
+        r.register("prose_lens_off",        "Prose Lens: Off",        None, |c| { crate::lenses::set_prose_lens(c.editor, None); CommandResult::Handled });
+        r.register_stateful("prose_lens_next", "Prose Lens", Some(MenuCategory::View),
+            |e| match e.active().view.prose_lens {
+                Some(cat) => MenuMark::Value(crate::lenses::category_label(cat)),
+                None => MenuMark::Value("Off"),
+            },
+            |c| { crate::lenses::cycle_prose_lens(c.editor); CommandResult::Handled });
+        // Nav — two-side pair (contract rule): jump the caret to the next/previous match under the
+        // active lens, range-selecting the WHOLE matched span (C-9, D6) so it reads as a real find.
+        r.register("prose_lens_next_match", "Next Prose-Lens Match", None, |c| { crate::lenses::prose_lens_next_match(c.editor); CommandResult::Handled });
+        r.register("prose_lens_prev_match", "Previous Prose-Lens Match", None, |c| { crate::lenses::prose_lens_prev_match(c.editor); CommandResult::Handled });
+
         // View menu — writing-experience toggles (Task 2 / Effort 5d).
         r.register("toggle_typewriter", "Toggle Typewriter", Some(MenuCategory::View), |c| { c.editor.view_opts.typewriter = !c.editor.view_opts.typewriter; CommandResult::Handled });
         r.register("toggle_focus",      "Toggle Focus Mode", Some(MenuCategory::View), |c| { c.editor.view_opts.focus = !c.editor.view_opts.focus; CommandResult::Handled });
