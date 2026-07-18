@@ -356,12 +356,17 @@ discard (identical to `Reparse`).
 - `pub const POS_SWEEP_DEBOUNCE_MS: u64 = 300;` (own const; reconcile's 150 ms inner loop is faster — the
   reconcile must settle the tree before the sweep reads it, so a slightly longer debounce is correct).
 - **Arm in `app.rs advance()`**, in the same version-latched block as reconcile/on_change, but ONLY when a
-  lens is active. The arm condition mirrors reconcile's latch, keyed on `computed_for` rather than a
-  `maybe_stale` flag: `arm = view.prose_lens.is_some() && pos.in_flight_version.is_none()
-  && pos.computed_for != Some(document.version) && (pos.due_at.is_none() || pos.armed_for_version !=
-  document.version)`. On arm: `pos.due_at = Some(now + POS_SWEEP_DEBOUNCE_MS); pos.armed_for_version =
-  document.version`. Edge-triggered on version; `armed_for_version` prevents idle re-arm (a settled buffer
-  whose `computed_for == version` never re-arms). PosStore therefore needs NO `maybe_stale` field — the
+  lens is active. The arm condition mirrors reconcile's latch but keys ONLY on `armed_for_version` (NOT the
+  compound `due_at.is_none() || …` that reconcile uses): `arm = view.prose_lens.is_some() &&
+  pos.in_flight_version.is_none() && pos.computed_for != Some(document.version) && pos.armed_for_version !=
+  document.version`. On arm: `pos.due_at = Some(now + POS_SWEEP_DEBOUNCE_MS); pos.armed_for_version =
+  document.version`. **CORRECTED per the plan-gate Critical-3 finding:** the reconcile-style
+  `due_at.is_none()` OR-escape must NOT be included here — with it, the oversized-doc cap-skip path (which
+  clears `due_at`) leaves `computed_for != Some(version)` and re-arms every tick, an idle re-arm loop.
+  Dropping the OR-clause (plus `PosStore::default` seeding `armed_for_version = u64::MAX` so a fresh
+  version-0 buffer still arms once, and the cap-skip path pinning `armed_for_version = version`) makes the
+  arm fire exactly once per version. Edge-triggered on version; `armed_for_version` prevents idle re-arm (a
+  settled buffer whose `armed_for_version == version` never re-arms). PosStore therefore needs NO `maybe_stale` field — the
   `computed_for != Some(version)` comparison IS the staleness signal (this is why `computed_for` is
   `Option<u64>`, §6.2 #6).
 - **`timers::SUBSYSTEMS` +row `pos_sweep`.** Its `deadline` fn returns `None` unless: a lens is active AND
