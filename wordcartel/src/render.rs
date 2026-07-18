@@ -504,11 +504,12 @@ struct RowCtx<'a> {
     marked_block: Option<crate::editor::MarkedBlock>,
     use_placed: bool,
     plain_source: bool,
+    prose_lens: &'a [crate::lenses::PosMatch],
 }
 
 /// Snapshot the row loop's per-frame inputs (render() phases 6–7). has_block/block_hidden/
-/// diag_active are gather-time locals feeding use_placed/diag_all; only the 12 fields the paint
-/// path reads are kept in RowCtx.
+/// diag_active/prose_lens_active are gather-time locals feeding use_placed/diag_all/prose_lens;
+/// only the 13 fields the paint path reads are kept in RowCtx.
 fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     let scroll = editor.active().view.scroll;
 
@@ -586,11 +587,20 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     let block_hidden = marked_block.is_some_and(|b| b.hidden);
     let has_block = marked_block.is_some() && !block_hidden;
 
+    // Active prose lens (S8 Task 5): the active category's slice iff a lens is on AND the
+    // store is current for this version; `active_pos_matches` is the single source of truth
+    // (mirrors `active_lens_diags` above). Windowing to the visible span happens per-row in
+    // `row_spans_placed` (the `lenses::window_matches` helper — hub budget).
+    let prose_lens: &[crate::lenses::PosMatch] =
+        crate::lenses::active_pos_matches(editor).unwrap_or(&[]);
+    let prose_lens_active = !prose_lens.is_empty();
+
     // Use the placed-path builder when search is active, valid diagnostics exist,
-    // a non-empty selection must be painted, or a visible marked block must be
-    // painted (segs path does no per-glyph styling). Computed ONCE (Codex): a
-    // visible block forces the placed path even with no selection/search/diag.
-    let use_placed = !hl_window.is_empty() || diag_active || has_sel || has_block;
+    // a non-empty selection must be painted, a visible marked block must be
+    // painted, or an active prose lens has matches (segs path does no per-glyph
+    // styling). Computed ONCE (Codex): a visible block forces the placed path
+    // even with no selection/search/diag.
+    let use_placed = !hl_window.is_empty() || diag_active || has_sel || has_block || prose_lens_active;
 
     // SourcePlain is the only mode with no semantic colour; LivePreview and
     // SourceHighlighted both paint role + inline styles (SH's raw markers carry
@@ -599,7 +609,7 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
 
     RowCtx {
         scroll, focus_region, sorted_lines, hl_current, hl_window, diag_all,
-        sel_from, sel_to, has_sel, marked_block, use_placed, plain_source,
+        sel_from, sel_to, has_sel, marked_block, use_placed, plain_source, prose_lens,
     }
 }
 
@@ -694,6 +704,10 @@ fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
     let diag_window: Vec<&wordcartel_core::diagnostics::Diagnostic> =
         ctx.diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
 
+    // Prose-lens window (S8): upper-bound only (lenses.rs helper — hub budget); the
+    // `end > lo` lower bound is applied per glyph by `overlaps` below, same idiom as diag.
+    let lens_window = crate::lenses::window_matches(ctx.prose_lens, hi);
+
     push_prefix_lead_in(&mut spans, &editor.theme, editor.depth, vr, map, row_dim);
 
     // One span per run of glyphs sharing the same (style, highlight-kind).
@@ -734,6 +748,13 @@ fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
             let search_face = editor.theme.face(SE::SearchMatch);
             let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
             style = style.patch(ss);
+        }
+
+        // Prose-lens highlight (S8) — composes above Search, below Diagnostics (errors
+        // stay topmost; a stylistic lens never outranks a real diagnostic).
+        if lens_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end)) {
+            let lf = editor.theme.face(SE::ProseLensMatch);
+            style = style.patch(crate::compose::face_to_ratatui(&lf, editor.depth));
         }
 
         // Apply diagnostic underline if this glyph overlaps any diagnostic.
@@ -1356,6 +1377,186 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 40, 6);
         assert!(!row_has_underline(&buf, 0), "version-mismatched diagnostics are hidden");
+    }
+
+    // -----------------------------------------------------------------------
+    // S8 Task 5 — prose-lens paint (between Search and Diag)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prose_lens_paints_flagged_span_between_search_and_diag() {
+        use wordcartel_core::theme::SemanticElement::ProseLensMatch;
+        let t = "The report was written by them.\n";
+        let mut e = Editor::new_from_text(t, None, (80, 24));
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive =
+            vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        crate::derive::rebuild(&mut e);
+
+        // use_placed must be forced on by an active prose-lens match.
+        let ctx = super::gather_row_ctx(&e);
+        assert!(ctx.use_placed, "an active prose lens forces the placed path");
+
+        // No prefix glyph on a plain paragraph and no ventilate/wrap here — byte offsets ==
+        // screen columns on row 0, same idiom as `diagnostics_underline_the_flagged_glyphs`.
+        let want_bg = crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth).bg;
+        let buf = render_to_buffer(&mut e, 80, 24);
+        for x in start..end {
+            assert_eq!(buf[(x as u16, 0)].style().bg, want_bg,
+                "glyph at col {x} inside the flagged span must carry the ProseLensMatch bg");
+        }
+        assert_ne!(buf[(0u16, 0u16)].style().bg, want_bg,
+            "glyph outside the flagged span ('T' at col 0) must not carry the ProseLensMatch bg");
+    }
+
+    #[test]
+    fn prose_lens_paints_cue_mode_modifier_not_color() {
+        // Depth::None + the no-color theme: no bg/fg is ever applied, but the ProseLensMatch
+        // modifier stack (bold+italic+underline, mono_faces) must still land on the flagged glyphs.
+        use wordcartel_core::theme::SemanticElement::ProseLensMatch;
+        let t = "The report was written by them.\n";
+        let mut e = Editor::new_from_text(t, None, (80, 24));
+        e.theme = wordcartel_core::theme::no_color();
+        e.depth = wordcartel_core::theme::Depth::None;
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive =
+            vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        crate::derive::rebuild(&mut e);
+
+        let want = crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth);
+        assert_eq!(want.bg, None, "cue mode carries no color — modifiers are the only cue");
+        let buf = render_to_buffer(&mut e, 80, 24);
+        for x in start..end {
+            let s = buf[(x as u16, 0)].style();
+            assert!(
+                s.add_modifier.contains(Modifier::BOLD)
+                    && s.add_modifier.contains(Modifier::ITALIC)
+                    && s.add_modifier.contains(Modifier::UNDERLINED),
+                "col {x} inside the flagged span must carry bold+italic+underline in cue mode, got {:?}",
+                s.add_modifier
+            );
+        }
+    }
+
+    #[test]
+    fn prose_lens_composes_between_search_and_diag() {
+        // Selection -> Search -> ProseLensMatch -> Diagnostics-last (spec order). A match that also
+        // overlaps a search hit and a diagnostic: the final bg must be ProseLensMatch's (patched
+        // AFTER Search), while the diagnostic still layers its underline on top (Diag never
+        // overwrites color, so this alone proves Diag composes above without erasing the lens bg).
+        use wordcartel_core::diagnostics::{DiagSource, Diagnostic, DiagnosticKind};
+        use wordcartel_core::theme::SemanticElement::ProseLensMatch;
+        let t = "The report was written by them.\n";
+        let mut e = Editor::new_from_text(t, None, (80, 24));
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive =
+            vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        // A search match covering the exact same span.
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "was written".chars() { e.search.as_mut().unwrap().insert(c); }
+        let rope = e.active().document.buffer.snapshot();
+        e.search.as_mut().unwrap().recompute(&rope, v);
+        assert_eq!(e.search.as_ref().unwrap().count(), 1, "the search must land exactly on the span");
+        // A grammar diagnostic covering the same span, in Review mode so it displays.
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).diagnostics = vec![Diagnostic {
+            range: start..end, kind: DiagnosticKind::Grammar, source: DiagSource::Harper,
+            code: None, href: None, message: "x".into(), suggestions: vec![] }];
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).computed_version = v;
+        crate::derive::rebuild(&mut e);
+
+        let want_bg = crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth).bg;
+        let buf = render_to_buffer(&mut e, 80, 24);
+        for x in start..end {
+            let s = buf[(x as u16, 0)].style();
+            assert_eq!(s.bg, want_bg,
+                "col {x}: ProseLensMatch bg must win over Search (patched after it)");
+            assert!(s.add_modifier.contains(Modifier::UNDERLINED),
+                "col {x}: the diagnostic underline still composes on top of the lens bg");
+        }
+    }
+
+    #[test]
+    fn prose_lens_paints_at_correct_absolute_offset_under_ventilate() {
+        // A prose lens must paint correctly UNDER the ventilate lens too (they compose): the
+        // paragraph is anchored past a heading + blank line (non-zero `vent_blocks` byte_origin),
+        // so a naive per-line origin (instead of `ventilate::origin_of`) would rebase the match to
+        // the wrong absolute bytes. Locate the painted glyphs by their TEXT content (not a
+        // hardcoded column), since ventilate reserves gutter columns ahead of the prose text.
+        use wordcartel_core::theme::SemanticElement::ProseLensMatch;
+        let t = "# Head\n\nOne cat sat. The report was written by them today.\n";
+        let mut e = Editor::new_from_text(t, None, (60, 10));
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive =
+            vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        e.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut e);
+        assert!(e.active().view.vent_blocks.get(&2).is_some_and(|vb| vb.byte_origin > 0),
+            "precondition: the paragraph's vent_blocks origin must be non-zero (past the heading)");
+
+        let want_bg = crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth).bg;
+        let buf = render_to_buffer(&mut e, 60, 10);
+        let (row, col) = (0..10u16).find_map(|r| {
+            let s = row_string(&buf, r);
+            s.find("written").map(|c| (r, c as u16))
+        }).expect("the second sentence ('written') must be on some visible row");
+        assert_eq!(buf[(col, row)].style().bg, want_bg,
+            "'written' glyph carries the ProseLensMatch bg at its real (ventilated) position");
+        // Control: the FIRST sentence ("One cat sat.") is outside the flagged span.
+        let (crow, ccol) = (0..10u16).find_map(|r| {
+            let s = row_string(&buf, r);
+            s.find("cat").map(|c| (r, c as u16))
+        }).expect("the first sentence ('cat') must be on some visible row");
+        assert_ne!(buf[(ccol, crow)].style().bg, want_bg,
+            "the unflagged first sentence must not carry the ProseLensMatch bg");
+    }
+
+    #[test]
+    fn prose_lens_paints_nothing_when_no_lens_active_or_store_stale() {
+        use wordcartel_core::theme::SemanticElement::ProseLensMatch;
+        let t = "The report was written by them.\n";
+        let mut e = Editor::new_from_text(t, None, (80, 24));
+        let v = e.active().document.version;
+        let start = t.find("was written").unwrap();
+        let end = start + "was written".len();
+        e.active_mut().pos.passive =
+            vec![crate::lenses::PosMatch { start, end, category: crate::lenses::ProseLensCategory::Passive }];
+        e.active_mut().pos.computed_for = Some(v);
+        let want_bg = crate::compose::face_to_ratatui(&e.theme.face(ProseLensMatch), e.depth).bg;
+
+        // No lens active: no paint, use_placed not forced by the lens.
+        crate::derive::rebuild(&mut e);
+        assert!(!super::gather_row_ctx(&e).use_placed, "no lens active → placed path not forced");
+        let buf = render_to_buffer(&mut e, 80, 24);
+        for x in start..end {
+            assert_ne!(buf[(x as u16, 0)].style().bg, want_bg, "no lens active → nothing painted at col {x}");
+        }
+
+        // Lens active but store stale (computed_for != version): still no paint.
+        crate::lenses::set_prose_lens(&mut e, Some(crate::lenses::ProseLensCategory::Passive));
+        e.active_mut().document.version += 1;
+        crate::derive::rebuild(&mut e);
+        assert!(!super::gather_row_ctx(&e).use_placed, "stale store → placed path not forced");
+        let buf2 = render_to_buffer(&mut e, 80, 24);
+        for x in start..end {
+            assert_ne!(buf2[(x as u16, 0)].style().bg, want_bg, "stale store → nothing painted at col {x}");
+        }
     }
 
     /// E7 T2: the display gate hides underlines the instant the buffer leaves Review, even
@@ -2215,7 +2416,7 @@ mod tests {
         //   CodeBlock=reverse, Link=underline, Strikethrough=strike, Comment=italic+dim,
         //   FrontMatter=reverse+italic, Selection=reverse+underline,
         //   SearchMatch=reverse, SearchCurrent=reverse+bold,
-        //   DiagSpelling=bold+underline, DiagGrammar=bold+underline (distinct face).
+        //   DiagSpelling=bold+underline, DiagGrammar=italic+underline (distinct face).
         // Transient overlay + chrome elements with modifier cues:
         //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim,
         //   ChromeAccent=reverse+bold (glyph-bearing prompt-active status — I3/D2).
