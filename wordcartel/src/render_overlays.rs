@@ -543,17 +543,27 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
 
         if ov_h >= 3 {
             let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-            let query_display = format!("> {}", fb.query);
+            // The MODE's own text source, never `fb.query` unconditionally: destination mode
+            // types into `fb.mode`'s `field`, so painting the query row from `fb.query` left a
+            // writer naming a Save-As/Write-Block/Export target typing into an invisible
+            // string — the field, the caret and the whole `field_cursor` machinery had no
+            // visual representation at all (C5 review finding C1). `filter_text` is the same
+            // accessor the listing filter reads, so the row can never show text the filter is
+            // not using. An empty field paints as a bare `> `, which §7.2's Row 2 safety
+            // rationale requires to be VISIBLY empty.
+            let field_text = fb.mode.filter_text(&fb.query);
+            let query_display = format!("> {field_text}");
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
 
-            // B11: end-of-query caret.
+            // B11: the text caret — at the end of a select-mode query, at `field_cursor` in
+            // destination mode (where Left/Right/Home actually move it).
             // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
             let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
-                + fb.query.chars().count();
+                + fb.mode.caret_chars(&fb.query);
             if caret_col < (query_area.x + query_area.width) as usize {
                 frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
             }
@@ -863,6 +873,83 @@ mod tests {
     fn elide_path_left_degenerate_widths_never_panic() {
         assert_eq!(elide_path_left("anything", 0), "", "zero columns show nothing");
         assert_eq!(elide_path_left("anything", 1), "\u{2026}", "one column shows only the marker");
+    }
+
+    // ---- the destination field reaches the SCREEN ---------------------------------
+
+    /// C5 review finding C1. The intercept routes destination-mode typing into
+    /// `BrowseMode::Destination`'s `field`, but the painter unconditionally drew
+    /// `format!("> {}", fb.query)` — which stays empty in destination mode. A writer naming a
+    /// Save-As target therefore typed into a string with NO visual representation: the query
+    /// row showed a bare `> `, and the hardware caret stayed pinned at the prefix while
+    /// Backspace/Left/Right edited text nobody could see. Spec §7.2 requires the writer to
+    /// "see the name land in the field", and Row 2's safety rationale requires a VISIBLY
+    /// empty field to distinguish itself from Row 4.
+    ///
+    /// Twenty-six tasks missed it because every field guard asserted `field` on the STRUCT or
+    /// read the resolved-target footer. This one scrapes the drawn cell grid, drives every
+    /// keystroke through the real intercept, and pumps the real async listing first — so it
+    /// fails the moment the painter stops rendering the mode's own text source.
+    ///
+    /// FAIL-VERIFY (mutation): restore the painter's `format!("> {}", fb.query)` — the
+    /// "chapter" assertion fails on a bare `> ` row. Separately restore the caret's
+    /// `fb.query.chars().count()` — the caret assertion fails, reporting column 3 (the
+    /// prefix) instead of 7. Both confirmed, then reverted.
+    #[test]
+    fn the_destination_field_and_its_caret_are_painted_in_the_query_row() {
+        let d = std::env::temp_dir().join(format!("wc-render-field-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("fixture dir");
+        let mut e = Editor::new_from_text("body\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Opened with an EMPTY field — exactly what a writer sees invoking Save-As fresh.
+        e.open_destination_picker(&fs, &tx, DestinationPurpose::SaveAs, d.clone(), String::new());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let area = Rect::new(0, 0, 80, 24);
+        let query_row = {
+            let fb = e.file_browser.as_ref().expect("picker open");
+            crate::chrome_geom::file_browser_overlay_rect(area, fb).y + 1
+        };
+
+        // (a) An empty field paints a VISIBLY empty row — §7.2 Row 2's safety rationale.
+        crate::derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let empty_row = row_text(&term, query_row);
+        assert_eq!(empty_row.trim_matches(|c| c == ' ' || c == '\u{2502}'), ">",
+            "an empty field must paint as a bare prompt, nothing more: {empty_row:?}");
+
+        // (b) Type through the REAL intercept — no handler call, no struct poke.
+        for c in ['c', 'h', 'a', 'p', 't', 'e', 'r'] {
+            crate::test_support::press_char_fb(&mut e, &fs, &tx, c);
+        }
+        crate::derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let row = row_text(&term, query_row);
+        assert!(row.contains("chapter"),
+            "the typed filename must reach the SCREEN, not just `fb.mode`'s field: {row:?}");
+
+        // (c) The caret tracks `field_cursor`, not the (empty) query. Two Lefts put it
+        //     between `chapt` and `er`; the painter must place it five columns past the
+        //     `> ` prefix, not at the prefix itself.
+        for _ in 0..2 { crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Left); }
+        crate::derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let ov_x = {
+            let fb = e.file_browser.as_ref().expect("picker open");
+            crate::chrome_geom::file_browser_overlay_rect(area, fb).x
+        };
+        let expected = ov_x + 1 + OV_QUERY_PREFIX_COLS + 5;
+        assert_eq!(term.get_cursor_position().expect("caret").x, expected,
+            "the caret must sit at `field_cursor`, not pinned to the empty query");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ---- the height, not the listing size, gates the cramped fallback -------------

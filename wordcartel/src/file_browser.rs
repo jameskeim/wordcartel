@@ -57,6 +57,21 @@ impl BrowseMode {
             BrowseMode::Destination { field, .. } => field,
         }
     }
+    /// Where the hardware caret belongs, in CHARACTERS from the start of [`filter_text`].
+    ///
+    /// Select/Recents have no cursor of their own — their query only ever grows and shrinks
+    /// at the end — so the caret sits past the last character. Destination mode has a real
+    /// cursor (`field_cursor`, a BYTE offset the `minibuffer::text_*` helpers maintain), and
+    /// the painter needs it in columns: counting `char_indices` below the offset converts it
+    /// without ever slicing, so a cursor that somehow landed off a char boundary cannot
+    /// panic the render loop.
+    pub fn caret_chars(&self, query: &str) -> usize {
+        match self {
+            BrowseMode::Select | BrowseMode::Recents => query.chars().count(),
+            BrowseMode::Destination { field, field_cursor, .. } =>
+                field.char_indices().take_while(|(i, _)| i < field_cursor).count(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
