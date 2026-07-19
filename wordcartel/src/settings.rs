@@ -803,6 +803,9 @@ mod tests {
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
             fn read_capped(&self, p: &std::path::Path, l: u64)
                 -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
@@ -876,6 +879,9 @@ mod tests {
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
             fn read_capped(&self, p: &std::path::Path, l: u64)
                 -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
@@ -907,6 +913,9 @@ mod tests {
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
             fn read_capped(&self, p: &std::path::Path, l: u64)
                 -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }

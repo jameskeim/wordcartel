@@ -19,6 +19,27 @@ pub(crate) trait WriteSync {
     fn sync_all(&self) -> std::io::Result<()>;
 }
 
+/// A resolved metadata probe. `len`/`mtime`/`is_file`/`is_dir` FOLLOW symlinks (they come
+/// from `metadata`); `is_symlink` does NOT (it comes from `symlink_metadata`). Two syscalls,
+/// one method — both existing behaviours preserved exactly.
+///
+/// `is_file` is a field and NEVER `!is_dir`: fifos, sockets, and devices are neither, so the
+/// equivalence is false and `config_layer_paths`-style probes would misclassify them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // C5 tasks 3-24 use this via implementors; forward reference
+pub(crate) struct FileStat {
+    pub len: u64,
+    pub mtime: Option<std::time::SystemTime>,
+    pub is_file: bool,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    /// Symlink whose target could not be RESOLVED — dangling, permission-denied along the
+    /// chain, or a resolution loop. NOT "the target is gone": `metadata` reports all three
+    /// as Err and this seam does not distinguish them, so user-facing wording must say
+    /// "cannot be resolved" rather than asserting absence.
+    pub broken: bool,
+}
+
 /// The filesystem ops the atomic-write commit needs. Object-safe (no generics,
 /// no associated types) so `&dyn Fs` works.
 pub(crate) trait Fs {
@@ -33,6 +54,9 @@ pub(crate) trait Fs {
     /// a permission problem.
     #[allow(dead_code)] // C5 tasks 3-24 use this via implementors; forward reference
     fn read_capped(&self, path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>>;
+    /// Metadata probe. See [`FileStat`] for the follow/don't-follow split.
+    #[allow(dead_code)] // C5 tasks 3-24 use this via implementors; forward reference
+    fn stat(&self, path: &Path) -> std::io::Result<FileStat>;
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
     /// Durably flush a directory entry. A dir that cannot be opened is NOT an error.
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
@@ -91,6 +115,32 @@ impl Fs for RealFs {
         f.take(limit + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > limit { return Ok(None); }
         Ok(Some(buf))
+    }
+    fn stat(&self, path: &Path) -> std::io::Result<FileStat> {
+        // symlink_metadata FIRST: it establishes that the entry exists at all, and whether
+        // it is a link. A path that does not exist in any form is Err — the ordinary
+        // "new file" answer, which must stay distinguishable from a broken link.
+        let lm = fs::symlink_metadata(path)?;
+        let is_symlink = lm.file_type().is_symlink();
+        match fs::metadata(path) {
+            Ok(m) => Ok(FileStat {
+                len: m.len(),
+                mtime: m.modified().ok(),
+                is_file: m.is_file(),
+                is_dir: m.is_dir(),
+                is_symlink,
+                broken: false,
+            }),
+            // A symlink we cannot resolve is `broken` — the link exists, its target is
+            // unreachable for SOME reason we deliberately do not distinguish.
+            Err(_) if is_symlink => Ok(FileStat {
+                len: 0, mtime: None, is_file: false, is_dir: false,
+                is_symlink: true, broken: true,
+            }),
+            // Not a symlink but metadata failed: a genuine IO/permission error on a real
+            // entry. `broken` is never used to paper over an unreadable regular file.
+            Err(e) => Err(e),
+        }
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         fs::rename(from, to)
@@ -465,6 +515,68 @@ mod tests {
             "wc-fsx-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), label));
         std::fs::create_dir_all(&d).expect("create dir");
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_follows_symlinks_for_size_but_reports_the_link_bit() {
+        // Load-bearing: every existing stat caller uses `metadata` (which FOLLOWS).
+        // A FileStat built only from symlink_metadata would report the LINK's size to
+        // save::fingerprint, silently breaking external-mod detection for symlinked docs.
+        let d = unique_dir("stat-follow");
+        let real = d.join("real.txt");
+        let link = d.join("link.txt");
+        std::fs::write(&real, b"0123456789").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let s = RealFs.stat(&link).expect("stat");
+        assert_eq!(s.len, 10, "len must be the TARGET's, not the link's");
+        assert!(s.is_file, "resolves to a regular file");
+        assert!(!s.is_dir);
+        assert!(s.is_symlink, "but the entry itself is a link");
+        assert!(!s.broken);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_broken_symlink_is_broken_not_err_and_missing_is_err() {
+        // These two MUST stay distinguishable: `canonicalize` fails identically for both,
+        // which is exactly why §7.6.1's broken-destination refusal needs this field.
+        let d = unique_dir("stat-broken");
+        let link = d.join("dangling.txt");
+        std::os::unix::fs::symlink(d.join("does-not-exist"), &link).expect("symlink");
+
+        let s = RealFs.stat(&link).expect("a broken link still stats — it exists as a link");
+        assert!(s.broken, "unresolvable target -> broken");
+        assert!(s.is_symlink);
+        assert!(!s.is_file && !s.is_dir, "broken implies neither");
+
+        let missing = RealFs.stat(&d.join("nothing-at-all.txt"));
+        assert!(missing.is_err(), "a path that does not exist at all is Err — the new-file case");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn stat_regular_file_and_dir_classify() {
+        let d = unique_dir("stat-kinds");
+        let f = d.join("f.txt");
+        std::fs::write(&f, b"x").expect("seed");
+        let sf = RealFs.stat(&f).expect("stat file");
+        assert!(sf.is_file && !sf.is_dir && !sf.is_symlink && !sf.broken);
+        let sd = RealFs.stat(&d).expect("stat dir");
+        assert!(sd.is_dir && !sd.is_file);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn stat_fault_is_injectable() {
+        let d = unique_dir("stat-fault");
+        let f = d.join("f.txt");
+        std::fs::write(&f, b"x").expect("seed");
+        let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Stat);
+        let err = fs.stat(&f).expect_err("injected stat must fail");
+        assert!(err.to_string().contains("injected: stat"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

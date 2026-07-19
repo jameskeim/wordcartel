@@ -60,6 +60,7 @@ pub(crate) enum FaultAt {
     Rename,
     SyncDir,
     ReadCapped,
+    Stat,
     // Not yet constructed by any test as of C5 Task 1 — a later task's remove_file
     // fault-injection test (a non-fsx module) is the first consumer. Silence the
     // dead-code lint for this deliberate forward reference rather than dropping the
@@ -130,6 +131,12 @@ impl Fs for FaultFs {
             return Err(Error::other("injected: read_capped"));
         }
         self.inner.read_capped(path, limit)
+    }
+    fn stat(&self, path: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+        if matches!(self.fail, FaultAt::Stat) {
+            return Err(Error::other("injected: stat"));
+        }
+        self.inner.stat(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         if matches!(self.fail, FaultAt::Rename) {
