@@ -2284,7 +2284,7 @@ mod tests {
         // `chars().count() as u16` truncated FIRST, so a length of 65536+10 wrapped to
         // column 10 and wrongly passed the `< w` guard, planting the caret at col ~12.
         let mut e = Editor::new_from_text("body\n", None, (80, 24));
-        e.open_minibuffer("x ", crate::minibuffer::MinibufferKind::SaveAs);
+        e.open_minibuffer("x ", crate::minibuffer::MinibufferKind::Filter);
         {
             let mb = e.minibuffer.as_mut().unwrap();
             mb.text = "a".repeat(65_546); // 65536 + 10

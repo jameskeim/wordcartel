@@ -264,43 +264,55 @@ fn do_save(ctx: &mut Ctx) {
     do_save_to(ctx, SaveTarget { chosen: path, resolved }, SaveMode::Normal);
 }
 
-/// Registry `"save"` handler: external-mod check then dispatch a background save.
+/// Registry `"save"` handler — unchanged public shape.
 pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
+    dispatch_save_reporting(ctx);
+    CommandResult::Handled
+}
+
+/// The same work, RETURNING whether it opened a Save-As destination picker.
+///
+/// This return value is what replaces `dispatch_save_then`'s old
+/// `minibuffer.kind == SaveAs` sniff. Inferring control flow from which overlay happens to
+/// be up is what made that coupling silently breakable; the fact is now produced by the
+/// function that knows it.
+fn dispatch_save_reporting(ctx: &mut Ctx) -> bool {
     let path = match &ctx.editor.active().document.path {
-        None => { crate::prompts::open_save_as(ctx.editor); return CommandResult::Handled; }
+        None => {
+            let opened = crate::prompts::open_save_as(ctx.editor, &ctx.fs, &ctx.msg_tx);
+            return opened;
+        }
         Some(p) => p.clone(),
     };
-
     // External-mod check (§4.3 step 2): cheap stat; if the on-disk fingerprint
     // diverged from what we last wrote, refuse and raise the external-mod modal.
-    let current_fp = fingerprint(&path);
+    let current_fp = fingerprint_with_fs(&*ctx.fs, &path);
     if current_fp != ctx.editor.active().document.stored_fp {
         ctx.editor.open_prompt(crate::prompt::Prompt::external_mod());
         ctx.editor.set_status_full(crate::status::StatusKind::Warning,
             "File changed on disk \u{2014} choose [R]eload or [O]verwrite",
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-        return CommandResult::Handled;
+        return false;
     }
-
     do_save(ctx);
-    CommandResult::Handled
+    false
 }
 
-/// The unified "save, then do `action`" entry. Goes through `dispatch_save`
+/// The unified "save, then do `action`" entry. Goes through `dispatch_save_reporting`
 /// (external-mod-checked). Handles all three buffer states:
 /// - NAMED, no conflict → a save job is dispatched → arm `pending_after_save{action}`.
-/// - NAMED, external-mod conflict → `dispatch_save` raised the modal → do NOT arm
-///   (the user resolves the modal and re-issues).
-/// - UNNAMED → `dispatch_save` opened the Save-As minibuffer → carry the action in
-///   `pending_save_as` so it fires after the Save-As write completes.
+/// - NAMED, external-mod conflict → the modal was raised → do NOT arm (the user resolves
+///   the modal and re-issues).
+/// - UNNAMED → the Save-As destination picker opened → carry the action in
+///   `pending_save_as` so it fires after the Save-As write completes. Gated on the RETURN
+///   VALUE, not on inspecting which overlay is up — see the module-level hazard note.
 pub(crate) fn dispatch_save_then(ctx: &mut crate::registry::Ctx, action: crate::editor::PostSaveAction) {
     let was_unnamed = ctx.editor.active().document.path.is_none();
     let buffer_id = ctx.editor.active().id;
     let v = ctx.editor.active().document.version;
-    dispatch_save(ctx);
+    let opened_save_as = dispatch_save_reporting(ctx);
     if was_unnamed {
-        // dispatch_save opened Save-As (MinibufferKind::SaveAs) for the no-path buffer.
-        if ctx.editor.minibuffer.as_ref().map(|m| m.kind) == Some(crate::minibuffer::MinibufferKind::SaveAs) {
+        if opened_save_as {
             ctx.editor.pending_save_as = Some(action);
         }
     } else if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
@@ -1177,5 +1189,63 @@ mod tests {
         let t = SaveTarget::same(p.clone());
         assert_eq!(t.chosen, p);
         assert_eq!(t.resolved, p, "the common case: no resolution needed, both equal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 21 — the quit-drain coupling hazard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_and_quit_on_an_unnamed_buffer_completes_through_the_picker() {
+        // THE HAZARD, asserted. `dispatch_save_then` armed `pending_save_as` by checking
+        // `minibuffer.kind == SaveAs`. Once Save-As opens a PICKER, that check is false
+        // forever — no compile error, no visible bug in the common path, but save-and-quit
+        // on an unnamed buffer silently stops completing.
+        let mut e = Editor::new_from_text("unsaved\n", None, (80, 24));
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        {
+            let mut ctx = Ctx {
+                editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(),
+                fs: std::sync::Arc::new(crate::fsx::RealFs),
+            };
+            dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::Quit);
+        }
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
+            "an unnamed buffer opens the DESTINATION picker, not a minibuffer");
+        assert_eq!(e.pending_save_as, Some(crate::editor::PostSaveAction::Quit),
+            "and the post-save action is armed — this is what the minibuffer sniff used to do");
+    }
+
+    #[test]
+    fn esc_out_of_a_drain_destination_picker_aborts_the_drain() {
+        // The Effort-6 Codex-C2 fix, carried to the new path. Without it, backing out leaves
+        // quit_drain Some-but-inert: stranded with no in-flight save and nothing to re-drive.
+        let mut e = Editor::new_from_text("unsaved\n", None, (80, 24));
+        e.quit_drain = Some(crate::editor::QuitDrain {
+            queue: std::collections::VecDeque::new(),
+            mode: crate::editor::QuitMode::SaveAll });
+        e.pending_save_as = Some(crate::editor::PostSaveAction::ContinueQuitDrain);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs,
+            std::env::temp_dir(), String::new());
+
+        // Driven through the REAL intercept. Calling `cancel_destination` directly is the
+        // pattern this very task's commit-arm comment condemns: Task 18 ships a plain
+        // `editor.file_browser = None` Esc arm that THIS task must replace, and a direct call
+        // passes whether or not that replacement happened.
+        //
+        // FAIL-VERIFY: leave Task 18's plain Esc arm in place, watch the drain assertions fail.
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Esc);
+
+        assert!(e.file_browser.is_none(), "Esc closes the picker");
+        assert!(e.pending_save_as.is_none(), "and clears the armed action");
+        assert!(e.quit_drain.is_none(), "and ABORTS the drain rather than stranding it");
+        assert!(!e.quit_drain_advance);
+        assert!(!e.quit, "backing out must not quit");
     }
 }

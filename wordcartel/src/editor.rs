@@ -499,6 +499,12 @@ pub struct Editor {
     pub pending_save_as: Option<PostSaveAction>,
     /// The target awaiting an OverwriteSaveAs confirmation (existing-file Save-As). (Task 3)
     pub pending_save_overwrite: Option<PathBuf>,
+    /// The CHOSEN (logical, pre-resolution) path paired with `pending_save_overwrite`'s
+    /// RESOLVED one — reconstructing a `SaveTarget` for the confirmed overwrite needs both
+    /// (Task 21). PAIRED LIFETIME: set and cleared in lockstep with `pending_save_overwrite`
+    /// everywhere overwrite state is abandoned, or a stale `chosen` could pair with a
+    /// different `resolved` on a later round trip — a silent wrong-target write.
+    pub pending_save_as_chosen: Option<PathBuf>,
     /// The target awaiting an OverwriteWriteBlock confirmation (^KW existing file). (9A Task 4)
     pub pending_write_block: Option<PathBuf>,
     /// H5 clean-recovery: the EXACT set of provably-valueless recovery files snapshotted when
@@ -673,6 +679,7 @@ impl Editor {
             plugin_inventory: Vec::new(),
             parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
+            pending_save_as_chosen: None,
             pending_write_block: None, pending_clean: Vec::new(),
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
@@ -954,6 +961,36 @@ impl Editor {
         };
         crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
         self.file_browser = Some(fb);
+    }
+
+    /// Open the destination picker for `purpose`, seeded at `dir` with `field` pre-filled.
+    ///
+    /// Returns whether it opened. Callers use the RETURN VALUE to decide follow-up control
+    /// flow — never by inspecting which overlay is up. `dispatch_save_then` used to sniff
+    /// `minibuffer.kind == SaveAs` to know a Save-As had started, which silently broke the
+    /// moment Save-As stopped using a minibuffer.
+    pub fn open_destination_picker(&mut self,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+        purpose: crate::file_browser::DestinationPurpose,
+        dir: std::path::PathBuf, field: String) -> bool
+    {
+        crate::overlays::close_all(self);
+        self.pending_keys.clear(); self.pending_mark = None;
+        let field_cursor = field.len();
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: dir.clone(), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Destination { purpose, field, field_cursor },
+            listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        // ASYNC, exactly like `open_file_browser`. A synchronous `refetch` here would block
+        // the input loop on the directory read and undo Task 13 for every destination
+        // picker — Save-As, Write-Block, and Export. There is no synchronous listing path.
+        crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
+        self.file_browser = Some(fb);
+        true
     }
 
     /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.

@@ -2109,8 +2109,10 @@ mod tests {
 
     #[test]
     fn quit_drain_aborts_when_save_as_dismissed() {
-        // Drain reaches a dirty UNNAMED buffer → Save-As minibuffer opens. An empty
-        // submit (dismiss) aborts the quit: quit_drain cleared, quit stays false.
+        // Drain reaches a dirty UNNAMED buffer → the Save-As DESTINATION PICKER opens
+        // (Task 21 — no longer a minibuffer). Dismissing via an empty-field Enter (the
+        // `CommitOutcome::Nothing` arm) aborts the quit: quit_drain cleared, quit stays
+        // false. Driven through the REAL intercept, not `commit_destination` directly.
         use crate::editor::Editor;
         use crate::prompt::PromptAction;
         use crate::jobs::InlineExecutor;
@@ -2121,11 +2123,12 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
-        assert_eq!(e.minibuffer.as_ref().map(|m| m.kind), Some(crate::minibuffer::MinibufferKind::SaveAs),
-            "unnamed dirty buffer in the drain opens the Save-As minibuffer");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
+            "unnamed dirty buffer in the drain opens the Save-As destination picker");
         assert!(e.quit_drain.is_some(), "drain still pending while Save-As is open");
-        // Dismiss via empty submit.
-        crate::prompts::save_as_submit(&mut e, "", &ex, &clk, &tx, &crate::test_support::test_fs());
+        // Dismiss via an empty-field Enter.
+        let fs = crate::test_support::test_fs();
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert!(e.quit_drain.is_none(), "dismissing the Save-As aborts the drain");
         assert!(!e.quit, "backing out of Save-As must not quit");
     }
@@ -3843,25 +3846,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn save_as_writes_new_path_and_rekeys() {
-        use crate::editor::Editor;
-        use crate::jobs::{Executor, InlineExecutor};
-        let dir = std::env::temp_dir().join(format!("wc-saveas-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("out.md");
-        let _ = std::fs::remove_file(&p);
-        let mut e = Editor::new_from_text("content\n", None, (80, 24)); // UNNAMED, dirty-ish
-        e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
-        let ex = InlineExecutor::default(); let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx, &crate::test_support::test_fs());
-        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "content\n", "file written");
-        assert_eq!(e.active().document.path.as_deref(), Some(p.as_path()), "path re-keyed");
-        assert!(!e.active().document.dirty(), "clean after save-as");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // `save_as_writes_new_path_and_rekeys` (unnamed buffer, Save-As writes and rekeys) is now
+    // covered end-to-end, through the real Enter intercept, by
+    // `file_browser_commit::tests::save_as_commits_end_to_end_from_enter` — Task 21 retired
+    // the minibuffer submit path (`save_as_submit`) this test drove.
 
     #[test]
     fn save_on_unnamed_buffer_opens_save_as_prompt() {
@@ -3872,8 +3860,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx); // no path → opens Save-As, NOT the dead stub
-        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
-            Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
+            "unnamed save opens the Save-As destination picker");
     }
 
     #[test]

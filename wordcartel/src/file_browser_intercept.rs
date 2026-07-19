@@ -12,6 +12,9 @@ use crate::file_browser::BrowseMode;
 
 /// File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
 /// fall through to normal handling while the browser stays open (mirrors theme_picker).
+#[allow(clippy::too_many_lines)] // a flat, exhaustive per-key dispatch table — every arm
+// already delegates to a domain helper (file_browser/file_browser_commit/list_window/
+// minibuffer); the count comes from arm cardinality, not fat logic in any one arm.
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
     ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.file_browser.is_none() { return crate::app::Handled::Pass(msg); }
@@ -42,21 +45,27 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         if k.kind == crossterm::event::KeyEventKind::Press {
             use crossterm::event::KeyCode;
             match k.code {
+                // Destination mode's Esc additionally aborts an in-progress quit drain and
+                // clears the overwrite-pair state — see `file_browser::cancel_destination`.
                 KeyCode::Esc => {
-                    // Plain close — Task 21 REPLACES this line with `cancel_destination`,
-                    // which adds the quit-drain abort. Keeping it plain here means this task
-                    // depends on nothing later.
-                    editor.file_browser = None;
+                    if editor.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()) {
+                        crate::file_browser::cancel_destination(editor);
+                    } else {
+                        editor.file_browser = None;
+                    }
                 }
-                // Enter's destination-mode wiring (the four-row commit table actually
-                // performing a write / raising the overwrite-confirm) is Task 21's
-                // `commit_destination`. Kept unconditional here, exactly as before this
-                // task — Select mode is the only mode this task wires all the way through
-                // Enter; Destination-mode Enter reaching a write is deliberately NOT part of
-                // this task's scope (see `file_browser_commit::classify_destination_enter`,
-                // tested directly as a pure function, and the Tab/click gestures below,
-                // which are this task's safe destination-mode affordances).
-                KeyCode::Enter => { crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx); }
+                // Destination mode commits via `file_browser_commit::commit_destination` — THE
+                // single place a picker commit becomes a write (Task 21).
+                KeyCode::Enter => {
+                    let is_destination = editor.file_browser.as_ref()
+                        .is_some_and(|fb| fb.mode.is_destination());
+                    if is_destination {
+                        crate::file_browser_commit::commit_destination(
+                            editor, ctx.fs, ctx.ex, ctx.clock, ctx.msg_tx);
+                    } else {
+                        crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
+                    }
+                }
                 // The Tab gesture (destination mode only): copy a highlighted FILE's name
                 // into the field. Never commits — see `file_browser_commit::copy_name_into_field`.
                 KeyCode::Tab => {

@@ -11,10 +11,6 @@ use crossterm::event::Event;
 pub enum MinibufferKind {
     Filter,
     GotoLine,
-    /// File-name input for Save As.
-    SaveAs,
-    /// File-name input for Write Block (^KW).
-    WriteBlock,
     /// Numeric input for Set Wrap Column.
     WrapColumn,
     /// Argument prompt for a parameterized plugin command (Task 5) — opened by
@@ -110,19 +106,12 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     // here and does NOT reach the filter-cancel Esc check below, so
                     // any in-flight filter continues running.
                     editor.minibuffer = None;
-                    // Save-As minibuffer dismiss: drop any queued post-save action.
-                    editor.pending_save_as = None;
-                    // Effort 6 (Codex C2): dismissing a drain's Save-As aborts the quit.
-                    editor.quit_drain = None;
-                    editor.quit_drain_advance = false;
                 }
                 crossterm::event::KeyCode::Enter => {
                     let mb = editor.minibuffer.take().unwrap();
                     match mb.kind {
                         MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, ctx.msg_tx),
                         MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
-                        MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
-                        MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text, ctx.fs),
                         MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
                         MinibufferKind::PluginArg { id } => {
                             if mb.text.len() > crate::limits::PLUGIN_MAX_COMMAND_ARG {

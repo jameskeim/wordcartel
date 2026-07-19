@@ -173,11 +173,146 @@ pub(crate) fn copy_name_into_field(field: &mut String, field_cursor: &mut usize,
     *field_cursor = field.len();
 }
 
+/// Execute a destination-mode Enter. THE single place a picker commit becomes a write.
+///
+/// Dispatches on `DestinationPurpose`, so adding a future destination consumer is one arm
+/// the compiler demands rather than a new branch somewhere else.
+#[allow(clippy::too_many_lines)] // a flat, exhaustive commit-outcome × purpose dispatch — the
+// highest-risk logic in C5 (the module doc comment), kept in ONE function on purpose so the
+// whole write decision is auditable in one place rather than split across call sites.
+pub(crate) fn commit_destination(
+    editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    executor: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    let Some(fb) = editor.file_browser.as_ref() else { return };
+    let crate::file_browser::BrowseMode::Destination { purpose, field, .. } = &fb.mode
+        else { return };
+    let purpose = purpose.clone();
+    let dir = fb.dir.clone();
+    let highlighted = fb.entries.get(fb.selected).cloned();
+
+    match classify_destination_enter(&**fs, &dir, field, highlighted.as_ref()) {
+        // Rows 1 and 3 — navigate, do not write. The listing lands asynchronously and
+        // `apply_listing_done` commits `fb.dir` only on success.
+        CommitOutcome::Descend(target) => {
+            if let Some(fb) = editor.file_browser.as_mut() {
+                crate::file_browser::start_listing(fb, target, fs, msg_tx);
+            }
+        }
+        // Nothing to commit — an empty field with no usable highlight. A Sticky Warning,
+        // matching what the retired `save_as_submit` empty-path arm produced.
+        CommitOutcome::Nothing => {
+            let noun = match purpose {
+                crate::file_browser::DestinationPurpose::SaveAs => "save-as",
+                crate::file_browser::DestinationPurpose::WriteBlock => "write block",
+                crate::file_browser::DestinationPurpose::Export { .. } => "export",
+            };
+            editor.set_status_full(crate::status::StatusKind::Warning,
+                format!("{noun}: empty path"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            // Backing out of a drain's Save-As aborts the quit (Effort-6 Codex C2).
+            if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
+                editor.pending_save_as = None;
+                editor.quit_drain = None;
+                editor.quit_drain_advance = false;
+            }
+        }
+        CommitOutcome::Commit(raw) => {
+            // Extension policy applies to SAVE destinations only — an export's extension is
+            // fixed by the chosen format.
+            let chosen = match &purpose {
+                crate::file_browser::DestinationPurpose::Export { .. } => raw,
+                _ => match apply_extension_policy(&raw) {
+                    ExtVerdict::Defaulted(p) | ExtVerdict::Honoured(p) => p,
+                    ExtVerdict::Redirect { path, ext } => {
+                        // F4: refuse the save, explain, and carry the typed path into the
+                        // export destination picker — advice with somewhere to go.
+                        editor.set_status_full(crate::status::StatusKind::Warning,
+                            format!("{ext} is an export format \u{2014} opening Export instead"),
+                            crate::status::StatusLifetime::Sticky,
+                            crate::status::StatusSource::Host, None);
+                        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(dir);
+                        let field = path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        editor.open_destination_picker(fs, msg_tx,
+                            crate::file_browser::DestinationPurpose::Export { ext },
+                            dir, field);
+                        return;
+                    }
+                    ExtVerdict::Refused(path) => {
+                        editor.set_status_full(crate::status::StatusKind::Warning,
+                            format!("{} \u{2014} names a directory, not a file", path.display()),
+                            crate::status::StatusLifetime::Sticky,
+                            crate::status::StatusSource::Host, None);
+                        return;
+                    }
+                },
+            };
+            // Resolve through symlinks BEFORE any write is dispatched (§7.6.1).
+            let resolved = match crate::fsx::resolve_write_destination(&**fs, &chosen) {
+                Ok(r) => r,
+                Err(crate::fsx::DestError::BrokenSymlink) => {
+                    editor.set_status_full(crate::status::StatusKind::Warning,
+                        format!("{}: destination symlink cannot be resolved", chosen.display()),
+                        crate::status::StatusLifetime::Sticky,
+                        crate::status::StatusSource::Host, None);
+                    return;
+                }
+            };
+            editor.file_browser = None;   // the picker's work is done
+
+            // The overwrite-confirm names the RESOLVED target — the file whose bytes will
+            // actually be replaced.
+            let exists = crate::fsx::exists_via(&**fs, &resolved);
+            match purpose {
+                crate::file_browser::DestinationPurpose::SaveAs => {
+                    if exists {
+                        editor.pending_save_overwrite = Some(resolved.clone());
+                        editor.pending_save_as_chosen = Some(chosen);
+                        editor.open_prompt(crate::prompt::Prompt::save_overwrite(&resolved));
+                    } else {
+                        crate::prompts::perform_save_as(
+                            editor, chosen, resolved, executor, clock, msg_tx, fs);
+                    }
+                }
+                crate::file_browser::DestinationPurpose::WriteBlock => {
+                    let Some(b) = editor.active().marked_block else {
+                        editor.set_status(crate::status::StatusKind::Info, "no marked block");
+                        return;
+                    };
+                    if exists {
+                        editor.pending_write_block = Some(resolved);
+                        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(
+                            editor.pending_write_block.as_ref().expect("just set")));
+                    } else {
+                        crate::prompts::perform_block_write(editor, &resolved, b.start, b.end, fs);
+                    }
+                }
+                crate::file_browser::DestinationPurpose::Export { ext } => {
+                    if exists {
+                        editor.pending_export = Some(crate::export::PendingExport {
+                            ext, target: resolved });
+                        editor.open_prompt(crate::prompt::Prompt::export_overwrite(
+                            &editor.pending_export.as_ref().expect("just set").target));
+                    } else {
+                        crate::export::do_export(editor, &ext, &resolved, msg_tx, false,
+                            std::sync::Arc::clone(fs));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::file_browser::FileEntry;
     use crate::fsx::EntryKind;
+    use crate::jobs::Executor;
 
     // The shared keystroke helpers (`press_key_fb`, `press_char_fb`, `press_enter_fb`,
     // `nix_privileged`) live in `test_support` as of Task 12. Only `press_key_fb` is used
@@ -423,6 +558,172 @@ mod tests {
             "and it must NOT raise the overwrite-confirm — that needs a deliberate Enter");
         assert_eq!(std::fs::read_to_string(d.join("victim.md")).expect("read"), "precious\n",
             "the file on disk is untouched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- All three drive Enter through the INTERCEPT, not commit_destination -----------
+    //
+    // FAIL-VERIFY (all three): delete the `KeyCode::Enter` arm from
+    // `file_browser_intercept`'s destination branch, watch all three fail, then revert.
+    //
+    // An earlier draft called `commit_destination` directly. That is the vacuous-guard
+    // pattern: a missing or mis-wired Enter arm would pass every one of them, and "the
+    // commit path does not exist" is the exact defect the gate caught in this task last
+    // round. A test named end-to-end that skips the entry point reads as coverage while
+    // proving only that a function it hand-called works.
+
+    fn press_enter(e: &mut crate::editor::Editor, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        ex: &dyn crate::jobs::Executor, clk: &dyn wordcartel_core::history::Clock,
+        tx: &std::sync::mpsc::Sender<crate::app::Msg>)
+    {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex, clock: clk, msg_tx: tx, fs };
+        let enter = Event::Key(KeyEvent {
+            code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let _ = crate::file_browser_intercept::intercept(crate::app::Msg::Input(enter), e, &ctx);
+    }
+
+    #[test]
+    fn save_as_commits_end_to_end_from_enter() {
+        let d = std::env::temp_dir().join(format!("wc-saveas-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let mut e = crate::editor::Editor::new_from_text("chapter body\n", None, (80, 24));
+        e.active_mut().document.version = 1;
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "chapter one".into());
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        // Extension policy applied, file written, buffer rekeyed and clean.
+        assert_eq!(std::fs::read_to_string(d.join("chapter one.md")).expect("written"),
+            "chapter body\n");
+        assert_eq!(e.active().document.path.as_deref(), Some(d.join("chapter one.md").as_path()));
+        assert!(!e.active().document.dirty());
+        assert!(e.file_browser.is_none(), "the picker closed on commit");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// PAIRED-LIFETIME regression: `pending_save_as_chosen` must be cleared everywhere
+    /// `pending_save_overwrite` is abandoned, or a stale `chosen` from THIS round trip could
+    /// pair with a different `resolved` on a LATER one — a silent wrong-target write. Commit
+    /// onto an EXISTING target (raising the OverwriteSaveAs modal, which sets both fields),
+    /// then cancel it — driven through the real modal intercept, not by inspecting the two
+    /// fields' setters directly.
+    ///
+    /// FAIL-VERIFY: drop the `pending_save_as_chosen = None` line from `prompts::intercept`'s
+    /// Esc arm, watch the `chosen_survives` assertion fail, then restore it.
+    #[test]
+    fn cancelling_the_overwrite_modal_clears_both_paired_fields() {
+        let d = std::env::temp_dir().join(format!("wc-saveas-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        std::fs::write(d.join("taken.md"), b"already here\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "taken.md".into());
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        assert!(e.pending_save_overwrite.is_some(), "existing target raises the overwrite modal");
+        assert!(e.pending_save_as_chosen.is_some(), "and pairs it with the chosen path");
+        assert!(e.prompt.is_some());
+
+        // Esc on the modal, through `prompts::intercept` — the real path, not a direct field
+        // clear (a direct clear would pass whether or not the Esc arm's own cleanup exists).
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+        let esc = crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Esc, modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE });
+        crate::prompts::intercept(crate::app::Msg::Input(esc), &mut e, &ctx);
+
+        assert!(e.prompt.is_none(), "Esc dismisses the modal");
+        assert!(e.pending_save_overwrite.is_none(), "resolved half cleared");
+        let chosen_survives = e.pending_save_as_chosen.is_some();
+        assert!(!chosen_survives,
+            "chosen half must ALSO be cleared — a surviving chosen could pair with a \
+             DIFFERENT resolved on a later round trip and silently write to the wrong target");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_block_commits_end_to_end_from_enter() {
+        let d = std::env::temp_dir().join(format!("wc-wb-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let mut e = crate::editor::Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock, d.clone(), "excerpt".into());
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+
+        assert_eq!(std::fs::read_to_string(d.join("excerpt.md")).expect("written"), "alpha");
+        assert!(e.active().document.path.is_none(),
+            "write-block does NOT rekey the buffer — it exports a slice");
+        assert!(e.active().marked_block.is_some(), "block stays after write");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn export_commits_end_to_end_from_enter_through() {
+        // Decision 4: a bare Enter on the PRE-SEEDED picker must reproduce today's
+        // zero-decision export. Export had no Enter-through commit test at all.
+        let d = std::env::temp_dir().join(format!("wc-exp-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let src = d.join("notes.md");
+        std::fs::write(&src, b"# hi\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src), (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Seeded exactly as `run_export` seeds it — the Enter-through path.
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::Export { ext: "html".into() },
+            d.clone(), "notes.html".into());
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+
+        // The commit arm dispatched an export for the seeded target. Assert on the DISPATCH
+        // rather than on pandoc's output: pandoc may be absent on the gate machine, and the
+        // wiring is what this test owns.
+        assert!(e.file_browser.is_none(), "the picker closed on commit");
+        // Assert the DISPATCH specifically — an `|| status contains "export"` fallback would
+        // pass on any export-ish status message, including a failure, proving nothing about
+        // whether Enter reached the commit arm.
+        // BOUNDED RECEIVE, not `try_iter()`: `do_export` spawns a thread, so an immediate
+        // drain races it and the test would pass or fail on scheduling. Same discipline the
+        // listing tests use.
+        let dispatched = std::iter::from_fn(|| rx.recv_timeout(
+                std::time::Duration::from_secs(5)).ok())
+            .take(4)
+            .any(|m| matches!(m,
+                crate::app::Msg::ExportDone { ref target, .. } if target == &d.join("notes.html")));
+        assert!(dispatched,
+            "Enter on the pre-seeded picker must dispatch an ExportDone for notes.html \
+             (status was {:?})", e.status_text());
         let _ = std::fs::remove_dir_all(&d);
     }
 

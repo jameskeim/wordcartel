@@ -270,6 +270,25 @@ pub(crate) fn click_commit_or_copy(editor: &mut crate::editor::Editor) {
     }
 }
 
+/// Esc out of a destination picker. Mirrors the cleanup `prompts::intercept`'s Esc arm
+/// already does for a modal prompt — including ABORTING an in-progress quit drain. Without
+/// that, backing out leaves `quit_drain` Some-but-inert.
+pub(crate) fn cancel_destination(editor: &mut crate::editor::Editor) {
+    editor.file_browser = None;
+    editor.pending_save_as = None;
+    editor.pending_save_overwrite = None;
+    // Cleared HERE too: it is half of a two-field pair with `pending_save_overwrite`, and a
+    // surviving `chosen` could be picked up by a LATER overwrite round trip and paired with
+    // a different resolved path. Every place that abandons overwrite Save-As state clears
+    // both — see the sweep in `prompts.rs`.
+    editor.pending_save_as_chosen = None;
+    editor.pending_write_block = None;
+    if editor.quit_drain.is_some() {
+        editor.quit_drain = None;
+        editor.quit_drain_advance = false;
+    }
+}
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonic listing epoch, PROCESS-GLOBAL by design.

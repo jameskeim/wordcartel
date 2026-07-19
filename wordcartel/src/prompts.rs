@@ -24,6 +24,10 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 editor.prompt = None; // Esc cancels any prompt
                 editor.pending_export = None;
                 editor.pending_save_overwrite = None;
+                // PAIRED with `pending_save_overwrite` above — see the doc comment on the
+                // field. Esc on the OverwriteSaveAs modal must clear both, or a stale
+                // `chosen` could pair with a different `resolved` on a later round trip.
+                editor.pending_save_as_chosen = None;
                 editor.pending_save_as = None;
                 editor.pending_write_block = None;
                 editor.pending_clean.clear(); // H5: Esc abandons the clean-recovery snapshot; delete nothing
@@ -70,12 +74,17 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
 }
 
 /// Execute the action chosen in a modal prompt, then clear the prompt.
-/// Open the Save-As minibuffer pre-filled with the active doc's directory.
-pub fn open_save_as(editor: &mut crate::editor::Editor) {
-    let pre = editor.active().document.path.as_ref()
-        .and_then(|p| p.parent()).map(|d| format!("{}/", d.display())).unwrap_or_default();
-    editor.open_minibuffer("Save as: ", crate::minibuffer::MinibufferKind::SaveAs);
-    if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
+/// Open the Save-As destination picker, seeded at the active document's directory.
+pub fn open_save_as(editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> bool
+{
+    let dir = editor.active().document.path.as_ref()
+        .and_then(|p| p.parent())
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    editor.open_destination_picker(fs, msg_tx,
+        crate::file_browser::DestinationPurpose::SaveAs, dir, String::new())
 }
 
 /// H5 `clean_recovery` command entry: enumerate the provably-valueless recovery files ONCE,
@@ -114,57 +123,16 @@ pub fn expand_path(text: &str) -> std::path::PathBuf {
     else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
 }
 
-/// Submit the Save-As minibuffer line: expand the path, raise an overwrite
-/// confirmation if the target exists, else perform the save-as immediately.
-pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
-                      executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-                      msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
-                      fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
-    let t = text.trim();
-    if t.is_empty() {
-        editor.set_status_full(crate::status::StatusKind::Warning, "save-as: empty path",
-            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-        editor.pending_save_as = None;
-        // Effort 6 (Codex C2): backing out of a drain's Save-As aborts the quit.
-        editor.quit_drain = None;
-        editor.quit_drain_advance = false;
-        return;
-    }
-    let target = expand_path(t);
-    if crate::fsx::exists_via(&**fs, &target) {
-        editor.pending_save_overwrite = Some(target.clone());
-        editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
-        return;
-    }
-    // Transitional: `save_as_submit` has no resolution step yet (Task 21 retires it), so
-    // both fields are the same value — the simplest correct form for its two-task lifetime.
-    perform_save_as(editor, target.clone(), target, executor, clock, msg_tx, fs);
-}
-
-/// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
-/// confirmation if the target exists, else write the block text immediately.
-/// Synchronous: uses `file::save_atomic` directly; does NOT touch document state.
-pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str,
-                          fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
-    let Some(b) = editor.active().marked_block else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
-    let t = text.trim();
-    if t.is_empty() {
-        editor.set_status_full(crate::status::StatusKind::Warning, "write block: empty path",
-            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-        return;
-    }
-    let target = expand_path(t);
-    if crate::fsx::exists_via(&**fs, &target) {
-        editor.pending_write_block = Some(target.clone());
-        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&target));
-        return;
-    }
-    perform_block_write(editor, &target, b.start, b.end);
-}
-
-fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::Path, start: usize, end: usize) {
+// `pub(crate)`, NOT private: `file_browser_commit::commit_destination` calls this across
+// module boundaries. Routes through the SEAM (`save_atomic_with_fs`), not the `RealFs`
+// wrapper — the same reasoning as `save.rs`'s worker-side save: an injected `FaultFs` must
+// reach this write, not silently bypass it.
+pub(crate) fn perform_block_write(editor: &mut crate::editor::Editor,
+    target: &std::path::Path, start: usize, end: usize,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>)
+{
     let text = editor.active().document.buffer.slice(start..end);
-    match crate::file::save_atomic(target, &text) {
+    match crate::file::save_atomic_with_fs(&**fs, target, &text) {
         Ok(_)  => editor.set_status(crate::status::StatusKind::Info, format!("wrote block to {}", target.display())),
         Err(e) => editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
@@ -222,6 +190,8 @@ pub fn resolve_prompt(
         PromptAction::Cancel => {
             editor.pending_export = None;
             editor.pending_save_overwrite = None;
+            // PAIRED with `pending_save_overwrite` above — see the doc comment on the field.
+            editor.pending_save_as_chosen = None;
             editor.pending_save_as = None;
             editor.pending_write_block = None;
             editor.pending_clean.clear(); // H5: Cancel abandons the snapshot; delete nothing
@@ -309,25 +279,21 @@ pub fn resolve_prompt(
             }
         }
         PromptAction::OverwriteSaveAs => {
-            if let Some(t) = editor.pending_save_overwrite.take() {
-                // Resolve the stored target the same way `do_save` resolves a plain Save's
-                // destination (§7.6.1) — the confirmed overwrite target can itself be a
-                // symlink whose write must land on the resolved file while the buffer keeps
-                // the chosen (logical) path.
-                match crate::fsx::resolve_write_destination(&**fs, &t) {
-                    Ok(resolved) => perform_save_as(editor, t, resolved, ex, clock, msg_tx, fs),
-                    Err(crate::fsx::DestError::BrokenSymlink) => {
-                        editor.set_status_full(crate::status::StatusKind::Warning,
-                            format!("{}: destination symlink cannot be resolved", t.display()),
-                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-                    }
-                }
+            // Both paths were already resolved BEFORE this prompt was raised — by
+            // `file_browser_commit::commit_destination`, which stores `chosen` alongside
+            // `pending_save_overwrite`'s `resolved` for exactly this reconstruction. No
+            // re-resolution here: re-running `resolve_write_destination` against a target
+            // that no longer matches what the writer confirmed would be the wrong check.
+            if let (Some(resolved), Some(chosen)) =
+                (editor.pending_save_overwrite.take(), editor.pending_save_as_chosen.take())
+            {
+                perform_save_as(editor, chosen, resolved, ex, clock, msg_tx, fs);
             }
         }
         PromptAction::OverwriteWriteBlock => {
             if let Some(t) = editor.pending_write_block.take() {
                 if let Some(b) = editor.active().marked_block {
-                    perform_block_write(editor, &t, b.start, b.end);
+                    perform_block_write(editor, &t, b.start, b.end, fs);
                 } else {
                     editor.set_status(crate::status::StatusKind::Info, "no marked block");
                 }
@@ -458,28 +424,37 @@ mod tests {
     }
 
     /// A17 T5 (F4 Warning table, prompt-input refusals row): an empty Save-As path refusal
-    /// is a Sticky Warning.
+    /// is a Sticky Warning. Migrated (Task 21) from the retired `save_as_submit` to the
+    /// picker path — an empty field yields `CommitOutcome::Nothing`, which
+    /// `commit_destination` turns into the SAME message/kind/lifetime. Driven through the
+    /// REAL intercept, not `commit_destination` directly (see the commit-arm's own
+    /// end-to-end tests in `file_browser_commit.rs` for why).
     #[test]
     fn save_as_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        let ex = InlineExecutor::default();
-        let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        save_as_submit(&mut e, "   ", &ex, &clk, &tx, &crate::test_support::test_fs());
+        let fs = crate::test_support::test_fs();
+        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
+            std::env::temp_dir(), "   ".into());
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.status_text(), "save-as: empty path");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
-    /// A17 T5: an empty Write-Block path refusal is a Sticky Warning.
+    /// A17 T5: an empty Write-Block path refusal is a Sticky Warning. Migrated (Task 21)
+    /// from the retired `block_write_submit` — see the Save-As twin above.
     #[test]
     fn block_write_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
-        block_write_submit(&mut e, "   ", &crate::test_support::test_fs());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs = crate::test_support::test_fs();
+        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+            std::env::temp_dir(), "   ".into());
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.status_text(), "write block: empty path");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -658,16 +633,20 @@ mod tests {
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
+    /// Migrated (Task 21) from the retired `save_as_submit` to the picker path — the field
+    /// carries an ABSOLUTE existing path, so `resolve_field` passes it through unchanged
+    /// regardless of the picker's seeded directory.
     #[test]
     fn save_as_existing_target_raises_overwrite_prompt() {
         use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
         let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", None, (80, 24));
-        let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx, &crate::test_support::test_fs());
+        let fs = crate::test_support::test_fs();
+        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
+            std::env::temp_dir(), p.to_str().unwrap().to_string());
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert!(e.prompt.is_some(), "existing target → confirm modal");
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
         assert_ne!(crate::prompt::PromptAction::OverwriteSaveAs, crate::prompt::PromptAction::Overwrite);
@@ -719,23 +698,15 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "draft\n", "original dirty buffer intact");
     }
 
-    #[test]
-    fn block_write_writes_block_text_only_doc_unchanged() {
-        use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-blkw-{}.md", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
-        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
-        let before_doc = e.active().document.buffer.to_string();
-        block_write_submit(&mut e, p.to_str().unwrap(), &crate::test_support::test_fs());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello", "block text written");
-        assert_eq!(e.active().document.buffer.to_string(), before_doc, "document unchanged");
-        assert!(e.active().marked_block.is_some(), "block stays after write");
-        let _ = std::fs::remove_file(&p);
-    }
+    // `block_write_writes_block_text_only_doc_unchanged` (the successful-write scenario) is
+    // now covered end-to-end, through the real Enter intercept, by
+    // `file_browser_commit::tests::write_block_commits_end_to_end_from_enter` (which also
+    // pins the "block stays after write" survival this test used to assert) — Task 21
+    // retired the minibuffer submit path this test drove.
 
     /// A17 T4: a genuine write-block IO failure (target's parent is a regular FILE, so
     /// `save_atomic` fails ENOTDIR) must land Sticky/Error — surviving a later Info ack (Q1).
+    /// Migrated (Task 21) from the retired `block_write_submit` to the picker path.
     #[test]
     fn block_write_failure_is_a_sticky_error_that_survives_a_later_info() {
         use crate::editor::Editor;
@@ -744,7 +715,11 @@ mod tests {
         let target = parent.join("out.txt"); // target "inside" a regular file → ENOTDIR
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
-        block_write_submit(&mut e, target.to_str().unwrap(), &crate::test_support::test_fs());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs = crate::test_support::test_fs();
+        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+            std::env::temp_dir(), target.to_str().unwrap().to_string());
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         e.set_status(crate::status::StatusKind::Info, "later ack");
@@ -752,6 +727,7 @@ mod tests {
         let _ = std::fs::remove_file(&parent);
     }
 
+    /// Migrated (Task 21) from the retired `block_write_submit` to the picker path.
     #[test]
     fn block_write_existing_target_raises_overwrite() {
         use crate::editor::Editor;
@@ -759,7 +735,11 @@ mod tests {
         std::fs::write(&p, "old").unwrap();
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
-        block_write_submit(&mut e, p.to_str().unwrap(), &crate::test_support::test_fs());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs = crate::test_support::test_fs();
+        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+            std::env::temp_dir(), p.to_str().unwrap().to_string());
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
     }
@@ -971,8 +951,8 @@ mod tests {
 
     #[test]
     fn close_save_on_unnamed_buffer_opens_save_as_with_carry() {
-        // Unnamed dirty buffer: CloseSave opens the Save-As minibuffer and carries
-        // CloseBuffer into pending_save_as.
+        // Unnamed dirty buffer: CloseSave opens the Save-As DESTINATION PICKER (Task 21 —
+        // no longer a minibuffer) and carries CloseBuffer into pending_save_as.
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::InlineExecutor;
         let mut e = Editor::new_from_text("draft\n", None, (80, 24));
@@ -982,9 +962,8 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
-        assert_eq!(e.minibuffer.as_ref().map(|m| m.kind),
-            Some(crate::minibuffer::MinibufferKind::SaveAs),
-            "Save-As minibuffer must open for unnamed buffer");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
+            "Save-As destination picker must open for unnamed buffer");
         assert!(matches!(e.pending_save_as, Some(PostSaveAction::CloseBuffer { .. })),
             "pending_save_as must carry CloseBuffer");
     }

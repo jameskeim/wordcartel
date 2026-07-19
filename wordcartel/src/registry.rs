@@ -295,7 +295,7 @@ impl Registry {
         });
         r.register("save", "Save", Some(MenuCategory::File), crate::save::dispatch_save);
         r.register("save_as", "Save As…", Some(MenuCategory::File), |c| {
-            crate::prompts::open_save_as(c.editor);
+            crate::prompts::open_save_as(c.editor, &c.fs, &c.msg_tx);
             CommandResult::Handled
         });
         r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
@@ -429,7 +429,7 @@ impl Registry {
         r.register_mut("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
         r.register_mut("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
         // Marked block write-to-file (Task 4 / Effort 9A).
-        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
+        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor, &c.fs, &c.msg_tx); CommandResult::Handled });
 
         // Effort 6: send-to-scratch verbs.
         r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
@@ -1191,11 +1191,10 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
-        // No path → save handler opens the Save-As minibuffer (Effort 7, Task 3).
+        // No path → save handler opens the Save-As destination picker (Task 21).
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
-            Some(crate::minibuffer::MinibufferKind::SaveAs)),
-            "unnamed save opens the Save-As minibuffer");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
+            "unnamed save opens the Save-As destination picker");
     }
 
     #[test]
