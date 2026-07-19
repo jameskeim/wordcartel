@@ -1181,6 +1181,11 @@ mod tests {
             crate::prompt::Prompt::clean_recovery(4, &[], 0),
         ] {
             assert!(p.detail.is_empty(), "no existing prompt gained a disclosure: {:?}", p.message);
+            // `message` is the single status-ROW line — any `\n` smuggled into it is silently
+            // lost the moment it's painted (the original C1 defect). Closing the class for
+            // every constructor here, not just the one that tripped it, so a future one can't
+            // reintroduce it.
+            assert!(!p.message.contains('\n'), "message must never carry a smuggled newline: {:?}", p.message);
         }
     }
 
@@ -1234,11 +1239,18 @@ mod tests {
     fn a_detail_box_too_tall_for_the_frame_announces_what_it_dropped() {
         // On a short terminal the box is clamped to the rows available above the status row.
         // Silently stopping mid-list would misreport the kept set as smaller than it is, so
-        // the last visible row becomes a count of everything the box could not show.
+        // the last visible row becomes a count of everything the box could not show — and
+        // that count must be actual UNNAMED ORPHANS, not `detail` lines: of the 8 kept
+        // orphans, only 2 (chapter-0, chapter-1) get a named row before the clamp fires, so
+        // 6 — not the heading, and not `clean_recovery`'s own 3-orphan elision line counted
+        // as a single entry — are genuinely unnamed.
         let mut e = clean_recovery_editor(8, 3, 80, 7); // 7 rows: the 7-line detail cannot fit
         let screen = screen_text(&render_to_buffer(&mut e, 80, 7));
-        assert!(screen.contains("\u{2026}and"),
-            "a clamped box says how many lines it dropped:\n{screen}");
+        assert!(screen.contains("/docs/chapter-0.md") && screen.contains("/docs/chapter-1.md"),
+            "precondition: exactly 2 orphans are named before the box clamps:\n{screen}");
+        assert!(screen.contains("\u{2026}and 6 more"),
+            "6 of the 8 kept orphans never got a named row — heading and elision-line count \
+             as themselves, not as one orphan each:\n{screen}");
         let status_row = row_string(&render_to_buffer(&mut e, 80, 7), 6);
         assert!(status_row.contains("[Y]es"),
             "and the choices are never pushed off the screen by it: {status_row:?}");

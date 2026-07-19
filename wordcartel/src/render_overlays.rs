@@ -441,10 +441,17 @@ pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Pro
 
     let inner_w = ov_rect.width.saturating_sub(2) as usize;
     let body_h = ov_rect.height.saturating_sub(2) as usize;
-    for (i, row) in (0..body_h).enumerate() {
+    for i in 0..body_h {
         // The final visible row turns into a count when the box could not hold the rest.
+        // The count is orphan ITEMS, never `detail` lines: line 0 is the heading (never an
+        // orphan), and a dropped line may itself already be `clean_recovery`'s own elision
+        // (`  …and N more`) — that one line speaks for N orphans, not one, so it is weighed
+        // by its own count rather than counted as a single entry. Indented like every other
+        // item, matching `clean_recovery`'s own elision line rather than sitting flush like
+        // a heading.
         let text = if body_h < lines.len() && i + 1 == body_h {
-            format!("\u{2026}and {} more", lines.len() - body_h + 1)
+            let orphans: usize = lines[i.max(1)..].iter().map(|l| elided_weight(l)).sum();
+            format!("  \u{2026}and {orphans} more")
         } else {
             lines[i].clone()
         };
@@ -453,12 +460,25 @@ pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Pro
         } else {
             text.chars().take(inner_w).collect()     // heading: keep the opening words
         };
-        let y = ov_rect.y + 1 + row as u16;
+        let y = ov_rect.y + 1 + i as u16;
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
             Rect::new(ov_rect.x + 1, y, inner_w as u16, 1),
         );
     }
+}
+
+/// How many orphan items one `detail` line accounts for. An elision line — `…and N more`,
+/// however indented — already speaks for `N` orphans; every other line names exactly one.
+/// Lets the box-clamp count in `paint_prompt_detail` re-total the true unnamed remainder
+/// when it clamps past `clean_recovery`'s own `KEPT_SHOWN` elision line, instead of
+/// undercounting it as a single dropped entry.
+fn elided_weight(line: &str) -> usize {
+    line.trim_start()
+        .strip_prefix("\u{2026}and ")
+        .and_then(|rest| rest.strip_suffix(" more"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1)
 }
 
 pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
