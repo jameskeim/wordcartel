@@ -1003,8 +1003,12 @@ impl Editor {
             .collect());
     }
 
-    /// Present recents through the existing picker. Rows become `FileEntry` values, so nav,
-    /// fuzzy ranking, windowing, mouse hover, and the painter all work unchanged.
+    /// Present recents through the existing picker. Rows populate BOTH `fb.listing` (the
+    /// IMMUTABLE cache — set here, once, never mutated afterward) and `fb.entries` (the
+    /// derived, filtered view) — mirroring `Select`/`Destination`, whose `rederive` always
+    /// re-derives `entries` fresh from `listing` on every keystroke. Filtering `entries` in
+    /// place instead (the Task 23 defect) makes the narrowed list its own source on the next
+    /// keystroke — a one-way ratchet that never widens back out as the writer backspaces.
     ///
     /// UNAVAILABLE rows carry `kind == EntryKind::Unknown`, which the picker ALREADY renders
     /// marked and refuses on Enter (Task 14) — so "greyed and not selectable" needs no new
@@ -1012,11 +1016,12 @@ impl Editor {
     pub fn open_recents(&mut self, rows: Vec<crate::recents::RecentRow>) {
         crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        let entries: Vec<crate::file_browser::FileEntry> = rows.iter().map(|r| {
-            crate::file_browser::FileEntry {
+        let listing: Vec<crate::fsx::DirEntryInfo> = rows.iter().map(|r| {
+            crate::fsx::DirEntryInfo {
                 // Full path as the label — recents span directories, so a bare file name
                 // would be ambiguous.
                 name: r.path.to_string_lossy().into_owned(),
+                raw_name: r.path.clone().into_os_string(),
                 kind: if r.available {
                     crate::fsx::EntryKind::File
                 } else {
@@ -1026,12 +1031,17 @@ impl Editor {
                 broken: false,
             }
         }).collect();
-        let total = entries.len();
+        let total = listing.len();
+        let entries: Vec<crate::file_browser::FileEntry> = listing.iter().map(|e| {
+            crate::file_browser::FileEntry {
+                name: e.name.clone(), kind: e.kind, is_symlink: e.is_symlink, broken: e.broken,
+            }
+        }).collect();
         self.file_browser = Some(crate::file_browser::FileBrowser {
             dir: std::env::current_dir().unwrap_or_default(),
             query: String::new(),
             mode: crate::file_browser::BrowseMode::Recents,
-            listing: Vec::new(), total_seen: total, unreadable: 0,
+            listing, total_seen: total, unreadable: 0,
             entries, disclosure: Default::default(), selected: 0, scroll_top: 0,
             awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         });

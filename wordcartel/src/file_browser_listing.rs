@@ -135,15 +135,18 @@ pub(crate) fn filter_and_rank(
 /// every path that rebuilds entries (initial listing, descend, field edit, filter-toggle
 /// change) would otherwise have to remember, and `apply_listing_done` did not.
 pub(crate) fn rederive(fb: &mut FileBrowser, show_clutter: bool, types: FileTypeFilter) {
-    // Recents rows are SYNTHESIZED (see `recents.rs`), not read from `fb.listing` — there is
-    // no directory, no "..", and no type/clutter policy to apply. Typing must still NARROW
-    // the list (that property is the entire reason `BrowseMode::Recents` is an explicit
-    // variant rather than the rejected early-return-in-rederive guard — an early return
-    // preserves the rows but cannot filter them), so this fuzzy-ranks the rows themselves.
+    // Recents rows are SYNTHESIZED (see `recents.rs`) into `fb.listing` at open time — an
+    // IMMUTABLE cache, exactly like the directory-backed modes' `fb.listing` — and every
+    // keystroke re-derives `fb.entries` FRESH from it. There is no directory, no "..", and no
+    // type/clutter policy to apply, so this only fuzzy-ranks the cached rows; but the source
+    // must be `fb.listing`, never `fb.entries` itself — filtering `entries` in place would
+    // make the narrowed list its own source on the next keystroke, a one-way ratchet that
+    // never widens back out as the writer backspaces (the Task 23 defect this fixed).
     if matches!(fb.mode, crate::file_browser::BrowseMode::Recents) {
-        if !fb.query.is_empty() {
-            fb.entries = crate::palette::fuzzy_filter(&fb.entries, &fb.query, |e| e.name.as_str());
-        }
+        let filtered = crate::palette::fuzzy_filter(&fb.listing, &fb.query, |e| e.name.as_str());
+        fb.entries = filtered.into_iter().map(|e| crate::file_browser::FileEntry {
+            name: e.name, kind: e.kind, is_symlink: e.is_symlink, broken: e.broken,
+        }).collect();
         if fb.selected >= fb.entries.len() {
             fb.selected = fb.entries.len().saturating_sub(1);
         }

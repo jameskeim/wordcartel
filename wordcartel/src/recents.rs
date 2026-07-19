@@ -100,6 +100,12 @@ pub(crate) fn open_recent(editor: &mut crate::editor::Editor,
 /// `close_all`, reset `query` to empty, and reset `selected` — so a probe landing a beat
 /// after the writer started typing would wipe their filter and move their cursor. The probe
 /// carries availability and nothing else; it must change availability and nothing else.
+///
+/// Re-marks BOTH `fb.listing` and `fb.entries`. `entries` alone is not enough: `rederive`
+/// now re-derives `entries` fresh from `listing` on every keystroke (the Task 23 ratchet
+/// fix), so a `listing` left stale would let an unavailable row's `Unknown` marking silently
+/// reappear as `File` the moment the writer's next keystroke re-filters — the probe's result
+/// would look applied and then un-apply itself.
 pub(crate) fn apply_recents_probed(editor: &mut crate::editor::Editor, epoch: u64,
     rows: Vec<RecentRow>)
 {
@@ -109,6 +115,9 @@ pub(crate) fn apply_recents_probed(editor: &mut crate::editor::Editor, epoch: u6
         .filter(|r| !r.available)
         .map(|r| r.path.to_string_lossy().into_owned())
         .collect();
+    for entry in fb.listing.iter_mut() {
+        if unavailable.contains(&entry.name) { entry.kind = crate::fsx::EntryKind::Unknown; }
+    }
     for entry in fb.entries.iter_mut() {
         if unavailable.contains(&entry.name) { entry.kind = crate::fsx::EntryKind::Unknown; }
     }
@@ -220,5 +229,53 @@ mod tests {
             .entries.iter().map(|r| r.name.clone()).collect();
         assert_eq!(names.len(), 2, "the list NARROWED, it did not clear or stay whole: {names:?}");
         assert!(names.iter().all(|n| n.contains("chapter")), "{names:?}");
+    }
+
+    #[test]
+    fn backspacing_the_query_widens_the_recents_list_back_out() {
+        // THE RATCHET. Task 23's `rederive` Recents arm filtered `fb.entries` IN PLACE and
+        // wrote the narrowed result back into `fb.entries` — so the already-narrowed list
+        // became its own source on the next keystroke. Typing narrowed correctly (the
+        // sibling test above); backing OUT never widened back, because there was nowhere
+        // left to widen FROM. `fb.listing` is the fix: an immutable cache, populated once at
+        // open by `open_recents`, that every keystroke re-derives `fb.entries` from fresh —
+        // exactly the invariant `Select`/`Destination` already hold.
+        //
+        // FAIL-VERIFY: revert `rederive`'s Recents arm to filter `&fb.entries` instead of
+        // `&fb.listing` (the Task 23 shape) — this test fails; the list stays at 2 rows
+        // after Backspace empties the query, instead of widening back to 4.
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        e.open_recents(vec![
+            RecentRow { path: "/w/chapter-one.md".into(), available: true },
+            RecentRow { path: "/w/chapter-two.md".into(), available: true },
+            RecentRow { path: "/w/notes.md".into(),       available: true },
+            RecentRow { path: "/w/outline.md".into(),     available: false },
+        ]);
+        assert_eq!(e.file_browser.as_ref().expect("open").entries.len(), 4, "precondition");
+
+        // Narrow to 2, through the real intercept.
+        for c in "chap".chars() { press_char_fb(&mut e, &fs, &tx, c); }
+        assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 2,
+            "precondition: narrowed before backspacing");
+
+        // Backspace all four typed characters, through the real intercept — `query` empties.
+        for _ in 0..4 {
+            crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Backspace);
+        }
+        let fb = e.file_browser.as_ref().expect("still open");
+        assert_eq!(fb.query, "", "the query itself correctly empties");
+
+        let names: Vec<String> = fb.entries.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(names.len(), 4,
+            "the list must WIDEN back to its full length once the filter is gone: {names:?}");
+        // Not merely the right COUNT — the right ROWS, in the original order, including the
+        // unavailable one. A count-only assertion would pass even if `rederive` widened back
+        // to 4 of the WRONG rows.
+        assert_eq!(names, vec![
+            "/w/chapter-one.md", "/w/chapter-two.md", "/w/notes.md", "/w/outline.md",
+        ], "the full, ORIGINAL list, not merely four rows: {names:?}");
     }
 }
