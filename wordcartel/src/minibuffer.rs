@@ -115,7 +115,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, ctx.msg_tx),
                         MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
                         MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
-                        MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
+                        MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text, ctx.fs),
                         MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
                         MinibufferKind::PluginArg { id } => {
                             if mb.text.len() > crate::limits::PLUGIN_MAX_COMMAND_ARG {

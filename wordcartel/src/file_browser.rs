@@ -74,8 +74,10 @@ pub(crate) fn file_browser_enter(fs: &dyn crate::fsx::Fs, editor: &mut crate::ed
                 }
             });
             if let Some(target) = target {
-                // §3: check readability BEFORE committing fb.dir.
-                if std::fs::read_dir(&target).is_ok() {
+                // §3: check readability BEFORE committing fb.dir. Routed through the seam
+                // (Some(0): this is a readability probe, not a listing — retention isn't
+                // needed, only whether the directory can be opened at all).
+                if fs.list_dir(&target, Some(0)).is_ok() {
                     if let Some(fb) = editor.file_browser.as_mut() {
                         fb.dir = target;
                         fb.query.clear();

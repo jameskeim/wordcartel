@@ -236,7 +236,7 @@ pub(crate) fn append_word_to_dict_with_fs(fs: &dyn crate::fsx::Fs, path: &std::p
     word: &str) -> std::io::Result<()>
 {
     if let Some(parent) = path.parent() {
-        // Directory PROVISIONING — exempt from the seam by clause (b) of spec §2.3.
+        // fs-chokepoint-allow: (b) directory provisioning for the dictionary's parent
         std::fs::create_dir_all(parent)?;
     }
     // Symlink refusal, matching every other durable write.

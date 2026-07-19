@@ -510,12 +510,15 @@ pub(crate) fn save_overrides(
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // fs-chokepoint-allow: (b) directory provisioning — probing the config dir, not user data
     let existed = parent.exists();
+    // fs-chokepoint-allow: (b) directory provisioning for the config dir
     std::fs::create_dir_all(&parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if !existed {
+            // fs-chokepoint-allow: (b) directory provisioning — chmod the newly-created dir
             std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }

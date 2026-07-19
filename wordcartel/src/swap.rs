@@ -33,10 +33,12 @@ pub fn state_dir() -> io::Result<PathBuf> {
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no state dir"))?;
     let dir = base.join("wordcartel");
+    // fs-chokepoint-allow: (b) directory provisioning — the seam's own state dir
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // fs-chokepoint-allow: (b) directory provisioning — chmod the newly-created state dir
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(dir)
@@ -151,6 +153,7 @@ pub fn swap_path(doc_path: Option<&Path>) -> io::Result<PathBuf> {
     let dir = state_dir()?;
     let name = match doc_path {
         Some(p) => {
+            // fs-chokepoint-allow: (c) pure path resolution — a name computation, not a read
             let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let base = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let h = fnv1a64(real.to_string_lossy().as_bytes());
@@ -177,6 +180,7 @@ pub(crate) fn delete_with_fs(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>) {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn pid_is_live(pid: u32) -> bool {
+    // fs-chokepoint-allow: (e) path syntax for a process-liveness probe, not a file
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 #[cfg(not(target_os = "linux"))]
@@ -363,6 +367,7 @@ pub(crate) fn write_atomic_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content
 
 pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {
     let realpath = editor.active().document.path.as_ref().map(|p| {
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not a read
         std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()).to_string_lossy().into_owned()
     });
     let (load_mtime_secs, load_size) = match editor.active().document.stored_fp {

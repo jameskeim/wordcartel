@@ -107,6 +107,7 @@ pub fn clip_env_from_process() -> ClipEnv {
     fn var_set(k: &str) -> bool { std::env::var_os(k).is_some_and(|v| !v.is_empty()) }
     fn on_path(bin: &str) -> bool {
         let Some(paths) = std::env::var_os("PATH") else { return false };
+        // fs-chokepoint-allow: (g) executable-availability probe on $PATH
         std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file())
     }
     let os = if cfg!(target_os = "macos") { Os::MacOs }

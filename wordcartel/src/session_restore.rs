@@ -55,6 +55,7 @@ pub fn load_block_from_entry(editor: &mut Editor, entry: &crate::state::StateEnt
 /// with only `&mut Editor`. No-op if there is no matching/non-stale session entry.
 pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
     let session = crate::state::load();
+    // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
     if let Ok(canon) = std::fs::canonicalize(path) {
         let key = canon.to_string_lossy().into_owned();
         if let Some(entry) = session.entries.get(&key) {
@@ -164,6 +165,7 @@ pub(crate) fn persist_session(
     // Per-file entry for the active buffer (unchanged): only when it has a real,
     // canonicalizable path. Scratch/new buffers contribute no per-file entry.
     if let Some(raw_path) = editor.active().document.path.as_deref() {
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
         if let Ok(canon) = std::fs::canonicalize(raw_path) {
             if let Some((mtime, size)) = crate::state::file_identity(raw_path) {
                 let entry = crate::state::StateEntry {

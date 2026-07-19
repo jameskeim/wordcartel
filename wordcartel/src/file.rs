@@ -2,8 +2,6 @@
 // Ported atomic primitive from ~/projects/par-command/repar/src/atomic.rs (MIT, user's own).
 // Added: symlink refusal, skip-unchanged, mode preservation (#[cfg(unix)]).
 
-#[cfg(test)]
-use std::fs;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -57,13 +55,13 @@ fn is_binary(bytes: &[u8]) -> bool {
 /// Map an IO error from File::open or read_to_end to the appropriate OpenError.
 /// Preserves BOTH is_dir() disambiguation sites — the NotFound arm (some FS
 /// surfaces a dir-read as NotFound) and the catch-all (some OSes return Other).
-fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
+fn map_open_io_err(fs: &dyn crate::fsx::Fs, e: std::io::Error, label: &str, path: &Path) -> OpenError {
     match e.kind() {
         std::io::ErrorKind::NotFound => {
             // Double-check: could be PermissionDenied that looks like NotFound
-            // on some FS. is_dir() does a separate stat — if that fails we keep
+            // on some FS. The stat is a separate probe — if that fails we keep
             // NotFound. If the path IS a dir, that takes precedence.
-            if path.is_dir() {
+            if matches!(fs.stat(path), Ok(st) if st.is_dir) {
                 OpenError::IsDir(label.to_owned())
             } else {
                 OpenError::NotFound(label.to_owned())
@@ -73,7 +71,7 @@ fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
         _ => {
             // For anything else, still check IsDir (some OSes return Other
             // when read() is called on a directory).
-            if path.is_dir() {
+            if matches!(fs.stat(path), Ok(st) if st.is_dir) {
                 OpenError::IsDir(label.to_owned())
             } else {
                 OpenError::Io(format!("{label}: {e}"))
@@ -110,7 +108,7 @@ pub(crate) fn open_bounded_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: 
     let bytes = match fs.read_capped(path, limit) {
         Ok(Some(b)) => b,
         Ok(None) => return Err(OpenError::TooLarge(label, limit)),
-        Err(e) => return Err(map_open_io_err(e, &label, path)),
+        Err(e) => return Err(map_open_io_err(fs, e, &label, path)),
     };
 
     // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but guard it
@@ -223,6 +221,12 @@ pub(crate) fn save_atomic_bytes_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, co
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: production code reaches the filesystem through the `fsx::Fs` seam
+    // exclusively (fs_chokepoint.rs GATE), so this import lives here rather than at
+    // module top level, where a standalone `#[cfg(test)] use std::fs;` would sit
+    // outside the guard's `mod tests` strip boundary and false-positive as a
+    // production import.
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 

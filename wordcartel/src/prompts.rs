@@ -131,7 +131,7 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
         return;
     }
     let target = expand_path(t);
-    if target.exists() {
+    if crate::fsx::exists_via(&**fs, &target) {
         editor.pending_save_overwrite = Some(target.clone());
         editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
         return;
@@ -142,7 +142,8 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
 /// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
 /// confirmation if the target exists, else write the block text immediately.
 /// Synchronous: uses `file::save_atomic` directly; does NOT touch document state.
-pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
+pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str,
+                          fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     let Some(b) = editor.active().marked_block else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let t = text.trim();
     if t.is_empty() {
@@ -151,7 +152,7 @@ pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
         return;
     }
     let target = expand_path(t);
-    if target.exists() {
+    if crate::fsx::exists_via(&**fs, &target) {
         editor.pending_write_block = Some(target.clone());
         editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&target));
         return;
@@ -286,7 +287,8 @@ pub fn resolve_prompt(
         PromptAction::OverwriteExport => {
             if let Some(pe) = editor.pending_export.take() {
                 // User explicitly confirmed clobbering the existing target.
-                crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true);
+                crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true,
+                    std::sync::Arc::clone(fs));
             }
         }
         PromptAction::OverwriteSaveAs => {
@@ -449,7 +451,7 @@ mod tests {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
-        block_write_submit(&mut e, "   ");
+        block_write_submit(&mut e, "   ", &crate::test_support::test_fs());
         assert_eq!(e.status_text(), "write block: empty path");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -697,7 +699,7 @@ mod tests {
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
         let before_doc = e.active().document.buffer.to_string();
-        block_write_submit(&mut e, p.to_str().unwrap());
+        block_write_submit(&mut e, p.to_str().unwrap(), &crate::test_support::test_fs());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello", "block text written");
         assert_eq!(e.active().document.buffer.to_string(), before_doc, "document unchanged");
         assert!(e.active().marked_block.is_some(), "block stays after write");
@@ -714,7 +716,7 @@ mod tests {
         let target = parent.join("out.txt"); // target "inside" a regular file → ENOTDIR
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
-        block_write_submit(&mut e, target.to_str().unwrap());
+        block_write_submit(&mut e, target.to_str().unwrap(), &crate::test_support::test_fs());
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         e.set_status(crate::status::StatusKind::Info, "later ack");
@@ -729,7 +731,7 @@ mod tests {
         std::fs::write(&p, "old").unwrap();
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
-        block_write_submit(&mut e, p.to_str().unwrap());
+        block_write_submit(&mut e, p.to_str().unwrap(), &crate::test_support::test_fs());
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
     }

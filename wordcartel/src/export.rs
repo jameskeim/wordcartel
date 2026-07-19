@@ -161,6 +161,7 @@ pub(crate) fn do_export(
     target: &Path,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
     overwrite_confirmed: bool,
+    fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     let sink = sink_for_ext(ext);
     let buffer_id = editor.active().id;
@@ -173,7 +174,7 @@ pub(crate) fn do_export(
     };
 
     std::thread::spawn(move || {
-        let result = guarded_export(|| run_pandoc(sink, &stdin, &target, &opts));
+        let result = guarded_export(|| run_pandoc(sink, &stdin, &target, &opts, &*fs));
         let _ = msg_tx.send(crate::app::Msg::ExportDone {
             buffer_id,
             target,
@@ -193,7 +194,7 @@ fn guarded_export(work: impl FnOnce() -> Result<ExportResult, crate::filter::Fil
 
 /// The actual pandoc invocation (runs on a worker thread).
 fn run_pandoc(
-    sink: ExportSink, stdin: &str, target: &Path, opts: &ExportOpts,
+    sink: ExportSink, stdin: &str, target: &Path, opts: &ExportOpts, fs: &dyn crate::fsx::Fs,
 ) -> Result<ExportResult, crate::filter::FilterError> {
     use crate::filter::{CancelFlag, FilterError};
 
@@ -233,7 +234,7 @@ fn run_pandoc(
             )?;
 
             // Verify the file was written.
-            if !tmp.exists() {
+            if !crate::fsx::exists_via(fs, &tmp) {
                 return Err(FilterError::ExportWrite(
                     format!("pandoc did not write {}", tmp.display())
                 ));
@@ -253,6 +254,7 @@ pub fn run_export(
     editor: &mut crate::editor::Editor,
     ext: &str,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     // Must have a named file (not a scratch buffer).
     let source = match editor.active().document.path.clone() {
@@ -274,7 +276,7 @@ pub fn run_export(
     let target = derived_export_path(&source, ext);
 
     // If target exists, ask for overwrite confirmation.
-    if target.exists() {
+    if crate::fsx::exists_via(&**fs, &target) {
         editor.pending_export = Some(PendingExport {
             ext: ext.to_owned(),
             target: target.clone(),
@@ -285,7 +287,7 @@ pub fn run_export(
 
     // Target did not exist: dispatch without overwrite confirmation.  If it
     // appears before the write completes, finalization refuses to clobber it.
-    do_export(editor, ext, &target, msg_tx, false);
+    do_export(editor, ext, &target, msg_tx, false, std::sync::Arc::clone(fs));
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +309,7 @@ mod tests {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
-        run_export(&mut e, "html", &tx);
+        run_export(&mut e, "html", &tx, &crate::test_support::test_fs());
         assert!(e.status_text().to_lowercase().contains("save the file first"));
         // A17 T5 (F4 Warning table): a Sticky Warning.
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
