@@ -24,21 +24,22 @@ pub struct FileBrowser {
 
 /// Rebuild `entries` from `dir`: synthetic ".." first (unless at root), then directories,
 /// then files, each alphabetical; substring-filtered (case-insensitive) by `query`.
-pub fn rebuild_entries(fb: &mut FileBrowser) {
+///
+/// Classification comes from the seam, which RESOLVES symlinks — so a symlink to a
+/// directory is a directory here (spec §4.9). `EntryKind::Other` and `Unknown` sort with
+/// files for now; Task 14 gives them their own markers and refusals.
+pub(crate) fn rebuild_entries(fs: &dyn crate::fsx::Fs, fb: &mut FileBrowser) {
     let q = fb.query.to_ascii_lowercase();
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&fb.dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
+    if let Ok(listing) = fs.list_dir(&fb.dir, Some(crate::limits::MAX_DIR_ENTRIES)) {
+        for e in listing.entries {
+            if !q.is_empty() && !e.name.to_ascii_lowercase().contains(&q) {
                 continue;
             }
-            if is_dir {
-                dirs.push(name)
-            } else {
-                files.push(name)
+            match e.kind {
+                crate::fsx::EntryKind::Dir => dirs.push(e.name),
+                _ => files.push(e.name),
             }
         }
     }
@@ -59,7 +60,7 @@ pub fn rebuild_entries(fb: &mut FileBrowser) {
 /// Execute the selected file-browser entry — the shared Enter path for the keyboard
 /// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
 /// guarding against unreadable targets, or opens a file through the dirty-guard path.
-pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
+pub(crate) fn file_browser_enter(fs: &dyn crate::fsx::Fs, editor: &mut crate::editor::Editor) {
     let chosen = editor.file_browser.as_ref().and_then(|fb| {
         fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
     });
@@ -80,7 +81,7 @@ pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
                         fb.query.clear();
                         fb.selected = 0;
                         fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
-                        crate::file_browser::rebuild_entries(fb);
+                        crate::file_browser::rebuild_entries(fs, fb);
                     }
                 } else {
                     editor.set_status_full(crate::status::StatusKind::Error, format!("cannot read directory: {}", target.display()),
@@ -110,7 +111,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         let ah = editor.active().view.area.1;
         if let Some(fb) = editor.file_browser.as_mut() {
             fb.query.push_str(text);
-            crate::file_browser::rebuild_entries(fb);
+            crate::file_browser::rebuild_entries(&**ctx.fs, fb);
             crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
         }
         return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
@@ -120,7 +121,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             use crossterm::event::KeyCode;
             match k.code {
                 KeyCode::Esc => { editor.file_browser = None; }
-                KeyCode::Enter => { file_browser_enter(editor); }
+                KeyCode::Enter => { file_browser_enter(&**ctx.fs, editor); }
                 c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
@@ -132,7 +133,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
                         fb.query.pop();
-                        crate::file_browser::rebuild_entries(fb);
+                        crate::file_browser::rebuild_entries(&**ctx.fs, fb);
                         crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                     }
                 }
@@ -143,7 +144,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
                         fb.query.push(c);
-                        crate::file_browser::rebuild_entries(fb);
+                        crate::file_browser::rebuild_entries(&**ctx.fs, fb);
                         crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                     }
                 }
@@ -167,13 +168,13 @@ mod tests {
         std::fs::write(dir.join("alpha.md"), "x").unwrap();
         std::fs::write(dir.join("beta.txt"), "x").unwrap();
         let mut fb = FileBrowser { dir: dir.clone(), query: String::new(), entries: vec![], selected: 0, scroll_top: 0 };
-        rebuild_entries(&mut fb);
+        rebuild_entries(&crate::fsx::RealFs, &mut fb);
         assert_eq!(fb.entries[0].name, "..", "parent first");
         let names: Vec<_> = fb.entries.iter().map(|e| e.name.as_str()).collect();
         let sub_i = names.iter().position(|n| *n == "sub").unwrap();
         let alpha_i = names.iter().position(|n| *n == "alpha.md").unwrap();
         assert!(sub_i < alpha_i, "directories sort before files");
-        fb.query = "alpha".into(); rebuild_entries(&mut fb);
+        fb.query = "alpha".into(); rebuild_entries(&crate::fsx::RealFs, &mut fb);
         assert!(fb.entries.iter().any(|e| e.name == "alpha.md"));
         assert!(!fb.entries.iter().any(|e| e.name == "beta.txt"), "substring filter");
         let _ = std::fs::remove_dir_all(&dir);
@@ -198,9 +199,9 @@ mod tests {
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut e = Editor::new_from_text("x\n", None, (40, 12));
-        e.open_file_browser(parent.clone());
+        e.open_file_browser(&crate::fsx::RealFs, parent.clone());
         // Rebuild entries so "secret" appears in the list.
-        if let Some(fb) = e.file_browser.as_mut() { rebuild_entries(fb); }
+        if let Some(fb) = e.file_browser.as_mut() { rebuild_entries(&crate::fsx::RealFs, fb); }
         // Select the "secret" entry (skip ".." which is index 0).
         if let Some(fb) = e.file_browser.as_mut() {
             let idx = fb.entries.iter().position(|en| en.name == "secret").expect("secret dir in entries");
@@ -248,8 +249,37 @@ mod tests {
     fn open_file_browser_enforces_xor() {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 12));
         e.open_palette();
-        e.open_file_browser(std::env::temp_dir());
+        e.open_file_browser(&crate::fsx::RealFs, std::env::temp_dir());
         assert!(e.file_browser.is_some());
         assert!(e.palette.is_none(), "opening file_browser clears the palette (XOR)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_entries_treats_a_symlinked_directory_as_a_directory() {
+        // §4.9 REGRESSION. `DirEntry::file_type()` does not follow symlinks, so a symlink to
+        // a directory reported is_dir == false: it sorted with FILES, rendered without the
+        // trailing '/', and Enter routed it to file::open, which returned "is a directory".
+        // The entry was UNUSABLE, not merely mis-sorted. Routing through the resolving
+        // list_dir fixes all three consumers at once.
+        let dir = std::env::temp_dir().join(format!("wc-fb-symdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real_sub")).expect("seed dir");
+        std::fs::write(dir.join("plain.md"), b"x").expect("seed file");
+        std::os::unix::fs::symlink(dir.join("real_sub"), dir.join("link_sub")).expect("symlink");
+
+        let mut fb = FileBrowser {
+            dir: dir.clone(), query: String::new(), entries: vec![], selected: 0, scroll_top: 0,
+        };
+        rebuild_entries(&crate::fsx::RealFs, &mut fb);
+
+        let link = fb.entries.iter().find(|e| e.name == "link_sub").expect("link listed");
+        assert!(link.is_dir, "a symlink to a directory MUST classify as a directory");
+
+        let names: Vec<&str> = fb.entries.iter().map(|e| e.name.as_str()).collect();
+        let link_i = names.iter().position(|n| *n == "link_sub").expect("present");
+        let file_i = names.iter().position(|n| *n == "plain.md").expect("present");
+        assert!(link_i < file_i, "and therefore sorts with the directories, before files");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

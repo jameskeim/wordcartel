@@ -232,12 +232,12 @@ pub(crate) fn cleanable_recovery_files(fs: &dyn crate::fsx::Fs, dir: &Path,
 {
     let me = std::process::id();
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let fname = entry.file_name();
-        let fname = fname.to_string_lossy();
-        if recovery_file_is_cleanable(fs, dir, &path, &fname, protected, me) { out.push(path); }
+    // cap: None — this scan is uncapped today and capping it would silently shrink what
+    // `clean_recovery` can find. It is a startup/command-time scan, off the redraw path.
+    let Ok(listing) = fs.list_dir(dir, None) else { return out };
+    for e in listing.entries {
+        let path = dir.join(&e.name);
+        if recovery_file_is_cleanable(fs, dir, &path, &e.name, protected, me) { out.push(path); }
     }
     out
 }
@@ -327,19 +327,19 @@ fn find_orphan_scratch_swap_in(fs: &dyn crate::fsx::Fs, dir: &std::path::Path)
 {
     let me = std::process::id();
     let mut best: Option<(std::path::PathBuf, SwapHeader, String)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let fname = entry.file_name();
-        let fname = fname.to_string_lossy();
-        let pid = fname.strip_prefix("scratch-")
+    let listing = fs.list_dir(dir, None).ok()?;   // uncapped, as today
+    for e in listing.entries {
+        let pid = e.name.strip_prefix("scratch-")
             .and_then(|s| s.strip_suffix(".swp"))
             .and_then(|s| s.parse::<u32>().ok());
         let Some(pid) = pid else { continue };
         if pid == me || pid_is_live(pid) { continue; }
-        let Some(raw) = read_swap_capped(fs, &entry.path()) else { continue };
+        let path = dir.join(&e.name);
+        let Some(raw) = read_swap_capped(fs, &path) else { continue };
         let Some((header, body)) = parse(&raw) else { continue };
         if body.is_empty() { continue; }
         let newer = match &best { Some((_, h, _)) => header.ts_ms > h.ts_ms, None => true };
-        if newer { best = Some((entry.path(), header, body)); }
+        if newer { best = Some((path, header, body)); }
     }
     best
 }
@@ -1014,6 +1014,22 @@ mod tests {
     fn enumerator_empty_dir_yields_nothing() {
         let dir = unique_dir("empty");
         assert!(cleanable_recovery_files(&crate::fsx::RealFs, &dir, &HashSet::new()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_scans_are_uncapped() {
+        // The swap state-dir scans are uncapped TODAY. Routing them through a capped
+        // list_dir would be a refactor-introduced regression — a new restriction the
+        // current code does not have — and would silently shrink what clean_recovery
+        // can find. They pass cap: None.
+        let dir = unique_dir("swap-uncapped");
+        let n = crate::limits::MAX_DIR_ENTRIES + 7;
+        for i in 0..n {
+            std::fs::write(dir.join(format!("recovered-x-{i}-0.md")), b"x").expect("seed");
+        }
+        let out = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &HashSet::new());
+        assert_eq!(out.len(), n, "every recovered-*.md dump is enumerated — no cap");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

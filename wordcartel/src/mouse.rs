@@ -453,7 +453,7 @@ pub(crate) fn mouse_cursor_picker(editor: &mut Editor, ev: MouseEvent, area: rat
 /// File-browser mouse slot: wheel moves + windows the selection; `Down(Left)` on a row enters
 /// it (dir descend / file open), on a click-away closes the browser.
 pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
-    _ctx: &crate::overlays::DispatchCtx) {
+    ctx: &crate::overlays::DispatchCtx) {
     if let MouseEventKind::Moved = ev.kind {
         let hit = editor.file_browser.as_ref()
             .and_then(|fb| crate::chrome_geom::file_browser_row_at(area, fb, ev.column, ev.row));
@@ -514,7 +514,7 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
                 fb.selected = idx;
                 crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
             }
-            crate::file_browser::file_browser_enter(editor);
+            crate::file_browser::file_browser_enter(&**ctx.fs, editor);
         } else if !inside {
             editor.file_browser = None; // click-away closes
         }
@@ -1528,7 +1528,7 @@ mod tests {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
-        e.open_file_browser(dir.clone());
+        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
         let total = e.file_browser.as_ref().unwrap().entries.len();
         assert_eq!(total, 21, "precondition: 21 entries");
         let (reg, ex, clk, tx, km) = ctx();
@@ -2192,7 +2192,7 @@ mod tests {
         let sub = dir.join("subdir");
         std::fs::create_dir(&sub).unwrap();
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
-        e.open_file_browser(dir.clone());
+        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
         let idx = e.file_browser.as_ref().unwrap().entries.iter()
             .position(|en| en.name == "subdir" && en.is_dir)
             .expect("subdir must appear in entries");

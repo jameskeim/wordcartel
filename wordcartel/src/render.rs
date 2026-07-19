@@ -2782,7 +2782,7 @@ mod tests {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        e.open_file_browser(dir.clone());
+        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
         let total = e.file_browser.as_ref().unwrap().entries.len();
         assert_eq!(total, 21, "precondition: 21 entries (.., d00..d19)");
         // Seed selected deep — render self-heal will compute scroll_top.
@@ -2810,7 +2810,7 @@ mod tests {
         std::fs::create_dir_all(&small_dir).unwrap();
         std::fs::write(small_dir.join("foo.md"), "x").unwrap();
         let mut e2 = Editor::new_from_text("x\n", None, (80, 24));
-        e2.open_file_browser(small_dir.clone());
+        e2.open_file_browser(&crate::fsx::RealFs, small_dir.clone());
         let buf2 = render_to_buffer(&mut e2, 80, 24);
         let total2 = e2.file_browser.as_ref().unwrap().entries.len();
         let rect2 = crate::chrome_geom::palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 24), total2);
@@ -3728,7 +3728,7 @@ mod tests {
     fn file_browser_query_shows_caret_end_of_string() {
         let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
         derive::rebuild(&mut ed);
-        ed.open_file_browser(std::path::PathBuf::from("."));
+        ed.open_file_browser(&crate::fsx::RealFs, std::path::PathBuf::from("."));
         if let Some(fb) = ed.file_browser.as_mut() { fb.query = "rs".into(); }
         let ov = crate::chrome_geom::palette_overlay_rect(
             Rect::new(0, 0, 40, 12), ed.file_browser.as_ref().unwrap().entries.len());

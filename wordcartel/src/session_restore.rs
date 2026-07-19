@@ -229,7 +229,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.md"), "loaded\n").unwrap();
         let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
-        e.open_file_browser(dir.clone());
+        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
         // select "note.md" and simulate Enter via the browser's open path:
         open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
         assert_eq!(e.active().document.buffer.to_string(), "loaded\n");

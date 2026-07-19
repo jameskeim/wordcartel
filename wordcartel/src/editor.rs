@@ -910,13 +910,13 @@ impl Editor {
     }
 
     /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
-    pub fn open_file_browser(&mut self, dir: std::path::PathBuf) {
+    pub fn open_file_browser(&mut self, fs: &dyn crate::fsx::Fs, dir: std::path::PathBuf) {
         crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
         self.file_browser = Some(crate::file_browser::FileBrowser {
             dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
         });
-        if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
+        if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fs, fb); }
     }
 
     /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.

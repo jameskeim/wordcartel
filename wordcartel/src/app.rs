@@ -4132,7 +4132,7 @@ mod tests {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
         let mut e = Editor::new_from_text("", None, (80, 24));
-        e.open_file_browser(dir.clone());
+        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
         assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 25,
             "precondition: 25 entries (.., d00..d23)");
         let reg = Registry::builtins();
@@ -4213,7 +4213,7 @@ mod tests {
         std::fs::write(parent.join("d14").join("file_a.md"), "x").unwrap();
         std::fs::write(parent.join("d14").join("file_b.md"), "x").unwrap();
         let mut e = Editor::new_from_text("", None, (80, 24));
-        e.open_file_browser(parent.clone());
+        e.open_file_browser(&crate::fsx::RealFs, parent.clone());
         // rebuild_entries sorts dirs before files; ".." is index 0, d00..d24 follow.
         // 26 entries total (.., d00..d24).
         assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 26,
