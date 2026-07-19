@@ -56,15 +56,27 @@ fn current_filter_opts(editor: &crate::editor::Editor) -> crate::file_browser_li
     }
 }
 
-/// `ls -F`-style label, composed with the directory slash.
+/// Directory-listing label in the spirit of `ls -F` — a trailing mark declares what an
+/// entry is — but honest about the granularity we actually retain. `ls -F` distinguishes a
+/// fifo (`|`) from a socket (`=`) from a door (`>`); `EntryKind::Other` deliberately collapses
+/// all of those (plus block/char devices) into one fact, so this uses one generic mark (`%`)
+/// for the whole class rather than claim a specific kind we don't know. `?` marks `Unknown` —
+/// the `file_type()` probe itself failed, or (via `broken`) a symlink's target could not be
+/// resolved: a name with no type. `/` and `@` keep their standard `ls -F` meanings (directory,
+/// symlink).
 ///
 /// TEXT suffixes, not colours, so they survive terminal-plain / no-color mode — the
 /// project's standing constraint on every affordance.
 pub(crate) fn entry_label(e: &FileEntry) -> String {
-    let slash = if matches!(e.kind, crate::fsx::EntryKind::Dir) { "/" } else { "" };
+    let mark = match e.kind {
+        crate::fsx::EntryKind::Dir => "/",
+        crate::fsx::EntryKind::File => "",
+        crate::fsx::EntryKind::Other => "%",
+        crate::fsx::EntryKind::Unknown => "?",
+    };
     let link = if e.is_symlink { "@" } else { "" };
     let broken = if e.broken { " (broken)" } else { "" };
-    format!("{}{slash}{link}{broken}", e.name)
+    format!("{}{mark}{link}{broken}", e.name)
 }
 
 /// What Enter does with a selected entry.
@@ -329,7 +341,45 @@ mod tests {
         assert_eq!(entry_label(&fe("linked", Dir, true, false)), "linked/@");
         assert_eq!(entry_label(&fe("notes.md", File, false, false)), "notes.md");
         assert_eq!(entry_label(&fe("alias.md", File, true, false)), "alias.md@");
-        assert_eq!(entry_label(&fe("dangling.md", Unknown, true, true)), "dangling.md@ (broken)");
+        assert_eq!(entry_label(&fe("dangling.md", Unknown, true, true)), "dangling.md?@ (broken)");
+    }
+
+    /// Task 14 gave `Other` and `Unknown` refusals in `classify_enter`, but `entry_label` had
+    /// no mark for either — a bare `Other` (fifo/socket/device) rendered byte-identical to a
+    /// plain file, so a writer only learned otherwise when Enter refused it. Covers the four
+    /// shapes the review found under-tested: bare `Other`, bare `Unknown`, a symlinked `Other`,
+    /// and a broken entry — each must stay distinguishable from a plain `File` and from
+    /// each other, per the same law that made `EntryKind` an enum instead of `is_file`/`is_dir`.
+    #[test]
+    fn entry_label_marks_other_and_unknown_distinctly() {
+        use crate::fsx::EntryKind::*;
+
+        // A bare Other (no symlink, not broken) must not look like an ordinary file.
+        let pipe = entry_label(&fe("pipe", Other, false, false));
+        let file = entry_label(&fe("pipe", File, false, false));
+        assert_eq!(pipe, "pipe%");
+        assert_ne!(pipe, file, "a fifo/socket/device must not render like a regular file");
+
+        // A bare Unknown (file_type() probe failed, not a symlink) is the same gap for the
+        // other unclassifiable kind.
+        let unknown = entry_label(&fe("mystery", Unknown, false, false));
+        assert_eq!(unknown, "mystery?");
+        assert_ne!(unknown, file, "an unclassified entry must not render like a regular file");
+        assert_ne!(unknown, pipe,
+            "Other and Unknown are different facts (§ fsx.rs EntryKind doc) and must render \
+             differently, not share a mark");
+
+        // A symlinked Other keeps the special-file mark AND the link mark.
+        let linked_pipe = entry_label(&fe("pipe-link", Other, true, false));
+        assert_eq!(linked_pipe, "pipe-link%@");
+        assert_ne!(linked_pipe, pipe, "the symlink mark must still distinguish the two");
+
+        // A broken entry (always Unknown + symlink, by the `broken` invariant) stays
+        // distinguishable from all three above.
+        let broken = entry_label(&fe("dangling.md", Unknown, true, true));
+        assert_eq!(broken, "dangling.md?@ (broken)");
+        assert_ne!(broken, unknown, "the ' (broken)' text must still set it apart");
+        assert_ne!(broken, linked_pipe, "a broken Unknown must not read like a symlinked Other");
     }
 
     #[test]
@@ -356,6 +406,19 @@ mod tests {
                 "must say cannot-be-resolved, NOT 'target is gone' — broken also covers \
                  permission and loop failures, got {msg:?}"),
             other => panic!("a broken link must be refused, got {other:?}"),
+        }
+        // A non-broken Unknown — a bare `file_type()` probe failure, reachable in production
+        // at fsx.rs's `Err(_) => (EntryKind::Unknown, false, false)` path, NOT a symlink — must
+        // get the OTHER reason. Collapsing this arm to always return the broken-symlink message
+        // is a real mutation that left every prior test green; this guards against it.
+        match classify_enter(&fe("mystery", Unknown, false, false), d) {
+            EnterOutcome::Refuse(msg) => {
+                assert!(msg.to_lowercase().contains("could not be determined"),
+                    "a non-broken Unknown must say type-could-not-be-determined, got {msg:?}");
+                assert!(!msg.to_lowercase().contains("cannot be resolved"),
+                    "a non-broken Unknown must NOT reuse the broken-symlink reason, got {msg:?}");
+            }
+            other => panic!("a non-broken Unknown must still be refused, got {other:?}"),
         }
     }
 
