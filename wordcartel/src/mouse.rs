@@ -490,9 +490,9 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
             let n = editor.file_browser.as_ref().map(|fb| fb.entries.len()).unwrap_or(0);
             if let Some(fb) = editor.file_browser.as_mut() {
                 crate::app::keep_overlay_visible(ah, after, n, &mut fb.scroll_top);
-                // A deliberate wheel scroll moved the highlight — see
-                // `FileBrowser::highlight_navigated`.
-                fb.highlight_navigated = true;
+                // A deliberate wheel scroll that actually MOVED the highlight (this arm is
+                // already gated on `after != before`) — see `FileBrowser::navigated_name`.
+                fb.navigated_name = fb.entries.get(after).map(|e| e.name.clone());
             }
         }
         return;
@@ -516,9 +516,11 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
             if let Some(fb) = editor.file_browser.as_mut() {
                 fb.selected = idx;
                 crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
-                // A deliberate click — the writer chose this row themselves, see
-                // `FileBrowser::highlight_navigated`.
-                fb.highlight_navigated = true;
+                // A deliberate click on THIS row — unlike a nav key, a click always names an
+                // explicit target by coordinate, so it counts even when it lands on the row
+                // already highlighted (there is no "no-op click" the way there is a no-op
+                // key). See `FileBrowser::navigated_name`.
+                fb.navigated_name = fb.entries.get(idx).map(|e| e.name.clone());
             }
             // THE CLICK DIVERGENCE (C5 Task 18, decision 9): `click_commit_or_copy` runs in
             // BOTH modes (a harmless no-op in Select — its own arm defers to the caller), but
@@ -1394,7 +1396,7 @@ mod tests {
             mode: crate::file_browser::BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         }); }).is_none(), "file_browser open must block arming");
         assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
             "dropdown open must block arming");

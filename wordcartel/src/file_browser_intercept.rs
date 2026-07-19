@@ -83,12 +83,17 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
+                        let before = fb.selected;
                         crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
                             ah, fb.entries.len(), &mut fb.selected, &mut fb.scroll_top);
-                        // A deliberate nav key — the writer has now chosen the highlight
-                        // themselves, so Row 1 of `classify_destination_enter` may act on it
-                        // even with a non-empty field (see `FileBrowser::highlight_navigated`).
-                        fb.highlight_navigated = true;
+                        // Only a GENUINE move counts as the writer choosing the highlight — a
+                        // recognised key that saturates at a boundary (Up at row 0, Down at
+                        // the last row, PageUp/Home already at the top, …) is a no-op, not a
+                        // choice, and must not arm Row 1 of `classify_destination_enter` on a
+                        // highlight nobody actually moved onto. See `FileBrowser::navigated_name`.
+                        if fb.selected != before {
+                            fb.navigated_name = fb.entries.get(fb.selected).map(|e| e.name.clone());
+                        }
                     }
                 }
                 KeyCode::Backspace => {

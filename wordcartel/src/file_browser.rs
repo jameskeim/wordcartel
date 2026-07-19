@@ -81,25 +81,58 @@ pub struct FileBrowser {
     /// succeeds, so the picker shows where the writer actually is until they have actually
     /// arrived — and an unreadable directory never moves them at all.
     pub pending_dir: Option<PathBuf>,
-    /// Has the writer DELIBERATELY moved the highlight — an arrow/Home/End/PageUp/PageDown
-    /// key, a mouse click, or a wheel scroll — since it last defaulted to row 0? Starts
-    /// `false` on open and resets to `false` every time a descend actually lands (the fresh
-    /// listing defaults the highlight again in the new directory).
+    /// The NAME of the entry the writer DELIBERATELY chose — via an arrow/Home/End/PageUp/
+    /// PageDown key that actually MOVED `selected`, a mouse click, or a wheel scroll — or
+    /// `None` if nothing has been deliberately chosen since the highlight last defaulted to
+    /// row 0. Reset to `None` every time a descend actually lands (the fresh listing defaults
+    /// the highlight again in the new directory, and nothing has been chosen there yet).
     ///
-    /// `pub(crate)`: read only by `commit_destination`/`footer_target` (both in-crate) and
-    /// written only by the nav call sites in `file_browser_intercept.rs`/`mouse.rs`.
+    /// `pub(crate)`: written only by the nav call sites in `file_browser_intercept.rs`/
+    /// `mouse.rs`; read only through [`FileBrowser::highlight_is_navigated`].
     ///
-    /// This is what `classify_destination_enter`'s Row 1 gates on. Without it, `filter_and_rank`
-    /// unconditionally pins the synthetic ".." row (or, at root, whichever real entry sorts
-    /// first — directories sort before files) at `entries[0]`, and `selected` initializes to
-    /// 0 — so the highlight sits on a directory the writer never chose. Row 1 fires on ANY
-    /// highlighted directory even with a non-empty field (deliberately, so a writer can type a
-    /// name, arrow into a subfolder, and commit there keeping the name) — so an untouched
-    /// default highlight made the ordinary "type a name, press Enter" sequence descend instead
-    /// of commit. Gating Row 1 on "has the writer actually touched the highlight, or is the
-    /// field empty" keeps the deliberate feature while refusing to act on a highlight nobody
-    /// chose.
-    pub(crate) highlight_navigated: bool,
+    /// This is what `classify_destination_enter`'s Row 1 gates on (via `highlight_is_navigated`).
+    /// Without it, `filter_and_rank` unconditionally pins the synthetic ".." row (or, at root,
+    /// whichever real entry sorts first — directories sort before files) at `entries[0]`, and
+    /// `selected` initializes to 0 — so the highlight sits on a directory the writer never
+    /// chose. Row 1 fires on ANY highlighted directory even with a non-empty field
+    /// (deliberately, so a writer can type a name, arrow into a subfolder, and commit there
+    /// keeping the name) — so an untouched default highlight made the ordinary "type a name,
+    /// press Enter" sequence descend instead of commit. Gating Row 1 on "has the writer
+    /// actually touched the highlight, or is the field empty" keeps the deliberate feature
+    /// while refusing to act on a highlight nobody chose.
+    ///
+    /// A NAME, not a bare bool, because the invariant this carries is "the writer chose what
+    /// is CURRENTLY highlighted" — not merely "a nav key fired at some point". Two failure
+    /// modes a bare bool cannot express on its own:
+    ///
+    /// 1. A recognised nav key that does not move `selected` (`Up` at row 0, `Down` at the
+    ///    last row, …) is a no-op, not a choice. The WRITE sites below only stamp this field
+    ///    when `selected` actually changed value — name-tracking alone would NOT fix this: a
+    ///    no-op key would just re-record the SAME name that was already highlighted, which is
+    ///    indistinguishable from a genuine (if redundant) re-confirmation.
+    /// 2. A re-filter (a keystroke into `field`/`query`) can shrink `entries` and clamp
+    ///    `selected` back into bounds — landing it on a DIFFERENT entry that merely slid into
+    ///    the same index. A bare bool surviving that clamp would misattribute the writer's
+    ///    choice to an entry they never touched. Storing the NAME and re-comparing it against
+    ///    `entries[selected]` live, on every read (`highlight_is_navigated`), makes this
+    ///    self-correcting: no separate invalidation step in `rederive` is needed, and none can
+    ///    be forgotten, because staleness is impossible to observe — the check is never made
+    ///    against a snapshot, only against the live entry.
+    pub(crate) navigated_name: Option<String>,
+}
+
+impl FileBrowser {
+    /// Is the entry CURRENTLY under `selected` the one the writer deliberately chose?
+    ///
+    /// Compares `navigated_name` against `entries[selected]` BY NAME, live, rather than
+    /// trusting that a stored bool is still valid — see the doc comment on `navigated_name`
+    /// for why a snapshot bool cannot survive a re-filter that slides a different entry under
+    /// the same index. Directory-entry names are unique within one directory listing, so a
+    /// name match here means the identical entry, not a coincidental namesake.
+    pub(crate) fn highlight_is_navigated(&self) -> bool {
+        self.navigated_name.as_deref()
+            .is_some_and(|n| self.entries.get(self.selected).is_some_and(|e| e.name == n))
+    }
 }
 
 /// Directory-listing label in the spirit of `ls -F` — a trailing mark declares what an
@@ -179,7 +212,7 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
     if field.trim().is_empty() { return None; }
     let highlighted = fb.entries.get(fb.selected);
     let typed = match crate::file_browser_commit::classify_destination_enter(
-        fs, &fb.dir, field, highlighted, fb.highlight_navigated) {
+        fs, &fb.dir, field, highlighted, fb.highlight_is_navigated()) {
         // Rows 1 and 3 — Enter descends, it does not write. Say so plainly rather than
         // showing a would-be write target that Enter will never produce.
         crate::file_browser_commit::CommitOutcome::Descend(target) => {
@@ -384,8 +417,14 @@ pub(crate) fn apply_listing_done(
                 fb.scroll_top = 0; // A6: reset with selected to avoid an out-of-order slice
                 // The highlight is back at its untouched default in the NEW directory — the
                 // writer has not chosen anything here yet, so Row 1 must not act on it until
-                // they do. See `FileBrowser::highlight_navigated`.
-                fb.highlight_navigated = false;
+                // they do. See `FileBrowser::navigated_name`. This reset is still necessary
+                // even though `highlight_is_navigated` re-validates by name on every read: a
+                // fresh directory could coincidentally have some OTHER entry land at the same
+                // `selected` index under the SAME name the writer chose in the PREVIOUS
+                // directory (e.g. "cab" again), which a live name-compare alone cannot detect
+                // as stale — it is a genuinely different fact ("chosen in dir A") that a new
+                // directory must start clean of.
+                fb.navigated_name = None;
             }
         }
         Err(e) => {
@@ -416,7 +455,7 @@ mod tests {
             dir, query: String::new(), mode: BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         }
     }
 
@@ -841,7 +880,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
         assert!(line.contains(&d.join("chapter one.md").display().to_string()),
@@ -899,7 +938,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
         assert!(line.contains(&d.join("chapter-one").display().to_string()),
@@ -924,7 +963,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains(&d.join("book.docx").display().to_string()),
@@ -949,7 +988,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains("sub"), "names the field as typed: {line}");
@@ -975,7 +1014,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains(&d.join("dangling.md").display().to_string()),
@@ -995,7 +1034,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(),
             "a whitespace-only field is empty, and names no target");
@@ -1007,7 +1046,7 @@ mod tests {
             dir: std::env::temp_dir(), query: "q".into(), mode: BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         };
         assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(), "select mode names no target");
         fb.mode = BrowseMode::Destination {

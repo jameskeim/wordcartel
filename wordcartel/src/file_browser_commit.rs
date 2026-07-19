@@ -50,13 +50,17 @@ pub(crate) fn resolve_field(dir: &Path, field: &str) -> PathBuf {
 /// directly so the resolved-target footer can never state a destination Enter will not actually
 /// reach (a bare field naming an EXISTING directory must be shown as a descend, never a write).
 ///
-/// `highlight_navigated` (see `FileBrowser::highlight_navigated`) is what Row 1 gates on: it is
-/// true once the writer has DELIBERATELY moved the highlight (arrow keys, a click, a wheel
-/// scroll) since it last defaulted to row 0. Without this gate, `filter_and_rank` unconditionally
-/// pins the synthetic ".." row (or, at filesystem root, whichever real entry sorts first —
-/// directories sort before files) at `entries[0]`, and `FileBrowser::selected` initializes to 0
-/// — so the ordinary "type a name, press Enter" sequence would hit Row 1 on a highlight the
-/// writer never touched and silently descend instead of committing.
+/// `highlight_navigated` (the caller passes `FileBrowser::highlight_is_navigated()` — see its
+/// doc comment and `FileBrowser::navigated_name`) is what Row 1 gates on: true only when the
+/// entry CURRENTLY highlighted is the one the writer DELIBERATELY chose — a nav key that
+/// actually moved `selected` (arrow keys, Home/End, PageUp/PageDown), a click, or a wheel
+/// scroll, re-validated by name against whatever is highlighted NOW so a re-filter that slides
+/// a different entry under the same index cannot inherit a choice it never received. Without
+/// this gate, `filter_and_rank` unconditionally pins the synthetic ".." row (or, at filesystem
+/// root, whichever real entry sorts first — directories sort before files) at `entries[0]`, and
+/// `FileBrowser::selected` initializes to 0 — so the ordinary "type a name, press Enter"
+/// sequence would hit Row 1 on a highlight the writer never touched and silently descend
+/// instead of committing.
 pub(crate) fn classify_destination_enter(
     fs: &dyn Fs,
     dir: &Path,
@@ -205,7 +209,7 @@ pub(crate) fn commit_destination(
     let purpose = purpose.clone();
     let dir = fb.dir.clone();
     let highlighted = fb.entries.get(fb.selected).cloned();
-    let highlight_navigated = fb.highlight_navigated;
+    let highlight_navigated = fb.highlight_is_navigated();
 
     match classify_destination_enter(&**fs, &dir, field, highlighted.as_ref(), highlight_navigated) {
         // Rows 1 and 3 — navigate, do not write. The listing lands asynchronously and
@@ -502,7 +506,7 @@ mod tests {
             entries: vec![FileEntry { name: "existing.md".into(), kind: EntryKind::File,
                 is_symlink: false, broken: false }],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         });
 
         press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Tab);
@@ -547,7 +551,7 @@ mod tests {
             entries: vec![FileEntry {
                 name: "victim.md".into(), kind: EntryKind::File, is_symlink: false, broken: false }],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         });
 
         // A REAL left-click on the row the painter drew, routed through the overlay mouse
@@ -650,8 +654,8 @@ mod tests {
     /// combined so the ordinary "type a name, press Enter" sequence never reached Row 4
     /// (Commit) at all — it hit Row 1 (Descend) on a highlight the writer never touched.
     ///
-    /// Fixed by gating Row 1 on `FileBrowser::highlight_navigated` — true only once the writer
-    /// has deliberately moved the highlight (arrow keys, a click, a wheel scroll) — OR an empty
+    /// Fixed by gating Row 1 on `FileBrowser::highlight_is_navigated()` — true only once the
+    /// writer has deliberately moved the highlight (arrow keys, a click, a wheel scroll) — OR an empty
     /// field. Reproduced BEFORE the fix (confirmed live, then reverted — see the task report):
     /// with the gate removed, this test's write assertions below fail and `pending_dir` instead
     /// shows a descend into `d.parent()`.
@@ -690,7 +694,7 @@ mod tests {
         assert_eq!(fb.selected, 0,
             "precondition: nothing has been typed or navigated yet — the highlight still \
              defaults to row 0, which IS the '..' row");
-        assert!(!fb.highlight_navigated, "precondition: the writer has not touched the highlight");
+        assert!(!fb.highlight_is_navigated(), "precondition: the writer has not touched the highlight");
 
         // Type a filename through the REAL intercept, one keystroke at a time — no navigation.
         for c in ['c', 'h', 'a', 'p'] {
@@ -711,12 +715,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The OTHER half of the fix: `highlight_navigated` must not disable Row 1 for a highlight
-    /// the writer genuinely chose. This is the design intent the task brief calls out as worth
-    /// preserving: type a name, arrow-key into a subfolder, and commit there — keeping the
-    /// typed name. Driven end-to-end through the real listing + real keyboard-nav + real Enter
-    /// intercept, not by hand-constructing `highlighted`/`highlight_navigated` — so a
-    /// regression in HOW the flag gets set (not just what it gates) would be caught here too.
+    /// The OTHER half of the fix: a genuinely navigated highlight must not disable Row 1. This
+    /// is the design intent the task brief calls out as worth preserving: type a name,
+    /// arrow-key into a subfolder, and commit there — keeping the typed name. Driven
+    /// end-to-end through the real listing + real keyboard-nav + real Enter intercept, not by
+    /// hand-constructing `highlighted`/`navigated_name` — so a regression in HOW the flag gets
+    /// set (not just what it gates) would be caught here too.
     ///
     /// The subfolder is named `chapter-drafts` — deliberately containing the typed field text
     /// as a substring — so it SURVIVES the dual-duty field-as-filter (`rederive`'s fuzzy
@@ -743,7 +747,7 @@ mod tests {
             .entries.iter().map(|r| r.name.clone()).collect();
         let dir_idx = names.iter().position(|n| n == "chapter-drafts")
             .expect("chapter-drafts survives the field-as-filter — precondition");
-        assert!(!e.file_browser.as_ref().unwrap().highlight_navigated,
+        assert!(!e.file_browser.as_ref().unwrap().highlight_is_navigated(),
             "precondition: nothing has been navigated yet");
 
         // Arrow DOWN through the REAL intercept until "chapter-drafts" is highlighted.
@@ -753,7 +757,7 @@ mod tests {
         let fb = e.file_browser.as_ref().expect("open");
         assert_eq!(fb.entries.get(fb.selected).map(|r| r.name.as_str()), Some("chapter-drafts"),
             "precondition: the real directory is now highlighted");
-        assert!(fb.highlight_navigated, "a real nav key sets the flag");
+        assert!(fb.highlight_is_navigated(), "a real nav key sets the flag");
 
         // Enter through the REAL intercept — Row 1 must still fire: descend, not commit.
         crate::test_support::press_enter_fb(&mut e, &fs, &tx);
@@ -768,6 +772,137 @@ mod tests {
             other => panic!("expected destination mode, got {other:?}"),
         }
         assert!(!d.join("chapter.md").exists(), "nothing was written — this was a descend");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GAP 1 REGRESSION (re-review of the parent-row-highlight fix above). The fix's own
+    /// intercept arm used to set `highlight_navigated = true` on ANY recognised nav key,
+    /// whether or not `apply_list_nav` actually moved `selected` — so an ordinary reflex `Up`
+    /// press at the TOP of the list (a genuine no-op: `saturating_sub` keeps `selected` at 0)
+    /// still armed Row 1. That reproduces the EXACT symptom the fix above closes: with the
+    /// highlight still sitting untouched on ".." at row 0, typing a filename and pressing
+    /// Enter descended into the parent instead of committing.
+    ///
+    /// Fixed by only stamping `FileBrowser::navigated_name` when `selected` actually changed
+    /// value (`file_browser_intercept.rs`'s nav arm now compares before/after
+    /// `apply_list_nav`) — see `FileBrowser::navigated_name`'s doc comment for why name
+    /// tracking ALONE would not have been enough: a no-op key would just re-record the same
+    /// name already highlighted.
+    ///
+    /// FAIL-VERIFY: revert the nav-key arm in `file_browser_intercept.rs` to stamp
+    /// `fb.navigated_name` unconditionally on any recognised key (dropping the
+    /// `if fb.selected != before` guard), watch this fail — `chap.md` is never written, the
+    /// picker stays open, `pending_dir` shows a descend into `d.parent()` — then restore.
+    #[test]
+    fn a_noop_nav_key_does_not_arm_row1_so_typing_then_enter_still_commits() {
+        let d = tmp("gap1-noop-nav");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), String::new());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        let fb = e.file_browser.as_ref().expect("picker open");
+        assert_eq!(fb.selected, 0, "precondition: default highlight sits on row 0 (the '..' row)");
+        assert!(!fb.highlight_is_navigated(), "precondition: nothing chosen yet");
+
+        // An ordinary reflex Up keypress at the top of the list. `list_window::apply_list_nav`'s
+        // Up arm is `selected.saturating_sub(1)` — 0 stays 0. Nothing moved.
+        crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Up);
+        let fb = e.file_browser.as_ref().expect("picker open");
+        assert_eq!(fb.selected, 0, "precondition: Up at the top is a genuine no-op");
+        assert!(!fb.highlight_is_navigated(),
+            "a no-op nav key must NOT arm Row 1 — the exact defect this test guards");
+
+        // Type a filename through the REAL intercept, one keystroke at a time — no navigation.
+        for c in ['c', 'h', 'a', 'p'] { crate::test_support::press_char_fb(&mut e, &fs, &tx, c); }
+
+        // Enter through the REAL intercept, exactly as a writer's keystroke would arrive.
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        assert_eq!(std::fs::read_to_string(d.join("chap.md")).expect("written"), "body\n",
+            "typing a name and pressing Enter must WRITE, not descend into the parent");
+        assert!(e.file_browser.is_none(), "the picker closed on commit");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// GAP 2 REGRESSION (re-review of the parent-row-highlight fix above). `rederive` clamps
+    /// `fb.selected` when it is out of bounds after a re-filter shrinks `entries`, but the OLD
+    /// code never re-validated that the entry AT that index was still the one the writer
+    /// chose — so a stale `highlight_navigated = true` could survive onto a DIFFERENT entry
+    /// that merely slid into the same slot.
+    ///
+    /// Reproduced exactly as the task describes: seed `cab` and `cat` (both dirs), filter to
+    /// "c" (both survive), arrow down onto `cab` (arming the flag against `cab` specifically),
+    /// then type `t` — the field becomes "ct", which filters `cab` OUT (it has no 't') while
+    /// `cat` survives. With only `cab`/`cat` as candidates, whatever `fb.selected` resolves to
+    /// after the shrink (whether via the out-of-bounds clamp or a plain index shift) MUST now
+    /// be `cat` — an entry the writer never touched.
+    ///
+    /// Fixed by storing the CHOSEN entry's NAME (`FileBrowser::navigated_name`) and
+    /// re-comparing it against `entries[selected]` live, on every read
+    /// (`FileBrowser::highlight_is_navigated`), rather than trusting a bare bool set once and
+    /// never revisited — see that method's doc comment.
+    ///
+    /// FAIL-VERIFY: make `highlight_is_navigated` return `self.navigated_name.is_some()`
+    /// without comparing it against `entries[self.selected]`'s name (i.e. trust the stale
+    /// bool-shaped fact alone), watch this fail — `ct.md` is never written, the picker stays
+    /// open, `pending_dir` shows a descend into `cat` — then restore.
+    #[test]
+    fn navigating_onto_an_entry_that_then_filters_out_does_not_leave_a_stale_flag_on_whatever_slides_in() {
+        let d = tmp("gap2-stale-flag");
+        std::fs::create_dir_all(d.join("cab")).expect("seed cab");
+        std::fs::create_dir_all(d.join("cat")).expect("seed cat");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "c".into());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        let names: Vec<String> = e.file_browser.as_ref().expect("open")
+            .entries.iter().map(|r| r.name.clone()).collect();
+        let cab_idx = names.iter().position(|n| n == "cab")
+            .expect("cab survives filter 'c' — precondition");
+        assert!(names.iter().any(|n| n == "cat"), "cat also survives filter 'c': {names:?}");
+
+        // Arrow DOWN onto "cab" through the REAL intercept.
+        for _ in 0..cab_idx {
+            crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Down);
+        }
+        let fb = e.file_browser.as_ref().expect("open");
+        assert_eq!(fb.entries.get(fb.selected).map(|r| r.name.as_str()), Some("cab"),
+            "precondition: 'cab' is highlighted");
+        assert!(fb.highlight_is_navigated(), "precondition: the flag is armed against 'cab'");
+
+        // Type 't' — field becomes "ct". "cab" has no 't' at all, so it filters OUT; "cat"
+        // (c…a…t) survives the fuzzy subsequence match. Only ".." and "cat" remain.
+        crate::test_support::press_char_fb(&mut e, &fs, &tx, 't');
+        let fb = e.file_browser.as_ref().expect("open");
+        let names: Vec<String> = fb.entries.iter().map(|r| r.name.clone()).collect();
+        assert!(!names.iter().any(|n| n == "cab"), "'cab' must have filtered out: {names:?}");
+        assert_eq!(fb.entries.get(fb.selected).map(|r| r.name.as_str()), Some("cat"),
+            "precondition: 'cat' now sits wherever 'cab' used to (shift or clamp): {names:?}");
+        assert!(!fb.highlight_is_navigated(),
+            "the flag must NOT survive onto 'cat' — the writer only ever chose 'cab'");
+
+        // Enter through the REAL intercept: "ct" names no existing path, so with the flag
+        // correctly cleared this must fall through to Row 4 and COMMIT — never Row 1's stale
+        // descend into 'cat'.
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        assert_eq!(std::fs::read_to_string(d.join("ct.md")).expect("written"), "body\n",
+            "Enter must WRITE — a stale flag must not descend into 'cat' instead");
+        assert!(e.file_browser.is_none(), "the picker closed on commit");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -839,9 +974,9 @@ mod tests {
     /// `fb.entries` with a ".." row unconditionally pinned at index 0 (`filter_and_rank`),
     /// which `classify_destination_enter`'s Row 1 would act on regardless of the non-empty
     /// field, hitting Descend instead of the Row-4 Commit this test needs to drive the
-    /// Redirect arm. `FileBrowser::highlight_navigated` now gates Row 1 on the writer having
-    /// actually moved the highlight (or an empty field), so pumping a real listing here is
-    /// safe and exercises the state real usage reaches. Commit itself is still driven
+    /// Redirect arm. `FileBrowser::highlight_is_navigated()` now gates Row 1 on the writer
+    /// having actually moved the highlight (or an empty field), so pumping a real listing here
+    /// is safe and exercises the state real usage reaches. Commit itself is still driven
     /// through the REAL Enter intercept.
     ///
     /// FAIL-VERIFY: remove the clearing added to the `Redirect` arm, watch the
@@ -960,9 +1095,9 @@ mod tests {
     /// `fb.entries` with a ".." row unconditionally pinned at index 0 (`filter_and_rank`),
     /// which `classify_destination_enter`'s Row 1 would act on regardless of the non-empty
     /// field, hitting Descend before the extension policy ever ran. `FileBrowser::
-    /// highlight_navigated` now gates Row 1 on the writer having actually moved the highlight
-    /// (or an empty field), so pumping a real listing here is safe. Commit itself is still
-    /// driven through the REAL Enter intercept.
+    /// highlight_is_navigated()` now gates Row 1 on the writer having actually moved the
+    /// highlight (or an empty field), so pumping a real listing here is safe. Commit itself is
+    /// still driven through the REAL Enter intercept.
     ///
     /// FAIL-VERIFY: remove the `Refused` arm's early return, watch this fail (the picker
     /// closes and something lands on disk under `d`), then restore.

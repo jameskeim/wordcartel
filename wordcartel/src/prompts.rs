@@ -662,7 +662,7 @@ mod tests {
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
             std::env::temp_dir(), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches. The
-        // typed field is a non-empty ABSOLUTE path, so `FileBrowser::highlight_navigated`
+        // typed field is a non-empty ABSOLUTE path, so `FileBrowser::highlight_is_navigated()`
         // gates Row 1 off regardless of whatever `temp_dir()` happens to sort first (very
         // possibly a directory, in a shared system temp dir full of other tests' leftovers).
         crate::test_support::pump_listing(&mut e, &rx);
