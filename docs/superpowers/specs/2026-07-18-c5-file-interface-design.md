@@ -1246,7 +1246,7 @@ they never move the selection except to clamp it into the new filtered list.
 | # | Condition | Action |
 |---|---|---|
 | 1 | The highlighted entry is a **directory** (including `..`) | **Descend.** Field is preserved across the descend (the writer keeps their filename while navigating). Selection resets, listing re-fetched, epoch bumped. |
-| 2 | Field is empty and the highlighted entry is a **file** | **Commit to that file** (explicit overwrite of an existing file). Goes through the overwrite-confirm prompt, which is what makes this safe. |
+| 2 | Field is empty and the highlighted entry is a **file** | **Commit to that exact file** — its own name is the target; extension policy (§8) does not rename it — **but only if it is markdown or format-neutral text** (no extension, `.md`, `.markdown`, `.txt`, `.text`). Goes through the overwrite-confirm prompt, which is what makes this safe. Any other extension is a foreign document format and the overwrite is **refused**, loudly (§8.1). |
 | 3 | Field, resolved against `fb.dir`, **names an existing directory** | **Descend into it**, clearing the field. |
 | 4 | Otherwise | **Commit `fb.dir + field`**, through extension policy (§8), then the existing overwrite-confirm if the resolved target exists. |
 
@@ -1566,6 +1566,52 @@ Edge cases the classifier must handle explicitly, each with a test:
 
 The policy applies to **save destinations only**. It never applies in select mode, and never to the
 export destination (whose extension is fixed by the chosen format).
+
+### 8.1 Amendment — Row 2 protects foreign document formats (ratified 2026-07-19)
+
+**This amends §7.2's decision table (Row 2) and this section's scoping sentence.** Both halves of
+Row 2's contract were wrong in turn during implementation; this records where they landed.
+
+**What went wrong, twice.** Row 2 originally piped the highlighted file's name through this section's
+policy. The `Default` verdict *renames* an extensionless input, so highlighting an existing `README`
+left it untouched and silently created a **different** file, `README.md` — with no overwrite-confirm
+(the new path did not exist) and no footer disclosure (the field was empty, and §7.3's footer is
+suppressed then). Fixing that by bypassing policy entirely then went too far the other way: Row 2
+would write the buffer's markdown over `report.docx`, `paper.pdf` or `thesis.tex`, producing a file
+that lies about its own format under a name that still claims to be one.
+
+**The amended law.** Row 2 is a commit onto a file the writer *pointed at*, so its **name is already
+the answer** — policy's name-transformation half never applies to it, and a `README` stays `README`.
+But the name is not the only question. Row 2 writes directly **only when the highlighted target is
+markdown or format-neutral text**:
+
+| Highlighted target | Row 2 |
+|---|---|
+| No extension at all (`README`, `.gitignore`, `notes.`) | **Write it**, exactly as named, through the ordinary overwrite-confirm. |
+| `.md`, `.markdown`, `.txt`, `.text` (case-insensitive) | **Write it**, exactly as named, same confirm. |
+| A format this app's Export can produce (`.docx`, `.pdf`, `.html`, `.tex`) | **Refuse**, and open the **Export** destination picker for that format instead. |
+| Any other extension (`.odp`, `.xlsx`, `.png`, …) | **Refuse**, with a status naming the reason. |
+
+Standing constraints:
+
+1. **The hazard is FORMAT, not encoding.** `.tex` is plain text and is still protected; `.txt` is
+   equally plain text and is not. The question a target must answer is "is this a *different document
+   format*," because markdown bytes destroy such a file's meaning while keeping its name.
+2. **A refusal is loud and names its reason.** No silent UI: the writer must understand why Enter did
+   nothing. Where the format is one Export can produce, the refusal **hands over the Export flow**
+   rather than dead-ending — restoring, for exactly the meaningful cases, the `.docx` → Export
+   behaviour the first fix retired.
+3. **The capability list is not re-derived.** "What Export can produce" is the existing `OUTPUT_EXTS`
+   set that this section's `Redirect` verdict already keys off and that `registry.rs` passes to
+   `export::run_export`. A second hardcoded list would drift the moment a format is added.
+4. **A refusal writes nothing, anywhere** — in particular it must not fall back to policy and leave a
+   `report.md` beside the file it declined to overwrite.
+5. **Typed field text is untouched by this amendment.** §8's table above still governs Rows 3–4 in
+   full: `chapter-one` still becomes `chapter-one.md`, and a typed `.docx` still redirects to Export.
+
+Guarded by tests driven through the **real intercept** over a pumped listing (arrow onto the entry,
+Enter with an empty field), because every defect this arm has shipped lived in the composition of
+three separately-correct pieces rather than in one function's return value.
 
 ---
 
