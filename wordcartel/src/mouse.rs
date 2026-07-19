@@ -514,7 +514,7 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
                 fb.selected = idx;
                 crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
             }
-            crate::file_browser::file_browser_enter(&**ctx.fs, editor);
+            crate::file_browser::file_browser_enter(ctx.fs, ctx.msg_tx, editor);
         } else if !inside {
             editor.file_browser = None; // click-away closes
         }
@@ -1378,6 +1378,7 @@ mod tests {
             dir: std::path::PathBuf::from("."), query: String::new(),
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
         }); }).is_none(), "file_browser open must block arming");
         assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
             "dropdown open must block arming");
@@ -1529,7 +1530,7 @@ mod tests {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
-        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
+        let _rx = crate::test_support::open_and_pump(&mut e, dir.clone());
         let total = e.file_browser.as_ref().unwrap().entries.len();
         assert_eq!(total, 21, "precondition: 21 entries");
         let (reg, ex, clk, tx, km) = ctx();
@@ -2193,16 +2194,24 @@ mod tests {
         let sub = dir.join("subdir");
         std::fs::create_dir(&sub).unwrap();
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
-        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
+        // A real descend spawns a listing on `tx` — build reg/km/ex/clk from `ctx()` but
+        // keep OUR OWN channel so the click's listing (below) can be pumped on the same rx
+        // the open used.
+        let (reg, ex, clk, _unused_tx, km) = ctx();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> = std::sync::Arc::new(crate::fsx::RealFs);
+        let (tx, rx) = std::sync::mpsc::channel();
+        e.open_file_browser(&fs, &tx, dir.clone());
+        crate::test_support::pump_listing(&mut e, &rx);
         let idx = e.file_browser.as_ref().unwrap().entries.iter()
             .position(|en| en.name == "subdir" && matches!(en.kind, crate::fsx::EntryKind::Dir))
             .expect("subdir must appear in entries");
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rect = crate::chrome_geom::palette_overlay_rect(area, e.file_browser.as_ref().unwrap().entries.len());
         let click_row = rect.y + 2 + idx as u16; // scroll_top is 0
-        let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &fs);
+        // The click's descend spawned another listing — pump it before reading `fb.dir`.
+        crate::test_support::pump_listing(&mut e, &rx);
         assert!(e.file_browser.as_ref().is_some_and(|fb| fb.dir == sub),
             "click on dir must descend into it; dir={:?}", e.file_browser.as_ref().map(|fb| &fb.dir));
         let _ = std::fs::remove_dir_all(&dir);

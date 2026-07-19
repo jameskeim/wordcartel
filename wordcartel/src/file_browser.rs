@@ -36,6 +36,12 @@ pub struct FileBrowser {
     pub selected: usize,
     /// First visible row index — drives the windowed painter (A6).
     pub scroll_top: usize,
+    /// The epoch this browser awaits. Compared against `Msg::ListingDone::epoch`.
+    pub awaiting_epoch: u64,
+    /// The directory a listing is in flight FOR. `fb.dir` does not move until that listing
+    /// succeeds, so the picker shows where the writer actually is until they have actually
+    /// arrived — and an unreadable directory never moves them at all.
+    pub pending_dir: Option<PathBuf>,
 }
 
 /// The options this browser filters by, derived from the editor's persisted
@@ -51,9 +57,15 @@ fn current_filter_opts(editor: &crate::editor::Editor) -> crate::file_browser_li
 }
 
 /// Execute the selected file-browser entry — the shared Enter path for the keyboard
-/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
-/// guarding against unreadable targets, or opens a file through the dirty-guard path.
-pub(crate) fn file_browser_enter(fs: &dyn crate::fsx::Fs, editor: &mut crate::editor::Editor) {
+/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. "..")
+/// by spawning an off-thread listing (Task 13) — `fb.dir`/`query`/`selected`/`scroll_top`
+/// do NOT move here; they move together in `apply_listing_done`'s success arm, so an
+/// unreadable target costs the writer nothing. Or opens a file through the dirty-guard path.
+pub(crate) fn file_browser_enter(
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    editor: &mut crate::editor::Editor,
+) {
     let chosen = editor.file_browser.as_ref().and_then(|fb| {
         fb.entries.get(fb.selected).map(|e| (e.name.clone(), matches!(e.kind, crate::fsx::EntryKind::Dir)))
     });
@@ -67,22 +79,8 @@ pub(crate) fn file_browser_enter(fs: &dyn crate::fsx::Fs, editor: &mut crate::ed
                 }
             });
             if let Some(target) = target {
-                // §3: check readability BEFORE committing fb.dir. Routed through the seam
-                // (Some(0): this is a readability probe, not a listing — retention isn't
-                // needed, only whether the directory can be opened at all).
-                if fs.list_dir(&target, Some(0)).is_ok() {
-                    let opts = current_filter_opts(editor);
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.dir = target;
-                        fb.query.clear();
-                        fb.selected = 0;
-                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
-                        crate::file_browser_listing::refetch(fs, fb, opts);
-                    }
-                } else {
-                    editor.set_status_full(crate::status::StatusKind::Error, format!("cannot read directory: {}", target.display()),
-                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-                    // stay in prior dir — do NOT mutate fb.dir
+                if let Some(fb) = editor.file_browser.as_mut() {
+                    start_listing(fb, target, fs, msg_tx);
                 }
             }
         } else {
@@ -118,7 +116,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             use crossterm::event::KeyCode;
             match k.code {
                 KeyCode::Esc => { editor.file_browser = None; }
-                KeyCode::Enter => { file_browser_enter(&**ctx.fs, editor); }
+                KeyCode::Enter => { file_browser_enter(ctx.fs, ctx.msg_tx, editor); }
                 c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
@@ -156,6 +154,100 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     crate::app::Handled::Pass(msg)
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic listing epoch, PROCESS-GLOBAL by design.
+///
+/// It is deliberately not a `FileBrowser` field: closing the picker would drop a per-browser
+/// counter, and a freshly-opened picker would start from the same value — so a stale result
+/// from the previous picker's in-flight listing could carry a matching epoch and be accepted
+/// (an ABA bug). A global counter never reissues a value, so the match is unforgeable.
+pub(crate) static LISTING_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_epoch() -> u64 {
+    LISTING_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Spawn a listing for `target` on its own thread.
+///
+/// `fb.dir` is DELIBERATELY not moved here — see `apply_listing_done`. `pending_dir` and
+/// `awaiting_epoch` are stamped together, so "a listing is in flight for X" is one fact in
+/// one place and cannot disagree with itself.
+///
+/// The overlay stays fully closable while this is in flight: closing means the result is
+/// discarded on arrival, and the detached thread exits on its own. A stuck mount strands one
+/// short-lived thread, never the UI.
+pub(crate) fn start_listing(
+    fb: &mut FileBrowser,
+    target: std::path::PathBuf,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    let epoch = next_epoch();
+    fb.awaiting_epoch = epoch;
+    fb.pending_dir = Some(target.clone());
+    let fs = std::sync::Arc::clone(fs);
+    let tx = msg_tx.clone();
+    std::thread::spawn(move || {
+        let result = fs.list_dir(&target, Some(crate::limits::MAX_DIR_ENTRIES));
+        let _ = tx.send(crate::app::Msg::ListingDone { epoch, dir: target, result });
+    });
+}
+
+/// Merge a listing result. Discards when there is no active picker, and when the epoch is
+/// not the one the active picker awaits. BOTH halves are required.
+///
+/// On SUCCESS the pending directory and its entries are committed TOGETHER, so the picker
+/// never shows a directory it has not actually read. On ERROR `fb.dir` is left untouched:
+/// an unreadable directory does not move the writer, it just tells them.
+pub(crate) fn apply_listing_done(
+    editor: &mut crate::editor::Editor,
+    epoch: u64,
+    dir: std::path::PathBuf,
+    result: std::io::Result<crate::fsx::DirListing>,
+) {
+    let Some(fb) = editor.file_browser.as_mut() else { return }; // no picker → inert
+    if fb.awaiting_epoch != epoch { return; }                    // stale → inert
+    debug_assert_eq!(fb.pending_dir.as_deref(), Some(dir.as_path()),
+        "the merge must target the directory it listed");
+    match result {
+        Ok(l) => {
+            // Commit the directory move and its contents in one step.
+            let moved = fb.pending_dir.take().is_some_and(|p| {
+                let changed = p != fb.dir;
+                fb.dir = p;
+                changed
+            });
+            fb.listing = l.entries;
+            fb.total_seen = l.total_seen;
+            fb.unreadable = l.unreadable;
+            if moved {
+                // Descend resets the view — but only now that we have actually arrived, so a
+                // failed descend does not cost the writer the query they had typed.
+                fb.query.clear();
+                fb.selected = 0;
+                fb.scroll_top = 0; // A6: reset with selected to avoid an out-of-order slice
+            }
+        }
+        Err(e) => {
+            // fb.dir is NOT touched. The writer stays where they were.
+            fb.pending_dir = None;
+            editor.set_status_full(crate::status::StatusKind::Error,
+                format!("cannot read directory: {} ({e})", dir.display()),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return;
+        }
+    }
+    let opts = crate::file_browser_listing::FilterOpts {
+        show_clutter: editor.files_show_clutter,
+        types: editor.files_type_filter,
+        destination: false,
+    };
+    if let Some(fb) = editor.file_browser.as_mut() {
+        crate::file_browser_listing::rederive(fb, opts);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +256,7 @@ mod tests {
         FileBrowser {
             dir, query: String::new(), listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
         }
     }
 
@@ -173,6 +266,17 @@ mod tests {
         }
     }
 
+    /// Test-only stand-in for the deleted synchronous `refetch`: one `list_dir` call, then
+    /// derive. Production now fetches only off-thread (`start_listing` + `apply_listing_done`);
+    /// these listing-pipeline tests still want a one-shot synchronous fetch to seed `fb.listing`.
+    fn seed_listing(fs: &dyn crate::fsx::Fs, fb: &mut FileBrowser, opts: crate::file_browser_listing::FilterOpts) {
+        match fs.list_dir(&fb.dir, Some(crate::limits::MAX_DIR_ENTRIES)) {
+            Ok(l) => { fb.listing = l.entries; fb.total_seen = l.total_seen; fb.unreadable = l.unreadable; }
+            Err(_) => { fb.listing = Vec::new(); fb.total_seen = 0; fb.unreadable = 0; }
+        }
+        crate::file_browser_listing::rederive(fb, opts);
+    }
+
     #[test]
     fn refetch_dirs_first_with_dotdot_and_query_filter() {
         let dir = std::env::temp_dir().join(format!("wc-fb-{}", std::process::id()));
@@ -180,7 +284,7 @@ mod tests {
         std::fs::write(dir.join("alpha.md"), "x").unwrap();
         std::fs::write(dir.join("beta.txt"), "x").unwrap();
         let mut fb = empty_fb(dir.clone());
-        crate::file_browser_listing::refetch(&crate::fsx::RealFs, &mut fb, default_opts());
+        seed_listing(&crate::fsx::RealFs, &mut fb, default_opts());
         assert_eq!(fb.entries[0].name, "..", "parent first");
         let names: Vec<_> = fb.entries.iter().map(|e| e.name.as_str()).collect();
         let sub_i = names.iter().position(|n| *n == "sub").unwrap();
@@ -212,15 +316,17 @@ mod tests {
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut e = Editor::new_from_text("x\n", None, (40, 12));
-        e.open_file_browser(&crate::fsx::RealFs, parent.clone());
-        // open_file_browser already fetched+derived entries; "secret" is in the list.
-        // Select the "secret" entry (skip ".." which is index 0).
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> = std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_file_browser(&fs, &tx, parent.clone());
+        // The listing runs on its own thread now — pump it before reading `entries`.
+        crate::test_support::pump_listing(&mut e, &rx);
+        // "secret" is in the list. Select it (skip ".." which is index 0).
         if let Some(fb) = e.file_browser.as_mut() {
             let idx = fb.entries.iter().position(|en| en.name == "secret").expect("secret dir in entries");
             fb.selected = idx;
         }
 
-        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins();
         let km = {
             let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
@@ -236,7 +342,10 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx, &fs);
+        // The descend spawned a listing that fails (chmod 000) — pump its result, exactly
+        // as the run loop would deliver it.
+        crate::test_support::pump_listing(&mut e, &rx);
 
         // Dir must NOT have changed — still at parent.
         let fb_dir = e.file_browser.as_ref().map(|fb| fb.dir.clone());
@@ -261,7 +370,8 @@ mod tests {
     fn open_file_browser_enforces_xor() {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 12));
         e.open_palette();
-        e.open_file_browser(&crate::fsx::RealFs, std::env::temp_dir());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        e.open_file_browser(&crate::test_support::test_fs(), &tx, std::env::temp_dir());
         assert!(e.file_browser.is_some());
         assert!(e.palette.is_none(), "opening file_browser clears the palette (XOR)");
     }
@@ -281,7 +391,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("real_sub"), dir.join("link_sub")).expect("symlink");
 
         let mut fb = empty_fb(dir.clone());
-        crate::file_browser_listing::refetch(&crate::fsx::RealFs, &mut fb, default_opts());
+        seed_listing(&crate::fsx::RealFs, &mut fb, default_opts());
 
         let link = fb.entries.iter().find(|e| e.name == "link_sub").expect("link listed");
         assert!(matches!(link.kind, crate::fsx::EntryKind::Dir),
@@ -331,7 +441,7 @@ mod tests {
         // reads live after the trait-object clone is handed to the keystroke path.
         let counting = std::sync::Arc::new(CountingFs { inner: crate::fsx::RealFs, calls: AtomicUsize::new(0) });
         let mut fb = empty_fb(dir.clone());
-        crate::file_browser_listing::refetch(&*counting, &mut fb, default_opts());
+        seed_listing(&*counting, &mut fb, default_opts());
         assert_eq!(counting.calls.load(Ordering::Relaxed), 1, "one fetch on open");
 
         // Keystrokes go through the REAL intercept — mutating `fb.query` and calling
@@ -347,5 +457,121 @@ mod tests {
         assert!(e.file_browser.as_ref().unwrap().entries.iter().any(|x| x.name == "alpha.md"),
             "and the filter still works");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_listing_after_close_and_reopen_is_discarded() {
+        // FAIL-VERIFY: move the epoch onto FileBrowser, watch this fail, then revert.
+        //
+        // THE ABA CASE. If the epoch lived on FileBrowser, closing would drop it and the
+        // reopened picker would restart at the same value — so the FIRST picker's still
+        // in-flight listing would carry a matching epoch and be accepted, painting the wrong
+        // directory. A process-global counter never reissues, so the match is unforgeable.
+        //
+        // Fast listings hide this: the window only opens when a listing OUTLIVES the picker
+        // that started it, which is exactly the hung-mount case the thread exists for.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let dir_a = std::env::temp_dir().join(format!("wc-aba-a-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("wc-aba-b-{}", std::process::id()));
+        for d in [&dir_a, &dir_b] { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).expect("dir"); }
+        std::fs::write(dir_a.join("from_a.md"), b"x").expect("seed");
+        std::fs::write(dir_b.join("from_b.md"), b"x").expect("seed");
+
+        // Picker #1 over dir_a; capture the epoch it is awaiting, then CLOSE it.
+        let _rx_a = crate::test_support::open_and_pump(&mut e, dir_a.clone());
+        let stale_epoch = e.file_browser.as_ref().expect("open").awaiting_epoch;
+        e.file_browser = None;
+
+        // Picker #2 over dir_b.
+        let _rx_b = crate::test_support::open_and_pump(&mut e, dir_b.clone());
+        let fresh_epoch = e.file_browser.as_ref().expect("reopen").awaiting_epoch;
+        assert_ne!(stale_epoch, fresh_epoch, "a global epoch never reissues across close/reopen");
+
+        // Picker #1's listing finally lands.
+        let stale = crate::fsx::DirListing {
+            entries: vec![crate::fsx::DirEntryInfo {
+                name: "from_a.md".into(), raw_name: "from_a.md".into(),
+                kind: crate::fsx::EntryKind::File, is_symlink: false, broken: false }],
+            total_seen: 1, unreadable: 0,
+        };
+        apply_listing_done(&mut e, stale_epoch, dir_a.clone(), Ok(stale));
+
+        let names: Vec<String> =
+            e.file_browser.as_ref().expect("still open").entries.iter().map(|r| r.name.clone()).collect();
+        assert!(!names.iter().any(|n| n == "from_a.md"),
+            "the stale listing must be discarded: {names:?}");
+        assert_eq!(e.file_browser.as_ref().expect("open").dir, dir_b, "picker #2 is untouched");
+        for d in [&dir_a, &dir_b] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    #[cfg(unix)]   // chmod-based unreadability is meaningless off Unix
+    #[allow(clippy::print_stderr)] // env-conditional skip notice — mirrors fsx.rs's harness allow
+    fn a_failed_descend_leaves_the_writer_exactly_where_they_were() {
+        // `chmod 000` does not restrict root or CAP_DAC_OVERRIDE. If the listing SUCCEEDS the
+        // premise is void — skip rather than assert an inverted result, because a test that
+        // passes for the wrong reason is worse than one that opts out loudly.
+        if crate::test_support::nix_privileged() {
+            eprintln!("skip: privileged process — chmod 000 does not restrict this test");
+            return;
+        }
+        // The hold-pending guarantee. `fb.dir` does not move on Enter — it moves only when a
+        // listing for the target SUCCEEDS. So an unreadable target costs the writer nothing:
+        // not their directory, not their query, not their selection.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let dir = std::env::temp_dir().join(format!("wc-faildescend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("keep.md"), b"x").expect("seed");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> = std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_file_browser(&fs, &tx, dir.clone());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        // Drive a REAL descend. Hand-stamping `awaiting_epoch`/`pending_dir` and calling
+        // `apply_listing_done` would test only the error arm — if `file_browser_enter`'s
+        // Descend arm moved `fb.dir`/`query` eagerly (the guarantee being claimed), that
+        // version passes.
+        //
+        // FAIL-VERIFY: make the Descend arm set `fb.dir = target` and clear `fb.query` before
+        // spawning, watch this fail on both the dir and the query assertion.
+        let bad = dir.join("unreadable");
+        std::fs::create_dir_all(&bad).expect("dir");
+        std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("chmod 000 so the listing fails");
+        e.file_browser.as_mut().expect("open").query.push_str("ke");
+        // Select the unreadable directory and press Enter through the real intercept.
+        {
+            let fb = e.file_browser.as_mut().expect("open");
+            fb.entries = vec![crate::file_browser::FileEntry {
+                name: "unreadable".into(), kind: crate::fsx::EntryKind::Dir,
+                is_symlink: false, broken: false }];
+            fb.selected = 0;
+        }
+        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+        // The listing fails on its thread; pump the result the run loop would deliver.
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o755)).ok();
+
+        let fb = e.file_browser.as_ref().expect("picker stays open");
+        assert_eq!(fb.dir, dir, "a failed descend does NOT move the writer");
+        assert_eq!(fb.query, "ke", "and does not cost them the query they had typed");
+        assert!(fb.pending_dir.is_none(), "the pending target is cleared");
+        assert!(e.status_text().contains("cannot read directory"), "and they are told");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listing_result_with_no_active_picker_is_discarded_without_panic() {
+        // Both halves of the discard condition are required: the epoch match, AND
+        // "no active picker discards unconditionally". Without the second, the first has
+        // nothing to compare against.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        assert!(e.file_browser.is_none(), "precondition: no picker");
+        let l = crate::fsx::DirListing { entries: vec![], total_seen: 0, unreadable: 0 };
+        apply_listing_done(&mut e, 12345, std::env::temp_dir(), Ok(l));
+        assert!(e.file_browser.is_none(), "no picker was resurrected, and no panic");
     }
 }

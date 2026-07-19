@@ -70,6 +70,16 @@ pub enum Msg {
     },
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
+    /// A directory listing completed on its own thread. NOT a `jobs::Job` — `ThreadExecutor`
+    /// is a single FIFO shared with Save and SwapWrite, so a listing blocked on a hung mount
+    /// would queue AHEAD of the user's saves, turning a browsing hiccup into a durability
+    /// outage. `dir` is diagnostic (and for the merge-targets-what-it-thinks assertion); the
+    /// discard condition is the EPOCH alone.
+    ListingDone {
+        epoch: u64,
+        dir: std::path::PathBuf,
+        result: std::io::Result<crate::fsx::DirListing>,
+    },
     Tick,
     /// The input reader thread ended (Err from read(), or a panic). Surfaced by
     /// the input watchdog; the run loop turns it into a clean InputLost shutdown.
@@ -125,6 +135,8 @@ impl std::fmt::Debug for Msg {
                 .field("id", id).field("buffer_id", buffer_id)
                 .field("has_text", &text.is_some()).finish(),
             Msg::ClipboardAvailability(ok) => f.debug_tuple("ClipboardAvailability").field(ok).finish(),
+            Msg::ListingDone { epoch, dir, .. } =>
+                write!(f, "ListingDone(epoch={epoch}, dir={})", dir.display()),
             Msg::Tick => f.write_str("Tick"),
             Msg::InputThreadDied => f.write_str("InputThreadDied"),
         }
@@ -335,6 +347,9 @@ fn reduce_dispatch(
         Msg::DiagProviderEvent { source, event } =>
             crate::diag_provider::apply_provider_event(editor, source, event, clock),
         Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx, fs),
+        Msg::ListingDone { epoch, dir, result } => {
+            crate::file_browser::apply_listing_done(editor, epoch, dir, result);
+        }
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Intercepted in the run loop before `reduce` (see run()); unreachable here.
@@ -4132,12 +4147,13 @@ mod tests {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
         let mut e = Editor::new_from_text("", None, (80, 24));
-        e.open_file_browser(&crate::fsx::RealFs, dir.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        e.open_file_browser(&crate::test_support::test_fs(), &tx, dir.clone());
+        crate::test_support::pump_listing(&mut e, &rx);
         assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 25,
             "precondition: 25 entries (.., d00..d23)");
         let reg = Registry::builtins();
         let km = cua_keymap();
-        let (tx, _rx) = std::sync::mpsc::channel();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
             code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
@@ -4177,6 +4193,8 @@ mod tests {
             "precondition for visible-row dispatch: scroll_top must be > 0");
         // Enter on a directory — descend (selected entry is d23 directory).
         crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        // The descend spawned a listing on `tx` — pump it before reading the post-descend state.
+        crate::test_support::pump_listing(&mut e, &rx);
         // After descend into a directory: selected==0, scroll_top==0.
         if let Some(fb) = e.file_browser.as_ref() {
             // We descended into the dir named `selected_entry`.
@@ -4213,14 +4231,15 @@ mod tests {
         std::fs::write(parent.join("d14").join("file_a.md"), "x").unwrap();
         std::fs::write(parent.join("d14").join("file_b.md"), "x").unwrap();
         let mut e = Editor::new_from_text("", None, (80, 24));
-        e.open_file_browser(&crate::fsx::RealFs, parent.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        e.open_file_browser(&crate::test_support::test_fs(), &tx, parent.clone());
+        crate::test_support::pump_listing(&mut e, &rx);
         // rebuild_entries sorts dirs before files; ".." is index 0, d00..d24 follow.
         // 26 entries total (.., d00..d24).
         assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 26,
             "precondition: 26 entries (.., d00..d24)");
         let reg = Registry::builtins();
         let km = cua_keymap();
-        let (tx, _rx) = std::sync::mpsc::channel();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
             code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
@@ -4234,6 +4253,7 @@ mod tests {
         assert!(matches!(fb.entries[fb.selected].kind, crate::fsx::EntryKind::Dir), "d14 must be a directory");
         // Enter → descend into d14. No panic, selected and scroll_top reset.
         crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        crate::test_support::pump_listing(&mut e, &rx);
         let fb = e.file_browser.as_ref().expect("file browser must remain open after descend into dir");
         assert_eq!(fb.selected, 0, "after descend: selected must reset to 0");
         assert_eq!(fb.scroll_top, 0, "after descend: scroll_top must reset to 0");

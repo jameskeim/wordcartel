@@ -346,7 +346,7 @@ mod tests {
             ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
-            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::fsx::RealFs, std::path::PathBuf::from(".")))),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
             ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
@@ -413,7 +413,7 @@ mod tests {
             ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
-            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::fsx::RealFs, std::path::PathBuf::from(".")))),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
             ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
@@ -443,6 +443,7 @@ mod tests {
     #[test]
     #[allow(clippy::type_complexity)] // test-local table of (name, opener closure) pairs; not a public API surface
     fn close_all_clears_every_overlay() {
+        let (tx, _rx) = std::sync::mpsc::channel();
         let diag_fixture = || wordcartel_core::diagnostics::Diagnostic {
             range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
             source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
@@ -454,7 +455,7 @@ mod tests {
             ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
-            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::fsx::RealFs, std::path::PathBuf::from(".")))),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
             ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),

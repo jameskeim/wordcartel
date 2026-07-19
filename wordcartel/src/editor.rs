@@ -917,22 +917,26 @@ impl Editor {
         self.palette = Some(p);
     }
 
-    /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
-    pub fn open_file_browser(&mut self, fs: &dyn crate::fsx::Fs, dir: std::path::PathBuf) {
+    /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant. The
+    /// listing is fetched off-thread (Task 13) — `fb.dir` is set immediately so the
+    /// painter has a title, and `start_listing` records the SAME `dir` as the pending
+    /// target, so the eventual commit is a no-op move for this initial open. ONE spawn
+    /// path serves both "open" and "descend", not two.
+    pub fn open_file_browser(&mut self,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+        dir: std::path::PathBuf)
+    {
         crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        let opts = crate::file_browser_listing::FilterOpts {
-            show_clutter: self.files_show_clutter,
-            types: self.files_type_filter,
-            destination: false,
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: dir.clone(), query: String::new(),
+            listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
         };
-        self.file_browser = Some(crate::file_browser::FileBrowser {
-            dir, query: String::new(), listing: Vec::new(), total_seen: 0, unreadable: 0,
-            entries: Vec::new(), disclosure: Default::default(), selected: 0, scroll_top: 0,
-        });
-        if let Some(fb) = self.file_browser.as_mut() {
-            crate::file_browser_listing::refetch(fs, fb, opts);
-        }
+        crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
+        self.file_browser = Some(fb);
     }
 
     /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.

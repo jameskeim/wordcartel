@@ -1,11 +1,14 @@
 //! Pure listing pipeline for the file browser: cache -> filter -> rank -> disclosure.
 //!
-//! No IO except `refetch`, and no `Editor`. Kept separate from `file_browser.rs` on one
-//! axis of change: this module answers "which rows exist", not "what a browser is".
+//! NO IO at all, and no `Editor`. Kept separate from `file_browser.rs` on one axis of
+//! change: this module answers "which rows exist", not "what a browser is". The one-time
+//! fetch that used to live here (`refetch`) moved off-thread (Task 13): `file_browser::
+//! start_listing` spawns it, `file_browser::apply_listing_done` merges the result and
+//! calls `rederive` below.
 
 use crate::config::FileTypeFilter;
 use crate::file_browser::{FileBrowser, FileEntry};
-use crate::fsx::{DirEntryInfo, EntryKind, Fs};
+use crate::fsx::{DirEntryInfo, EntryKind};
 
 /// VCS/system directory names withheld as clutter even though they are already
 /// dot-prefixed — so the list stays honest if the dotfile rule ever changes.
@@ -122,23 +125,6 @@ pub(crate) fn filter_and_rank(
     }));
 
     (rows, Disclosure { shown, hidden_clutter, hidden_type, capped_out, unreadable, total_seen })
-}
-
-/// Fetch ONCE for `fb.dir`, then derive. Called on open and descend only.
-pub(crate) fn refetch(fs: &dyn Fs, fb: &mut FileBrowser, opts: FilterOpts) {
-    match fs.list_dir(&fb.dir, Some(crate::limits::MAX_DIR_ENTRIES)) {
-        Ok(l) => {
-            fb.listing = l.entries;
-            fb.total_seen = l.total_seen;
-            fb.unreadable = l.unreadable;
-        }
-        Err(_) => {
-            fb.listing = Vec::new();
-            fb.total_seen = 0;
-            fb.unreadable = 0;
-        }
-    }
-    rederive(fb, opts);
 }
 
 /// Re-derive `entries`/`disclosure` from the CACHED listing. This is the keystroke path and

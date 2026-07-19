@@ -290,7 +290,7 @@ impl Registry {
                 .and_then(|p| p.parent())
                 .map(|d| d.to_path_buf())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            c.editor.open_file_browser(&*c.fs, dir);
+            c.editor.open_file_browser(&c.fs, &c.msg_tx, dir);
             CommandResult::Handled
         });
         r.register("save", "Save", Some(MenuCategory::File), crate::save::dispatch_save);

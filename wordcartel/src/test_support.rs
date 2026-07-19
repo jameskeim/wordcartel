@@ -217,7 +217,6 @@ pub(crate) fn press_char_fb(e: &mut crate::editor::Editor,
 { press_key_fb(e, fs, tx, crossterm::event::KeyCode::Char(c)); }
 
 /// Enter through the intercept.
-#[allow(dead_code)] // Task 12 introduces this; Tasks 13-26 are its first callers.
 pub(crate) fn press_enter_fb(e: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     tx: &std::sync::mpsc::Sender<crate::app::Msg>)
@@ -226,7 +225,6 @@ pub(crate) fn press_enter_fb(e: &mut crate::editor::Editor,
 /// True when the process can read a mode-000 directory (root / CAP_DAC_OVERRIDE), which
 /// voids the premise of any chmod-based unreadability test. Tests that would otherwise
 /// assert a false negative skip loudly on this rather than passing vacuously.
-#[allow(dead_code)] // Task 12 introduces this; Tasks 13-26 are its first callers.
 pub(crate) fn nix_privileged() -> bool {
     let d = std::env::temp_dir().join(format!("wc-priv-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -241,4 +239,41 @@ pub(crate) fn nix_privileged() -> bool {
         return readable;
     }
     #[allow(unreachable_code)] { let _ = std::fs::remove_dir_all(&d); false }
+}
+
+// ---------------------------------------------------------------------------
+// Task 13: the file-browser listing now runs off-thread behind a process-global
+// epoch (`file_browser::start_listing` / `apply_listing_done`). Every test that opens
+// a picker and wants to read its entries must pump the `Msg::ListingDone` the spawned
+// thread sends — these two helpers are shared across every module with a file-browser
+// test (`file_browser`, `mouse`, `render`, `app`, `session_restore`, `overlays`).
+// ---------------------------------------------------------------------------
+
+/// Deliver one pending `Msg::ListingDone` from the channel into the editor. The listing
+/// runs on its own thread, so a test that drives Enter/open must pump the result to
+/// observe the outcome. Bounded wait — never hangs a test run.
+pub(crate) fn pump_listing(e: &mut crate::editor::Editor,
+    rx: &std::sync::mpsc::Receiver<crate::app::Msg>) -> bool
+{
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(crate::app::Msg::ListingDone { epoch, dir, result }) => {
+            crate::file_browser::apply_listing_done(e, epoch, dir, result);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Open the file browser via the real async path (`Editor::open_file_browser`) and pump
+/// its initial listing so `fb.entries` is populated before the caller's first assertion.
+/// Returns the receiver so the caller can pump further listings (e.g. a subsequent
+/// descend) on the SAME channel.
+pub(crate) fn open_and_pump(e: &mut crate::editor::Editor, dir: std::path::PathBuf)
+    -> std::sync::mpsc::Receiver<crate::app::Msg>
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> = std::sync::Arc::new(crate::fsx::RealFs);
+    e.open_file_browser(&fs, &tx, dir);
+    pump_listing(e, &rx);
+    rx
 }
