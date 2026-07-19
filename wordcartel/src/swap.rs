@@ -248,7 +248,7 @@ pub(crate) fn cleanable_recovery_files(fs: &dyn crate::fsx::Fs, dir: &Path,
     let Ok(listing) = fs.list_dir(dir, None) else { return out };
     for e in listing.entries {
         let path = dir.join(&e.name);
-        if recovery_file_is_cleanable(fs, dir, &path, &e.name, protected, me) { out.push(path); }
+        if recovery_file_is_cleanable(fs, dir, &path, &e.name, protected, me, None) { out.push(path); }
     }
     out
 }
@@ -257,15 +257,20 @@ pub(crate) fn cleanable_recovery_files(fs: &dyn crate::fsx::Fs, dir: &Path,
 /// and `recovery_path_still_cleanable` (H5 confirm-time re-verify). `dir` is the directory the
 /// candidate lives in (needed to resolve a `.tmp` target); `me` is our pid. Fails closed: any
 /// path whose recovery value cannot be positively disproved returns `false`.
+/// `parsed` is an OPTIONAL already-parsed header for a `*.swp` candidate, so a caller that
+/// has read the swap for its own reasons does not force a second read+parse of the same file
+/// (`kept_recoverable`). It is a caching parameter only: passing `None` reads it here, and the
+/// verdict is identical either way — the oracle stays single, which is what keeps the offered
+/// and kept sets describing the same world.
 fn recovery_file_is_cleanable(
     fs: &dyn crate::fsx::Fs, dir: &Path, path: &Path, fname: &str,
-    protected: &HashSet<PathBuf>, me: u32,
+    protected: &HashSet<PathBuf>, me: u32, parsed: Option<&SwapHeader>,
 ) -> bool {
     if protected.contains(path) { return false; } // open buffer / session swap → never offer
     if fname.starts_with("recovered-") && fname.ends_with(".md") {
         true                                       // the app's own already-extracted dump
     } else if fname.ends_with(".swp") {
-        swap_is_cleanable(fs, path)
+        swap_is_cleanable(fs, path, parsed)
     } else if fname.ends_with(".tmp") {
         tmp_is_cleanable(fs, dir, path, fname, me)
     } else {
@@ -283,7 +288,8 @@ pub(crate) fn recovery_path_still_cleanable(fs: &dyn crate::fsx::Fs, path: &Path
     protected: &HashSet<PathBuf>) -> bool
 {
     let (Some(dir), Some(fname)) = (path.parent(), path.file_name()) else { return false };
-    recovery_file_is_cleanable(fs, dir, path, &fname.to_string_lossy(), protected, std::process::id())
+    recovery_file_is_cleanable(fs, dir, path, &fname.to_string_lossy(), protected,
+        std::process::id(), None)
 }
 
 /// A recovery artifact the sweep DELIBERATELY spares because it may hold unsaved work,
@@ -319,14 +325,10 @@ pub struct KeptRecoverable {
 /// Ordered most-recently-written first, so the entry likeliest to matter heads a truncated
 /// list. Never used to decide a deletion.
 ///
-/// # Examples
-///
-/// ```ignore
-/// let protected = crate::swap::open_swap_paths(editor);
-/// for k in crate::swap::kept_recoverable(fs, &state_dir, &protected) {
-///     eprintln!("keeping {} (written {})", k.realpath, k.ts_ms);
-/// }
-/// ```
+/// Called with the SAME `protected` set and state dir as `cleanable_recovery_files` — see
+/// `prompts::open_clean_recovery`, which computes both once so the offered and kept lists
+/// cannot describe different moments. (No doc example: this fn is crate-private, so an
+/// example block over it is never compiled and would be an unchecked claim.)
 pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
     protected: &HashSet<PathBuf>) -> Vec<KeptRecoverable>
 {
@@ -339,9 +341,13 @@ pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
         if !e.name.ends_with(".swp") { continue; }
         let path = dir.join(&e.name);
         if protected.contains(&path) { continue; }              // an open buffer's live swap
-        if recovery_file_is_cleanable(fs, dir, &path, &e.name, protected, me) { continue; }
+        // Read and parse ONCE, then hand the header to the shared oracle rather than letting
+        // it re-read the same file: every reported orphan would otherwise cost two reads.
         let Some(raw) = read_swap_capped(fs, &path) else { continue };
         let Some((header, _body)) = parse(&raw) else { continue };  // cannot identify itself
+        if recovery_file_is_cleanable(fs, dir, &path, &e.name, protected, me, Some(&header)) {
+            continue;                                           // the sweep offers it; not kept
+        }
         if pid_is_live(header.pid) { continue }                 // a running session owns it
         let Some(realpath) = header.realpath else { continue }; // no document path to name
         out.push(KeptRecoverable { realpath, ts_ms: header.ts_ms });
@@ -352,9 +358,23 @@ pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
 
 /// True iff a `*.swp` candidate is provably valueless (see `cleanable_recovery_files`).
 /// Every early return is a "keep" (fail closed).
-fn swap_is_cleanable(fs: &dyn crate::fsx::Fs, candidate: &Path) -> bool {
-    let Some(raw) = read_swap_capped(fs, candidate) else { return false };  // unreadable / oversized
-    let Some((header, _body)) = parse(&raw) else { return false };      // unparseable provenance
+///
+/// `parsed` supplies an already-parsed header when the caller has one; `None` reads and
+/// parses the candidate here. Only the header is consulted (the body was never used), so the
+/// two forms are the same verdict over the same bytes.
+fn swap_is_cleanable(fs: &dyn crate::fsx::Fs, candidate: &Path, parsed: Option<&SwapHeader>)
+    -> bool
+{
+    let read_here;
+    let header = match parsed {
+        Some(h) => h,
+        None => {
+            let Some(raw) = read_swap_capped(fs, candidate) else { return false }; // unreadable
+            let Some((h, _body)) = parse(&raw) else { return false };  // unparseable provenance
+            read_here = h;
+            &read_here
+        }
+    };
     if pid_is_live(header.pid) { return false }                         // a live writer owns it
     let Some(rp) = header.realpath.as_deref() else { return false };    // no doc path recorded
     let real = Path::new(rp);
@@ -1035,17 +1055,45 @@ mod tests {
 
         // (a) DiscardSilently + dead pid → cleanable.
         let (p, sp) = make_doc_with_swap("saved\n", "saved\n", DEAD_PID);
-        assert!(swap_is_cleanable(&crate::fsx::RealFs, &sp), "swap body == saved file → zero recovery value → cleanable");
+        assert!(swap_is_cleanable(&crate::fsx::RealFs, &sp, None), "swap body == saved file → zero recovery value → cleanable");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
 
         // (b) Prompt (diverged) → NEVER cleanable (recoverable unsaved content).
         let (p, sp) = make_doc_with_swap("on disk\n", "UNSAVED WORK\n", DEAD_PID);
-        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &sp), "a diverged, recoverable swap must never be cleanable — no data loss");
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &sp, None), "a diverged, recoverable swap must never be cleanable — no data loss");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
 
         // (c) live pid → excluded even though the body matches (a live writer owns it).
         let (p, sp) = make_doc_with_swap("saved\n", "saved\n", std::process::id());
-        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &sp), "a live-pid swap is never swept");
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &sp, None), "a live-pid swap is never swept");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+    }
+
+    /// The `parsed` caching parameter must be a pure optimisation: a caller that already read
+    /// the swap (`kept_recoverable`) hands the header in, and the verdict must be BYTE-for-byte
+    /// the verdict the reading form gives. If these two ever disagreed, the offered set and the
+    /// kept set would describe different worlds — a swap could be both swept and reported spared.
+    ///
+    /// FAIL-VERIFY: make the `Some(h)` arm ignore `h` and answer `false`, watch case (a) fail.
+    #[test]
+    fn swap_is_cleanable_gives_the_same_verdict_from_a_cached_header() {
+        let reread = |sp: &std::path::Path| swap_is_cleanable(&crate::fsx::RealFs, sp, None);
+        let cached = |sp: &std::path::Path| {
+            let raw = read_swap_capped(&crate::fsx::RealFs, sp).expect("swap is readable");
+            let (h, _body) = parse(&raw).expect("swap parses");
+            swap_is_cleanable(&crate::fsx::RealFs, sp, Some(&h))
+        };
+        // (a) valueless + dead pid → cleanable, from either form.
+        let (p, sp) = make_doc_with_swap("saved\n", "saved\n", DEAD_PID);
+        assert!(reread(&sp) && cached(&sp), "a valueless dead-pid swap is cleanable either way");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+        // (b) diverged → never cleanable, from either form (the no-data-loss half).
+        let (p, sp) = make_doc_with_swap("on disk\n", "UNSAVED WORK\n", DEAD_PID);
+        assert!(!reread(&sp) && !cached(&sp), "a diverged swap is spared either way");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+        // (c) live pid → excluded from either form.
+        let (p, sp) = make_doc_with_swap("saved\n", "saved\n", std::process::id());
+        assert!(!reread(&sp) && !cached(&sp), "a live-pid swap is spared either way");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
     }
 
@@ -1059,7 +1107,7 @@ mod tests {
         let raw = std::fs::read_to_string(&sp).unwrap();
         let relocated = unique_dir("reloc").join("relocated.swp");
         std::fs::write(&relocated, &raw).unwrap();
-        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &relocated),
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &relocated, None),
             "a swap not at its canonical swap_path(realpath) is excluded (stale/relocated twin)");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&relocated);
@@ -1069,7 +1117,7 @@ mod tests {
             content_hash: fnv1a64(b"x\n"), version: 1, ts_ms: 1, pid: DEAD_PID, ..Default::default() };
         let none_swap = unique_dir("none").join("nopath.swp");
         write_atomic(&none_swap, &serialize(&h, "x\n")).unwrap();
-        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &none_swap), "a swap with no recorded realpath is excluded");
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &none_swap, None), "a swap with no recorded realpath is excluded");
         let _ = std::fs::remove_file(&none_swap);
     }
 

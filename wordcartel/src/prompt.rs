@@ -15,12 +15,10 @@ const KEPT_SHOWN: usize = 5;
 /// panics: a `ts_ms` in the future (a clock that went backwards, a file copied from another
 /// machine) saturates to `just now` rather than underflowing.
 ///
-/// # Examples
-///
-/// ```ignore
-/// assert_eq!(format_age(10_000, 10_000), "just now");
-/// assert_eq!(format_age(3 * 86_400_000, 0), "3 days ago");
-/// ```
+/// `format_age(10_000, 10_000)` is `"just now"`; `format_age(3 * 86_400_000, 0)` is
+/// `"3 days ago"`. Stated as prose rather than as a doc example: this fn is private, so an
+/// example block over it can never be compiled and would be an unchecked claim.
+/// `format_age_coarsens_upward_and_never_underflows` is where those equalities are enforced.
 fn format_age(now_ms: u64, ts_ms: u64) -> String {
     let secs = now_ms.saturating_sub(ts_ms) / 1_000;
     let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
