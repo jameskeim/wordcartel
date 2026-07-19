@@ -222,6 +222,55 @@ mod tests {
         assert_eq!(fb.query, "ch1", "and leaves the in-flight filter the writer typed intact");
     }
 
+    /// C5 review finding M7. `apply_recents_probed` marks a recent whose file has vanished as
+    /// `EntryKind::Unknown` so that Enter refuses it — but it then inherited the shared
+    /// `Unknown` wording, "type could not be determined". That is a LISTING fact, reported
+    /// about a row that was never listed: nothing probed this file's type and failed, the file
+    /// simply is not there any more. A writer told their manuscript has an indeterminate type
+    /// goes looking for a filesystem problem instead of a moved file.
+    ///
+    /// Driven through the real Enter path, and paired against a genuine directory listing's
+    /// `Unknown` so the fix cannot be "reword the arm for everyone" — the two facts stay
+    /// distinct, which is the property the `Unknown` arm exists to preserve.
+    ///
+    /// FAIL-VERIFY: drop the `recents` arm from `classify_enter`, watch the status assertion
+    /// fail with "type could not be determined". Confirmed, then reverted.
+    #[test]
+    fn an_unavailable_recent_is_refused_as_gone_not_as_indeterminate() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let gone = std::path::PathBuf::from("/nonexistent/ch1.md");
+        e.open_recents_pending(vec![gone.clone()]);
+        let live_epoch = e.file_browser.as_ref().expect("picker open").awaiting_epoch;
+        crate::recents::apply_recents_probed(&mut e, live_epoch,
+            vec![crate::recents::RecentRow { path: gone, available: false }]);
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+
+        let status = e.status_text().to_lowercase();
+        assert!(status.contains("no longer available"),
+            "the refusal must say the file is gone: {status:?}");
+        assert!(!status.contains("could not be determined"),
+            "not that its type is indeterminate — nothing failed to classify it: {status:?}");
+        assert!(e.file_browser.is_some(), "and the picker stays open to pick something else");
+
+        // The listing fact keeps its own wording: a real `Unknown` in a real directory is a
+        // classification failure and must NOT inherit the recents phrasing.
+        let listed = crate::file_browser::classify_enter(
+            &crate::file_browser::FileEntry {
+                name: "mystery".into(), kind: crate::fsx::EntryKind::Unknown,
+                is_symlink: false, broken: false },
+            std::path::Path::new("/tmp"), false);
+        match listed {
+            crate::file_browser::EnterOutcome::Refuse(m) =>
+                assert!(m.contains("type could not be determined"),
+                    "a listed unclassifiable entry keeps the classification wording: {m:?}"),
+            other => panic!("an Unknown entry must still be refused, got {other:?}"),
+        }
+    }
+
     #[test]
     fn typing_narrows_the_recents_list_rather_than_clearing_it() {
         // THE reason `Recents` is an explicit variant. The rejected design used an early

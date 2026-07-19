@@ -191,7 +191,13 @@ pub(crate) enum EnterOutcome {
 
 /// What Enter does with an entry. An exhaustive match on `kind`, so `Other` and `Unknown`
 /// cannot fall into a branch meant for files.
-pub(crate) fn classify_enter(e: &FileEntry, dir: &std::path::Path) -> EnterOutcome {
+///
+/// `recents` changes only the WORDING of the `Unknown` refusal, never which entries are
+/// refused. `recents.rs` marks a row whose file no longer exists as `Unknown` so it reaches
+/// this same refusal — but the shared reason, "type could not be determined", is a listing
+/// fact reported about a row that was never listed. What actually happened is that the file
+/// is gone, and that is what the writer needs to hear (review finding M7).
+pub(crate) fn classify_enter(e: &FileEntry, dir: &std::path::Path, recents: bool) -> EnterOutcome {
     if e.name == ".." {
         // The LOGICAL parent — `fb.dir` is deliberately not canonicalized, so this returns
         // where the writer actually came from rather than a symlink target's real parent.
@@ -208,9 +214,11 @@ pub(crate) fn classify_enter(e: &FileEntry, dir: &std::path::Path) -> EnterOutco
         // Unclassifiable, including every broken symlink. "cannot be resolved", never
         // "target is gone": `broken` also covers permission denial and resolution loops.
         crate::fsx::EntryKind::Unknown => EnterOutcome::Refuse(if e.broken {
-            format!("{} — symlink cannot be resolved", e.name)
+            format!("{} \u{2014} symlink cannot be resolved", e.name)
+        } else if recents {
+            format!("{} \u{2014} no longer available", e.name)
         } else {
-            format!("{} — type could not be determined", e.name)
+            format!("{} \u{2014} type could not be determined", e.name)
         }),
     }
 }
@@ -300,10 +308,11 @@ pub(crate) fn file_browser_enter(
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     let chosen = editor.file_browser.as_ref().and_then(|fb| {
-        fb.entries.get(fb.selected).cloned().map(|e| (e, fb.dir.clone()))
+        fb.entries.get(fb.selected).cloned()
+            .map(|e| (e, fb.dir.clone(), matches!(fb.mode, BrowseMode::Recents)))
     });
-    let Some((entry, dir)) = chosen else { return };
-    match classify_enter(&entry, &dir) {
+    let Some((entry, dir, recents)) = chosen else { return };
+    match classify_enter(&entry, &dir, recents) {
         EnterOutcome::Descend(target) => {
             if let Some(fb) = editor.file_browser.as_mut() {
                 // Does NOT touch fb.dir / query / selected / scroll_top. All four move
@@ -553,22 +562,22 @@ mod tests {
     fn classify_enter_covers_every_kind_exhaustively() {
         use crate::fsx::EntryKind::*;
         let d = std::path::Path::new("/tmp/wc-classify");
-        assert_eq!(classify_enter(&fe("sub", Dir, false, false), d),
+        assert_eq!(classify_enter(&fe("sub", Dir, false, false), d, false),
             EnterOutcome::Descend(d.join("sub")));
-        assert_eq!(classify_enter(&fe("sub", Dir, true, false), d),
+        assert_eq!(classify_enter(&fe("sub", Dir, true, false), d, false),
             EnterOutcome::Descend(d.join("sub")), "a symlinked dir descends like any dir");
-        assert_eq!(classify_enter(&fe("n.md", File, false, false), d),
+        assert_eq!(classify_enter(&fe("n.md", File, false, false), d, false),
             EnterOutcome::Open(d.join("n.md")));
 
         // A fifo must be REFUSED, and for a concrete reason: file::open on a fifo BLOCKS.
-        match classify_enter(&fe("pipe", Other, false, false), d) {
+        match classify_enter(&fe("pipe", Other, false, false), d, false) {
             EnterOutcome::Refuse(msg) => assert!(msg.to_lowercase().contains("cannot be opened"),
                 "the reason must name the openability problem, got {msg:?}"),
             other => panic!("a fifo must be refused, got {other:?}"),
         }
         // An unresolvable entry is refused with a DIFFERENT reason — the pair of facts the
         // old bool model could not separate.
-        match classify_enter(&fe("dangling.md", Unknown, true, true), d) {
+        match classify_enter(&fe("dangling.md", Unknown, true, true), d, false) {
             EnterOutcome::Refuse(msg) => assert!(msg.to_lowercase().contains("cannot be resolved"),
                 "must say cannot-be-resolved, NOT 'target is gone' — broken also covers \
                  permission and loop failures, got {msg:?}"),
@@ -578,7 +587,7 @@ mod tests {
         // at fsx.rs's `Err(_) => (EntryKind::Unknown, false, false)` path, NOT a symlink — must
         // get the OTHER reason. Collapsing this arm to always return the broken-symlink message
         // is a real mutation that left every prior test green; this guards against it.
-        match classify_enter(&fe("mystery", Unknown, false, false), d) {
+        match classify_enter(&fe("mystery", Unknown, false, false), d, false) {
             EnterOutcome::Refuse(msg) => {
                 assert!(msg.to_lowercase().contains("could not be determined"),
                     "a non-broken Unknown must say type-could-not-be-determined, got {msg:?}");
@@ -592,7 +601,7 @@ mod tests {
     #[test]
     fn dotdot_descends_to_the_logical_parent() {
         let d = std::path::Path::new("/tmp/wc-classify/sub");
-        assert_eq!(classify_enter(&fe("..", crate::fsx::EntryKind::Dir, false, false), d),
+        assert_eq!(classify_enter(&fe("..", crate::fsx::EntryKind::Dir, false, false), d, false),
             EnterOutcome::Descend(std::path::PathBuf::from("/tmp/wc-classify")),
             "'..' walks the LOGICAL parent — fb.dir is deliberately not canonicalized, so a \
              writer who descended through a symlink leaves by the path they came in on");
