@@ -104,7 +104,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     // Drop an async clipboard-paste result that arrives while the browser is open —
     // it must not land in the document behind the overlay (Codex I6, mirror palette).
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     if let Msg::Input(Event::Paste(text)) = &msg {
         let ah = editor.active().view.area.1;
@@ -113,7 +113,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             crate::file_browser::rebuild_entries(fb);
             crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -150,7 +150,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     // Non-key msg falls through to normal handling while the browser stays open.
     crate::app::Handled::Pass(msg)
@@ -223,7 +223,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
 
         // Dir must NOT have changed — still at parent.
         let fb_dir = e.file_browser.as_ref().map(|fb| fb.dir.clone());

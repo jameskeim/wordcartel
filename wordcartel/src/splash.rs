@@ -228,7 +228,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &crate::test_support::test_fs() };
         intercept(msg, e, &ctx)
     }
 

@@ -114,7 +114,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     match mb.kind {
                         MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, ctx.msg_tx),
                         MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
-                        MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ctx.ex, ctx.clock, ctx.msg_tx),
+                        MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
                         MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
                         MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
                         MinibufferKind::PluginArg { id } => {
@@ -131,7 +131,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
     crate::app::Handled::Pass(msg)
@@ -179,7 +179,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &crate::test_support::test_fs() };
         let msg = crate::app::Msg::Input(Event::Key(enter_key()));
         intercept(msg, &mut editor, &ctx);
 
@@ -204,7 +204,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &crate::test_support::test_fs() };
         let msg = crate::app::Msg::Input(Event::Key(enter_key()));
         intercept(msg, &mut editor, &ctx);
 

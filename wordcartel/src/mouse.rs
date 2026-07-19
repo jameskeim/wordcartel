@@ -170,7 +170,7 @@ pub(crate) fn mouse_palette(editor: &mut Editor, ev: MouseEvent, area: ratatui::
                     crate::workspace::switch_to(editor, idx);
                 }
             } else {
-                crate::app::dispatch_overlay_command(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, id);
+                crate::app::dispatch_overlay_command(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, id, ctx.fs);
             }
         } else if !inside {
             crate::overlays::close_all(editor); // click outside closes
@@ -274,7 +274,7 @@ pub(crate) fn mouse_menu(editor: &mut Editor, ev: MouseEvent, area: ratatui::lay
             let m = editor.menu.as_mut().unwrap();
             m.open = cat; m.highlighted = 0; m.scroll_top = 0;
         } else if let Some(action) = row_action {
-            crate::menu::dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action);
+            crate::menu::dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action, ctx.fs);
         } else {
             crate::overlays::close_all(editor); // outside (and non-action cells) → close
         }
@@ -689,7 +689,7 @@ pub(crate) fn mouse_prompt(editor: &mut Editor, ev: MouseEvent, area: ratatui::l
             .and_then(|p| crate::chrome_geom::prompt_choice_at(area, p, ev.column, ev.row));
         if let Some(action) = action {
             // resolve_prompt clears editor.prompt in its arms — do NOT clear it here.
-            crate::prompts::resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx);
+            crate::prompts::resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs);
         }
     }
 }
@@ -747,6 +747,7 @@ pub(crate) fn mouse_search(editor: &mut Editor, ev: MouseEvent, area: ratatui::l
 }
 
 #[allow(clippy::too_many_lines)] // mouse event dispatch — one branch per screen region
+#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub fn handle(
     editor: &mut Editor,
     ev: MouseEvent,
@@ -755,6 +756,7 @@ pub fn handle(
     ex: &dyn crate::jobs::Executor,
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     if editor.pending_mark.is_some() || !editor.mouse_capture {
         return;
@@ -776,7 +778,7 @@ pub fn handle(
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if !no_overlay_open(editor) {
-        let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx };
+        let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx, fs };
         route_overlay(editor, ev, area, &ctx);
         return;
     }
@@ -1015,7 +1017,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let (reg, ex, clk, tx, km) = ctx();
         // cell (1,1) = 'e' in "def" → offset 5 (no menu, so screen row == editing row)
-        handle(&mut e, down(1, 1), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(1, 1), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(crate::nav::head(&e), 5);
     }
 
@@ -1024,7 +1026,7 @@ mod tests {
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         crate::derive::rebuild(&mut e);
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, down(0, 10), &reg, &km, &ex, &clk, &tx); // row past content
+        handle(&mut e, down(0, 10), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // row past content
         assert_eq!(crate::nav::head(&e), e.active().document.buffer.len());
     }
 
@@ -1037,7 +1039,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let (reg, ex, clk, tx, km) = ctx();
 
-        handle(&mut e, down(0, 10), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(0, 10), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
 
         let head = crate::nav::head(&e);
         let fv = {
@@ -1054,7 +1056,7 @@ mod tests {
         e.pending_mark = Some(crate::editor::MarkPending::Set);
         crate::derive::rebuild(&mut e);
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(crate::nav::head(&e), 0, "click ignored while mark capture pending");
         assert!(e.pending_mark.is_some());
     }
@@ -1064,9 +1066,9 @@ mod tests {
         let mut e = Editor::new_from_text("abcdef\n", None, (80, 24));
         crate::derive::rebuild(&mut e);
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx); // anchor at offset 1
+        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // anchor at offset 1
         let drag = MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 4, row: 0, modifiers: KeyModifiers::NONE };
-        handle(&mut e, drag, &reg, &km, &ex, &clk, &tx); // head at offset 4
+        handle(&mut e, drag, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // head at offset 4
         let r = e.active().document.selection.primary();
         assert_eq!((r.from(), r.to()), (1, 4));
     }
@@ -1077,7 +1079,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
         let (reg, ex, clk, tx, km) = ctx();
         let shift_down = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 4, row: 0, modifiers: KeyModifiers::SHIFT };
-        handle(&mut e, shift_down, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, shift_down, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let r = e.active().document.selection.primary();
         assert_eq!((r.from(), r.to()), (1, 4), "extends from existing anchor to click");
     }
@@ -1088,11 +1090,11 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let (reg, ex, clk, tx, km) = ctx();
         // two Downs on the same cell within 400ms (TestClock fixed at 0)
-        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx);
-        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let r = e.active().document.selection.primary();
         assert_eq!(e.active().document.buffer.slice(r.from()..r.to()), "beta");
-        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx); // triple → paragraph
+        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // triple → paragraph
         let r2 = e.active().document.selection.primary();
         assert!(e.active().document.buffer.slice(r2.from()..r2.to()).starts_with("alpha beta"));
     }
@@ -1105,7 +1107,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         let before = crate::nav::head(&e);
         let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
-        handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.active().view.scroll > 0, "view scrolled");
         assert_eq!(crate::nav::head(&e), before, "caret unchanged");
     }
@@ -1128,7 +1130,7 @@ mod tests {
         let rect = crate::chrome_geom::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
         let click_row = rect.y + 2 + idx as u16; // list starts at ov_y+2
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "palette closed after click");
         // move_right from offset 0 → caret at 1 proves the command was dispatched
         assert_eq!(crate::nav::head(&e), 1, "clicked move_right dispatched");
@@ -1162,7 +1164,7 @@ mod tests {
         // Click the FIRST visible list row (visual row 0, absolute row scroll_top).
         let click_row = rect.y + 2; // ov_y + 2 = first list entry
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "palette closed after click");
         // select_left from caret 1 → non-empty selection [0,1].
         // move_left from caret 1 → caret 0, selection empty.
@@ -1186,7 +1188,7 @@ mod tests {
         // 20 scroll-downs, pointer off-rect.
         let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
         for _ in 0..20 {
-            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let p = e.palette.as_ref().expect("palette still open after wheel");
         let lh = crate::list_window::list_h_for(p.rows.len(), 24);
@@ -1203,7 +1205,7 @@ mod tests {
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         e.palette = Some(crate::palette::Palette::default());
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx); // top-left, outside the centered overlay
+        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // top-left, outside the centered overlay
         assert!(e.palette.is_none());
     }
 
@@ -1216,7 +1218,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // Down on the scrollbar column (w-1 = 79), mid-track row
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 79, row: 6, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.mouse.scrollbar_dragging);
         assert!(e.active().view.scroll > 0, "scrubbed to a lower position");
     }
@@ -1230,7 +1232,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // (1, 0) is outside the overlay rect — click-away closes the picker and
         // restores the original theme; the caret must not move regardless.
-        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(crate::nav::head(&e), 0, "click absorbed by theme picker — caret must not move");
         assert!(e.theme_picker.is_none(), "click-away closes the theme picker");
     }
@@ -1275,7 +1277,7 @@ mod tests {
         let col = format_rect.x + 1; // somewhere inside the label
 
         // Click on the Format label while the bar is inactive (menu None).
-        handle(&mut e, down(col, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(col, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let menu = e.menu.as_ref().expect("click must set editor.menu to Some placeholder");
         assert!(!menu.built, "placeholder must not be built (hydration happens in reduce)");
         assert_eq!(menu.open, 3, "placeholder open must be the MENU_ORDER index of Format");
@@ -1311,7 +1313,7 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, up, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, up, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(!e.mouse.dragging, "dragging must be cleared when Up(Left) arrives during overlay");
         assert!(!e.mouse.scrollbar_dragging, "scrollbar_dragging must be cleared when Up(Left) arrives during overlay");
     }
@@ -1331,7 +1333,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let (reg, ex, _, tx, km) = ctx();
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
-        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
         assert_eq!(e.mouse.menu_reveal_due, Some(MENU_DWELL_MS),
             "Moved onto row 0 must arm reveal at now + DWELL_MS");
     }
@@ -1344,8 +1346,8 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let (reg, ex, _, tx, km) = ctx();
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
-        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
-        handle(&mut e, moved(6, 0), &reg, &km, &ex, &TestClock(100), &tx);
+        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
+        handle(&mut e, moved(6, 0), &reg, &km, &ex, &TestClock(100), &tx, &crate::test_support::test_fs());
         assert_eq!(e.mouse.menu_reveal_due, Some(100 + MENU_DWELL_MS),
             "second row-0 motion must re-arm the deadline to the LAST motion time");
     }
@@ -1361,7 +1363,7 @@ mod tests {
             e.menu_bar_mode = crate::config::MenuBarMode::Auto;
             setup(&mut e);
             let (reg, ex, _, tx, km) = ctx();
-            handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+            handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
             e.mouse.menu_reveal_due
         };
         assert!(fire(&|e| { e.mouse.dragging = true; }).is_none(),
@@ -1391,10 +1393,10 @@ mod tests {
         let (reg, ex, _, tx, km) = ctx();
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
         e.mouse.menu_bar_revealed = true;
-        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
         assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
             "first leave motion must arm the grace deadline");
-        handle(&mut e, moved(6, 5), &reg, &km, &ex, &TestClock(100), &tx);
+        handle(&mut e, moved(6, 5), &reg, &km, &ex, &TestClock(100), &tx, &crate::test_support::test_fs());
         assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
             "second leave motion must NOT re-arm — grace must stay at the FIRST leave time");
     }
@@ -1407,9 +1409,9 @@ mod tests {
         let (reg, ex, _, tx, km) = ctx();
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
         e.mouse.menu_bar_revealed = true;
-        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
         assert!(e.mouse.menu_hide_due.is_some(), "precondition: grace must be armed");
-        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(100), &tx);
+        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(100), &tx, &crate::test_support::test_fs());
         assert!(e.mouse.menu_hide_due.is_none(), "re-entry must cancel the pending hide");
         assert!(e.mouse.menu_bar_revealed, "bar must still be revealed after re-entry");
     }
@@ -1424,7 +1426,7 @@ mod tests {
         e.mouse.menu_bar_revealed = true;
         e.menu = Some(crate::menu::empty_at(0)); // dropdown open
         let (reg, ex, _, tx, km) = ctx();
-        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
         assert!(e.mouse.menu_hide_due.is_none(),
             "dwell (incl. leave-bookkeeping) must not run while an overlay is open");
     }
@@ -1435,7 +1437,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.scrollbar_mode = crate::config::TransientMode::Auto;
         let (reg, ex, _, tx, km) = ctx();
-        handle(&mut e, moved(39, 4), &reg, &km, &ex, &TestClock(0), &tx); // col w-1 = 39
+        handle(&mut e, moved(39, 4), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs()); // col w-1 = 39
         assert_eq!(e.mouse.scrollbar_reveal_due, Some(MENU_DWELL_MS));
     }
 
@@ -1453,7 +1455,7 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, wheel_up, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_up, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.mouse.menu_reveal_due.is_none(),
             "ScrollUp at row 0 must not arm the dwell (Moved-kind gate)");
     }
@@ -1494,7 +1496,7 @@ mod tests {
         };
         // 16 scroll-downs — pushes past the 15-row window.
         for _ in 0..16 {
-            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let tp = e.theme_picker.as_ref().expect("picker must remain open");
         let max_top = 20usize.saturating_sub(lh);
@@ -1535,7 +1537,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         for _ in 0..20 {
-            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let fb = e.file_browser.as_ref().expect("browser must remain open");
         let lh = crate::list_window::list_h_for(fb.entries.len(), 24);
@@ -1588,7 +1590,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "palette must close after clicking a buffer row");
         assert_eq!(e.active().id, b_id,
             "click must switch to the clicked row's buffer (B), not reopen the palette");
@@ -1626,7 +1628,7 @@ mod tests {
             e.menu_bar_mode = crate::config::MenuBarMode::Auto;
             setup(&mut e);
             let (reg, ex, _, tx, km) = ctx();
-            handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+            handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
             assert!(e.mouse.menu_reveal_due.is_none(), "{name}: modal open must suppress menu dwell");
         }
     }
@@ -1639,7 +1641,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.prompt = Some(crate::prompt::Prompt::quit_confirm());
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, down(3, 4), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(3, 4), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(crate::nav::head(&e), 0, "click must not move the caret while a prompt is open");
     }
 
@@ -1663,7 +1665,7 @@ mod tests {
         let click_row = rect.y + 2 + target as u16; // list starts ov_y+2 (scroll_top 0)
         let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.theme_picker.is_none(), "picker closes on row click");
         assert_eq!(e.theme.name, "forever-blue-jeans-dark", "clicked theme applied");
     }
@@ -1678,7 +1680,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // (0, 0) is well outside the centered overlay — click-away.
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 0, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.theme_picker.is_none(), "click-away closes the picker");
         assert_eq!(e.theme.name, original_name, "click-away restores the original theme");
     }
@@ -1704,7 +1706,7 @@ mod tests {
         let click_row = list_top + 3; // row 3 = Beam · blinking
         let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.cursor_picker.is_none(), "picker closes on row click");
         assert_eq!(e.caret_shape, CaretShape::Beam, "clicked row applied via the shared caret_shape setter");
         assert!(e.caret_blink, "row 3 (Beam · blinking) applied via the shared caret_blink setter");
@@ -1729,7 +1731,7 @@ mod tests {
         assert_eq!(e.caret_shape, CaretShape::Underline, "preview applied before the click-away");
         let (reg, ex, clk, tx, km) = ctx();
         // (0, 0) is well outside the centered overlay — click-away.
-        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.cursor_picker.is_none(), "click-away closes the cursor picker");
         assert_eq!(e.caret_shape, CaretShape::Beam, "click-away restores the original shape");
         assert!(e.caret_blink, "click-away restores the original blink");
@@ -1751,7 +1753,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
         for _ in 0..6 {
-            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let cp = e.cursor_picker.as_ref().expect("picker still open after wheel");
         let n = crate::cursor_picker::ROW_ACTIONS.len();
@@ -1781,7 +1783,7 @@ mod tests {
         let n = crate::cursor_picker::ROW_ACTIONS.len();
         let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
         // Hover row 3 (Beam · blinking) — list starts at r.y + 1 (no query row).
-        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 3, "hover set the highlight");
         let (_, _, shape, _) = crate::cursor_picker::ROW_ACTIONS[3];
         assert_eq!(e.caret_shape, shape, "hover fired the preview funnel (caret shape changed live)");
@@ -1798,9 +1800,9 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let n = crate::cursor_picker::ROW_ACTIONS.len();
         let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
-        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx); // preview row 3
+        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // preview row 3
         e.set_caret_shape(crate::config::CaretShape::Default); // tamper
-        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx); // SAME row again
+        handle(&mut e, moved(r.x + 1, r.y + 1 + 3), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // SAME row again
         assert_eq!(e.caret_shape, crate::config::CaretShape::Default,
             "same-row hover did NOT re-fire the preview (dedupe on row-change)");
     }
@@ -1818,13 +1820,21 @@ mod tests {
         let n = crate::cursor_picker::ROW_ACTIONS.len();
         let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
         // Sweep across rows 1,2,3.
-        for row in 1..=3u16 { handle(&mut e, moved(r.x + 1, r.y + 1 + row), &reg, &km, &ex, &clk, &tx); }
+        for row in 1..=3u16 { handle(&mut e, moved(r.x + 1, r.y + 1 + row), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); }
         // Esc through the intercept restores original + closes.
-        crate::app::reduce(crate::app::Msg::Input(crossterm::event::Event::Key(
+        crate::app::reduce(
+        crate::app::Msg::Input(crossterm::event::Event::Key(
             crossterm::event::KeyEvent { code: crossterm::event::KeyCode::Esc,
                 modifiers: KeyModifiers::NONE, kind: crossterm::event::KeyEventKind::Press,
                 state: crossterm::event::KeyEventState::NONE })),
-            &mut e, &reg, &km, &ex, &clk, &tx);
+            &mut e,
+            &reg,
+            &km,
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert!(e.cursor_picker.is_none(), "Esc closed the picker");
         assert_eq!(e.caret_shape, orig, "Esc after a hover sweep restored the original caret");
     }
@@ -1843,8 +1853,8 @@ mod tests {
         }
         let theme_before = e.theme.clone();
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, wheel_ev(true, 40, 12), &reg, &km, &ex, &clk, &tx);
-        handle(&mut e, wheel_ev(false, 40, 12), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(true, 40, 12), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        handle(&mut e, wheel_ev(false, 40, 12), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let tp = e.theme_picker.as_ref().unwrap();
         assert_eq!((tp.selected, tp.scroll_top), (0, 0), "empty theme list: wheel is a total no-op");
         assert_eq!(e.theme, theme_before, "empty list fired NO preview (theme unchanged)");
@@ -1864,7 +1874,7 @@ mod tests {
         { e.cursor_picker.as_mut().unwrap().selected = last; }
         e.set_caret_shape(crate::config::CaretShape::Block); // sentinel ≠ row 6's Underline
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, wheel_ev(true, 0, 0), &reg, &km, &ex, &clk, &tx); // down at bottom → no move
+        handle(&mut e, wheel_ev(true, 0, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // down at bottom → no move
         assert_eq!(e.cursor_picker.as_ref().unwrap().selected, last, "still at the bottom boundary");
         assert_eq!(e.caret_shape, crate::config::CaretShape::Block,
             "boundary wheel notch did NOT re-fire preview (sentinel Block survives; a spurious \
@@ -1887,7 +1897,7 @@ mod tests {
         let sentinel = format!("__sentinel_not_{row0}");
         { e.theme_picker.as_mut().unwrap().previewed = Some(sentinel.clone()); }
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, wheel_ev(false, 0, 0), &reg, &km, &ex, &clk, &tx); // up at 0 → no move
+        handle(&mut e, wheel_ev(false, 0, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // up at 0 → no move
         assert_eq!(e.theme_picker.as_ref().unwrap().selected, 0, "still at the top boundary");
         assert_eq!(e.theme_picker.as_ref().unwrap().previewed.as_deref(), Some(sentinel.as_str()),
             "boundary wheel notch did NOT re-fire preview (sentinel in `previewed` survives; a \
@@ -1909,7 +1919,7 @@ mod tests {
         let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
         for row in [1u16, 3, 5] {
             e.set_caret_shape(crate::config::CaretShape::Default); // tamper before each hover
-            handle(&mut e, moved(r.x + 1, r.y + 1 + row), &reg, &km, &ex, &clk, &tx);
+            handle(&mut e, moved(r.x + 1, r.y + 1 + row), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
             let (_, _, shape, _) = crate::cursor_picker::ROW_ACTIONS[row as usize];
             assert_eq!(e.caret_shape, shape, "hover on row {row} fired exactly once (tamper undone)");
         }
@@ -1935,7 +1945,7 @@ mod tests {
         let target_byte = e.outline.as_ref().unwrap().rows[1].byte;
         let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.outline.is_none(), "outline closes on click");
         assert_eq!(crate::nav::head(&e), target_byte, "caret jumps to the clicked heading");
     }
@@ -1955,7 +1965,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         for _ in 0..10 {
-            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let o = e.outline.as_ref().expect("outline must remain open after wheel");
         let lh = crate::list_window::list_h_for(o.rows.len(), 24);
@@ -1978,7 +1988,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // (0, 0) is well outside the centered overlay.
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 0, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.outline.is_none(), "click-away closes the outline");
         assert_eq!(crate::nav::head(&e), before, "caret unchanged on click-away");
     }
@@ -2017,7 +2027,7 @@ mod tests {
             row: r.y + 1,
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.diag.is_none(), "overlay closed after click-apply");
         assert_eq!(e.active().document.buffer.to_string(), "the cat\n",
             "first suggestion was applied via click");
@@ -2045,7 +2055,7 @@ mod tests {
         let buf_before = e.active().document.buffer.to_string();
         let (reg, ex, clk, tx, km) = ctx();
         // (0, 0) is outside the centered overlay.
-        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.diag.is_none(), "click-away closes the diag overlay");
         assert_eq!(e.active().document.buffer.to_string(), buf_before,
             "buffer unchanged on click-away");
@@ -2076,7 +2086,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // Click at q_col + 1 — the `Q` glyph, inside the [Q]uit span.
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: q_col + 1, row: status_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit, "clicking [Q]uit anyway must trigger the QuitAnyway action");
     }
 
@@ -2105,7 +2115,7 @@ mod tests {
             row: status_row,
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         // resolve_prompt(Transform(Unwrap)) falls through to `editor.prompt = None` —
         // prompt dismissed confirms the click hit a valid choice.
         assert!(e.prompt.is_none(),
@@ -2131,7 +2141,7 @@ mod tests {
             row: status_row,
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "click before first marker must keep the prompt open");
         assert_eq!(crate::nav::head(&e), caret_before,
             "click on status row while prompt open must not move the caret");
@@ -2168,7 +2178,7 @@ mod tests {
             row: status_row,
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit,
             "clicking at char col of [Q] (col {q_char_col}) must trigger QuitAnyway; \
              byte-offset col ({q_byte_col}) would miss the span start");
@@ -2191,7 +2201,7 @@ mod tests {
         let click_row = rect.y + 2 + idx as u16; // scroll_top is 0
         let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.file_browser.as_ref().is_some_and(|fb| fb.dir == sub),
             "click on dir must descend into it; dir={:?}", e.file_browser.as_ref().map(|fb| &fb.dir));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2216,7 +2226,7 @@ mod tests {
             open: 0, highlighted: 0, built: true, scroll_top: 0 });
         let (reg, ex, clk, tx, km) = ctx();
         let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 2, row: 3, modifiers: KeyModifiers::NONE };
-        for _ in 0..10 { handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx); }
+        for _ in 0..10 { handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); }
         let m = e.menu.as_ref().unwrap();
         assert!(m.highlighted > 0, "wheel moves the highlight");
         assert!(m.scroll_top > 0, "wheel scrolls the window once the highlight passes the visible rows");
@@ -2298,7 +2308,7 @@ mod tests {
             column: 1, row: 8, // row 8 = painted indicator row
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, click, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, click, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(caret_before, crate::nav::head(&e),
             "click on painted indicator row (row 8) must NOT dispatch move_right — caret must not advance");
     }
@@ -2318,7 +2328,7 @@ mod tests {
             column: 1, row: 9, // row 9 = one below the 8-row painted dropdown
             modifiers: KeyModifiers::NONE,
         };
-        handle(&mut e, click, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, click, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(caret_before, crate::nav::head(&e),
             "click below painted dropdown (row 9) must NOT dispatch move_right — caret must not advance");
     }
@@ -2348,7 +2358,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         let (_w, h) = e.active().view.area;
         let status_row = h - 1;
-        handle(&mut e, down(4 + 1, status_row), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(4 + 1, status_row), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.minibuffer.as_ref().unwrap().cursor, '\u{e9}'.len_utf8(),
             "click at char-col 1 must land on the byte boundary AFTER the multibyte 'é'");
         assert!(e.minibuffer.is_some(), "minibuffer stays open");
@@ -2364,7 +2374,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         let (_w, h) = e.active().view.area;
         let status_row = h - 1;
-        handle(&mut e, down(4 + 50, status_row), &reg, &km, &ex, &clk, &tx); // far past the text
+        handle(&mut e, down(4 + 50, status_row), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // far past the text
         let mb = e.minibuffer.as_ref().unwrap();
         assert_eq!(mb.cursor, mb.text.len(), "click past end clamps to text.len()");
     }
@@ -2379,7 +2389,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         let (_w, h) = e.active().view.area;
         let status_row = h - 1;
-        handle(&mut e, down(1, status_row), &reg, &km, &ex, &clk, &tx); // col 1 < prompt_cols (4)
+        handle(&mut e, down(1, status_row), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // col 1 < prompt_cols (4)
         assert_eq!(e.minibuffer.as_ref().unwrap().cursor, 2, "click on the prompt must not move the caret");
         assert!(e.minibuffer.is_some(), "minibuffer stays open");
     }
@@ -2403,7 +2413,7 @@ mod tests {
         let status_row = e.active().view.area.1 - 1;
         // "Find: " = 6 cols; col 8 → char idx 2 within "wor" ('w','o' consumed).
         let d = down(8, status_row);
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let s = e.search.as_ref().unwrap();
         assert_eq!(s.field, crate::search_overlay::Field::Needle);
         assert_eq!(s.cursor, 2, "cursor lands at the char-mapped byte offset within the needle");
@@ -2429,7 +2439,7 @@ mod tests {
         let status_row = e.active().view.area.1 - 1;
         let prefix = "Find: wor  Replace: ".chars().count() as u16;
         let d = down(prefix + 2, status_row); // char idx 2 within "cat" ('c','a' consumed)
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let s = e.search.as_ref().unwrap();
         assert_eq!(s.field, crate::search_overlay::Field::Template);
         assert_eq!(s.cursor, 2);
@@ -2453,7 +2463,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // row1 col5 sits inside the second "abc" (16..19: col4..7 on line1).
         let d = down(5, 1);
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
 
         let sel = e.active().document.selection.primary();
         assert_eq!((sel.from(), sel.to()), (16, 19), "selection == clicked match's range");
@@ -2503,7 +2513,7 @@ mod tests {
         // Click the second "abc" at its CURRENT screen position (row1, unchanged —
         // only line0 was edited); the LIVE (post-edit) match is now 18..21.
         let d = down(6, 1);
-        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
 
         let sel = e.active().document.selection.primary();
         assert_eq!((sel.from(), sel.to()), (18, 21),
@@ -2514,7 +2524,7 @@ mod tests {
         // Control: a click that lands on NO match leaves selection untouched.
         let before = e.active().document.selection.clone();
         let miss = down(0, 0); // 'X' of the inserted "XX" prefix — not inside any match
-        handle(&mut e, miss, &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, miss, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.selection, before, "non-match click leaves selection unchanged");
     }
 
@@ -2540,7 +2550,7 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rect = crate::chrome_geom::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
         // Hover the 4th visible list row (list starts at rect.y + 2).
-        handle(&mut e, moved(rect.x + 1, rect.y + 2 + 3), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(rect.x + 1, rect.y + 2 + 3), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.palette.as_ref().unwrap().selected, 3, "hover set highlight to the pointer row");
     }
 
@@ -2552,7 +2562,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         crate::app::hydrate_overlays(&mut e, &reg, &km);
         e.palette.as_mut().unwrap().selected = 2; // a keyboard-set highlight
-        handle(&mut e, moved(0, 0), &reg, &km, &ex, &clk, &tx); // top-left, off the overlay
+        handle(&mut e, moved(0, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); // top-left, off the overlay
         assert_eq!(e.palette.as_ref().unwrap().selected, 2, "off-rect hover leaves the highlight as-is");
     }
 
@@ -2572,7 +2582,7 @@ mod tests {
         let rect = crate::chrome_geom::palette_overlay_rect(area, n);
         // Wheel down with the pointer over the top visible row → scroll by 3, re-hover pins the
         // highlight to that top row (absolute row scroll_top).
-        handle(&mut e, wheel_ev(true, rect.x + 1, rect.y + 2), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(true, rect.x + 1, rect.y + 2), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let p = e.palette.as_ref().unwrap();
         assert_eq!(p.scroll_top, 3, "wheel scrolled the viewport by WHEEL_STEP");
         assert_eq!(p.selected, p.scroll_top, "re-hover pinned the highlight to the pointer's top row");
@@ -2592,8 +2602,8 @@ mod tests {
         p.scroll_top = 0; p.selected = 0;
         e.palette = Some(p);
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, wheel_ev(true, 40, 12), &reg, &km, &ex, &clk, &tx);
-        handle(&mut e, wheel_ev(false, 40, 12), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(true, 40, 12), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        handle(&mut e, wheel_ev(false, 40, 12), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let p = e.palette.as_ref().unwrap();
         assert_eq!((p.selected, p.scroll_top), (0, 0), "empty-list wheel is a total no-op (I3b)");
     }
@@ -2610,7 +2620,7 @@ mod tests {
         let n = e.outline.as_ref().unwrap().rows.len();
         assert!(n >= 2, "precondition: two headings");
         let rect = crate::chrome_geom::palette_overlay_rect(area, n);
-        handle(&mut e, moved(rect.x + 1, rect.y + 2 + 1), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(rect.x + 1, rect.y + 2 + 1), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.outline.is_some(), "hover keeps the outline open (no jump)");
         assert_eq!(e.outline.as_ref().unwrap().selected, 1, "hover moved the highlight");
         assert_eq!(e.active().view.scroll, scroll_before, "hover did NOT jump the document");
@@ -2633,7 +2643,7 @@ mod tests {
         let n = e.diag.as_ref().unwrap().row_count();
         let rect = crate::chrome_geom::palette_overlay_rect(area, n);
         // diag list starts at rect.y + 1 (no query row).
-        handle(&mut e, moved(rect.x + 1, rect.y + 1 + 1), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(rect.x + 1, rect.y + 1 + 1), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.diag.is_some(), "hover keeps the diag overlay open (no apply)");
         assert_eq!(e.active().document.version, v0, "hover did NOT apply a fix (buffer unchanged)");
     }
@@ -2664,7 +2674,7 @@ mod tests {
         let bar = crate::chrome_geom::menu_bar_layout(hit_area, &groups);
         let (other_cat, other_rect) = bar.iter().find(|(c, _)| *c != open0).copied()
             .expect("a second category exists");
-        handle(&mut e, moved(other_rect.x, other_rect.y), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(other_rect.x, other_rect.y), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let m = e.menu.as_ref().unwrap();
         assert_eq!(m.open, other_cat, "hover onto a different bar label switched the open category");
         assert_eq!((m.highlighted, m.scroll_top), (0, 0), "switch reset the highlight + scroll (triple)");
@@ -2683,7 +2693,7 @@ mod tests {
         let groups = e.menu.as_ref().unwrap().groups.clone();
         let bar = crate::chrome_geom::menu_bar_layout(hit_area, &groups);
         let (_, own_rect) = bar.iter().find(|(c, _)| *c == open0).copied().unwrap();
-        handle(&mut e, moved(own_rect.x, own_rect.y), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(own_rect.x, own_rect.y), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let m = e.menu.as_ref().unwrap();
         assert_eq!(m.open, open0, "hover on the SAME open label keeps the category");
         assert_eq!(m.highlighted, 2, "cat == open dedupe: no reset of the highlight");
@@ -2707,7 +2717,7 @@ mod tests {
             "fixture must have >=2 dropdown rows to exercise hover"
         );
         let drop = crate::chrome_geom::menu_dropdown_rect(hit_area, &groups, open).unwrap();
-        handle(&mut e, moved(drop.x, drop.y + 1), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(drop.x, drop.y + 1), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let want = crate::chrome_geom::menu_dropdown_row_at(hit_area, &groups, open, scroll_top, drop.x, drop.y + 1).unwrap();
         assert_eq!(e.menu.as_ref().unwrap().highlighted, want, "dropdown hover set highlighted to the pointer row");
     }
@@ -2719,7 +2729,7 @@ mod tests {
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
         let (reg, ex, clk, tx, km) = ctx();
         // No overlay open → the event routes to the DWELL path, not the menu slot.
-        handle(&mut e, moved(2, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, moved(2, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.menu.is_none(), "first-open stays deliberate: bar hover with no menu open does not auto-open");
         assert!(e.mouse.menu_reveal_due.is_some(),
             "row-0 hover with no menu open must still arm the dwell timer, not just silently drop the Moved event");
@@ -2754,7 +2764,7 @@ mod tests {
         let item_rows = drop.height as usize - 1; // = 5 (overflow reserves the indicator row)
         // Wheel down several notches with the pointer OFF the dropdown (re-hover finds nothing;
         // the highlight is driven by the wheel's clamp — the fragile path).
-        for _ in 0..3 { handle(&mut e, wheel_ev(true, 0, 7), &reg, &km, &ex, &clk, &tx); }
+        for _ in 0..3 { handle(&mut e, wheel_ev(true, 0, 7), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); }
         let (st, hl) = { let m = e.menu.as_ref().unwrap(); (m.scroll_top, m.highlighted) };
         assert!(st > 0, "tall category scrolled the dropdown viewport");
         assert!(hl >= st && hl < st + item_rows,
@@ -2773,10 +2783,10 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.menu = Some(tall_menu(3));
         let (reg, ex, clk, tx, km) = ctx();
-        handle(&mut e, wheel_ev(true, 0, 5), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(true, 0, 5), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.menu.as_ref().unwrap().highlighted, 1, "short category: wheel down steps the highlight to 1");
         assert_eq!(e.menu.as_ref().unwrap().scroll_top, 0, "short category does not scroll");
-        handle(&mut e, wheel_ev(false, 0, 5), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, wheel_ev(false, 0, 5), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.menu.as_ref().unwrap().highlighted, 0, "wheel up steps back to 0");
     }
 }

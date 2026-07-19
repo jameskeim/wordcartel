@@ -139,14 +139,14 @@ impl Harness {
     /// state-orthogonal for the seed journeys). A clipboard/mouse journey must add them.
     fn step(&mut self, msg: Msg) -> bool {
         let clock = TestClock(self.now);
-        let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
+        let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx, &crate::test_support::test_fs()) };
         // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): mirrors run()'s
         // choreography — runs AFTER reduce's borrow scope has dropped, holding NO outer borrow,
         // so a dispatched plugin command's Lua callback can re-borrow the editor via the
         // bridge's wc.* closures. `None` for the non-plugin journeys — a real skip, not a
         // null-host no-op call.
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx, &crate::test_support::test_fs());
         }
         // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — mirrors run()'s
         // post-pump call; idempotent + self-guarding, so a no-op for the non-plugin journeys and
@@ -174,10 +174,10 @@ impl Harness {
         // Clear any residue so this step's spans are attributable to this step.
         let _ = crate::derive::bench_spans::drain();
         let t0 = std::time::Instant::now();
-        let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
+        let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx, &crate::test_support::test_fs()) };
         let t_reduce = t0.elapsed();
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx, &crate::test_support::test_fs());
         }
         { crate::app::hydrate_overlays(&mut self.editor.borrow_mut(), &self.reg, &self.keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
@@ -714,7 +714,7 @@ fn on_save_hook_fires_on_real_save() {
     let clock = TestClock(h.now);
     {
         let mut e = h.editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx);
     }
     // InlineExecutor already ran the job inline; drain + apply the merge (fires the event).
@@ -724,7 +724,7 @@ fn on_save_hook_fires_on_real_save() {
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
     // The pump drains the event the merge just enqueued — no outer borrow held.
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
 
     let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
         .expect("the plugin's Lua-global counter must exist");
@@ -760,7 +760,7 @@ fn on_buffer_close_and_open_fire() {
         let mut e = h.editor.borrow_mut();
         crate::workspace::open_as_new_buffer(&mut e, &path_a);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     assert_eq!(opens, 1, "the reuse-shape open must fire on_open exactly once, not twice");
     let last_open: String =
@@ -774,7 +774,7 @@ fn on_buffer_close_and_open_fire() {
         let mut e = h.editor.borrow_mut();
         crate::workspace::open_as_new_buffer(&mut e, &path_b);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     assert_eq!(opens, 2, "the new-buffer-shape open must also fire on_open, once");
     let last_open: String =
@@ -788,7 +788,7 @@ fn on_buffer_close_and_open_fire() {
         let mut e = h.editor.borrow_mut();
         crate::workspace::close_buffer_now(&mut e, b_id);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let closes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
     assert_eq!(closes, 1, "the clean close must fire on_buffer_close exactly once");
     let last_close: String =
@@ -804,7 +804,7 @@ fn on_buffer_close_and_open_fire() {
         assert!(matches!(r, crate::commands::CommandResult::Quit));
         assert!(e.quit, "Quit must set the quit flag on a clean workspace");
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens_after_quit: i64 =
         h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     let closes_after_quit: i64 =
@@ -944,12 +944,12 @@ fn pomodoro_lua_e2e_success_demo() {
     // already-supplied-arg path, so no minibuffer opens (Task 5 case 2).
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         let r = reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
         assert_eq!(r, CommandResult::Handled);
         assert!(e.minibuffer.is_none(), "an already-supplied arg must never open the prompt");
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx); // runs the Lua callback: arms wc.timer, sets status
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs()); // runs the Lua callback: arms wc.timer, sets status
 
     let deadline = 25 * 60 * 1000u64;
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "start arms exactly one timer");
@@ -961,9 +961,9 @@ fn pomodoro_lua_e2e_success_demo() {
     // no input in between (mirrors the run loop waking on next_wake alone).
     let fire_at = deadline + 1;
     clock.set(fire_at);
-    let keep = reduce(Msg::Tick, &mut editor.borrow_mut(), &reg, &keymap, &ex, &clock, &tx);
+    let keep = reduce(Msg::Tick, &mut editor.borrow_mut(), &reg, &keymap, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert!(keep, "Msg::Tick must not itself request quit");
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
     assert_eq!(editor.borrow().status_text(), "Pomodoro: 25 min session complete",
         "the observer-tier callback ran DURING inactivity");
@@ -976,19 +976,19 @@ fn pomodoro_lua_e2e_success_demo() {
     // self-fire on the cancel dispatch's pump (unlike a stale/frozen bridge clock would).
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before cancel");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), Some(fire_at + deadline));
 
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         reg.dispatch_with_arg(cancel_id, &mut ctx, None);
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert!(editor.borrow().pending_plugin_timers.is_empty(), "wc.timer_cancel disarms the session");
     assert_eq!(editor.borrow().status_text(), "Pomodoro: cancelled");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None);
@@ -997,10 +997,10 @@ fn pomodoro_lua_e2e_success_demo() {
     // its own teardown (P3 §3g auto-disarm).
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before reload");
 
     editor.borrow_mut().plugins_reload_requested = true;
@@ -1084,7 +1084,7 @@ fn wordcount_lua_e2e_success_demo() {
     let ex = InlineExecutor::default();
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx);
     }
     {
@@ -1092,7 +1092,7 @@ fn wordcount_lua_e2e_success_demo() {
         let mut e = editor.borrow_mut();
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().status_text(), "Saved — 3 words (goal: 100)",
         "the demo's on_save hook must report the live word count against its configured goal");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma\n",
@@ -1109,7 +1109,7 @@ fn wordcount_lua_e2e_success_demo() {
 
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx);
     }
     {
@@ -1117,7 +1117,7 @@ fn wordcount_lua_e2e_success_demo() {
         let mut e = editor.borrow_mut();
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().status_text(), "Saved (v2) — 3 words (goal: 100)",
         "the EDITED plugin's wording must be live after plugins_reload, on the very next save");
 }
@@ -1685,7 +1685,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("prose_lens_passive"), &mut ctx);
     }
     assert_eq!(h.editor.borrow().active().view.prose_lens, Some(crate::lenses::ProseLensCategory::Passive),
@@ -1717,7 +1717,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("prose_lens_next_match"), &mut ctx);
     }
     {
@@ -1753,7 +1753,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("prose_lens_off"), &mut ctx);
     }
     h.tick();
@@ -1894,7 +1894,7 @@ fn e2e_lens_switch_flips_the_painted_underline_set() {
         use crate::registry::{Ctx, CommandId};
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("analysis_next"), &mut ctx);
     }
     assert_eq!(h.editor.borrow().active_analysis_source, DiagSource::Plugin("mock"),

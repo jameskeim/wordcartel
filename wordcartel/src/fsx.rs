@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A writable+syncable temp handle. Owns the underlying file; `set_mode` applies
 /// the final permission bits on Unix (no-op elsewhere).
-pub(crate) trait WriteSync {
+pub trait WriteSync {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
     fn flush(&mut self) -> std::io::Result<()>;
     fn set_mode(&self, mode: u32) -> std::io::Result<()>;
@@ -27,7 +27,7 @@ pub(crate) trait WriteSync {
 /// equivalence is false and `config_layer_paths`-style probes would misclassify them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // C5 tasks 3-24 use this via implementors; forward reference
-pub(crate) struct FileStat {
+pub struct FileStat {
     pub len: u64,
     pub mtime: Option<std::time::SystemTime>,
     pub is_file: bool,
@@ -45,7 +45,7 @@ pub(crate) struct FileStat {
 /// failure mode this design kept hitting. Critically, `Other` (a legitimately-classified fifo)
 /// and `Unknown` (we could not classify it) are DIFFERENT facts that two bools cannot separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EntryKind {
+pub enum EntryKind {
     /// RESOLVED regular file (follows symlinks).
     File,
     /// RESOLVED directory (follows symlinks).
@@ -59,7 +59,7 @@ pub(crate) enum EntryKind {
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // C5 tasks 5-24 use this via implementors; forward reference
-pub(crate) struct DirEntryInfo {
+pub struct DirEntryInfo {
     /// LOSSY-rendered (`to_string_lossy`). A name that is not valid UTF-8 arrives here with
     /// replacement characters, which is fine for display and for the `.lua` suffix test, but
     /// means a caller CANNOT recover the original bytes from this field.
@@ -88,7 +88,7 @@ pub(crate) struct DirEntryInfo {
 /// INVARIANT: `total_seen == entries.len() + unreadable + capped_out`.
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // C5 tasks 5-24 use this via implementors; forward reference
-pub(crate) struct DirListing {
+pub struct DirListing {
     pub entries: Vec<DirEntryInfo>,
     pub total_seen: usize,
     pub unreadable: usize,
@@ -96,7 +96,12 @@ pub(crate) struct DirListing {
 
 /// The filesystem ops the atomic-write commit needs. Object-safe (no generics,
 /// no associated types) so `&dyn Fs` works.
-pub(crate) trait Fs {
+///
+/// `pub`, not `pub(crate)` — Task 5 threads `dyn Fs` into `Ctx`/`DispatchCtx` and several `pub`
+/// functions (`app::reduce`, `mouse::handle`, `plugin::pump::PluginHost::pump`, …), exactly like
+/// its sibling seam traits `wordcartel_core::history::Clock` and `jobs::Executor` already are —
+/// a `pub(crate)` trait behind a `pub` item is a `private_interfaces` warning (a build-clean GATE).
+pub trait Fs {
     /// O_EXCL create at `path` with `mode` (Unix); returns a write+sync handle.
     fn create_excl(&self, path: &Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>>;
     /// Best-effort mode of an existing file (Unix); `None` if absent/unreadable/off-unix.

@@ -177,13 +177,15 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
 /// editor, and report keep-running. Factored from the 21 verbatim repetitions. NOT used
 /// where a stage returns without draining (the search Esc/Alt+a arms — §8 invariant C).
 pub(crate) fn fold_and_continue(editor: &mut crate::editor::Editor, ex: &dyn crate::jobs::Executor,
-    clock: &dyn wordcartel_core::history::Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) -> bool {
-    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
+    clock: &dyn wordcartel_core::history::Clock, msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) -> bool {
+    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs); }
     !editor.quit
 }
 
 /// Close the active overlay, dispatch `id` via the registry, drain executor results,
 /// then hydrate any overlay opened by the dispatched command.
+#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub(crate) fn dispatch_overlay_command(
     editor: &mut Editor,
     reg: &crate::registry::Registry,
@@ -192,11 +194,12 @@ pub(crate) fn dispatch_overlay_command(
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
     id: crate::registry::CommandId,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     crate::overlays::close_all(editor);
-    let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+    let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
     reg.dispatch(id, &mut ctx);
-    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
+    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs); }
     // Hydrate any overlay the dispatched command may have opened (Codex 3c).
     hydrate_overlays(editor, reg, keymap);
 }
@@ -212,7 +215,7 @@ pub fn menu_select_for_test(
 ) {
     editor.menu = None;
     let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), reg);
-    dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
+    dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id, &crate::test_support::test_fs());
 }
 
 /// Process one message. Returns true while the app should keep running.
@@ -221,6 +224,7 @@ pub fn menu_select_for_test(
 /// `reduce_dispatch`, then arms the diagnostics re-arm seam on the single exit path — this covers
 /// every `Handled::Done` early-return inside `reduce_dispatch` AND its normal tail (spec §2.2 item 1;
 /// E7 T3).
+#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub fn reduce(
     msg: Msg,
     editor: &mut Editor,
@@ -229,6 +233,7 @@ pub fn reduce(
     ex: &dyn Executor,
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) -> bool {
     // PTY-smoke panic trigger (debug builds only): F12 while WCARTEL_SMOKE_PANIC
     // is set panics HERE — the first statement of reduce, ahead of every
@@ -249,7 +254,7 @@ pub fn reduce(
     }
     let before_id = editor.active().id;
     let before_version = editor.active().document.version;
-    let keep = reduce_dispatch(msg, editor, reg, keymap, ex, clock, msg_tx);
+    let keep = reduce_dispatch(msg, editor, reg, keymap, ex, clock, msg_tx, fs);
     crate::diagnostics_run::arm_if_edited(editor, before_id, before_version, clock);
     keep
 }
@@ -257,6 +262,7 @@ pub fn reduce(
 /// The interceptor chain + message match, extracted from `reduce` so the single `arm_if_edited`
 /// seam in `reduce` wraps every exit path (H1 dispatch-hub discipline). Behavior-identical to the
 /// pre-E7 body minus the inline diagnostics arm (now `arm_if_edited`, called from `reduce`).
+#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 fn reduce_dispatch(
     msg: Msg,
     editor: &mut Editor,
@@ -265,12 +271,13 @@ fn reduce_dispatch(
     ex: &dyn Executor,
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) -> bool {
     // Overlay/modal input dispatch (H21). Real chain order: splash row FIRST, then the
     // `marks` chord pre-stage, then the remaining overlay rows in ALL order. `marks` is NOT
     // a table row (chord state, no overlay struct) — it sits between the splash row and the
     // rest to preserve today's `splash → marks → others` precedence (spec §2.6).
-    let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx };
+    let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx, fs };
     let mut msg = msg;
     msg = match (crate::overlays::OverlayId::Splash.row().intercept)(msg, editor, &ctx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
@@ -286,7 +293,7 @@ fn reduce_dispatch(
     let before = editor.active().document.version; // post-interceptor; feeds last_edit_at only
     match msg {
         Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press =>
-            crate::input::handle_key(k, editor, reg, keymap, ex, clock, msg_tx),
+            crate::input::handle_key(k, editor, reg, keymap, ex, clock, msg_tx, fs),
         Msg::Input(Event::Paste(text)) => {
             if let Some(mb) = editor.minibuffer.as_mut() {
                 for ch in text.chars() { mb.insert(ch); }
@@ -306,13 +313,13 @@ fn reduce_dispatch(
             crate::nav::ensure_visible(editor);
         }
         Msg::Input(Event::Mouse(ev)) => {
-            crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
+            crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx, fs);
             // A click-opened menu placeholder must be built before the next render —
             // the key-dispatch path hydrates; the mouse path must too (A1 spec C1).
             hydrate_overlays(editor, reg, keymap);
         }
         Msg::Input(_) => {}
-        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx),
+        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
         }
@@ -327,7 +334,7 @@ fn reduce_dispatch(
         }
         Msg::DiagProviderEvent { source, event } =>
             crate::diag_provider::apply_provider_event(editor, source, event, clock),
-        Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx),
+        Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx, fs),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Intercepted in the run loop before `reduce` (see run()); unreachable here.
@@ -341,7 +348,7 @@ fn reduce_dispatch(
     }
     // Fold any other results that became ready while handling this message.
     for o in ex.drain() {
-        crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx);
+        crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs);
     }
     !editor.quit
 }
@@ -459,6 +466,13 @@ pub(crate) fn first_frame_settle(editor: &mut Editor) {
 /// draw → read event → step → repeat until `editor.quit`.
 #[allow(clippy::too_many_lines)] // event-loop init + drive sequence — cohesive startup; the deadline machinery is already seamed to timers.rs
 pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
+    // COMPOSITION ROOT for the filesystem seam — the first statement, before ANY filesystem
+    // work. Config discovery, theme resolution, session load, and the launch file open all
+    // happen below this line and all take `&*fs` after Tasks 6/7. Everything downstream gets
+    // a clone; tests substitute an Arc<FaultFs> here.
+    let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+        std::sync::Arc::new(crate::fsx::RealFs);
+
     // Install the panic hook (once) so the terminal is restored on panic.
     term::install_panic_hook();
 
@@ -837,12 +851,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             exit_reason = ExitReason::InputLost;
             break;
         }
-        let keep = { reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx) };
+        let keep = { reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx, &fs) };
         // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): runs AFTER
         // reduce's borrow scope has dropped, holding NO outer borrow — a queued plugin
         // command's Lua callback re-borrows the editor itself (via the bridge's wc.*
         // closures), so no borrow may be alive here.
-        plugin_host.pump(&editor, &reg, &executor, &clock, &msg_tx);
+        plugin_host.pump(&editor, &reg, &executor, &clock, &msg_tx, &fs);
         // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — the pump's
         // reg.dispatch is a dispatch path with no per-site hydrate, unlike the key/menu/mouse
         // paths. Idempotent + self-guarding (hydrate_overlays only fills an EMPTY overlay), so
@@ -870,7 +884,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                 e.settings_save_requested = false;
                 if let Some(of) = settings::perform_settings_save(
                     &mut e, cli.no_config, overrides_path.as_deref(),
-                    &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &crate::fsx::RealFs)
+                    &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &*fs)
                 {
                     overrides_snapshot = of; // second-save correctness — replace our copy
                 }
@@ -978,17 +992,17 @@ mod tests {
         // First Ctrl+Q: dirty → multi-buffer quit modal up, NOT quit yet (Effort 6).
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "dirty quit must raise the multi-buffer modal");
         assert!(!e.quit);
         // Press 'r' → Review each → per-buffer review prompt for the one dirty buffer.
         let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(key('r')), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(key('r')), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "review-each raises the per-buffer prompt");
         assert!(!e.quit);
         // Press 'd' → Discard this buffer → drain empties → quit.
-        crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit, "discarding the last dirty buffer quits");
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
@@ -1035,12 +1049,12 @@ mod tests {
         let mut e = Editor::new_from_text("# H\n\nbody\n", Some(path.clone()), (80, 24));
 
         // One edit → dirty, last_edit_at armed (reduce drains/applies its own job outcomes).
-        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
+        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
         assert!(e.active().document.dirty(), "precondition: the edit made the buffer dirty");
 
         // Five simulated minutes of idle: a Tick each second, clock advancing, no edits.
         for sec in 1..=300u64 {
-            crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx);
+            crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx, &crate::test_support::test_fs());
         }
         crate::swap::delete(Some(&path)); // clean the state-dir swap file this test wrote
 
@@ -1069,13 +1083,13 @@ mod tests {
 
         // Realistic session: an edit, then a >2s pause so the first checkpoint lands (real writing
         // pauses constantly — to read, to think, between sentences). This seeds last_swap_at.
-        crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
-        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(3_000), &tx); // 3s idle → first checkpoint
+        crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(3_000), &tx, &crate::test_support::test_fs()); // 3s idle → first checkpoint
         // Then edit every simulated second for five minutes — content genuinely changes each
         // second, so the max-cap (T_MAX = 30s since the last checkpoint) is the correct cadence.
         for sec in 4..=304u64 {
-            crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx);
-            crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx);
+            crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx, &crate::test_support::test_fs());
+            crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx, &crate::test_support::test_fs());
         }
         crate::swap::delete(Some(&path));
 
@@ -1103,20 +1117,20 @@ mod tests {
         let mut e = Editor::new_from_text("start\n", Some(path.clone()), (80, 24));
 
         // Edit → idle → first checkpoint; the latch is now set.
-        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
-        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(2_000), &tx);
+        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(2_000), &tx, &crate::test_support::test_fs());
         assert_eq!(ex.swaps(), 1, "first edit is checkpointed");
         assert!(e.active().swapped_version.is_some(), "latch set after the swap");
 
         // Save → deletes the swap file, clears the latch, buffer becomes clean.
-        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &TestClock(2_500), &tx);
+        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &TestClock(2_500), &tx, &crate::test_support::test_fs());
         assert!(!e.active().document.dirty(), "save made the buffer clean");
         assert!(e.active().swapped_version.is_none(),
             "save must clear the swap latch (the swap file it referenced was deleted)");
 
         // Edit again → idle → a FRESH swap must be written, not suppressed by a stale latch.
-        crate::app::reduce(press(KeyCode::Char('y'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(3_000), &tx);
-        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(5_000), &tx);
+        crate::app::reduce(press(KeyCode::Char('y'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(3_000), &tx, &crate::test_support::test_fs());
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(5_000), &tx, &crate::test_support::test_fs());
         crate::swap::delete(Some(&path));
         assert_eq!(ex.swaps(), 2, "post-save edit must be re-checkpointed (latch was cleared)");
     }
@@ -1146,7 +1160,7 @@ mod tests {
             code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE,
         }));
-        crate::app::reduce(enter, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(enter, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "buffer-switcher palette must be dismissed after Enter");
         assert_eq!(e.active().id, b_id,
             "active buffer must be the buffer selected in the switcher");
@@ -1163,7 +1177,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let ctrl_c = Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(ctrl_c), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(ctrl_c), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.register.get(), Some("hello"));
         assert_eq!(e.clipboard_sync_request.as_deref(), Some("hello"));
     }
@@ -1179,7 +1193,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let ctrl_v = Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(ctrl_v), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(ctrl_v), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), before, "Ctrl+V no longer pastes inline");
         assert!(e.clipboard_get_pending.is_some(), "Ctrl+V sets a paste intent");
     }
@@ -1192,7 +1206,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "aXYb\n");
         assert_eq!(e.register.get(), Some("XY"), "OS text updates the register");
         e.active_mut().undo();
@@ -1208,7 +1222,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         // Simulate a menu selection routing: open, then feed a synthesized Selected(copy) via the menu handler path.
-        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.menu.is_some(), "F10 opens the menu");
         // drive a selection of "copy" through the menu->dispatch path (helper exercising drain_events->dispatch_overlay_command)
         crate::app::menu_select_for_test(&mut e, &reg, &ex, &clk, &tx, crate::registry::CommandId("copy"));
@@ -1227,15 +1241,15 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |c| Event::Key(KeyEvent { code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // F10 opens; menu hydrated with groups
-        crate::app::reduce(Msg::Input(press(KeyCode::F(10))), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::F(10))), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.menu.is_some());
         let m = e.menu.as_ref().unwrap();
         assert!(!m.groups.is_empty(), "menu hydrated with groups");
         assert_eq!(m.open, 0);
         // Right moves to the next category, Down highlights a row
-        crate::app::reduce(Msg::Input(press(KeyCode::Right)), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Right)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.menu.as_ref().unwrap().open, 1);
-        crate::app::reduce(Msg::Input(press(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.menu.as_ref().unwrap().highlighted, 1);
     }
 
@@ -1248,7 +1262,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "aRb\n", "None -> register fallback");
     }
 
@@ -1259,7 +1273,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "empty register -> no change");
     }
 
@@ -1271,7 +1285,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "aXYd\n", "selection replaced by pasted text");
         e.active_mut().undo();
         assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
@@ -1283,7 +1297,7 @@ mod tests {
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: BufferId(99999), text: Some("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: BufferId(99999), text: Some("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "unknown buffer -> dropped");
     }
 
@@ -1297,7 +1311,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let huge = "x".repeat(crate::clipboard::PASTE_MAX_BYTES + 1);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some(huge) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some(huge) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "oversize paste must not insert");
         assert_eq!(e.register.get(), Some("orig"), "oversize paste must not mutate the register");
         assert!(e.status_text().to_lowercase().contains("too large"));
@@ -1309,7 +1323,7 @@ mod tests {
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.status_text().to_lowercase().contains("clipboard"));
         assert!(e.clipboard_notice_shown);
         // A17 T5 (F4 Warning table): the notice is now a Sticky Warning — dismiss it (the user
@@ -1319,7 +1333,7 @@ mod tests {
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         e.dismiss_status();
         e.set_status(crate::status::StatusKind::Info, "typing");
-        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.status_text(), "typing", "notice shown only once");
     }
 
@@ -1402,7 +1416,7 @@ mod tests {
         for c in "hi".chars() {
             let ev = Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press, state: KeyEventState::NONE });
-            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx));
+            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs()));
         }
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
@@ -1433,7 +1447,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let key = Event::Key(KeyEvent { code: KeyCode::Char('x'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "xhi\n");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(1_000 + e.diag_cfg.debounce_ms),
             "active-buffer edit in Review arms exactly once");
@@ -1468,7 +1482,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().id, b_id, "switch landed on B");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "a buffer switch is not an edit: no arm");
     }
@@ -1498,12 +1512,28 @@ mod tests {
         let clk = TestClock(3_000);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('.'), KeyModifiers::CONTROL)),
-            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::Input(mkpress(KeyCode::Char('.'), KeyModifiers::CONTROL)),
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert!(e.diag.is_some(), "Ctrl+. opens the quick-fix overlay");
         e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None; // opening the overlay is not an edit
-        crate::app::reduce(Msg::Input(mkpress(KeyCode::Enter, KeyModifiers::NONE)),
-            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::Input(mkpress(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(3_000 + e.diag_cfg.debounce_ms),
             "quick-fix apply (interceptor Handled::Done path) arms via the unified seam");
@@ -1527,7 +1557,7 @@ mod tests {
         let clk = TestClock(4_000);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         r(&mut e, mkpress(KeyCode::Char('r'), KeyModifiers::CONTROL));   // open Replace
         for c in "aa".chars() { r(&mut e, mkpress(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, mkpress(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
@@ -1559,9 +1589,17 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(5_000);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
-            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applied under the open prompt");
         assert!(e.prompt.is_some(), "prompt remains open — only the background result was folded");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(5_000 + e.diag_cfg.debounce_ms),
@@ -1593,11 +1631,11 @@ mod tests {
         // (never twice for one edit).
         let click = Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
             column: 2, row: 0, modifiers: KeyModifiers::NONE });
-        crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "a click alone is not an edit: no arm");
         let key = Event::Key(KeyEvent { code: KeyCode::Char('!'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(6_000 + e.diag_cfg.debounce_ms),
             "the subsequent edit arms exactly once");
     }
@@ -1640,7 +1678,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n",
             "sanity: the edit itself still applies outside Review");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None,
@@ -1662,7 +1700,7 @@ mod tests {
         let clk = TestClock(4_500);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         r(&mut e, mkpress(KeyCode::Char('r'), KeyModifiers::CONTROL));   // open Replace
         for c in "aa".chars() { r(&mut e, mkpress(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, mkpress(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
@@ -1692,9 +1730,17 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(5_500);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
-            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n",
             "sanity: FilterDone still applies outside Review");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None,
@@ -1737,7 +1783,7 @@ mod tests {
         let r = crate::chrome_geom::palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
         let click = Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
             column: r.x + 1, row: r.y + 1, modifiers: KeyModifiers::NONE });
-        crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.diag.is_none(), "overlay closes after click-apply");
         assert_eq!(e.active().document.buffer.to_string(), "the cat\n",
             "sanity: the suggestion was applied via the click");
@@ -1757,7 +1803,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let msg = Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) };
-        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n");
         // one undo step restores the original
         e.active_mut().undo();
@@ -1774,8 +1820,17 @@ mod tests {
         e.active_mut().document.version += 1; // simulate an intervening edit
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: stale_v, range: 1..3, cursor: 2,
-            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: stale_v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "abcde\n", "stale filter result discarded");
         assert!(e.status_text().to_lowercase().contains("discarded"));
     }
@@ -1789,10 +1844,18 @@ mod tests {
         let id = e.active().id; let v = e.active().document.version;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter,
             outcome: RunResult::Err(FilterError::NonZero { code: "Exited(3)".into(), stderr: "boom".into() }) },
-            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "abcde\n");
         assert!(e.status_text().contains("boom") && e.status_text().contains('3'));
     }
@@ -1832,7 +1895,7 @@ mod tests {
         // Clock past the idle threshold.
         struct C(u64); impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { self.0 } }
         let clk = C(crate::swap::T_IDLE_MS + 5);
-        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.active().last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
         let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
         assert!(sp.exists());
@@ -1857,15 +1920,15 @@ mod tests {
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // First Ctrl+Q → multi-buffer modal up, not quit.
-        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some() && !e.quit);
         let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // 'r' → Review each → per-buffer prompt.
-        crate::app::reduce(crate::app::Msg::Input(key('r')), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(key('r')), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some() && !e.quit, "review-each raises the per-buffer prompt");
         // 'd' → Discard → drain empties → quit.
-        crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit, "discard exits");
         assert!(e.prompt.is_none(), "prompt cleared");
     }
@@ -1911,13 +1974,13 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         // Drive the drain to completion: each save result re-drives via apply_job_result.
         let mut guard = 0;
         while !e.quit {
             let rs = ex.drain();
             if rs.is_empty() { break; }
-            for o in rs { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
+            for o in rs { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs()); }
             guard += 1; assert!(guard < 16, "drain did not converge");
         }
         assert!(e.quit, "Save-All drains both dirty buffers then quits");
@@ -1938,10 +2001,10 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit_drain.is_some(), "drain started");
         assert!(e.prompt.is_some(), "per-buffer review prompt raised");
-        crate::prompts::resolve_prompt(PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::Cancel, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit_drain.is_none(), "cancel aborts the drain");
         assert!(!e.quit, "not quitting after cancel");
     }
@@ -1963,7 +2026,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         // Start a ReviewEach quit drain — drive_quit_drain raises the per-buffer prompt.
-        crate::prompts::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit_drain.is_some(), "drain started");
         assert!(e.prompt.is_some(), "per-buffer review prompt raised by drive_quit_drain");
         // Simulate Esc on the review prompt via the real reduce path.
@@ -1975,7 +2038,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
-        crate::app::reduce(crate::app::Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit_drain.is_none(), "Esc on review prompt aborts the drain");
         assert!(!e.quit, "app does not quit after Esc-abort");
     }
@@ -1998,8 +2061,8 @@ mod tests {
             let ex = InlineExecutor::default();
             let clk = TestClock(0);
             let (tx, _rx) = std::sync::mpsc::channel();
-            crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
+            crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs()); }
             assert!(e.quit_drain.is_none(), "failed save aborts the drain");
             assert!(!e.quit, "a failed save must not quit (no data loss)");
             assert!(e.status_text().to_lowercase().contains("symlink"), "error status surfaced");
@@ -2020,12 +2083,12 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.minibuffer.as_ref().map(|m| m.kind), Some(crate::minibuffer::MinibufferKind::SaveAs),
             "unnamed dirty buffer in the drain opens the Save-As minibuffer");
         assert!(e.quit_drain.is_some(), "drain still pending while Save-As is open");
         // Dismiss via empty submit.
-        crate::prompts::save_as_submit(&mut e, "", &ex, &clk, &tx);
+        crate::prompts::save_as_submit(&mut e, "", &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.quit_drain.is_none(), "dismissing the Save-As aborts the drain");
         assert!(!e.quit, "backing out of Save-As must not quit");
     }
@@ -2042,7 +2105,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
         assert!(!e.quit, "not yet — waiting for the save result");
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
@@ -2060,7 +2123,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
         assert_eq!(e.pending_after_save, None, "no path → not armed");
@@ -2175,12 +2238,12 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        for c in "cat".chars() { crate::app::reduce(Msg::Input(key(c)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
+        for c in "cat".chars() { crate::app::reduce(Msg::Input(key(c)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs()); }
         assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat");
         // Enter submits -> dispatch_filter -> a FilterDone arrives, minibuffer cleared
         let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.minibuffer.is_none(), "submit clears the minibuffer");
         match rx.recv().unwrap() { Msg::FilterDone { outcome: crate::filter::RunResult::Stdout(s), .. } => assert_eq!(s, "abc\n"),
                                    o => panic!("expected FilterDone, got {o:?}") }
@@ -2198,8 +2261,8 @@ mod tests {
         e.open_minibuffer("Go to line: ", crate::minibuffer::MinibufferKind::GotoLine);
         // type "3" then Enter
         let (tx, _rx) = std::sync::mpsc::channel();
-        for ch in "3".chars() { crate::app::reduce(Msg::Input(Event::Key(KeyEvent{code:KeyCode::Char(ch),modifiers:KeyModifiers::NONE,kind:KeyEventKind::Press,state:KeyEventState::NONE})), &mut e, &Registry::builtins(), &cua_keymap(), &InlineExecutor::default(), &TestClock(0), &tx); }
-        crate::app::reduce(Msg::Input(Event::Key(KeyEvent{code:KeyCode::Enter,modifiers:KeyModifiers::NONE,kind:KeyEventKind::Press,state:KeyEventState::NONE})), &mut e, &Registry::builtins(), &cua_keymap(), &InlineExecutor::default(), &TestClock(0), &tx);
+        for ch in "3".chars() { crate::app::reduce(Msg::Input(Event::Key(KeyEvent{code:KeyCode::Char(ch),modifiers:KeyModifiers::NONE,kind:KeyEventKind::Press,state:KeyEventState::NONE})), &mut e, &Registry::builtins(), &cua_keymap(), &InlineExecutor::default(), &TestClock(0), &tx, &crate::test_support::test_fs()); }
+        crate::app::reduce(Msg::Input(Event::Key(KeyEvent{code:KeyCode::Enter,modifiers:KeyModifiers::NONE,kind:KeyEventKind::Press,state:KeyEventState::NONE})), &mut e, &Registry::builtins(), &cua_keymap(), &InlineExecutor::default(), &TestClock(0), &tx, &crate::test_support::test_fs());
         // line 3 ("three") starts at byte 8
         assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(2));
         assert!(e.minibuffer.is_none(), "submit closes the minibuffer");
@@ -2217,8 +2280,17 @@ mod tests {
         e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
-            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open minibuffer");
     }
 
@@ -2256,7 +2328,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
         };
-        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
         // The output file must exist beside the source.
         assert!(output_path.exists(), "exported file must exist");
@@ -2307,7 +2379,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(b"<h1>Hello</h1>\n".to_vec())),
             overwrite_confirmed: false,
         };
-        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
         // The racing file is untouched; status tells the user to re-run.
         let got = std::fs::read(&output_path).expect("read target");
@@ -2353,7 +2425,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(new_bytes.clone())),
             overwrite_confirmed: true,
         };
-        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
         let got = std::fs::read(&output_path).expect("read target");
         assert_eq!(got, new_bytes, "confirmed export must overwrite the existing target");
@@ -2399,7 +2471,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
         };
-        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
         assert!(output_path.exists(), "ExportDone under prompt must still write the file");
         assert!(e.status_text().contains("exported"));
@@ -2431,7 +2503,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let key = Event::Key(KeyEvent { code: KeyCode::Char('t'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "Ctrl+T must open the transform chooser");
         assert_eq!(
             e.prompt.as_ref().unwrap().action_for('r'),
@@ -2483,8 +2555,17 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let range = 0..e.active().document.buffer.to_string().len();
         let out = "one\ntwo\n".to_string(); // pretend ventilate output
-        crate::app::reduce(Msg::TransformDone { buffer_id: id, version: v, range,
-            kind: TransformKind::Ventilate, result: Ok(out.clone()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::TransformDone { buffer_id: id, version: v, range,
+            kind: TransformKind::Ventilate, result: Ok(out.clone()) },
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), out);
         e.active_mut().undo();
         assert_eq!(e.active().document.buffer.to_string(), "one two three four five six seven\n");
@@ -2501,8 +2582,17 @@ mod tests {
         e.active_mut().document.version += 1; // an intervening edit
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::TransformDone { buffer_id: id, version: stale, range: 0..10,
-            kind: TransformKind::Reflow, result: Ok("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::TransformDone { buffer_id: id, version: stale, range: 0..10,
+            kind: TransformKind::Reflow, result: Ok("X".into()) },
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "alpha beta\n", "stale result discarded");
         assert!(e.status_text().to_lowercase().contains("discarded"));
         assert!(!e.transform_in_flight, "in-flight cleared even on discard");
@@ -2712,7 +2802,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("XY".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("XY".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "aXYb\n");
         assert_eq!(e.register.get(), Some("XY"));
         e.active_mut().undo();
@@ -2728,7 +2818,7 @@ mod tests {
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("cat".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("cat".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat", "paste goes into the minibuffer");
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched");
     }
@@ -2746,7 +2836,7 @@ mod tests {
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("foo".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("foo".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched under open palette");
         assert_eq!(e.palette.as_ref().unwrap().query, "foo", "paste inserted into palette query");
         assert!(e.palette.is_some(), "palette remains open after paste");
@@ -2761,7 +2851,7 @@ mod tests {
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("bar".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("bar".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched under open menu");
         assert!(e.menu.is_some(), "menu remains open after paste");
     }
@@ -2781,7 +2871,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "async paste must not land in doc behind open menu");
         assert!(e.menu.is_some(), "menu remains open after ClipboardPaste is dropped");
     }
@@ -2799,7 +2889,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "async paste must not land in doc behind open palette");
         assert!(e.palette.is_some(), "palette remains open after ClipboardPaste is dropped");
     }
@@ -2814,7 +2904,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "async paste must not land in doc behind open theme picker");
         assert!(e.theme_picker.is_some(), "theme picker remains open after ClipboardPaste is dropped");
     }
@@ -2828,7 +2918,7 @@ mod tests {
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("x".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("x".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "paste ignored under a modal");
         assert!(e.prompt.is_some());
     }
@@ -2842,7 +2932,7 @@ mod tests {
         e.register.set("keep".into());
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste(String::new())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste(String::new())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "abcd\n", "empty paste must NOT delete the selection");
         assert_eq!(e.register.get(), Some("keep"), "empty paste must NOT clear the register");
     }
@@ -2859,7 +2949,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3); // select abc
         let km = cua_keymap(); let (tx,_rx)=std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(press(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.register.get(), Some("abc"), "Ctrl+C copied via the data-driven keymap");
     }
 
@@ -2875,10 +2965,10 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", Some("/tmp/wc-kmtest.md".into()), (80, 24));
         let (tx,_rx)=std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.pending_keys.len(), 1, "first key is pending");
         assert!(e.status_text().contains("ctrl-k") || e.status_text().to_lowercase().contains("k"), "pending shown");
-        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_keys.is_empty(), "sequence resolved, pending cleared");
         // (save dispatched — the file path means dispatch_save runs; assert via status or saved flag per the real save)
     }
@@ -2895,9 +2985,9 @@ mod tests {
         let before = e.active().document.buffer.to_string();
         let (tx,_rx)=std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.pending_keys.len(), 1);
-        crate::app::reduce(press(KeyCode::Esc, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Esc, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_keys.is_empty(), "Esc cleared the pending sequence");
         assert_eq!(e.active().document.buffer.to_string(), before, "no buffer change");
     }
@@ -2927,7 +3017,7 @@ mod tests {
         let mut e = Editor::new_from_text("", None, (80, 24));
         let km = cua_keymap(); let (tx,_rx)=std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(press(KeyCode::Char('h'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Char('h'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "h", "unbound printable inserts literally");
     }
 
@@ -2942,12 +3032,12 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |c, m| Event::Key(KeyEvent { code: c, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // Ctrl+P opens + hydrates
-        crate::app::reduce(Msg::Input(press(KeyCode::Char('p'), KeyModifiers::CONTROL)), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('p'), KeyModifiers::CONTROL)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_some());
         assert!(!e.palette.as_ref().unwrap().rows.is_empty(), "palette hydrated with all commands on open");
         // type "copy", select first, Enter → dispatches copy (register gets the selection)
-        for ch in "copy".chars() { crate::app::reduce(Msg::Input(press(KeyCode::Char(ch), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx); }
-        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx);
+        for ch in "copy".chars() { crate::app::reduce(Msg::Input(press(KeyCode::Char(ch), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs()); }
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "Enter closes the palette");
         assert_eq!(e.register.get(), Some("abc"), "selected command (Copy) dispatched");
     }
@@ -2964,12 +3054,12 @@ mod tests {
         // An async ClipboardPaste arriving while the palette is open must be
         // intercepted and dropped — it must NOT reach the document (race fix).
         let bid = e.active().id;
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("X".into()) }, &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("X".into()) }, &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_some(), "palette still open");
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "ClipboardPaste must be dropped while palette is open");
         // Esc closes the palette
         let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none());
     }
 
@@ -2980,10 +3070,10 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         // F10 with menu closed → opens the menu
-        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.menu.is_some(), "F10 should open menu when closed");
         // F10 with menu open → closes the menu
-        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.menu.is_none(), "F10 should close menu when open");
     }
 
@@ -2997,7 +3087,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |c, m| Event::Key(KeyEvent { code: c, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(press(KeyCode::Char('q'), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('q'), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.pending_mark, None, "capture consumed the key");
         assert_eq!(e.active().marks.get(&'q'), Some(&0));
         assert_eq!(e.active().document.buffer.to_string(), "abc\n", "captured key did NOT type into the doc");
@@ -3013,7 +3103,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.pending_mark, None);
         assert!(e.active().marks.is_empty());
     }
@@ -3027,7 +3117,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock::new(0);
         let id = reg.resolve_name("toggle_mouse_capture").expect("registered");
-        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
           reg.dispatch(id, &mut ctx); }
         assert!(!e.mouse_capture, "toggled off");
     }
@@ -3044,9 +3134,9 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.search.is_some(), "Ctrl+F opens search");
-        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
+        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs()); }
         let s = e.search.as_ref().unwrap();
         assert_eq!(s.needle, "bar");
         assert_eq!(s.current().unwrap().start, 4); // caret jumped to the match
@@ -3062,9 +3152,9 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
-        crate::app::reduce(Msg::Input(mkpress(KeyCode::Esc, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
+        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs()); }
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Esc, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.search.is_none(), "Esc closes search");
         assert_eq!(e.active().document.selection.primary().to(), 0, "caret restored to origin");
     }
@@ -3077,7 +3167,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));   // open Replace
         for c in "aa".chars() { r(&mut e, press(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, press(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
@@ -3125,7 +3215,13 @@ mod tests {
         // Dispatch a resize to a much smaller terminal.
         crate::app::reduce(
             crate::app::Msg::Input(Event::Resize(80, 10)),
-            &mut e, &reg, &km, &ex, &clk, &tx,
+            &mut e,
+            &reg,
+            &km,
+            &ex,
+            &clk,
+            &tx,
+            &crate::test_support::test_fs(),
         );
 
         // After resize + ensure_visible the cache must be fresh and screen_pos
@@ -3170,7 +3266,13 @@ mod tests {
         // Dispatch a resize event.
         crate::app::reduce(
             crate::app::Msg::Input(Event::Resize(120, 30)),
-            &mut e, &reg, &km, &ex, &clk, &tx,
+            &mut e,
+            &reg,
+            &km,
+            &ex,
+            &clk,
+            &tx,
+            &crate::test_support::test_fs(),
         );
 
         // ALL buffers — not just the active one — must reflect the new dimensions.
@@ -3194,7 +3296,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));
         for c in "aa".chars() { r(&mut e, press(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, press(KeyCode::Tab, KeyModifiers::NONE));
@@ -3219,8 +3321,17 @@ mod tests {
         e.open_search(crate::search_overlay::Phase::Find, 0);
         let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
-            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open search overlay");
         assert!(e.search.is_some(), "search overlay remains open after non-key message");
     }
@@ -3235,8 +3346,17 @@ mod tests {
         e.open_outline();
         let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 4..6, cursor: 5,
-            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(
+        Msg::FilterDone { buffer_id: id, version: v, range: 4..6, cursor: 5,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.active().document.buffer.to_string(), "# H\nXcde\n", "FilterDone applies even under an open outline overlay");
         assert!(e.outline.is_some(), "outline overlay remains open after non-key message");
     }
@@ -3260,7 +3380,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.outline.is_none(), "stale outline overlay must close without jumping");
         assert_eq!(e.active().document.selection.primary().head, start,
             "stale outline Enter must not move the caret");
@@ -3293,7 +3413,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));    // open Replace (Phase::Replace)
         r(&mut e, press(KeyCode::Char('r'), KeyModifiers::ALT));        // Alt+R: toggle to regex mode
         // type an invalid regex pattern: unbalanced open paren
@@ -3311,7 +3431,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));
         for c in "aa".chars() { r(&mut e, press(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, press(KeyCode::Tab, KeyModifiers::NONE));
@@ -3354,9 +3474,17 @@ mod tests {
         assert!(e.prompt.is_none(), "precondition: no modal");
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
-        crate::app::reduce(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
+        crate::app::reduce(
+        Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
             event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
-            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+            &mut e,
+            &reg,
+            &cua_keymap(),
+            &ex,
+            &clk,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert_eq!(e.status_text(), INSTALL_HINT, "Degraded reached the status line via reduce_dispatch");
     }
 
@@ -3376,7 +3504,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due
         // a Tick at now=500 with diagnostics enabled dispatches one check into the provider
-        crate::app::reduce(Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
             .unwrap().in_flight_version, Some(e.active().document.version));
         let v = e.active().document.version;
@@ -3407,9 +3535,9 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.diag.is_some(), "Ctrl+. opens the quick-fix overlay on the diagnostic");
-        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n");
         assert!(e.diag.is_none(), "overlay closes after apply");
         assert!(e.active_mut().undo(), "the fix is one undo unit");
@@ -3464,7 +3592,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let ctrl_dot = Event::Key(KeyEvent { code: KeyCode::Char('.'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(ctrl_dot), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(ctrl_dot), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         // The overlay must NOT open and the buffer must be unchanged.
         assert!(e.diag.is_none(), "stale diagnostics: quick_fix must NOT open the overlay");
         assert_eq!(e.active().document.buffer.to_string(), buf_before, "buffer must be unchanged");
@@ -3488,9 +3616,9 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let f8 = Event::Key(KeyEvent { code: KeyCode::F(8), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(f8.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(f8.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.selection.primary().to(), 8, "F8 moves to the next diagnostic");
-        crate::app::reduce(Msg::Input(f8), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(f8), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.selection.primary().to(), 0, "F8 wraps to the first");
     }
 
@@ -3556,14 +3684,14 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // Open the overlay.
-        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.diag.is_some(), "overlay must open");
         assert_eq!(e.diag.as_ref().unwrap().opened_version, v, "opened_version captured at open");
         // Simulate a concurrent edit while the overlay is open: bump the document version.
         e.active_mut().document.version += 1;
         let buf_before = e.active().document.buffer.to_string();
         // Press Enter — must be refused because opened_version != current version.
-        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         // Overlay must be closed and buffer must be unchanged.
         assert!(e.diag.is_none(), "stale overlay must be closed without applying");
         assert_eq!(e.active().document.buffer.to_string(), buf_before,
@@ -3589,10 +3717,10 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(ed.search.is_some(), "Ctrl+F must open search");
         for c in "needle".chars() {
-            crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx);
+            crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let needle_pos = doc.find("needle").unwrap();
         assert_eq!(ed.active().document.selection.primary().from(), needle_pos,
@@ -3690,7 +3818,7 @@ mod tests {
         e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        crate::prompts::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "content\n", "file written");
         assert_eq!(e.active().document.path.as_deref(), Some(p.as_path()), "path re-keyed");
@@ -3705,7 +3833,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx); // no path → opens Save-As, NOT the dead stub
         assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
             Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
@@ -3812,7 +3940,7 @@ mod tests {
         assert!(twc_idx > 15, "toggle_word_count must be past the 15-row visible cap");
         // Drive Down to toggle_word_count's row.
         for _ in 0..twc_idx {
-            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         // Assert the windowing invariant: the selected row is within the visible window.
         let p = e.palette.as_ref().unwrap();
@@ -3823,7 +3951,7 @@ mod tests {
             p.selected, p.scroll_top, lh);
         // Dispatch: Enter → toggle_word_count runs → word_count flips.
         let word_count_before = e.view_opts.word_count;
-        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "Enter closes the palette");
         assert_ne!(e.view_opts.word_count, word_count_before, "toggle_word_count was dispatched");
     }
@@ -3847,18 +3975,18 @@ mod tests {
         }));
         let total = e.palette.as_ref().unwrap().rows.len();
         // End — lands at the last row.
-        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let p = e.palette.as_ref().unwrap();
         assert_eq!(p.selected, total.saturating_sub(1), "End lands on last row");
         let lh = crate::list_window::list_h_for(p.rows.len(), 24);
         assert!(p.selected.saturating_sub(p.scroll_top) < lh, "End: selection visible");
         // Home — lands at row 0.
-        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let p = e.palette.as_ref().unwrap();
         assert_eq!(p.selected, 0, "Home lands on first row");
         assert_eq!(p.scroll_top, 0, "Home: scroll_top resets to 0");
         // PageDown from 0 — jumps by lh.
-        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let p = e.palette.as_ref().unwrap();
         let lh2 = crate::list_window::list_h_for(p.rows.len(), 24);
         assert!(p.selected > 0, "PageDown moved past first row");
@@ -3886,13 +4014,13 @@ mod tests {
             code: KeyCode::Char(c), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
         }));
         // Navigate deep via End.
-        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let deep_scroll_top = e.palette.as_ref().unwrap().scroll_top;
         assert!(deep_scroll_top > 0, "scroll_top must be > 0 after End");
         // Type a narrowing query — filter shrinks the row set.
         // Use 's' + 'a' + 'v' + 'e' which matches 'save', 'save_as', etc. — a small result set.
         for ch in "save".chars() {
-            crate::app::reduce(press_char(ch), &mut e, &reg, &km, &ex, &clk, &tx);
+            crate::app::reduce(press_char(ch), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let p = e.palette.as_ref().unwrap();
         let lh = crate::list_window::list_h_for(p.rows.len(), 24);
@@ -3924,7 +4052,7 @@ mod tests {
         let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
             code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
         }));
-        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let p = e.palette.as_ref().unwrap();
         let lh = crate::list_window::list_h_for(p.rows.len(), 24);
         assert!(lh > 0, "list_h must be > 0 for a 24-row terminal");
@@ -3963,7 +4091,7 @@ mod tests {
         assert_eq!(lh, 15, "list_h must be 15 for a 24-row terminal with 25 rows");
         // Down ×20 — crosses the 15-row window.
         for _ in 0..20 {
-            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let o = e.outline.as_ref().unwrap();
         assert_eq!(o.selected, 20);
@@ -3971,17 +4099,17 @@ mod tests {
             "Down×20: selected={} scroll_top={} lh={} — selection must be visible",
             o.selected, o.scroll_top, lh);
         // End — lands at the last heading.
-        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let o = e.outline.as_ref().unwrap();
         assert_eq!(o.selected, 24, "End must land on last row");
         assert!(o.selected.saturating_sub(o.scroll_top) < lh, "End: selection visible");
         // Home — lands at 0, scroll_top resets.
-        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let o = e.outline.as_ref().unwrap();
         assert_eq!(o.selected, 0, "Home must land on first row");
         assert_eq!(o.scroll_top, 0, "Home: scroll_top must reset to 0");
         // PageDown from 0 — jumps by lh.
-        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let o = e.outline.as_ref().unwrap();
         assert!(o.selected > 0, "PageDown must move past first row");
         assert!(o.selected.saturating_sub(o.scroll_top) < lh, "PageDown: selection visible");
@@ -4018,7 +4146,7 @@ mod tests {
         assert_eq!(lh, 15);
         // Down ×20 — crosses the 15-row window.
         for _ in 0..20 {
-            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let fb = e.file_browser.as_ref().unwrap();
         assert_eq!(fb.selected, 20);
@@ -4026,29 +4154,29 @@ mod tests {
             "Down×20: selected={} scroll_top={} lh={} — selection must be visible",
             fb.selected, fb.scroll_top, lh);
         // End — last row.
-        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let fb = e.file_browser.as_ref().unwrap();
         assert_eq!(fb.selected, 24, "End must land on last row");
         assert!(fb.selected.saturating_sub(fb.scroll_top) < lh, "End: selection visible");
         // Home — row 0.
-        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let fb = e.file_browser.as_ref().unwrap();
         assert_eq!(fb.selected, 0); assert_eq!(fb.scroll_top, 0);
         // PageDown from 0.
-        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let fb = e.file_browser.as_ref().unwrap();
         assert!(fb.selected > 0);
         assert!(fb.selected.saturating_sub(fb.scroll_top) < lh, "PageDown: selection visible");
         // Enter-dispatches-visible: navigate to a deep selection, Enter opens that entry.
         // Navigate to the last entry (index 24 = d23 directory), scroll_top > 0.
-        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let selected_entry = e.file_browser.as_ref().unwrap()
             .entries[e.file_browser.as_ref().unwrap().selected].name.clone();
         // The selected entry's scroll_top must be > 0 (we're at the end of a 25-entry list).
         assert!(e.file_browser.as_ref().unwrap().scroll_top > 0,
             "precondition for visible-row dispatch: scroll_top must be > 0");
         // Enter on a directory — descend (selected entry is d23 directory).
-        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         // After descend into a directory: selected==0, scroll_top==0.
         if let Some(fb) = e.file_browser.as_ref() {
             // We descended into the dir named `selected_entry`.
@@ -4098,14 +4226,14 @@ mod tests {
             code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
         }));
         // PgDn from 0: selected = min(0 + 15, 25) = 15 (= d14, after ".." + d00..d13).
-        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let fb = e.file_browser.as_ref().unwrap();
         assert_eq!(fb.selected, 15, "PgDn must land on index 15 (d14)");
         assert!(fb.scroll_top > 0, "PgDn must advance scroll_top past 0");
         assert_eq!(fb.entries[fb.selected].name, "d14", "selected entry must be d14");
         assert!(fb.entries[fb.selected].is_dir, "d14 must be a directory");
         // Enter → descend into d14. No panic, selected and scroll_top reset.
-        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let fb = e.file_browser.as_ref().expect("file browser must remain open after descend into dir");
         assert_eq!(fb.selected, 0, "after descend: selected must reset to 0");
         assert_eq!(fb.scroll_top, 0, "after descend: scroll_top must reset to 0");
@@ -4150,7 +4278,7 @@ mod tests {
         }));
         // Drive Down ×20.
         for _ in 0..20 {
-            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         }
         let tp = e.theme_picker.as_ref().unwrap();
         assert_eq!(tp.selected, 20, "selected must be 20 after Down×20");
@@ -4185,11 +4313,11 @@ mod tests {
         let ex = InlineExecutor::default(); let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
         // Open via the `theme` command dispatch — same path as the real menu.
-        { let tx2 = tx.clone(); let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx2 };
+        { let tx2 = tx.clone(); let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx2, fs: crate::test_support::test_fs() };
           reg.dispatch(CommandId("theme"), &mut ctx); }
         assert!(e.theme_picker.is_some(), "precondition: picker must be open");
         // Enter immediately — no Down/Up, so previewed is None.
-        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.theme_picker.is_none(), "picker must be closed after Enter");
         assert_eq!(e.theme_identity,
             crate::settings::ThemeIdentity::Builtin("terminal-plain".into()),
@@ -4209,11 +4337,11 @@ mod tests {
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         // Down once: selected moves from 0 → 1; preview funnel fires for rows[1].
-        crate::app::reduce(press(KeyCode::Down, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Down, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         // Capture the name that was previewed before Enter closes the picker.
         let second_row = e.theme_picker.as_ref().unwrap().rows[1].clone();
         // Enter: consumes previewed, sets theme_identity.
-        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.theme_picker.is_none(), "picker closed after Enter");
         assert_eq!(e.theme_identity,
             crate::settings::ThemeIdentity::Builtin(second_row.clone()),
@@ -4368,7 +4496,7 @@ mod tests {
             code: KeyCode::Esc, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE,
         }));
-        crate::app::reduce(esc, &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(esc, &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
 
         assert!(e.prompt.is_none(), "prompt dismissed by Esc");
         assert!(e.by_id(id).is_some(), "buffer still open");
@@ -4410,7 +4538,7 @@ mod tests {
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         reg.dispatch(CommandId("keymap_wordstar"), &mut ctx);
         assert_eq!(e.active_keymap_preset, "wordstar");
         assert!(e.keymap_rebuild, "switch requests a rebuild");
@@ -4425,7 +4553,7 @@ mod tests {
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         reg.dispatch(CommandId("keymap_cua"), &mut ctx); // cua is already active
         assert!(!e.keymap_rebuild, "idempotent switch must not request a rebuild");
         assert_eq!(e.status_text(), "keymap: cua (already active)");
@@ -4445,7 +4573,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
             reg.dispatch(CommandId("save_settings"), &mut ctx);
         }
         assert!(e.settings_save_requested,
@@ -4541,7 +4669,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.palette.is_none(), "palette dispatch closes the overlay");
         assert_ne!(e.active().document.version, before_ver, "delete_line must bump the version");
         assert!(e.active().last_edit_at.is_none(),
@@ -4569,10 +4697,10 @@ mod tests {
         let mk = |code: KeyCode| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // A text-insert key DOES drain (app.rs:958) — establishes the spy works.
-        crate::app::reduce(Msg::Input(mk(KeyCode::Char('a'))), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mk(KeyCode::Char('a'))), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(ex.drains.get(), 1, "a search text-insert key drains once");
         // Esc returns WITHOUT draining (app.rs:926) — the count must not advance.
-        crate::app::reduce(Msg::Input(mk(KeyCode::Esc)), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mk(KeyCode::Esc)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(ex.drains.get(), 1, "search Esc must NOT drain the executor (§8.1-C)");
         assert!(e.search.is_none(), "Esc cancels the search overlay");
     }
@@ -4622,13 +4750,13 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mk = |code: KeyCode| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(mk(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mk(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         {
             let o = e.outline.as_ref().unwrap();
             assert_eq!(o.selected, 1, "Down advances the selection");
             assert!(o.query.is_empty(), "motion must NOT populate the query (§8.1-H)");
         }
-        crate::app::reduce(Msg::Input(mk(KeyCode::Char('A'))), &mut e, &reg, &km, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(mk(KeyCode::Char('A'))), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.outline.as_ref().unwrap().query, "A", "a Char edit re-queries the outline");
     }
 }

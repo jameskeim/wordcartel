@@ -37,12 +37,12 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 }
             } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                 if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
-                    resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx);
+                    resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs);
                 }
             }
         }
         // Merge a directly-delivered background result even under a modal.
-        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ctx.ex, ctx.clock, ctx.msg_tx),
+        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
@@ -66,7 +66,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         _ => {}
     }
     // Always drain ready results (merges the awaited save&quit result).
-    crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx))
+    crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs))
 }
 
 /// Execute the action chosen in a modal prompt, then clear the prompt.
@@ -118,7 +118,8 @@ pub fn expand_path(text: &str) -> std::path::PathBuf {
 /// confirmation if the target exists, else perform the save-as immediately.
 pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
                       executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-                      msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+                      msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+                      fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     let t = text.trim();
     if t.is_empty() {
         editor.set_status_full(crate::status::StatusKind::Warning, "save-as: empty path",
@@ -135,7 +136,7 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
         editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
         return;
     }
-    perform_save_as(editor, target, executor, clock, msg_tx);
+    perform_save_as(editor, target, executor, clock, msg_tx, fs);
 }
 
 /// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
@@ -169,10 +170,11 @@ fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::P
 
 fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
                    executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-                   msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+                   msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+                   fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     let v = editor.active().document.version;
     let buffer_id = editor.active().id;
-    { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone() };
+    { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
       crate::save::do_save_to(&mut ctx, target, crate::save::SaveMode::SaveAs); }
     if let Some(action) = editor.pending_save_as.take() {
         editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
@@ -196,6 +198,7 @@ pub fn resolve_prompt(
     ex: &dyn Executor,
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     match action {
         PromptAction::Cancel => {
@@ -214,24 +217,24 @@ pub fn resolve_prompt(
             let mode = if matches!(action, PromptAction::QuitSaveAll) { crate::editor::QuitMode::SaveAll } else { crate::editor::QuitMode::ReviewEach };
             let queue: std::collections::VecDeque<_> = editor.buffers.iter().filter(|b| editor.is_dirty(b.id)).map(|b| b.id).collect();
             editor.quit_drain = Some(crate::editor::QuitDrain { queue, mode });
-            crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx);
+            crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx, fs);
             return;
         }
         PromptAction::ReviewSave => {
             editor.prompt = None;
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
             crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
             return;
         }
         PromptAction::ReviewDiscard => {
             editor.prompt = None;
             if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
-            crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx);
+            crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx, fs);
             return;
         }
         PromptAction::CloseSave { id } => {
             editor.prompt = None;
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
             crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::CloseBuffer { id });
             return;
         }
@@ -243,13 +246,13 @@ pub fn resolve_prompt(
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
             editor.prompt = None; // dismiss the quit-confirm modal first
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
             crate::save::dispatch_save_and_quit(&mut ctx);
             return; // prompt handled; must NOT clear an external-mod modal
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
             crate::save::overwrite_save(&mut ctx);
         }
         PromptAction::Recover => {
@@ -288,7 +291,7 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteSaveAs => {
             if let Some(t) = editor.pending_save_overwrite.take() {
-                perform_save_as(editor, t, ex, clock, msg_tx);
+                perform_save_as(editor, t, ex, clock, msg_tx, fs);
             }
         }
         PromptAction::OverwriteWriteBlock => {
@@ -434,7 +437,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        save_as_submit(&mut e, "   ", &ex, &clk, &tx);
+        save_as_submit(&mut e, "   ", &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.status_text(), "save-as: empty path");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -499,7 +502,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &crate::test_support::test_fs() };
         let handled = intercept(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
             event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
             &mut e, &ctx);
@@ -519,7 +522,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
+        resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_after_save.is_none(), "no job dispatched → do not arm pending_after_save");
         assert!(!e.quit);
     }
@@ -538,7 +541,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk, &tx);
+        resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.active().document.buffer.to_string(), "recovered body\n",
             "recovered content loaded into the active buffer");
         assert!(!p.exists(), "orphan swap file must be deleted on Recover");
@@ -634,7 +637,7 @@ mod tests {
         let mut e = Editor::new_from_text("new\n", None, (80, 24));
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "existing target → confirm modal");
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
         assert_ne!(crate::prompt::PromptAction::OverwriteSaveAs, crate::prompt::PromptAction::Overwrite);
@@ -745,7 +748,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         let pas = e.pending_after_save.as_ref().expect("pending_after_save must be armed");
         assert_eq!(pas.buffer_id, id);
         assert_eq!(pas.version, 1);
@@ -772,7 +775,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(crate::prompt::PromptAction::CloseDiscard { id }, &mut e, &ex, &clk, &tx);
+        resolve_prompt(crate::prompt::PromptAction::CloseDiscard { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         // Buffer is gone (last ordinary → slot replaced with fresh untitled, old id absent)
         assert!(e.by_id(id).is_none(), "discarded buffer is gone");
         // Swap file must NOT be deleted by Discard (decision 1)
@@ -825,7 +828,7 @@ mod tests {
         // A new file appears after the prompt was raised.
         std::fs::write(&latecomer, "late").unwrap();
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
-        resolve_prompt(crate::prompt::PromptAction::CleanRecovery, &mut e, &ex, &clk, &tx);
+        resolve_prompt(crate::prompt::PromptAction::CleanRecovery, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(!a.exists() && !b.exists(), "exactly the snapshot is deleted");
         assert!(latecomer.exists(), "a file appearing after the snapshot is NEVER swept (TOCTOU-safe)");
         assert!(e.pending_clean.is_empty(), "snapshot consumed");
@@ -884,7 +887,7 @@ mod tests {
         write_atomic(&sp_bad, &serialize(&h_div, "UNSAVED EDIT\n")).unwrap();
 
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
-        resolve_prompt(crate::prompt::PromptAction::CleanRecovery, &mut e, &ex, &clk, &tx);
+        resolve_prompt(crate::prompt::PromptAction::CleanRecovery, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
 
         assert!(!sp_ok.exists(), "the still-valueless snapshot swap IS deleted");
         assert!(sp_bad.exists(),
@@ -905,7 +908,7 @@ mod tests {
         e.pending_clean = vec![a.clone()];
         e.open_prompt(crate::prompt::Prompt::clean_recovery(1));
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
-        resolve_prompt(crate::prompt::PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+        resolve_prompt(crate::prompt::PromptAction::Cancel, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(a.exists(), "Cancel deletes nothing");
         assert!(e.pending_clean.is_empty(), "Cancel clears the snapshot");
         assert!(e.prompt.is_none());
@@ -925,7 +928,7 @@ mod tests {
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &crate::test_support::test_fs() };
         let esc = Event::Key(KeyEvent {
             code: KeyCode::Esc, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
@@ -948,7 +951,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(e.minibuffer.as_ref().map(|m| m.kind),
             Some(crate::minibuffer::MinibufferKind::SaveAs),
             "Save-As minibuffer must open for unnamed buffer");

@@ -740,7 +740,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
           dispatch_swap_write(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(e.active().last_swap_at, Some(123), "merge records last_swap_at");
@@ -774,7 +774,7 @@ mod tests {
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
         // Dispatch a swap — it captures the OLD path.
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
           dispatch_swap_write(&mut ctx); }
         // Simulate a SaveAs rekey landing before this swap's merge drains: the buffer's path is now
         // the NEW file, and the save-side clear reset the latch.

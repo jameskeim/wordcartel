@@ -239,7 +239,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         // Dispatch the scroll event (sets scrollbar_until_ms = t + 1200).
-        crate::mouse::handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
+        crate::mouse::handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         // Recompute at t (now < until) — bar must be visible.
         crate::chrome::recompute_scrollbar_visible(&mut e, t);
         assert!(e.mouse.scrollbar_visible, "scrollbar must be visible immediately after a scroll event");

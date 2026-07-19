@@ -390,7 +390,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         {
-            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() };
             dispatch_save(&mut ctx);
         }
         assert_eq!(e.status_text(), "Saving\u{2026}", "status set before dispatch (§3.9)");
@@ -411,7 +411,7 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         // User edits on to version 2 BEFORE the merge applies.
         e.active_mut().document.version = 2;
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
@@ -434,7 +434,7 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
@@ -457,7 +457,7 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -478,7 +478,7 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Info);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Transient);
@@ -501,7 +501,7 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
 
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
@@ -532,7 +532,7 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty());
         assert!(!sp.exists(), "a save that leaves the buffer clean deletes the swap");
@@ -540,7 +540,7 @@ mod tests {
         // Now: dispatch a save at v2, but edit on to v3 before the merge → keep swap.
         crate::swap::write_atomic(&sp, "stub2").unwrap();
         e.active_mut().document.version = 2;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         e.active_mut().document.version = 3; // edited on
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty());
@@ -561,7 +561,7 @@ mod tests {
         e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         assert!(e.prompt.is_some(), "external change must raise the modal, not clobber");
         assert!(ex.drain().is_empty(), "no save job dispatched on conflict");
         // A17 T5 (F4 Warning table): the external-mod refusal is a Sticky Warning.
@@ -581,7 +581,7 @@ mod tests {
         e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
         let ex = crate::jobs::InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
+        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() };
           dispatch_save(&mut ctx); }
         assert!(e.prompt.is_some(), "a file appearing where there was none is a conflict");
         assert!(ex.drain().is_empty(), "no save job dispatched on new-file conflict");
@@ -597,7 +597,7 @@ mod tests {
         let mut e = Editor::new_from_text("mine\n", None, (80, 24));
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; overwrite_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; overwrite_save(&mut ctx); }
         assert_eq!(e.status_text(), "No file name — use Save As");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -615,7 +615,7 @@ mod tests {
         e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
         let ex = InlineExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; overwrite_save(&mut ctx); }
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; overwrite_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n", "overwrite wins");
         assert!(!e.active().document.dirty());
@@ -676,7 +676,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         {
-            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() };
             dispatch_save(&mut ctx);
         }
         assert!(ex.drain().is_empty(), "no save job dispatched on external-mod conflict");
@@ -932,7 +932,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         {
-            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() };
             dispatch_save(&mut ctx);
         }
         assert!(e.prompt.is_some(),

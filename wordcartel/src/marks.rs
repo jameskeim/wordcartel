@@ -21,7 +21,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => { editor.pending_mark = None; } // non-name key cancels
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     // non-key message: fall through to normal handling
     crate::app::Handled::Pass(msg)

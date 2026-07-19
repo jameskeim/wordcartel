@@ -29,6 +29,10 @@ pub struct Ctx<'a> {
     pub executor: &'a dyn Executor,
     /// Owned `Sender` (not a borrow) because `dispatch_filter` moves a clone into a `'static` spawned thread.
     pub msg_tx: std::sync::mpsc::Sender<Msg>,
+    /// The filesystem seam. OWNED (`Arc`), not borrowed, because `jobs::Job::run` is
+    /// `Box<dyn FnOnce() -> JobResult + Send>` — a job closure must be able to clone this in.
+    /// Synchronous call sites still take plain `&dyn Fs`; see §5.2 of the C5 spec.
+    pub fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 }
 
 pub type Handler = fn(&mut Ctx) -> CommandResult;
@@ -1091,6 +1095,24 @@ mod tests {
     struct Z;
     impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
 
+    /// The compile-shape guard for this task: `Ctx.fs` must be an OWNED handle so a job
+    /// closure (`'static + Send`, per `jobs::Job::run`) can clone it in and use it after
+    /// crossing a real thread boundary — a borrowed `&dyn Fs` cannot do this.
+    #[test]
+    fn ctx_fs_field_exists_and_is_clonable_into_a_closure() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ctx = Ctx {
+            editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx,
+            fs: std::sync::Arc::new(crate::fsx::RealFs),
+        };
+        let handle = std::sync::Arc::clone(&ctx.fs);
+        let t = std::thread::spawn(move || handle.stat(std::path::Path::new("/")).is_ok());
+        assert!(t.join().expect("joins"));
+    }
+
     #[test]
     fn menu_from_str_parses_all_eight_and_rejects_unknown() {
         for (s, m) in [
@@ -1167,7 +1189,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
         // No path → save handler opens the Save-As minibuffer (Effort 7, Task 3).
         assert_eq!(r, crate::commands::CommandResult::Handled);
@@ -1186,7 +1208,7 @@ mod tests {
         // Dispatch `id` against editor `e` with the caret preset to `caret`; return the new head
         // (and leave `e`'s selection for the caller to inspect).
         let dispatch = |e: &mut Editor, id: &'static str| {
-            let mut ctx = Ctx { editor: e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = Ctx { editor: e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             reg.dispatch(CommandId(id), &mut ctx)
         };
         let head = |e: &Editor| e.active().document.selection.primary().head;
@@ -1259,7 +1281,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
 
         assert_eq!(r, CommandResult::Handled);
@@ -1283,7 +1305,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
 
         assert_eq!(r, CommandResult::Handled);
@@ -1311,7 +1333,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch_with_arg(id, &mut ctx, Some("25".into()));
 
         assert_eq!(r, CommandResult::Handled);
@@ -1333,7 +1355,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
 
         assert_eq!(r, CommandResult::Handled);
@@ -1351,7 +1373,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch_with_arg(CommandId("save"), &mut ctx, Some("x".into()));
         assert_eq!(r, CommandResult::Handled);
     }
@@ -1376,7 +1398,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
     }
@@ -1397,7 +1419,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
         assert_eq!(r, CommandResult::Handled);
         assert_eq!(e.pending_plugin_calls.len(), 1, "re-registered id dispatches as a plugin call");
@@ -1424,7 +1446,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("nope"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Noop);
         assert!(e.status_text().contains("unknown command"), "must surface, never silent (§12.5)");
@@ -1538,7 +1560,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("plugins_reload"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert!(e.plugins_reload_requested, "plugins_reload sets the request flag the seam consumes");
@@ -1555,7 +1577,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
@@ -1585,7 +1607,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
@@ -1984,7 +2006,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         reg.dispatch(CommandId(id), &mut ctx);
     }
 
@@ -2231,7 +2253,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         assert!(ctx.editor.view_opts.splash, "default on");
         let r = reg.dispatch(CommandId("splash_off"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
@@ -2282,7 +2304,7 @@ mod tests {
         // Dispatch flips it on and rebuilds.
         let ex = InlineExecutor::default();
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut ed, clock: &Z, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut ed, clock: &Z, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         assert_eq!(reg.dispatch(CommandId("toggle_ventilate"), &mut ctx), CommandResult::Handled);
         assert!(ed.active().view.ventilate, "dispatch turned the lens on");
         assert!(matches!(f(&ed), MenuMark::OnOff(true)));

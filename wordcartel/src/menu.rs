@@ -173,10 +173,10 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
         // Drop an async clipboard-paste result that arrives while the menu is
         // open — it must not land in the document behind the overlay.
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     if let Msg::Input(Event::Paste(_)) = &msg {
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -227,11 +227,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     }
                 } // menu borrow dropped here
                 if let Some(action) = selected {
-                    dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action);
+                    dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action, ctx.fs);
                 }
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     // Non-key msg falls through to normal handling while menu stays open.
     crate::app::Handled::Pass(msg)
@@ -245,6 +245,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
 /// palette's buffer-switcher rows already use (`mouse::route_overlay`'s palette branch).
 /// The Documents dynamic menu (Task 4.2, `DYNAMIC_SECTIONS`) is the first built menu rows
 /// to carry `SwitchBuffer`.
+#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub(crate) fn dispatch_row_action(
     editor: &mut crate::editor::Editor,
     reg: &crate::registry::Registry,
@@ -253,10 +254,11 @@ pub(crate) fn dispatch_row_action(
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
     action: MenuRowAction,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     match action {
         MenuRowAction::Command(id) =>
-            crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id),
+            crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id, fs),
         MenuRowAction::SwitchBuffer(bid) => {
             editor.menu = None;
             if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
@@ -630,7 +632,7 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &crate::test_support::test_fs() };
         let _ = intercept(crate::app::Msg::Input(enter_key()), &mut ed, &ctx);
         assert_eq!(ed.active().id, b_id, "selecting the Documents row switches to that buffer");
         assert!(ed.menu.is_none(), "menu closes after activation");

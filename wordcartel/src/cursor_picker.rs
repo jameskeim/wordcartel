@@ -83,10 +83,10 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
     // appends `Event::Paste` text to its query. Both arms must be consumed so neither leaks
     // into the document behind the overlay (app.rs would otherwise insert the paste text).
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
-        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     if matches!(&msg, Msg::Input(Event::Paste(_))) {
-        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -115,7 +115,7 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
                 _ => {}
             }
         }
-        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     // Non-key msg falls through to normal handling while the picker stays open.
     Handled::Pass(msg)

@@ -10,6 +10,7 @@
 /// `Msg::Input(Event::Key(k))` arm body (Effort H1 T9); the call site still runs inside
 /// `reduce`'s normal `match`, so the version-hook epilogue (spec §8.1-A) still sees
 /// key-driven edits — this is NOT given interception early-return semantics.
+#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub(crate) fn handle_key(
     k: crossterm::event::KeyEvent,
     editor: &mut crate::editor::Editor,
@@ -18,6 +19,7 @@ pub(crate) fn handle_key(
     ex: &dyn crate::jobs::Executor,
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
     // interception blocks ABOVE this point. Here in normal mode the order is
@@ -40,7 +42,8 @@ pub(crate) fn handle_key(
             crate::keymap::Resolution::Command(id) => {
                 editor.pending_keys.clear();
                 editor.clear_transient_status();
-                let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(),
+                    fs: std::sync::Arc::clone(fs) };
                 reg.dispatch(id, &mut ctx);
                 crate::app::hydrate_overlays(editor, reg, keymap);
             }

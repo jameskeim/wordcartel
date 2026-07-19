@@ -24,6 +24,14 @@ pub(crate) fn press(code: KeyCode, mods: KeyModifiers) -> Msg {
     Msg::Input(Event::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }))
 }
 
+/// A throwaway owned `Fs` handle for test call sites that must supply one but exercise no
+/// fault behavior — the plain `RealFs` case. Kept as ONE helper (rather than a
+/// `std::sync::Arc::new(crate::fsx::RealFs)` literal repeated at every call site) so the many
+/// `reduce`/`pump`/`resolve_prompt`/… test callers threaded in C5 Task 5 stay one short call.
+pub(crate) fn test_fs() -> std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> {
+    std::sync::Arc::new(crate::fsx::RealFs)
+}
+
 /// Install an ENABLED Harper `RecordingProvider` into a bare test editor so
 /// `apply_diagnostics_done`'s `is_enabled(Harper)` guard (and `arm_enabled`'s enabled-only
 /// arming) accept Harper results/arms. `Editor::new_from_text` builds an EMPTY `ProviderSet`;

@@ -93,11 +93,12 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 /// Apply a finished job's result, then advance a multi-buffer quit drain if one
 /// is waiting on this completion. The single funnel for all JobDone handling so
 /// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
-pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     apply_result(r, editor);
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
-        drive_quit_drain(editor, ex, clock, msg_tx);
+        drive_quit_drain(editor, ex, clock, msg_tx, fs);
     }
 }
 
@@ -167,11 +168,12 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
 /// Apply a finished job outcome, then advance a multi-buffer quit drain if one
 /// is waiting on this completion. The single funnel for all JobDone handling so
 /// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
-pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     apply_outcome(outcome, editor);
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
-        drive_quit_drain(editor, ex, clock, msg_tx);
+        drive_quit_drain(editor, ex, clock, msg_tx, fs);
     }
 }
 
@@ -179,7 +181,8 @@ pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, 
 /// and either dispatch its save (SaveAll) or raise the per-buffer review prompt
 /// (ReviewEach). When the queue is empty, quit. Re-driven by save completion
 /// (apply_result sets `quit_drain_advance`) and by review-prompt resolution.
-pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     loop {
         if editor.quit_drain.is_none() { return; }
         // Pop already-clean / vanished buffers off the front. Each iteration uses a
@@ -202,7 +205,7 @@ pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Cloc
         let mode = editor.quit_drain.as_ref().unwrap().mode;
         match mode {
             crate::editor::QuitMode::SaveAll => {
-                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
                 crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
                 return; // wait for the save (named) or Save-As (unnamed) to complete
             }
@@ -435,7 +438,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
@@ -458,7 +461,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
@@ -599,7 +602,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::CloseSave { id: x_id }, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::CloseSave { id: x_id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_after_save.is_some(), "pending armed");
         let pre_count = e.buffers.len();
         for o in ex.drain() { apply_outcome(o, &mut e); }
@@ -670,7 +673,7 @@ mod tests {
             let ex = InlineExecutor::default();
             let clk = TestClock(0);
             let (tx, _rx) = std::sync::mpsc::channel();
-            crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+            crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
             for o in ex.drain() { apply_outcome(o, &mut e); }
             assert!(e.by_id(id).is_some(), "buffer NOT closed — save failed");
             assert!(e.pending_after_save.is_none(), "pending cleared on save failure");
@@ -835,7 +838,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "external-mod conflict raises the modal");
         assert!(e.pending_after_save.is_none(), "pending_after_save NOT armed on conflict");
         let _ = std::fs::remove_file(&p);
