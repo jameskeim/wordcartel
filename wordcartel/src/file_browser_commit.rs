@@ -910,6 +910,11 @@ mod tests {
                 "{name}: a refusal writes nothing anywhere");
             assert!(e.status().map_or("", |s| s.text()).contains(name.rsplit('.').next().expect("ext")),
                 "{name}: the refusal names the reason: {:?}", e.status().map_or("", |s| s.text()));
+            // The `read_dir` check above is vacuous on its own for the `Foreign` arm: that write
+            // would be deferred behind the overwrite confirm, so no file appears YET either way.
+            // Assert the confirm was never armed, so the filesystem claim has teeth on both arms.
+            assert!(e.pending_save_overwrite.is_none(),
+                "{name}: a refusal arms no overwrite confirm");
             let _ = std::fs::remove_dir_all(&d);
         }
     }
