@@ -275,6 +275,20 @@ fn kind_of(is_file: bool, is_dir: bool) -> EntryKind {
     if is_file { EntryKind::File } else if is_dir { EntryKind::Dir } else { EntryKind::Other }
 }
 
+/// `Path::exists()` through the seam. `Path::exists()` FOLLOWS symlinks, so a broken link
+/// answers `false` — and `stat` reports such a link as `Ok(broken: true)`. Both facts are
+/// reconciled here in ONE place so no call site re-derives them.
+pub(crate) fn exists_via(fs: &dyn Fs, path: &Path) -> bool {
+    matches!(fs.stat(path), Ok(st) if !st.broken)
+}
+
+/// `Path::is_file()` through the seam — a RESOLVED regular file. Returns `false` on any
+/// error, which is exactly what `Path::is_file()` does today at every migrated site
+/// (it swallows the error). NEVER `!is_dir`: fifos, sockets, and devices are neither.
+pub(crate) fn is_file_via(fs: &dyn Fs, path: &Path) -> bool {
+    matches!(fs.stat(path), Ok(st) if st.is_file)
+}
+
 // Platform-specific O_EXCL open with `mode` on Unix; plain create_new elsewhere.
 #[cfg(unix)]
 fn open_excl(path: &Path, mode: u32) -> std::io::Result<fs::File> {
@@ -693,6 +707,44 @@ mod tests {
         let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Stat);
         let err = fs.stat(&f).expect_err("injected stat must fail");
         assert!(err.to_string().contains("injected: stat"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_file_via_rejects_a_fifo_and_a_dir() {
+        // `!is_dir` is NOT "regular file". config_layer_paths, plugin discovery, and the
+        // clipboard PATH search all ask `is_file()`, and a fifo answering `true` would turn
+        // "skip it" into a blocking read.
+        // MUST create a real fifo. Without one, `is_file_via` implemented as `!st.is_dir` —
+        // the exact defect this test's own comment warns about — passes every assertion
+        // (file→true, dir→false, missing→Err→false). The fifo is the only case that separates
+        // the two implementations.
+        //
+        // FAIL-VERIFY: implement `is_file_via` as `matches!(fs.stat(p), Ok(st) if !st.is_dir)`,
+        // watch the fifo assertion fail.
+        let d = unique_dir("isfile-fifo");
+        let f = d.join("plain.txt");
+        std::fs::write(&f, b"x").expect("seed");
+        assert!(is_file_via(&RealFs, &f), "regular file");
+        assert!(!is_file_via(&RealFs, &d), "a directory is not a file");
+        assert!(!is_file_via(&RealFs, &d.join("absent")), "a missing path is false, not an error");
+        #[cfg(unix)]
+        {
+            let fifo = d.join("pipe");
+            // DEVIATION from the brief's literal `unsafe { libc::mkfifo(...) }`: this crate's
+            // `#![forbid(unsafe_code)]` (wordcartel/src/lib.rs:1) makes that block a hard
+            // compile error, and `forbid` cannot be locally overridden with `#[allow(...)]`.
+            // `nix::unistd::mkfifo` is a SAFE wrapper around the identical syscall (nix 0.29 is
+            // already in the lock transitively; added as a direct dev-dependency under `[fs]`
+            // feature) — same mandatory, non-skippable fifo creation the brief calls for, none
+            // of this crate's unsafe code.
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o644))
+                .expect("mkfifo must succeed — this IS the guard, not an optional extra");
+            assert!(!is_file_via(&RealFs, &fifo),
+                "a FIFO is NOT a regular file — the one assertion an `!is_dir` implementation \
+                 fails, and the reason this test exists");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

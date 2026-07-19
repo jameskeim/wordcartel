@@ -29,6 +29,7 @@ mlua = { version = "0.10", features = ["vendored", "lua54"] }
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+nix = { version = "0.29", features = ["fs"] }
 
 [lints]
 workspace = true

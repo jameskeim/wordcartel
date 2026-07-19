@@ -28,17 +28,30 @@ pub struct FileFingerprint {
 /// conflict check). `mtime`/`size` come from `metadata`, `hash` from a separate
 /// bounded read (no single-syscall guarantee across the three fields).
 pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
-    fingerprint_with_limit(path, crate::limits::MAX_OPEN_BYTES)
+    fingerprint_with_fs(&crate::fsx::RealFs, path)
 }
 
-/// Content-hash fingerprint, capping the content read at `limit`. `meta` failure
-/// (missing/unreadable) → `None`; but a present-but-over-cap file yields a
-/// metadata-only fingerprint (real mtime+size, sentinel hash 0) rather than `None`,
-/// so `stored_fp` never becomes `None` and the external-mod check is not silently
-/// defeated (`None == None`) for files grown beyond the cap.
-fn fingerprint_with_limit(path: &Path, limit: u64) -> Option<FileFingerprint> {
-    let meta = std::fs::metadata(path).ok()?;
-    let hash = match crate::file::bounded_read_opt(path, limit) {
+/// Seam-taking core of [`fingerprint`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn fingerprint_with_fs(fs: &dyn crate::fsx::Fs, path: &Path) -> Option<FileFingerprint> {
+    fingerprint_with_limit(fs, path, crate::limits::MAX_OPEN_BYTES)
+}
+
+/// Content-hash fingerprint, capping the content read at `limit`.
+///
+/// Returns `None` when the path is missing/unstattable — AND when it is a BROKEN symlink,
+/// because today's `std::fs::metadata(path).ok()?` fails for a dangling link and the seam's
+/// `stat` succeeds for one. Without the explicit `broken` guard this would return `Some`
+/// with zeroed fields and silently defeat the external-mod check.
+///
+/// A present, resolvable but over-cap file still yields a metadata-only fingerprint (real
+/// mtime+size, sentinel hash 0) rather than `None`, so `stored_fp` never becomes `None`
+/// and `None == None` cannot disable the conflict check.
+fn fingerprint_with_limit(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
+    -> Option<FileFingerprint>
+{
+    let st = fs.stat(path).ok()?;
+    if st.broken { return None; }
+    let hash = match crate::file::bounded_read_opt_with_fs(fs, path, limit) {
         Some(bytes) => {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hasher::write(&mut h, &bytes);
@@ -46,7 +59,7 @@ fn fingerprint_with_limit(path: &Path, limit: u64) -> Option<FileFingerprint> {
         }
         None => 0, // over-cap (or transient read failure): fall back to mtime+size only
     };
-    Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len(), hash })
+    Some(FileFingerprint { mtime: st.mtime, size: st.len, hash })
 }
 
 /// Whether a save job writes the document's own path (Normal) or re-keys the
@@ -876,7 +889,8 @@ mod tests {
     fn fingerprint_over_cap_falls_back_to_metadata_not_none() {
         let p = scratch();
         std::fs::write(&p, b"0123456789").unwrap(); // 10 bytes
-        let fp = fingerprint_with_limit(&p, 4).expect("over-cap present file still yields a fingerprint");
+        let fp = fingerprint_with_limit(&crate::fsx::RealFs, &p, 4)
+            .expect("over-cap present file still yields a fingerprint");
         assert_eq!(fp.size, 10, "size from metadata");
         assert_eq!(fp.hash, 0, "over-cap → sentinel hash, NOT None (closes None==None)");
         let _ = std::fs::remove_file(&p);
@@ -886,7 +900,7 @@ mod tests {
     fn fingerprint_within_cap_hashes_content_unchanged() {
         let p = scratch();
         std::fs::write(&p, b"aaaa").unwrap();
-        let within = fingerprint_with_limit(&p, 1_000_000).expect("fp");
+        let within = fingerprint_with_limit(&crate::fsx::RealFs, &p, 1_000_000).expect("fp");
         assert_ne!(within.hash, 0, "≤cap → real content hash");
         assert_eq!(within.hash, fingerprint(&p).unwrap().hash, "≤cap path identical to public fingerprint (no churn)");
         let _ = std::fs::remove_file(&p);
@@ -912,6 +926,33 @@ mod tests {
         assert_ne!(fp_a, fp_b,
             "FileFingerprint must detect same-size/same-mtime external content change (BUG-2)");
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_on_a_broken_symlink_is_none() {
+        // BEHAVIOUR PRESERVATION. Today `fingerprint` opens with
+        // `std::fs::metadata(path).ok()?`, so a broken symlink yields None. Under the seam,
+        // `stat` SUCCEEDS for a broken link (broken == true) — so the caller must map
+        // broken -> None explicitly. Without that mapping this returns Some with zeroed
+        // fields and silently corrupts the external-mod comparison.
+        let d = std::env::temp_dir().join(format!("wc-fp-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("dir");
+        let link = d.join("dangling.md");
+        std::os::unix::fs::symlink(d.join("gone.md"), &link).expect("symlink");
+        assert!(fingerprint_with_fs(&crate::fsx::RealFs, &link).is_none(),
+            "a broken symlink must fingerprint as None, exactly as metadata().ok()? did");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fingerprint_faults_are_injectable() {
+        let p = scratch();
+        std::fs::write(&p, b"aaaa").expect("seed");
+        let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Stat);
+        assert!(fingerprint_with_fs(&ff, &p).is_none(),
+            "an injected stat failure degrades to None, matching today's .ok()?");
         let _ = std::fs::remove_file(&p);
     }
 

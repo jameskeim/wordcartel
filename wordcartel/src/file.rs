@@ -115,7 +115,7 @@ pub(crate) fn open_bounded_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: 
 
     // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but guard it
     // anyway (opening a dir with read() sometimes succeeds on some FS).
-    if path.is_dir() {
+    if matches!(fs.stat(path), Ok(st) if st.is_dir) {
         return Err(OpenError::IsDir(label));
     }
 
@@ -150,14 +150,24 @@ pub(crate) fn bounded_read_opt_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, lim
 }
 
 pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
-    // (1) Symlink refusal — symlink_metadata does NOT follow the link.
-    match path.symlink_metadata() {
-        Ok(meta) if meta.file_type().is_symlink() => return Err(SaveError::Symlink),
+    save_atomic_with_fs(&crate::fsx::RealFs, path, content)
+}
+
+/// Seam-taking core of [`save_atomic`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn save_atomic_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content: &str)
+    -> Result<SaveOutcome, SaveError>
+{
+    // (1) Symlink refusal. UNCHANGED semantics: `stat` reports `is_symlink` from
+    // `symlink_metadata`, which does not follow — exactly what this check needs.
+    // This stays an unconditional last-resort guard; C5 resolves destinations BEFORE
+    // they reach here (spec §7.6.1), so it simply never fires on the save path.
+    match fs.stat(path) {
+        Ok(st) if st.is_symlink => return Err(SaveError::Symlink),
         _ => {}
     }
 
     // (2) Skip-unchanged — bounded read; over-cap or unreadable → skip the optimization.
-    if let Some(existing) = bounded_read_opt(path, crate::limits::MAX_OPEN_BYTES) {
+    if let Some(existing) = bounded_read_opt_with_fs(fs, path, crate::limits::MAX_OPEN_BYTES) {
         if existing == content.as_bytes() {
             return Ok(SaveOutcome::Unchanged);
         }
@@ -165,15 +175,10 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
 
     // (3) Commit through the shared fault-tested core. Mode is preserved from the
     // existing target (else 0600); dir-fsync after rename for durability.
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content.as_bytes(),
-        crate::fsx::WriteOpts {
-            mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
-            dir_fsync: true,
-        },
-    )
+    crate::fsx::atomic_replace(fs, path, content.as_bytes(), crate::fsx::WriteOpts {
+        mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
+        dir_fsync: true,
+    })
     .map_err(|e| SaveError::Io(e.to_string()))?;
 
     Ok(SaveOutcome::Saved)

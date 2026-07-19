@@ -126,14 +126,23 @@ pub fn load() -> SessionState {
 
 /// Return the (mtime_secs, size) identity of a file, or None on error.
 pub fn file_identity(path: &Path) -> Option<(i64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
-    let mtime = m
-        .modified()
-        .ok()
+    file_identity_with_fs(&crate::fsx::RealFs, path)
+}
+
+/// Seam-taking core of [`file_identity`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn file_identity_with_fs(fs: &dyn crate::fsx::Fs, path: &Path) -> Option<(i64, u64)> {
+    let st = fs.stat(path).ok()?;
+    // SAME guard as `save::fingerprint`, and for the same reason: today's
+    // `std::fs::metadata(path).ok()?` FAILS for a broken symlink, so this returns None.
+    // The seam's `stat` SUCCEEDS for one, so without this the session-restore staleness
+    // check would receive a (mtime = 0, len = 0) identity — which matches nothing and
+    // silently discards resume state, or worse matches a genuinely empty file.
+    if st.broken { return None; }
+    let mtime = st.mtime
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Some((mtime, m.len()))
+    Some((mtime, st.len))
 }
 
 // ---------------------------------------------------------------------------
@@ -311,5 +320,21 @@ seq = 1
         let d = tmp();
         std::fs::write(d.join("session.toml"), "x".repeat(crate::limits::MAX_SESSION_BYTES + 1)).unwrap();
         assert!(load_in(&d).entries.is_empty(), "over-cap session.toml → empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_on_a_broken_symlink_is_none() {
+        // Without the guard this returns Some((0, 0)) — an identity that silently discards
+        // resume state, or matches a genuinely empty file.
+        //
+        // FAIL-VERIFY: delete the `if st.broken` line, watch this fail, then revert.
+        let d = std::env::temp_dir().join(format!("wc-fid-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let link = d.join("dangling.md");
+        std::os::unix::fs::symlink(d.join("gone.md"), &link).expect("symlink");
+        assert!(file_identity_with_fs(&crate::fsx::RealFs, &link).is_none(),
+            "a broken symlink must yield None, exactly as metadata().ok()? did");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

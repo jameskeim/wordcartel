@@ -481,14 +481,14 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
     let xdg = dirs::config_dir();
-    let hand_paths = config::config_layer_paths(&cli, xdg.as_deref(), &anchor);
+    let hand_paths = config::config_layer_paths_with_fs(&*fs, &cli, xdg.as_deref(), &anchor);
     // The overrides layer: ABOVE the hand chain, BELOW --config (spec D3). --no-config
     // empties hand_paths and skips the overrides too (config_layer_paths returned early).
     let overrides_path = xdg.as_ref()
         .map(|x| x.join("wordcartel").join("settings-overrides.toml"));
     let mut all_paths = hand_paths.clone();
     if !cli.no_config {
-        if let Some(op) = overrides_path.as_ref().filter(|p| p.is_file()) {
+        if let Some(op) = overrides_path.as_ref().filter(|p| crate::fsx::is_file_via(&*fs, p)) {
             // Race-free: derive from what config_layer_paths ACTUALLY pushed, not a re-stat
             // (Fable plan M3). The is_some() guard kills the None == None arm — an EMPTY
             // hand chain (no XDG config, no project file, no --config: the headline
@@ -501,7 +501,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let (baseline_cfg, _baseline_warns) = config::load(&hand_paths); // WITHOUT overrides
     let (cfg, mut warns) = config::load(&all_paths);                  // production config
     if let Some(c) = &cli.config_path {
-        if !c.is_file() {
+        if !crate::fsx::is_file_via(&*fs, c) {
             warns.push(format!("config: --config path not found: {}", c.display()));
         }
     }
@@ -520,7 +520,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         let id = editor.active().id; // reuse slot 0's id for the launch buffer
         match crate::editor::Buffer::from_file(id, p, area) {
             Ok(b) => {
-                let was_new_file = b.document.path.is_some() && !p.exists();
+                let was_new_file = b.document.path.is_some() && !crate::fsx::exists_via(&*fs, p);
                 // A17 T8 category (b): route the launch install through the single chokepoint. Slot 0
                 // is the fresh writable scratch host, so this always succeeds; the `was_new_file`
                 // status only follows a successful install.
@@ -601,7 +601,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
     // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
     let mut overrides_snapshot = overrides_path.as_ref()
-        .filter(|p| p.is_file())
+        .filter(|p| crate::fsx::is_file_via(&*fs, p))
         .and_then(|p| fs.read_capped(p, crate::limits::MAX_CONFIG_BYTES).ok().flatten())
         .and_then(|b| String::from_utf8(b).ok())
         .map(|s| settings::parse_overrides(&s))
@@ -609,7 +609,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Mask snapshot: parse the --config layer via parse_mask so theme provenance is
     // collapsed at load time (file vs name are indistinguishable for the guard).
     let mask_snapshot = cli.config_path.as_ref()
-        .filter(|c| c.is_file())
+        .filter(|c| crate::fsx::is_file_via(&*fs, c))
         .and_then(|c| fs.read_capped(c, crate::limits::MAX_CONFIG_BYTES).ok().flatten())
         .and_then(|b| String::from_utf8(b).ok())
         .map(|s| settings::parse_mask(&s))

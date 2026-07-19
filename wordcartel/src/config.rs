@@ -401,13 +401,23 @@ pub fn config_layer_paths(
     xdg_config_dir: Option<&Path>,
     anchor_dir: &Path,
 ) -> Vec<PathBuf> {
+    config_layer_paths_with_fs(&crate::fsx::RealFs, cli, xdg_config_dir, anchor_dir)
+}
+
+/// Seam-taking core of [`config_layer_paths`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn config_layer_paths_with_fs(
+    fs: &dyn crate::fsx::Fs,
+    cli: &Cli,
+    xdg_config_dir: Option<&Path>,
+    anchor_dir: &Path,
+) -> Vec<PathBuf> {
     if cli.no_config {
         return Vec::new();
     }
     let mut v = Vec::new();
     if let Some(x) = xdg_config_dir {
         let p = x.join("wordcartel").join("config.toml");
-        if p.is_file() {
+        if crate::fsx::is_file_via(fs, &p) {
             v.push(p);
         }
     }
@@ -415,14 +425,14 @@ pub fn config_layer_paths(
     let mut dir = Some(anchor_dir);
     while let Some(d) = dir {
         let p = d.join(".wordcartel.toml");
-        if p.is_file() {
+        if crate::fsx::is_file_via(fs, &p) {
             v.push(p);
             break;
         }
         dir = d.parent();
     }
     if let Some(c) = &cli.config_path {
-        if c.is_file() {
+        if crate::fsx::is_file_via(fs, c) {
             v.push(c.clone());
         }
         // (a missing --config path is surfaced as a warning by the caller in Task 5)
