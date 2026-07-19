@@ -98,7 +98,6 @@ pub(crate) fn classify_destination_enter(
 }
 
 /// Extensions that mean "this is an export, not a save".
-#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
 const OUTPUT_EXTS: &[&str] = &["docx", "pdf", "html", "tex"];
 
 /// The verdict `apply_extension_policy` reaches for a SAVE destination's extension.
@@ -234,6 +233,17 @@ pub(crate) fn commit_destination(
                             format!("{ext} is an export format \u{2014} opening Export instead"),
                             crate::status::StatusLifetime::Sticky,
                             crate::status::StatusSource::Host, None);
+                        // A Redirect IS an abandoned save — the write did not happen, and
+                        // the writer is being offered a different feature. Same rule the
+                        // `CommitOutcome::Nothing` empty-path arm above applies: abandoning
+                        // a save-then must abort the drain, or a LATER save could `.take()`
+                        // this stale action and fire a `Quit` the writer no longer wants
+                        // (Critical-1, Task 21 fix round).
+                        if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
+                            editor.pending_save_as = None;
+                            editor.quit_drain = None;
+                            editor.quit_drain_advance = false;
+                        }
                         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(dir);
                         let field = path.file_name()
                             .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -658,6 +668,163 @@ mod tests {
         assert!(!chosen_survives,
             "chosen half must ALSO be cleared — a surviving chosen could pair with a \
              DIFFERENT resolved on a later round trip and silently write to the wrong target");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CRITICAL-1 regression: the `Redirect` arm used to leave `pending_save_as` and
+    /// `quit_drain` armed while it reopened an Export picker. A `Redirect` IS an abandoned
+    /// save — the write never happened, and the writer is being offered a different feature
+    /// — so it must clear the same fields the `CommitOutcome::Nothing` empty-path arm does.
+    /// Without the fix, a save that later completes on some OTHER target could `.take()`
+    /// this stale `Quit` and fire it — the writer never asked to quit anymore.
+    ///
+    /// Armed exactly as the reviewer reproduced it live: `pending_save_as = Some(Quit)`
+    /// paired with an armed `quit_drain` (the state `dispatch_save_then` sets for
+    /// save-and-quit on an unnamed buffer). Seeded exactly as the other Enter-through
+    /// tests in this module seed a typed name — `open_destination_picker`'s `field`
+    /// parameter — rather than by simulating individual keystrokes: typing a real
+    /// character through `file_browser_intercept` re-derives `fb.entries` from the
+    /// (empty, not-yet-listed) directory, which unconditionally pins a `".."` row at
+    /// index 0 (`filter_and_rank`) and would make Enter hit Row 1 (Descend) instead of
+    /// the Row-4 Commit this test needs to drive the Redirect arm — an unrelated
+    /// existing quirk of typing before a listing lands, not part of this fix round.
+    /// Commit itself is still driven through the REAL Enter intercept.
+    ///
+    /// FAIL-VERIFY: remove the clearing added to the `Redirect` arm, watch the
+    /// `pending_save_as`/`quit_drain` assertions fail, then restore.
+    #[test]
+    fn redirect_clears_the_pending_quit_drain_state() {
+        let d = tmp("redirect-quit-strand");
+        let mut e = crate::editor::Editor::new_from_text("unsaved\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "notes.html".into());
+        e.pending_save_as = Some(crate::editor::PostSaveAction::Quit);
+        e.quit_drain = Some(crate::editor::QuitDrain {
+            queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+
+        assert!(e.pending_save_as.is_none(),
+            "a Redirect abandons the save — the armed post-save action must not survive");
+        assert!(e.quit_drain.is_none(), "and the drain must not be left stranded");
+        assert!(!e.quit_drain_advance);
+        assert!(!e.quit, "no stale Quit can fire from a save that never happened");
+
+        // And the redirect itself still did its job: an Export picker opened for the
+        // typed name, carrying the writer's intent forward.
+        match &e.file_browser.as_ref().expect("export picker opened").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, field, .. } => {
+                assert_eq!(purpose,
+                    &crate::file_browser::DestinationPurpose::Export { ext: "html".into() });
+                assert_eq!(field, "notes.html");
+            }
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CRITICAL-2 regression: `resolve_prompt`'s `OverwriteSaveAs` arm calls
+    /// `perform_save_as(editor, chosen, resolved, …)`. Swap those two positional
+    /// `PathBuf` arguments and every existing test still passed — the two existing
+    /// overwrite tests (above) only assert that the modal RAISES and that Esc clears
+    /// both fields; neither drives the CONFIRM keypress through to an actual write.
+    ///
+    /// A symlink makes `chosen` and `resolved` genuinely different paths so a swap is
+    /// observable: bytes must land at the RESOLVED (canonical) target, and
+    /// `document.path` must end up holding the CHOSEN (symlink) path.
+    ///
+    /// FAIL-VERIFY: swap the two arguments in the `OverwriteSaveAs` arm, watch the
+    /// `real`-contents / `document.path` assertions fail, then restore.
+    #[cfg(unix)]
+    #[test]
+    fn confirming_the_overwrite_modal_writes_to_the_resolved_symlink_target() {
+        let d = tmp("overwrite-confirm");
+        let real = d.join("real.md");
+        let link = d.join("link.md");
+        std::fs::write(&real, b"old\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
+            d.clone(), link.to_str().expect("utf8").to_string());
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "the existing target through the symlink raises the overwrite modal");
+        let resolved_seen = e.pending_save_overwrite.clone().expect("resolved half armed");
+        assert_eq!(resolved_seen, std::fs::canonicalize(&real).expect("canonicalize"),
+            "resolved must be the canonical target, not the symlink");
+        assert_eq!(e.pending_save_as_chosen.as_deref(), Some(link.as_path()),
+            "chosen half is the symlink the writer typed");
+
+        // Confirm ('o'), through the REAL modal intercept — not `resolve_prompt` called
+        // directly, so the key mapping AND the resolver are both exercised.
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+        let o = crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Char('o'), modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE });
+        crate::prompts::intercept(crate::app::Msg::Input(o), &mut e, &ctx);
+        for out in ex.drain() { crate::jobs_apply::apply_outcome(out, &mut e); }
+
+        assert_eq!(std::fs::read_to_string(&real).expect("read"), "new body\n",
+            "the write must land at the RESOLVED target — a swapped argument would write \
+             to (or through) the symlink path string instead");
+        assert!(link.symlink_metadata().expect("lstat").file_type().is_symlink(),
+            "the symlink itself must survive — atomic_replace renames over the TARGET");
+        assert_eq!(e.active().document.path.as_deref(), Some(link.as_path()),
+            "document.path must hold the CHOSEN path (the symlink), not the resolved target");
+        assert!(!e.active().document.dirty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// IMPORTANT-3 regression: the `Refused` arm's early return/Warning is the only thing
+    /// stopping a trailing-separator destination (which names a directory, not a file) from
+    /// falling through and writing using the raw path. The pure `apply_extension_policy`
+    /// unit test (below) pins the VERDICT, but nothing previously proved the arm is reachable
+    /// — and actually short-circuits — on the live commit path.
+    ///
+    /// Seeded via `open_destination_picker`'s `field` parameter, same as the module's other
+    /// Enter-through tests — NOT by typing the trailing slash keystroke-by-keystroke: that
+    /// path re-derives `fb.entries` from the (empty, not-yet-listed) directory, which
+    /// unconditionally pins a `".."` row at index 0 (`filter_and_rank`) and would make Enter
+    /// hit Row 1 (Descend) before the extension policy ever runs — an unrelated existing
+    /// quirk of typing before a listing lands, not part of this fix round. Commit itself is
+    /// still driven through the REAL Enter intercept.
+    ///
+    /// FAIL-VERIFY: remove the `Refused` arm's early return, watch this fail (the picker
+    /// closes and something lands on disk under `d`), then restore.
+    #[test]
+    fn a_trailing_separator_destination_is_refused_end_to_end_writes_nothing() {
+        let d = tmp("refused-e2e");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "sub/".into());
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+
+        assert!(e.file_browser.is_some(), "the picker stays open — a refusal is not a commit");
+        assert!(e.prompt.is_none(), "no overwrite modal raised — nothing was resolved to a write");
+        assert_eq!(e.status().map(crate::status::Status::kind),
+            Some(crate::status::StatusKind::Warning), "a clear status explains the refusal");
+        assert!(std::fs::read_dir(&d).expect("read dir").next().is_none(),
+            "the directory stays completely empty — no `sub` dir, and no hidden `sub/.md` file");
         let _ = std::fs::remove_dir_all(&d);
     }
 

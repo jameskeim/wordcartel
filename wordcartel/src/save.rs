@@ -84,7 +84,9 @@ pub(crate) struct SaveTarget {
 
 impl SaveTarget {
     /// For a destination that needed no resolution (the common case: the two are equal).
-    #[allow(dead_code)] // C5 Task 21 wires Write-Block through this same-target path; forward reference
+    #[allow(dead_code)] // used only by this module's and session_restore.rs's test modules
+    // to build a no-resolution-needed target for scenario setup; Write-Block never
+    // constructs a SaveTarget — it calls `perform_block_write` directly with a bare path.
     pub(crate) fn same(p: std::path::PathBuf) -> Self {
         SaveTarget { chosen: p.clone(), resolved: p }
     }
