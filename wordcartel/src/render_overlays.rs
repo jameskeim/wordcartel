@@ -481,6 +481,32 @@ fn elided_weight(line: &str) -> usize {
         .unwrap_or(1)
 }
 
+/// The picker's border title: what this dialog IS, and where it is pointed.
+///
+/// Built unconditionally as `" Open: {dir} "` until C5 review finding I2 — so a Save-As
+/// destination dialog, the branch's highest-risk write surface, announced itself as an OPEN
+/// dialog, and Recents claimed to be opening the last listing's directory, which is not even
+/// where its rows live. Combined with the field being invisible (C1), nothing on the
+/// destination screen said that Enter might write.
+///
+/// An exhaustive match on both axes, so a future `BrowseMode` or `DestinationPurpose` has to
+/// declare its own title rather than inheriting a wrong one.
+fn file_browser_title(fb: &crate::file_browser::FileBrowser) -> String {
+    use crate::file_browser::{BrowseMode, DestinationPurpose};
+    let dir = fb.dir.display();
+    match &fb.mode {
+        BrowseMode::Select => format!(" Open: {dir} "),
+        // Recents rows are SYNTHESIZED from the session store, not read from `fb.dir` — so
+        // naming a directory here would be a lie about where the writer is looking.
+        BrowseMode::Recents => " Recent files ".to_string(),
+        BrowseMode::Destination { purpose, .. } => match purpose {
+            DestinationPurpose::SaveAs => format!(" Save As: {dir} "),
+            DestinationPurpose::WriteBlock => format!(" Write Block to: {dir} "),
+            DestinationPurpose::Export { ext } => format!(" Export .{ext} to: {dir} "),
+        },
+    }
+}
+
 pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
     let h = area.height;
@@ -534,7 +560,7 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
 
         frame.render_widget(Clear, ov_rect);
         frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
-        let title = format!(" Open: {} ", fb.dir.display());
+        let title = file_browser_title(fb);
         let mut block = Block::default().borders(Borders::ALL).title(title)
             .border_style(cs.overlay_border);
         if footer_takes_title {
@@ -962,6 +988,47 @@ mod tests {
             "the caret must sit at `field_cursor`, not pinned to the empty query");
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- the title says which dialog this is --------------------------------------
+
+    /// C5 review finding I2: the title was built unconditionally as `" Open: {dir} "`, so a
+    /// Save-As destination dialog — the branch's highest-risk write surface — presented itself
+    /// as an open dialog, and Recents claimed to be opening the last listing's directory. This
+    /// scrapes the DRAWN title row per mode rather than asserting on `file_browser_title`'s
+    /// return value, since the painter ignoring the helper is the failure it must catch.
+    ///
+    /// FAIL-VERIFY: restore `format!(" Open: {} ", fb.dir.display())` in the painter — every
+    /// case but Select fails. Confirmed, then reverted.
+    #[test]
+    fn each_picker_mode_is_titled_for_what_it_actually_does() {
+        let dir = std::env::temp_dir().join(format!("wc-render-title-{}", std::process::id()));
+        let cases: [(BrowseMode, &str, &str); 5] = [
+            (BrowseMode::Select, "Open:", "Save"),
+            (BrowseMode::Recents, "Recent files", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::SaveAs,
+                field: String::new(), field_cursor: 0 }, "Save As:", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::WriteBlock,
+                field: String::new(), field_cursor: 0 }, "Write Block to:", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into() },
+                field: String::new(), field_cursor: 0 }, "Export .pdf to:", "Open:"),
+        ];
+        for (mode, expected, forbidden) in cases {
+            let mut e = Editor::new_from_text("x\n", None, (80, 24));
+            let mut fb = empty_destination_fb(dir.clone(), "");
+            fb.mode = mode;
+            e.file_browser = Some(fb);
+            crate::derive::rebuild(&mut e);
+            let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+            let top = drawn_box_rect(&term).y;
+            let row = row_text(&term, top);
+            assert!(row.contains(expected),
+                "the drawn title must say {expected:?}: {row:?}");
+            assert!(!row.contains(forbidden),
+                "and must not still say {forbidden:?}: {row:?}");
+        }
     }
 
     // ---- the withholding disclosure reaches the SCREEN ----------------------------
