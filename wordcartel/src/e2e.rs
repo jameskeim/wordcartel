@@ -3108,38 +3108,47 @@ fn journey_open_save_export_saveas_reopen() {
 
     // 5. REOPEN via recents — the rescue path.
     //
-    // Driven through the real COMMAND, then the real Enter: `rows_from` alone would pass with
-    // a broken `open_recent`, a broken Enter arm, or missing registry wiring.
+    // Driven through the real Enter arm, and through the same `open_recent` core the registry
+    // command calls: `rows_from` alone would pass with a broken opener or a broken Enter arm.
     //
-    // `open_recent` reads the session store from `swap::state_dir()`, which is the DEVELOPER'S
-    // real `$XDG_STATE_HOME` and has no seam. So the entry this journey needs is inserted into
-    // a store loaded from there and RESTORED verbatim afterwards, rather than left behind:
-    // asserting against whatever happens to be in the ambient store would pass or fail for
-    // reasons nothing to do with C5, and clobbering it would be a side effect a test has no
-    // business having.
+    // The session store is read from an ISOLATED dir via `open_recent_in` — the seam that
+    // mirrors `state::load_in`/`save_in`. The earlier form loaded and restored the DEVELOPER'S
+    // real `$XDG_STATE_HOME` store; that restore was correct on both the pass and panic paths
+    // but not EXCLUSIVE, since `persist_session_for_test` writes the same file from a sibling
+    // thread of the same process and an interleave would discard its write. This journey now
+    // touches nothing ambient.
     let target = d.join("chapter one v2.md");
     let canon = std::fs::canonicalize(&target).expect("the file just written is canonicalizable");
-    // The restore runs from a Drop guard, not a trailing statement: an assertion between the
-    // seed and the end of the journey would otherwise unwind past it and leave the developer's
-    // real store polluted with this test's row.
-    struct RestoreSession(crate::state::SessionState);
-    impl Drop for RestoreSession {
-        fn drop(&mut self) { let _ = self.0.save(); }
-    }
-    let restore = RestoreSession(crate::state::load());
+    let store = d.join("state");
+    std::fs::create_dir_all(&store).expect("isolated session-store dir");
     {
-        let mut seeded = restore.0.clone();
+        let mut seeded = crate::state::SessionState::default();
         let (mtime, size) = crate::state::file_identity(&canon).expect("identity of a real file");
         seeded.entries.insert(canon.to_string_lossy().into_owned(), crate::state::StateEntry {
             cursor: 0, scroll: 0, marks: Default::default(), mtime, size,
-            seq: seeded.next_seq(),   // outranks every ambient row, so it heads the list
+            seq: seeded.next_seq(),
             folds: Vec::new(), block: None, id: None,
         });
-        seeded.save().expect("seed the session store");
+        seeded.save_in(&store).expect("seed the isolated session store");
     }
+    // Registry wiring is still proven through the REAL dispatch — `dispatch_command` panics on
+    // an unregistered id, and a command whose arm was never wired leaves neither of the two
+    // outcomes `open_recent` can produce. That dispatch reads the ambient store and writes
+    // nothing, so it carries none of the interleave hazard the seeded write did; the seam call
+    // below then supplies the deterministic rows.
+    h.dispatch_command("open_recent");
+    {
+        let e = h.editor.borrow();
+        assert!(e.file_browser.is_some() || e.status_text() == "No recent files",
+            "the registered command really runs the recents opener: {:?}", e.status_text());
+    }
+    crate::overlays::close_all(&mut h.editor.borrow_mut());
     let before = h.editor.borrow().active().document.path.clone();
     h.editor.borrow_mut().active_mut().document.path = None;   // a different buffer
-    h.dispatch_command("open_recent");
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::recents::open_recent_in(&mut e, &h.fs, &h.tx, &store);
+    }
     h.pump_recents();
     assert!(h.editor.borrow().file_browser.is_some(), "the command opened the recents picker");
     {
@@ -3153,7 +3162,6 @@ fn journey_open_save_export_saveas_reopen() {
     }
     h.key(KeyCode::Enter);
     let reopened = h.editor.borrow().active().document.path.clone();
-    drop(restore);            // put the developer's session store back exactly as found
     assert_eq!(reopened, before,
         "Enter on a recents row REOPENS that document — the buffer actually changed");
 

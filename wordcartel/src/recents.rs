@@ -61,13 +61,39 @@ pub(crate) fn open_recent(editor: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>)
 {
-    // Through the SEAM, not `state::load()` — that wrapper hardcodes `RealFs`, and reaching
-    // around an `fs` this function was handed is the exact defect condition the standing
-    // constraints call out. `state_dir()` is directory provisioning and stays raw.
+    // `state_dir()` is directory provisioning and stays raw; the session READ below goes
+    // through the seam.
     let session = match crate::swap::state_dir() {
         Ok(dir) => crate::state::load_in_with_fs(&**fs, &dir),
         Err(_) => crate::state::SessionState::default(),
     };
+    open_recent_from(editor, fs, msg_tx, session);
+}
+
+/// Directory-injectable form of `open_recent`, mirroring `state::load_in`/`save_in`.
+///
+/// `open_recent` was the last session-store reader with no directory seam, so a test
+/// exercising it had to read — and therefore restore — the DEVELOPER'S real
+/// `$XDG_STATE_HOME/wordcartel/session.toml`. Load-then-restore is not exclusive: the
+/// `persist_session_for_test` tests write that same file on a sibling thread of the same
+/// process, so an interleave could silently discard their write. Tests point this at a temp
+/// dir instead and touch nothing ambient.
+#[cfg(test)]
+pub(crate) fn open_recent_in(editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, dir: &std::path::Path)
+{
+    let session = crate::state::load_in_with_fs(&**fs, dir);
+    open_recent_from(editor, fs, msg_tx, session);
+}
+
+/// Shared core of `open_recent` / `open_recent_in`: everything downstream of WHERE the
+/// session came from. Split so the two entries can never diverge in ranking, epoch
+/// discipline, or the off-thread probe.
+fn open_recent_from(editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, session: crate::state::SessionState)
+{
     // Paths are ranked here so the writer sees the list at once; the per-row `is_file`
     // probe (the only part that touches the filesystem beyond the already-loaded session)
     // goes to the thread.
