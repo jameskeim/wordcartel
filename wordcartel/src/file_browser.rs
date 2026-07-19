@@ -81,6 +81,25 @@ pub struct FileBrowser {
     /// succeeds, so the picker shows where the writer actually is until they have actually
     /// arrived — and an unreadable directory never moves them at all.
     pub pending_dir: Option<PathBuf>,
+    /// Has the writer DELIBERATELY moved the highlight — an arrow/Home/End/PageUp/PageDown
+    /// key, a mouse click, or a wheel scroll — since it last defaulted to row 0? Starts
+    /// `false` on open and resets to `false` every time a descend actually lands (the fresh
+    /// listing defaults the highlight again in the new directory).
+    ///
+    /// `pub(crate)`: read only by `commit_destination`/`footer_target` (both in-crate) and
+    /// written only by the nav call sites in `file_browser_intercept.rs`/`mouse.rs`.
+    ///
+    /// This is what `classify_destination_enter`'s Row 1 gates on. Without it, `filter_and_rank`
+    /// unconditionally pins the synthetic ".." row (or, at root, whichever real entry sorts
+    /// first — directories sort before files) at `entries[0]`, and `selected` initializes to
+    /// 0 — so the highlight sits on a directory the writer never chose. Row 1 fires on ANY
+    /// highlighted directory even with a non-empty field (deliberately, so a writer can type a
+    /// name, arrow into a subfolder, and commit there keeping the name) — so an untouched
+    /// default highlight made the ordinary "type a name, press Enter" sequence descend instead
+    /// of commit. Gating Row 1 on "has the writer actually touched the highlight, or is the
+    /// field empty" keeps the deliberate feature while refusing to act on a highlight nobody
+    /// chose.
+    pub(crate) highlight_navigated: bool,
 }
 
 /// Directory-listing label in the spirit of `ls -F` — a trailing mark declares what an
@@ -159,7 +178,8 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
     let BrowseMode::Destination { field, purpose, .. } = &fb.mode else { return None };
     if field.trim().is_empty() { return None; }
     let highlighted = fb.entries.get(fb.selected);
-    let typed = match crate::file_browser_commit::classify_destination_enter(fs, &fb.dir, field, highlighted) {
+    let typed = match crate::file_browser_commit::classify_destination_enter(
+        fs, &fb.dir, field, highlighted, fb.highlight_navigated) {
         // Rows 1 and 3 — Enter descends, it does not write. Say so plainly rather than
         // showing a would-be write target that Enter will never produce.
         crate::file_browser_commit::CommitOutcome::Descend(target) => {
@@ -362,6 +382,10 @@ pub(crate) fn apply_listing_done(
                 fb.query.clear();
                 fb.selected = 0;
                 fb.scroll_top = 0; // A6: reset with selected to avoid an out-of-order slice
+                // The highlight is back at its untouched default in the NEW directory — the
+                // writer has not chosen anything here yet, so Row 1 must not act on it until
+                // they do. See `FileBrowser::highlight_navigated`.
+                fb.highlight_navigated = false;
             }
         }
         Err(e) => {
@@ -392,7 +416,7 @@ mod tests {
             dir, query: String::new(), mode: BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         }
     }
 
@@ -817,7 +841,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
         assert!(line.contains(&d.join("chapter one.md").display().to_string()),
@@ -875,7 +899,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
         assert!(line.contains(&d.join("chapter-one").display().to_string()),
@@ -900,7 +924,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains(&d.join("book.docx").display().to_string()),
@@ -925,7 +949,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains("sub"), "names the field as typed: {line}");
@@ -951,7 +975,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains(&d.join("dangling.md").display().to_string()),
@@ -971,7 +995,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(),
             "a whitespace-only field is empty, and names no target");
@@ -983,7 +1007,7 @@ mod tests {
             dir: std::env::temp_dir(), query: "q".into(), mode: BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(), "select mode names no target");
         fb.mode = BrowseMode::Destination {

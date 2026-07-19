@@ -515,7 +515,7 @@ mod tests {
                 name: format!("f{i:02}.md"), kind: crate::fsx::EntryKind::File,
                 is_symlink: false, broken: false }).collect(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         let list_h = file_browser_list_h(area, &fb) as usize;
         assert!(list_h > 0 && list_h < fb.entries.len(),

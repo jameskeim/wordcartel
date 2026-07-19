@@ -957,7 +957,7 @@ impl Editor {
             dir: dir.clone(), query: String::new(), mode: crate::file_browser::BrowseMode::Select,
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
         self.file_browser = Some(fb);
@@ -983,7 +983,7 @@ impl Editor {
             mode: crate::file_browser::BrowseMode::Destination { purpose, field, field_cursor },
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         // ASYNC, exactly like `open_file_browser`. A synchronous `refetch` here would block
         // the input loop on the directory read and undo Task 13 for every destination

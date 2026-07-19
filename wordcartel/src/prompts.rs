@@ -429,6 +429,20 @@ mod tests {
     /// `commit_destination` turns into the SAME message/kind/lifetime. Driven through the
     /// REAL intercept, not `commit_destination` directly (see the commit-arm's own
     /// end-to-end tests in `file_browser_commit.rs` for why).
+    ///
+    /// DELIBERATELY does NOT pump the async listing (unlike the audit applied elsewhere —
+    /// see the parent-row-highlight task report). This is a SEPARATE, pre-existing property
+    /// of Row 1, not the defect that audit fixed: Row 1 fires on ANY highlighted directory
+    /// whenever the field is EMPTY, by design — `FileBrowser::highlight_navigated`'s gate is
+    /// `navigated || trimmed.is_empty()`, and a bare Enter on an untouched highlight with
+    /// nothing typed is treated as an ordinary browse gesture. Since `std::env::temp_dir()`
+    /// is never filesystem root, its listing always carries a ".." row, so IF this test
+    /// pumped that listing, Enter would descend into the parent directory instead of
+    /// reaching `CommitOutcome::Nothing` — the "empty path" warning would never fire once a
+    /// real listing has landed. Confirmed live (pump added, ran, status came back empty
+    /// instead of "save-as: empty path"; reverted) — reported as a FINDING in the task
+    /// report, not fixed here: whether Row 1 should ever cede to Row 2 on an untouched
+    /// directory highlight with an empty field is a design question, not a mechanical one.
     #[test]
     fn save_as_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
@@ -444,7 +458,8 @@ mod tests {
     }
 
     /// A17 T5: an empty Write-Block path refusal is a Sticky Warning. Migrated (Task 21)
-    /// from the retired `block_write_submit` — see the Save-As twin above.
+    /// from the retired `block_write_submit` — see the Save-As twin above, INCLUDING the
+    /// same deliberate non-pump: confirmed to break identically if pumped (same finding).
     #[test]
     fn block_write_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
@@ -642,10 +657,15 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", None, (80, 24));
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
             std::env::temp_dir(), p.to_str().unwrap().to_string());
+        // Pump the async listing to completion — the state real usage actually reaches. The
+        // typed field is a non-empty ABSOLUTE path, so `FileBrowser::highlight_navigated`
+        // gates Row 1 off regardless of whatever `temp_dir()` happens to sort first (very
+        // possibly a directory, in a shared system temp dir full of other tests' leftovers).
+        crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert!(e.prompt.is_some(), "existing target → confirm modal");
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
@@ -715,10 +735,12 @@ mod tests {
         let target = parent.join("out.txt"); // target "inside" a regular file → ENOTDIR
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
             std::env::temp_dir(), target.to_str().unwrap().to_string());
+        // Pump the async listing to completion — the state real usage actually reaches.
+        crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -735,10 +757,12 @@ mod tests {
         std::fs::write(&p, "old").unwrap();
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
             std::env::temp_dir(), p.to_str().unwrap().to_string());
+        // Pump the async listing to completion — the state real usage actually reaches.
+        crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);

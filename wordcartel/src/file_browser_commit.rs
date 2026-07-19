@@ -39,26 +39,41 @@ pub(crate) fn resolve_field(dir: &Path, field: &str) -> PathBuf {
 
 /// The four-row Enter decision table (spec §7.2). Evaluated top to bottom; first match wins.
 ///
-/// | # | Condition                                   | Action              |
-/// |---|---------------------------------------------|---------------------|
-/// | 1 | highlighted entry is a directory (incl "..")| Descend             |
-/// | 2 | field empty AND highlighted entry is a file | Commit to that file |
-/// | 3 | field resolves to an EXISTING directory     | Descend into it     |
-/// | 4 | otherwise                                   | Commit dir + field  |
+/// | # | Condition                                                      | Action              |
+/// |---|------------------------------------------------------------------|---------------------|
+/// | 1 | highlighted entry is a dir (incl "..") AND (navigated OR field empty) | Descend      |
+/// | 2 | field empty AND highlighted entry is a file                    | Commit to that file |
+/// | 3 | field resolves to an EXISTING directory                         | Descend into it     |
+/// | 4 | otherwise                                                       | Commit dir + field  |
 ///
 /// The sole source of truth for "what will Enter do" — `file_browser::footer_target` calls this
 /// directly so the resolved-target footer can never state a destination Enter will not actually
 /// reach (a bare field naming an EXISTING directory must be shown as a descend, never a write).
+///
+/// `highlight_navigated` (see `FileBrowser::highlight_navigated`) is what Row 1 gates on: it is
+/// true once the writer has DELIBERATELY moved the highlight (arrow keys, a click, a wheel
+/// scroll) since it last defaulted to row 0. Without this gate, `filter_and_rank` unconditionally
+/// pins the synthetic ".." row (or, at filesystem root, whichever real entry sorts first —
+/// directories sort before files) at `entries[0]`, and `FileBrowser::selected` initializes to 0
+/// — so the ordinary "type a name, press Enter" sequence would hit Row 1 on a highlight the
+/// writer never touched and silently descend instead of committing.
 pub(crate) fn classify_destination_enter(
     fs: &dyn Fs,
     dir: &Path,
     field: &str,
     highlighted: Option<&FileEntry>,
+    highlight_navigated: bool,
 ) -> CommitOutcome {
+    let trimmed = field.trim();
+
     // Row 1 — a highlighted directory descends, EVEN with a non-empty field, so the writer
-    // keeps their filename while navigating.
+    // keeps their filename while navigating. Gated on `highlight_navigated || trimmed.is_empty()`:
+    // the "keep the filename while navigating" feature stays intact (the writer moved the
+    // highlight there themselves), and a bare Enter with nothing typed still navigates on
+    // whatever is highlighted (an ordinary browse gesture) — but a NON-empty field with an
+    // UNTOUCHED default highlight falls through to Row 3/4 instead of silently descending.
     if let Some(e) = highlighted {
-        if matches!(e.kind, EntryKind::Dir) {
+        if matches!(e.kind, EntryKind::Dir) && (highlight_navigated || trimmed.is_empty()) {
             let target = if e.name == ".." {
                 dir.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.to_path_buf())
             } else {
@@ -67,8 +82,6 @@ pub(crate) fn classify_destination_enter(
             return CommitOutcome::Descend(target);
         }
     }
-
-    let trimmed = field.trim();
 
     // Row 2 — an empty field commits onto the highlighted FILE. Explicit overwrite intent:
     // it takes navigating there AND pressing Enter with a visibly empty field, and it still
@@ -192,8 +205,9 @@ pub(crate) fn commit_destination(
     let purpose = purpose.clone();
     let dir = fb.dir.clone();
     let highlighted = fb.entries.get(fb.selected).cloned();
+    let highlight_navigated = fb.highlight_navigated;
 
-    match classify_destination_enter(&**fs, &dir, field, highlighted.as_ref()) {
+    match classify_destination_enter(&**fs, &dir, field, highlighted.as_ref(), highlight_navigated) {
         // Rows 1 and 3 — navigate, do not write. The listing lands asynchronously and
         // `apply_listing_done` commits `fb.dir` only on success.
         CommitOutcome::Descend(target) => {
@@ -353,7 +367,7 @@ mod tests {
         std::fs::create_dir_all(d.join("drafts")).expect("seed");
         let e = fe("drafts", EntryKind::Dir);
         assert_eq!(
-            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter", Some(&e)),
+            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter", Some(&e), true),
             CommitOutcome::Descend(d.join("drafts")),
             "row 1 wins even with a non-empty field — the writer keeps their filename while \
              navigating");
@@ -369,7 +383,7 @@ mod tests {
         std::fs::write(d.join("existing.md"), b"x").expect("seed");
         let e = fe("existing.md", EntryKind::File);
         assert_eq!(
-            classify_destination_enter(&crate::fsx::RealFs, &d, "", Some(&e)),
+            classify_destination_enter(&crate::fsx::RealFs, &d, "", Some(&e), false),
             CommitOutcome::Commit(d.join("existing.md")));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -383,7 +397,7 @@ mod tests {
         let d = tmp("row3");
         std::fs::create_dir_all(d.join("chapter-one")).expect("seed");
         assert_eq!(
-            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-one", None),
+            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-one", None, false),
             CommitOutcome::Descend(d.join("chapter-one")),
             "a field naming an existing directory descends into it");
         let _ = std::fs::remove_dir_all(&d);
@@ -397,10 +411,10 @@ mod tests {
         let d = tmp("row3-pin");
         std::fs::create_dir_all(d.join("chapter-one")).expect("seed");
         assert_eq!(
-            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-one", None),
+            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-one", None, false),
             CommitOutcome::Descend(d.join("chapter-one")));
         assert_eq!(
-            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-oneX", None),
+            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-oneX", None, false),
             CommitOutcome::Commit(d.join("chapter-oneX")),
             "one more character and it is an ordinary new-file commit");
         let _ = std::fs::remove_dir_all(&d);
@@ -410,7 +424,7 @@ mod tests {
     fn row4_commits_dir_plus_field() {
         let d = tmp("row4");
         assert_eq!(
-            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter one", None),
+            classify_destination_enter(&crate::fsx::RealFs, &d, "chapter one", None, false),
             CommitOutcome::Commit(d.join("chapter one")),
             "the ordinary case: a new file in the directory the writer is looking at");
         let _ = std::fs::remove_dir_all(&d);
@@ -488,7 +502,7 @@ mod tests {
             entries: vec![FileEntry { name: "existing.md".into(), kind: EntryKind::File,
                 is_symlink: false, broken: false }],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         });
 
         press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Tab);
@@ -533,7 +547,7 @@ mod tests {
             entries: vec![FileEntry {
                 name: "victim.md".into(), kind: EntryKind::File, is_symlink: false, broken: false }],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         });
 
         // A REAL left-click on the row the painter drew, routed through the overlay mouse
@@ -605,11 +619,15 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = crate::jobs::InlineExecutor::default();
         let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "chapter one".into());
+        // Pump the async listing to completion — the state real usage actually reaches. Before
+        // the parent-row-highlight fix this would have hit Row 1 on the default ".." highlight
+        // and descended instead of committing; see the FAIL-VERIFY on the test below.
+        crate::test_support::pump_listing(&mut e, &rx);
 
         press_enter(&mut e, &fs, &ex, &clk, &tx);
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
@@ -620,6 +638,136 @@ mod tests {
         assert_eq!(e.active().document.path.as_deref(), Some(d.join("chapter one.md").as_path()));
         assert!(!e.active().document.dirty());
         assert!(e.file_browser.is_none(), "the picker closed on commit");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// REGRESSION — the parent-row-highlight defect. `filter_and_rank` pins the synthetic
+    /// ".." row at `entries[0]` unconditionally whenever the picker is not at filesystem root,
+    /// and `FileBrowser::selected` initializes to 0. So the moment the async listing lands —
+    /// with NOTHING typed yet and NO navigation performed — ".." is already highlighted. Row 1
+    /// of `classify_destination_enter` used to descend on ANY highlighted directory, even with
+    /// a non-empty field (deliberately, so a writer can type-then-navigate-then-commit); the two
+    /// combined so the ordinary "type a name, press Enter" sequence never reached Row 4
+    /// (Commit) at all — it hit Row 1 (Descend) on a highlight the writer never touched.
+    ///
+    /// Fixed by gating Row 1 on `FileBrowser::highlight_navigated` — true only once the writer
+    /// has deliberately moved the highlight (arrow keys, a click, a wheel scroll) — OR an empty
+    /// field. Reproduced BEFORE the fix (confirmed live, then reverted — see the task report):
+    /// with the gate removed, this test's write assertions below fail and `pending_dir` instead
+    /// shows a descend into `d.parent()`.
+    ///
+    /// This mirrors what a writer actually does: open the picker on a NON-ROOT directory
+    /// (so ".." exists), pump the listing to completion (unlike the other Enter-through tests
+    /// in this module, which deliberately seed via `open_destination_picker`'s `field` param
+    /// and never populate `entries` from a real listing — see the comments on
+    /// `redirect_clears_the_pending_quit_drain_state` / the trailing-separator test above,
+    /// which name this exact gap), type a filename through the real intercept, and press Enter
+    /// through the real intercept.
+    ///
+    /// FAIL-VERIFY: change Row 1's guard back to `matches!(e.kind, EntryKind::Dir)` (dropping
+    /// `&& (highlight_navigated || trimmed.is_empty())`) in `classify_destination_enter`, watch
+    /// this fail (no file written, `file_browser` still open, `pending_dir` == `d.parent()`),
+    /// then restore.
+    #[test]
+    fn typing_a_name_after_the_listing_lands_commits_not_descends() {
+        let d = tmp("parent-highlight-defect");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Opened with an EMPTY field — exactly what a writer sees invoking Save-As fresh.
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), String::new());
+        // Pump the async listing to completion — the state real usage actually reaches,
+        // unlike the hand-seeded `field` shortcuts elsewhere in this module.
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        let fb = e.file_browser.as_ref().expect("picker open");
+        assert_eq!(fb.entries.first().map(|r| r.name.as_str()), Some(".."),
+            "precondition: the parent row is present (d is not filesystem root)");
+        assert_eq!(fb.selected, 0,
+            "precondition: nothing has been typed or navigated yet — the highlight still \
+             defaults to row 0, which IS the '..' row");
+        assert!(!fb.highlight_navigated, "precondition: the writer has not touched the highlight");
+
+        // Type a filename through the REAL intercept, one keystroke at a time — no navigation.
+        for c in ['c', 'h', 'a', 'p'] {
+            crate::test_support::press_char_fb(&mut e, &fs, &tx, c);
+        }
+        assert_eq!(e.file_browser.as_ref().expect("open").selected, 0,
+            "typing does not move the highlight off row 0");
+
+        // Enter through the REAL intercept, exactly as a writer's keystroke would arrive.
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        // Enter with a typed name must COMMIT — write the file and close the picker — never
+        // silently descend on a highlight the writer never touched.
+        assert_eq!(std::fs::read_to_string(d.join("chap.md")).expect("written"), "body\n",
+            "typing a name and pressing Enter must write the file, not navigate to the parent");
+        assert!(e.file_browser.is_none(), "the picker closed on commit");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The OTHER half of the fix: `highlight_navigated` must not disable Row 1 for a highlight
+    /// the writer genuinely chose. This is the design intent the task brief calls out as worth
+    /// preserving: type a name, arrow-key into a subfolder, and commit there — keeping the
+    /// typed name. Driven end-to-end through the real listing + real keyboard-nav + real Enter
+    /// intercept, not by hand-constructing `highlighted`/`highlight_navigated` — so a
+    /// regression in HOW the flag gets set (not just what it gates) would be caught here too.
+    ///
+    /// The subfolder is named `chapter-drafts` — deliberately containing the typed field text
+    /// as a substring — so it SURVIVES the dual-duty field-as-filter (`rederive`'s fuzzy
+    /// filter over `fb.mode.filter_text`) and is still on screen to arrow onto; an unrelated
+    /// name like `drafts` would be filtered out by a field of `chapter` before the writer could
+    /// ever navigate to it, which is a separate, pre-existing property of the dual-duty filter,
+    /// not something this test is about.
+    #[test]
+    fn arrowing_to_a_real_directory_still_descends_and_keeps_the_typed_field() {
+        let d = tmp("row1-preserved");
+        std::fs::create_dir_all(d.join("chapter-drafts")).expect("seed dir");
+        std::fs::write(d.join("chapter-notes.md"), b"x").expect("seed unrelated match");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Field pre-filled with "chapter" — equivalent to the writer having already typed it —
+        // so the listing filters to just ".." plus the two `chapter*` entries once it lands.
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "chapter".into());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        let names: Vec<String> = e.file_browser.as_ref().expect("open")
+            .entries.iter().map(|r| r.name.clone()).collect();
+        let dir_idx = names.iter().position(|n| n == "chapter-drafts")
+            .expect("chapter-drafts survives the field-as-filter — precondition");
+        assert!(!e.file_browser.as_ref().unwrap().highlight_navigated,
+            "precondition: nothing has been navigated yet");
+
+        // Arrow DOWN through the REAL intercept until "chapter-drafts" is highlighted.
+        for _ in 0..dir_idx {
+            crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Down);
+        }
+        let fb = e.file_browser.as_ref().expect("open");
+        assert_eq!(fb.entries.get(fb.selected).map(|r| r.name.as_str()), Some("chapter-drafts"),
+            "precondition: the real directory is now highlighted");
+        assert!(fb.highlight_navigated, "a real nav key sets the flag");
+
+        // Enter through the REAL intercept — Row 1 must still fire: descend, not commit.
+        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+
+        let fb = e.file_browser.as_ref()
+            .expect("the picker stays open — a descend never commits");
+        assert_eq!(fb.pending_dir.as_deref(), Some(d.join("chapter-drafts").as_path()),
+            "Enter on a navigated directory highlight still descends into it");
+        match &fb.mode {
+            crate::file_browser::BrowseMode::Destination { field, .. } =>
+                assert_eq!(field, "chapter", "the typed field survives navigating — Row 1's point"),
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        assert!(!d.join("chapter.md").exists(), "nothing was written — this was a descend");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -640,11 +788,13 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
         let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "taken.md".into());
+        // Pump the async listing to completion — the state real usage actually reaches.
+        crate::test_support::pump_listing(&mut e, &rx);
 
         press_enter(&mut e, &fs, &ex, &clk, &tx);
         assert!(e.pending_save_overwrite.is_some(), "existing target raises the overwrite modal");
@@ -682,13 +832,17 @@ mod tests {
     /// paired with an armed `quit_drain` (the state `dispatch_save_then` sets for
     /// save-and-quit on an unnamed buffer). Seeded exactly as the other Enter-through
     /// tests in this module seed a typed name — `open_destination_picker`'s `field`
-    /// parameter — rather than by simulating individual keystrokes: typing a real
-    /// character through `file_browser_intercept` re-derives `fb.entries` from the
-    /// (empty, not-yet-listed) directory, which unconditionally pins a `".."` row at
-    /// index 0 (`filter_and_rank`) and would make Enter hit Row 1 (Descend) instead of
-    /// the Row-4 Commit this test needs to drive the Redirect arm — an unrelated
-    /// existing quirk of typing before a listing lands, not part of this fix round.
-    /// Commit itself is still driven through the REAL Enter intercept.
+    /// parameter.
+    ///
+    /// Now PUMPS the real listing before the Enter (the parent-row-highlight fix, task
+    /// report). Previously this deliberately skipped pumping: typing/pumping populated
+    /// `fb.entries` with a ".." row unconditionally pinned at index 0 (`filter_and_rank`),
+    /// which `classify_destination_enter`'s Row 1 would act on regardless of the non-empty
+    /// field, hitting Descend instead of the Row-4 Commit this test needs to drive the
+    /// Redirect arm. `FileBrowser::highlight_navigated` now gates Row 1 on the writer having
+    /// actually moved the highlight (or an empty field), so pumping a real listing here is
+    /// safe and exercises the state real usage reaches. Commit itself is still driven
+    /// through the REAL Enter intercept.
     ///
     /// FAIL-VERIFY: remove the clearing added to the `Redirect` arm, watch the
     /// `pending_save_as`/`quit_drain` assertions fail, then restore.
@@ -698,11 +852,12 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("unsaved\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
         let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "notes.html".into());
+        crate::test_support::pump_listing(&mut e, &rx);
         e.pending_save_as = Some(crate::editor::PostSaveAction::Quit);
         e.quit_drain = Some(crate::editor::QuitDrain {
             queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
@@ -752,11 +907,13 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
         let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
             d.clone(), link.to_str().expect("utf8").to_string());
+        // Pump the async listing to completion — the state real usage actually reaches.
+        crate::test_support::pump_listing(&mut e, &rx);
 
         press_enter(&mut e, &fs, &ex, &clk, &tx);
         assert!(e.prompt.is_some(), "the existing target through the symlink raises the overwrite modal");
@@ -796,12 +953,16 @@ mod tests {
     /// — and actually short-circuits — on the live commit path.
     ///
     /// Seeded via `open_destination_picker`'s `field` parameter, same as the module's other
-    /// Enter-through tests — NOT by typing the trailing slash keystroke-by-keystroke: that
-    /// path re-derives `fb.entries` from the (empty, not-yet-listed) directory, which
-    /// unconditionally pins a `".."` row at index 0 (`filter_and_rank`) and would make Enter
-    /// hit Row 1 (Descend) before the extension policy ever runs — an unrelated existing
-    /// quirk of typing before a listing lands, not part of this fix round. Commit itself is
-    /// still driven through the REAL Enter intercept.
+    /// Enter-through tests.
+    ///
+    /// Now PUMPS the real listing before the Enter (the parent-row-highlight fix, task
+    /// report). Previously this deliberately avoided typing/pumping: it would have populated
+    /// `fb.entries` with a ".." row unconditionally pinned at index 0 (`filter_and_rank`),
+    /// which `classify_destination_enter`'s Row 1 would act on regardless of the non-empty
+    /// field, hitting Descend before the extension policy ever ran. `FileBrowser::
+    /// highlight_navigated` now gates Row 1 on the writer having actually moved the highlight
+    /// (or an empty field), so pumping a real listing here is safe. Commit itself is still
+    /// driven through the REAL Enter intercept.
     ///
     /// FAIL-VERIFY: remove the `Refused` arm's early return, watch this fail (the picker
     /// closes and something lands on disk under `d`), then restore.
@@ -811,11 +972,12 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
         let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "sub/".into());
+        crate::test_support::pump_listing(&mut e, &rx);
 
         press_enter(&mut e, &fs, &ex, &clk, &tx);
 
@@ -837,11 +999,13 @@ mod tests {
             Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
         let ex = crate::jobs::InlineExecutor::default();
         let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::WriteBlock, d.clone(), "excerpt".into());
+        // Pump the async listing to completion — the state real usage actually reaches.
+        crate::test_support::pump_listing(&mut e, &rx);
 
         press_enter(&mut e, &fs, &ex, &clk, &tx);
 
@@ -870,6 +1034,10 @@ mod tests {
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::Export { ext: "html".into() },
             d.clone(), "notes.html".into());
+        // Pump the async listing to completion — the state real usage actually reaches.
+        // `d` also contains the source file `notes.md`, so the SAME `rx` used for the
+        // ExportDone read below first drains exactly this one ListingDone.
+        crate::test_support::pump_listing(&mut e, &rx);
 
         press_enter(&mut e, &fs, &ex, &clk, &tx);
 
@@ -897,9 +1065,9 @@ mod tests {
     #[test]
     fn an_empty_field_with_no_highlight_commits_nothing() {
         let d = tmp("nothing");
-        assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "", None),
+        assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "", None, false),
             CommitOutcome::Nothing, "no field, no highlight — Enter is inert, never a write");
-        assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "   ", None),
+        assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "   ", None, false),
             CommitOutcome::Nothing, "a whitespace-only field is empty");
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -293,7 +293,7 @@ mod tests {
             },
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         crate::file_browser::start_listing(&mut fb, d.clone(), &fs, &tx);
         e.file_browser = Some(fb);
@@ -355,7 +355,7 @@ mod tests {
             },
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None,
+            awaiting_epoch: 0, pending_dir: None, highlight_navigated: false,
         };
         crate::file_browser::start_listing(&mut fb, d.clone(), &fs, &tx);
         e_dst.file_browser = Some(fb);
