@@ -527,8 +527,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             all_paths.insert(idx, op.clone());
         }
     }
-    let (baseline_cfg, _baseline_warns) = config::load(&hand_paths); // fs-chokepoint-allow: (w) config-class
-    let (cfg, mut warns) = config::load(&all_paths);                  // fs-chokepoint-allow: (w) config-class
+    // fs-chokepoint-allow: (w) config-class
+    let (baseline_cfg, _baseline_warns) = config::load(&hand_paths);
+    // fs-chokepoint-allow: (w) config-class
+    let (cfg, mut warns) = config::load(&all_paths);
     if let Some(c) = &cli.config_path {
         if !crate::fsx::is_file_via(&*fs, c) {
             warns.push(format!("config: --config path not found: {}", c.display()));
@@ -539,7 +541,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let (cols, rows) = crossterm::terminal::size()?;
     let area = (cols, rows);
 
-    let path = cli.path;
+    // Cloned, not moved out: `cli` stays whole so the startup seeding below can borrow it.
+    let path = cli.path.clone();
 
     // Open the file and branch on errors per §C5. Built on the Buffer::from_file seam
     // (Effort 7 Task 1) without behavior change: Ok → named clean; NotFound → named "new
@@ -585,79 +588,14 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
     }
 
-    // Seed mouse_capture from config (default true; may be overridden by config layers).
-    editor.mouse_capture = cfg.mouse.mouse_capture;
-    editor.view_opts = cfg.view.clone();
-    // Seed the option modes through the shared setters (contract law 6 — no direct field writes;
-    // set_status_line_mode also enforces the no-true-Off invariant). Dwell-clears are no-ops at
-    // startup (no dwell pending yet).
-    editor.set_scrollbar_mode(cfg.view.scrollbar);
-    editor.set_status_line_mode(cfg.view.status_line);
-    editor.set_caret_shape(cfg.view.caret_shape);
-    editor.set_caret_blink(cfg.view.caret_blink);
-    editor.set_messages_min_kind(cfg.view.messages_min_kind);
-    editor.set_clipboard_provider(cfg.clipboard.provider);
-    editor.set_show_clutter(cfg.files.show_clutter);
-    editor.set_file_type_filter(cfg.files.type_filter);
-    editor.clear_clipboard_provider_dirty(); // worker gets the initial plan below; no redundant rebuild
-    editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
-    editor.diag_cfg = cfg.diagnostics.clone();
-    editor.export_cfg = cfg.export.clone();
-    editor.set_menu_bar_mode(cfg.menu.bar);
-    // Startup unpin-target policy: when config itself pins the bar, unpin returns to Auto — override
-    // the setter's generic remember-current (the pre-seed mode is not meaningful here).
-    if cfg.menu.bar == crate::config::MenuBarMode::Pinned {
-        editor.menu_bar_unpinned_mode = crate::config::MenuBarMode::Auto;
-    }
-    editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();
-    // Resolve and seed the active theme + color depth (once, at startup — §3.6).
-    let env = crate::theme_resolve::EnvSnapshot::from_env();
-    // Parse the chrome disposition from config; seed editor field; pass to resolve.
-    let (chrome_disp, chrome_warn) = crate::theme_resolve::parse_chrome(&cfg.theme.chrome);
-    if let Some(w) = chrome_warn { warns.push(w); }
-    editor.chrome_disposition = chrome_disp;
-    let (canvas_mode, canvas_warn) = crate::theme_resolve::parse_canvas(&cfg.theme.canvas);
-    if let Some(w) = canvas_warn { warns.push(w); }
-    editor.canvas = canvas_mode;
-    let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env, chrome_disp); // fs-chokepoint-allow: (w) config-class
-    editor.theme = resolved.theme;
-    editor.depth = resolved.depth;
-    editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
-    warns.extend(resolved.warnings); // join the existing startup warning stream
-
-    // D1+A5 Task 4: baseline resolve (WITHOUT the overrides layer) + three snapshots.
-    // baseline_cfg was loaded above from hand_paths only; the overrides file is NOT in it.
-    let baseline_resolved = crate::theme_resolve::resolve_theme( // fs-chokepoint-allow: (w) config-class
-        &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
-    let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
-    // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
-    let mut overrides_snapshot = overrides_path.as_ref()
-        .filter(|p| crate::fsx::is_file_via(&*fs, p))
-        .and_then(|p| fs.read_capped(p, crate::limits::MAX_CONFIG_BYTES).ok().flatten())
-        .and_then(|b| String::from_utf8(b).ok())
-        .map(|s| settings::parse_overrides(&s))
-        .unwrap_or_default();
-    // Mask snapshot: parse the --config layer via parse_mask so theme provenance is
-    // collapsed at load time (file vs name are indistinguishable for the guard).
-    let mask_snapshot = cli.config_path.as_ref()
-        .filter(|c| crate::fsx::is_file_via(&*fs, c))
-        .and_then(|c| fs.read_capped(c, crate::limits::MAX_CONFIG_BYTES).ok().flatten())
-        .and_then(|b| String::from_utf8(b).ok())
-        .map(|s| settings::parse_mask(&s))
-        .unwrap_or_default();
-    // Seed theme_identity from the MERGED config's provenance — an overrides/hand `name`
-    // wins over `file` per theme_identity_of's rule; use editor.theme.name since resolved.theme
-    // was already moved into the editor above.
-    editor.theme_identity = settings::theme_identity_of(&cfg.theme, &editor.theme.name);
-
-    // Load the personal dictionary from disk (missing/unreadable/over-cap/invalid-UTF-8 → empty; no abort).
-    if let Some(dict_path) = &cfg.diagnostics.dictionary {
-        if let Some(text) = crate::file::bounded_read_opt(dict_path, crate::limits::MAX_OPEN_BYTES) // fs-chokepoint-allow: (w) config-class
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-        {
-            editor.dictionary = text.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        }
-    }
+    // Everything a config layer says about a new session — option modes through their shared
+    // setters, the theme, the personal dictionary, and the settings-provenance snapshots — is
+    // seeded in one place (`startup.rs`), not inline here. A new option registers itself there;
+    // this hub stays a dispatch hub (CLAUDE.md → "Module structure").
+    let seed = crate::startup::seed_from_config(
+        &mut editor, &cfg, &baseline_cfg, &cli, overrides_path.as_deref(), &*fs, &mut warns);
+    let crate::startup::StartupSeed { env, baseline: baseline_snapshot,
+        overrides: mut overrides_snapshot, mask: mask_snapshot } = seed;
 
     // Recovery-on-open (§5.1).
     // Named files: use assess() with content-hash comparison.
@@ -672,7 +610,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         match crate::swap::assess(&*fs, editor.active().document.path.as_deref(), file_bytes.as_deref()) {
             crate::swap::RecoveryDecision::OpenNormally => {}
             crate::swap::RecoveryDecision::DiscardSilently => {
-                crate::swap::delete(editor.active().document.path.as_deref()); // fs-chokepoint-allow: (w) swap cleanup, not migrated
+                // fs-chokepoint-allow: (w) swap cleanup, not migrated
+                crate::swap::delete(editor.active().document.path.as_deref());
             }
             crate::swap::RecoveryDecision::Prompt(_h, body) => {
                 editor.active_mut().pending_swap_body = Some(body);
@@ -680,11 +619,15 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                 editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
             }
         }
-    } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() { // fs-chokepoint-allow: (w) swap cleanup, not migrated
-        editor.active_mut().pending_swap_body = Some(body);
-        editor.active_mut().pending_swap_path = Some(sp);
-        editor.open_prompt(crate::prompt::Prompt::swap_recovery());
-        editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
+    } else {
+        // fs-chokepoint-allow: (w) swap cleanup, not migrated
+        let orphan = crate::swap::find_orphan_scratch_swap();
+        if let Some((sp, _header, body)) = orphan {
+            editor.active_mut().pending_swap_body = Some(body);
+            editor.active_mut().pending_swap_path = Some(sp);
+            editor.open_prompt(crate::prompt::Prompt::swap_recovery());
+            editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
+        }
     }
 
     // Install the terminal guard: enable raw mode + enter alternate screen.
