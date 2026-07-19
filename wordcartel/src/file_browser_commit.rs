@@ -107,6 +107,10 @@ pub(crate) enum ExtVerdict {
     Redirect { path: PathBuf, ext: String },
     /// Any other extension — honoured silently.
     Honoured(PathBuf),
+    /// The typed name has a TRAILING SEPARATOR (e.g. `sub/`) — it names a directory, not a
+    /// file. Refuse outright: unlike `Redirect`, there is no alternate flow to offer, only
+    /// the field for the writer to fix.
+    Refused(PathBuf),
 }
 
 /// F4's default-and-redirect policy for SAVE destinations.
@@ -118,6 +122,16 @@ pub(crate) enum ExtVerdict {
 /// fixed by the format).
 #[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
 pub(crate) fn apply_extension_policy(path: &Path) -> ExtVerdict {
+    // A TRAILING SEPARATOR (`sub/`) names a directory the writer is asking to create or
+    // enter, not a file — but `Path::file_name()` (and therefore `extension()`) silently
+    // strips it, so `/d/sub/` and `/d/sub` are indistinguishable once parsed. This check
+    // must run on the raw string BEFORE any `Path` method sees it, or the writer ends up
+    // with a hidden `.md` file created INSIDE the directory they named (the Row-4
+    // fallthrough in `classify_destination_enter` routes a not-yet-existing directory-like
+    // name here rather than to Descend).
+    if path.to_string_lossy().chars().last().is_some_and(std::path::is_separator) {
+        return ExtVerdict::Refused(path.to_path_buf());
+    }
     // `Path::extension()` returns `Some("")` for a TRAILING-DOT name like `notes.` — there
     // IS an embedded dot, so it is not None, and the part after it is empty. Treating that
     // as "has an extension" would take the Honoured arm and skip defaulting, leaving the
@@ -461,5 +475,40 @@ mod tests {
         assert_eq!(apply_extension_policy(&p("/d/chapter.one")),
             ExtVerdict::Honoured(p("/d/chapter.one")),
             "`one` is an unrecognized extension — honoured, not defaulted");
+
+        // A TRAILING SEPARATOR names a directory, not a file — refuse rather than create a
+        // hidden `sub/.md`.
+        //
+        // FAIL-VERIFY: remove the trailing-separator arm from `apply_extension_policy`,
+        // watch this assert `ExtVerdict::Defaulted(p("/d/sub/.md"))` instead — confirmed,
+        // then restored.
+        assert_eq!(apply_extension_policy(&p("/d/sub/")),
+            ExtVerdict::Refused(p("/d/sub/")),
+            "a trailing separator names a directory — refuse, do not default a hidden .md file");
+
+        // Four edge cases the review found handled-but-untested — each pinned so a future
+        // change can't silently flip one without a test noticing.
+
+        // `.foo.` — a dotfile AND a trailing dot. The dotfile guard short-circuits before the
+        // trailing-dot filter ever runs, so it is honoured VERBATIM, trailing dot and all.
+        assert_eq!(apply_extension_policy(&p("/d/.foo.")),
+            ExtVerdict::Honoured(p("/d/.foo.")));
+
+        // `.md` alone — `file_name()` is `.md`, which `Path::extension()` treats as a
+        // dotfile (no OTHER dot), not an extension. Honoured, not re-defaulted to `.md.md`.
+        assert_eq!(apply_extension_policy(&p("/d/.md")),
+            ExtVerdict::Honoured(p("/d/.md")));
+
+        // `.config.md` — a leading dot AND a real extension. The second dot means
+        // `Path::extension()` returns `Some("md")` directly, so the dotfile guard is never
+        // reached; `md` is not an OUTPUT ext, so it is honoured.
+        assert_eq!(apply_extension_policy(&p("/d/.config.md")),
+            ExtVerdict::Honoured(p("/d/.config.md")));
+
+        // Empty path — contract only, not a special case: `classify_destination_enter`
+        // guards an empty/whitespace-only field before Row 4 ever calls this, so an empty
+        // `Path` is almost certainly unreachable in practice; pinned here so a change to
+        // that guarantee doesn't silently regress this fallback.
+        assert_eq!(apply_extension_policy(&p("")), ExtVerdict::Defaulted(p(".md")));
     }
 }
