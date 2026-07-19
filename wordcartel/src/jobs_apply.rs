@@ -304,6 +304,7 @@ pub(crate) fn apply_export_done(
     target: std::path::PathBuf,
     result: Result<crate::export::ExportResult, crate::filter::FilterError>,
     overwrite_confirmed: bool,
+    fs: &dyn crate::fsx::Fs,
 ) {
     // TOCTOU guard (Codex pre-merge gate): run_export only prompts for overwrite
     // if the target existed at check time.  When it did not (overwrite_confirmed
@@ -313,9 +314,9 @@ pub(crate) fn apply_export_done(
     // The residual check-to-write window is microseconds vs. the whole pandoc
     // run; an unsafe-free atomic no-replace rename is unavailable under
     // #![forbid(unsafe_code)].
-    if !overwrite_confirmed && target.exists() {
+    if !overwrite_confirmed && crate::fsx::exists_via(fs, &target) {
         if let Ok(crate::export::ExportResult::TempReady(tmp)) = &result {
-            let _ = std::fs::remove_file(tmp);
+            let _ = fs.remove_file(tmp);
         }
         editor.set_status_full(crate::status::StatusKind::Warning, format!(
             "export target {} appeared — re-run export to overwrite",
@@ -337,13 +338,13 @@ pub(crate) fn apply_export_done(
             }
         }
         Ok(crate::export::ExportResult::TempReady(tmp)) => {
-            match std::fs::rename(&tmp, &target) {
+            match fs.rename(&tmp, &target) {
                 Ok(()) => {
                     let status = format!("exported {}", target.display());
                     editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = fs.remove_file(&tmp);
                     editor.set_status_full(crate::status::StatusKind::Error, format!("export rename failed: {e}"),
                         crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
@@ -958,7 +959,7 @@ mod tests {
         std::fs::write(&parent, "i am a file\n").unwrap();
         let target = parent.join("out.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, &crate::fsx::RealFs);
         assert!(e.status_text().contains("export write failed"));
         assert_sticky_error_survives_info(&mut e);
         let _ = std::fs::remove_file(&parent);
@@ -972,7 +973,7 @@ mod tests {
         let missing_tmp = std::env::temp_dir().join(format!("wc-c4-exportrename-missing-{}.tmp", std::process::id()));
         let target = std::env::temp_dir().join(format!("wc-c4-exportrename-target-{}.html", std::process::id()));
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true, &crate::fsx::RealFs);
         assert!(e.status_text().contains("export rename failed"));
         assert_sticky_error_survives_info(&mut e);
     }
@@ -982,7 +983,7 @@ mod tests {
         use crate::editor::Editor;
         let target = std::env::temp_dir().join(format!("wc-c4-exportpandoc-{}.html", std::process::id()));
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true);
+        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true, &crate::fsx::RealFs);
         assert_sticky_error_survives_info(&mut e);
     }
 
@@ -995,7 +996,7 @@ mod tests {
         let target = std::env::temp_dir().join(format!("wc-c4-exporttoctou-{}.html", std::process::id()));
         std::fs::write(&target, "existing\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false);
+        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false, &crate::fsx::RealFs);
         assert!(e.status_text().contains("appeared — re-run export to overwrite"));
         assert_sticky_warning_survives_info(&mut e);
         let _ = std::fs::remove_file(&target);

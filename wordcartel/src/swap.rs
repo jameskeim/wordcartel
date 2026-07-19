@@ -163,8 +163,15 @@ pub fn swap_path(doc_path: Option<&Path>) -> io::Result<PathBuf> {
 
 /// Best-effort delete of a document's swap file.
 pub fn delete(doc_path: Option<&Path>) {
+    delete_with_fs(&crate::fsx::RealFs, doc_path)
+}
+
+/// Best-effort delete of a document's swap file. The result is DISCARDED and must stay
+/// discarded: a failed swap cleanup is never worth surfacing to the writer or failing a
+/// save over.
+pub(crate) fn delete_with_fs(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>) {
     if let Ok(p) = swap_path(doc_path) {
-        let _ = std::fs::remove_file(p);
+        let _ = fs.remove_file(&p);
     }
 }
 

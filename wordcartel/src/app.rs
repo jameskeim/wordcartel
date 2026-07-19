@@ -324,7 +324,7 @@ fn reduce_dispatch(
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
         }
         Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed);
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**fs);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);

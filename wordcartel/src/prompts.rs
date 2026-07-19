@@ -47,7 +47,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
         Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed);
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**ctx.fs);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, ctx.clock);
@@ -267,16 +267,16 @@ pub fn resolve_prompt(
             };
             if let Some((body, orphan)) = staged {
                 crate::save::load_recovered(editor, &body);
-                if let Some(p) = orphan {
-                    let _ = std::fs::remove_file(p);
-                }
+                // Delete AFTER load_recovered — `pending_swap_path` is the orphan-scratch
+                // recovery carrier, and load_recovered replaces the whole Buffer.
+                if let Some(p) = orphan { let _ = fs.remove_file(&p); }
             }
         }
         PromptAction::DiscardSwap => {
             if let Some(p) = editor.active_mut().pending_swap_path.take() {
-                let _ = std::fs::remove_file(p);
+                let _ = fs.remove_file(&p);
             } else {
-                crate::swap::delete(editor.active().document.path.as_deref());
+                crate::swap::delete_with_fs(&**fs, editor.active().document.path.as_deref());
             }
         }
         PromptAction::OpenOriginal => {
@@ -319,7 +319,7 @@ pub fn resolve_prompt(
             let mut n = 0usize;
             for p in std::mem::take(&mut editor.pending_clean) {
                 if !crate::swap::recovery_path_still_cleanable(&**fs, &p, &protected) { continue; }
-                if std::fs::remove_file(&p).is_ok() { n += 1; }
+                if fs.remove_file(&p).is_ok() { n += 1; }
             }
             editor.set_status(crate::status::StatusKind::Info, format!("Cleaned {n} file(s)"));
         }

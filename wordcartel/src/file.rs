@@ -190,15 +190,29 @@ pub(crate) fn save_atomic_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content:
 // ---------------------------------------------------------------------------
 
 pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content,
-        crate::fsx::WriteOpts {
-            mode: crate::fsx::ModePolicy::Fixed(0o600),
-            dir_fsync: true,
-        },
-    )
+    save_atomic_bytes_with_fs(&crate::fsx::RealFs, path, content)
+}
+
+/// Byte-exact atomic write. NO UTF-8 check and NO skip-unchanged (unlike `save_atomic`),
+/// but it DOES share the symlink refusal: `atomic_replace` renames over the target, which
+/// through a link would replace the link with a regular file.
+///
+/// The guard is new in C5. Before, export targets were derived and never user-chosen, so
+/// the exposure did not exist; C5 lets a writer pick an export destination (spec §9), and
+/// a target can become a symlink between resolution and write. Session-state writes
+/// (`state::SessionState::save_in`) acquire the same guard — a deliberate change, not a
+/// side effect.
+pub(crate) fn save_atomic_bytes_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content: &[u8])
+    -> Result<(), SaveError>
+{
+    match fs.stat(path) {
+        Ok(st) if st.is_symlink => return Err(SaveError::Symlink),
+        _ => {}
+    }
+    crate::fsx::atomic_replace(fs, path, content, crate::fsx::WriteOpts {
+        mode: crate::fsx::ModePolicy::Fixed(0o600),
+        dir_fsync: true,
+    })
     .map_err(|e| SaveError::Io(e.to_string()))
 }
 
@@ -479,6 +493,23 @@ mod tests {
         let err = open(&p).expect_err("must refuse oversized file");
         assert!(matches!(err, OpenError::TooLarge(..)), "expected TooLarge, got {err:?}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_atomic_bytes_refuses_a_symlink() {
+        // save_atomic_bytes had NO symlink guard. It is the export write path, and C5 makes
+        // export targets user-selectable for the first time — so a chosen target can now be
+        // a symlink, and the target can be swapped for one between resolution and write.
+        let real = scratch_path("bytes-link-real");
+        let link = scratch_path("bytes-link");
+        fs::write(&real, b"original\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = save_atomic_bytes_with_fs(&crate::fsx::RealFs, &link, b"new\n")
+            .expect_err("must refuse");
+        assert!(matches!(err, SaveError::Symlink), "got {err:?}");
+        assert_eq!(fs::read(&real).expect("read"), b"original\n", "target untouched");
+        let _ = fs::remove_file(&link); let _ = fs::remove_file(&real);
     }
 
     /// No temp litter left after a successful save.
