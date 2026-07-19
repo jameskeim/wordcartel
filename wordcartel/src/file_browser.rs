@@ -323,7 +323,7 @@ pub(crate) fn file_browser_enter(
         }
         EnterOutcome::Open(path) => {
             editor.file_browser = None;
-            crate::workspace::open_as_new_buffer(editor, &path);
+            crate::workspace::open_as_new_buffer(editor, &**fs, &path);
         }
         EnterOutcome::Refuse(msg) => {
             // Shown and marked, but not actioned — and the picker STAYS OPEN so the writer
@@ -1103,5 +1103,46 @@ mod tests {
         let l = crate::fsx::DirListing { entries: vec![], total_seen: 0, unreadable: 0 };
         apply_listing_done(&mut e, 12345, std::env::temp_dir(), Ok(l));
         assert!(e.file_browser.is_none(), "no picker was resurrected, and no panic");
+    }
+
+    #[test]
+    fn picker_enter_opens_through_the_injected_fs_not_a_hardcoded_realfs() {
+        // C5 §2.3 / §4.1 — the headline consumer of the seam. The picker HOLDS `ctx.fs`; before
+        // this fix it dropped it, because `open_as_new_buffer` -> `Buffer::from_file` ->
+        // `file::open` hardcoded `RealFs`. The bypass was invisible to `tests/fs_chokepoint.rs`
+        // (which scanned for raw `std::fs` tokens, and there were none) and survived 26 tasks.
+        //
+        // The injected `fs` faults on `read_capped` ONLY: the directory listing still succeeds,
+        // so the picker populates normally and the ONLY thing that can differ is whether the
+        // open read went through the seam.
+        //
+        // FAIL-VERIFY: restore `open_as_new_buffer(editor, &path)` (RealFs internally) — the
+        // real, readable file opens, no error status is set, and both assertions below fail.
+        let dir = std::env::temp_dir().join(format!("wc-fbfault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("note.md"), b"real content\n").expect("seed a genuinely readable file");
+
+        let mut e = crate::editor::Editor::new_from_text("scratch\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::test_support::FaultFs::new(
+                crate::test_support::FaultAt::ReadCapped));
+        e.open_file_browser(&fs, &tx, dir.clone());
+        assert!(crate::test_support::pump_listing(&mut e, &rx),
+            "precondition: the listing itself must SUCCEED under this fault, or the test proves nothing");
+        {
+            let fb = e.file_browser.as_mut().expect("picker open");
+            let i = fb.entries.iter().position(|x| x.name == "note.md").expect("seeded file is listed");
+            fb.selected = i;
+        }
+        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!e.buffers.iter().any(|b| b.document.path.as_deref() == Some(dir.join("note.md").as_path())),
+            "the open must fault THROUGH the injected seam — a buffer here means the read \
+             bypassed `fs` and hit the real file");
+        assert!(matches!(e.status().map(|s| s.kind()), Some(crate::status::StatusKind::Error)),
+            "the seam's IO error must surface on the status line, not silently");
     }
 }

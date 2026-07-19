@@ -825,7 +825,7 @@ fn on_buffer_close_and_open_fire() {
     // 1) Reuse-shape open: fires on_open once.
     {
         let mut e = h.editor.borrow_mut();
-        crate::workspace::open_as_new_buffer(&mut e, &path_a);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &path_a);
     }
     h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
@@ -839,7 +839,7 @@ fn on_buffer_close_and_open_fire() {
     // pushes a fresh buffer instead of reusing — the OTHER open_as_new_buffer arm.
     {
         let mut e = h.editor.borrow_mut();
-        crate::workspace::open_as_new_buffer(&mut e, &path_b);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &path_b);
     }
     h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();

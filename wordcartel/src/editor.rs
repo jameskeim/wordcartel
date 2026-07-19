@@ -301,8 +301,14 @@ impl Buffer {
 
     /// Open `path` into a named Buffer, mirroring run()'s open branch:
     /// Ok → named clean; NotFound → named empty "new file" (`"\n"`); other errors propagate.
-    pub fn from_file(id: BufferId, path: &std::path::Path, area: (u16, u16)) -> Result<Buffer, crate::file::OpenError> {
-        match crate::file::open(path) {
+    ///
+    /// Takes the `fs` seam (C5 §2.3 / §4.1) rather than reaching `file::open`'s `RealFs`
+    /// wrapper: this is the document-read path behind every open (picker Enter, recents,
+    /// launch open, replace-in-place), so it must be fault-injectable end to end.
+    pub fn from_file(id: BufferId, fs: &dyn crate::fsx::Fs, path: &std::path::Path, area: (u16, u16))
+        -> Result<Buffer, crate::file::OpenError>
+    {
+        match crate::file::open_with_fs(fs, path) {
             Ok(text) => Ok(Buffer::from_text(id, &text, Some(path.to_path_buf()), area)),
             Err(crate::file::OpenError::NotFound(_)) => Ok(Buffer::from_text(id, "\n", Some(path.to_path_buf()), area)),
             Err(e) => Err(e),
@@ -1702,7 +1708,7 @@ mod tests {
         std::fs::write(&p, "hello\nworld\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (40, 10)); // host editor for ids
         let id = e.alloc_id();
-        let b = Buffer::from_file(id, &p, (40, 10)).expect("ok");
+        let b = Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)).expect("ok");
         assert_eq!(b.id, id);
         assert_eq!(b.document.buffer.to_string(), "hello\nworld\n");
         assert_eq!(b.document.path.as_deref(), Some(p.as_path()));
@@ -1716,7 +1722,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let mut e = Editor::new_from_text("\n", None, (40, 10));
         let id = e.alloc_id();
-        let b = Buffer::from_file(id, &p, (40, 10)).expect("NotFound → named empty buffer, not Err");
+        let b = Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)).expect("NotFound → named empty buffer, not Err");
         assert_eq!(b.document.path.as_deref(), Some(p.as_path()));
         assert_eq!(b.document.buffer.to_string(), "\n");
     }
@@ -1727,7 +1733,7 @@ mod tests {
         std::fs::write(&p, [0u8, 159, 146, 150]).unwrap(); // invalid UTF-8 / NUL
         let mut e = Editor::new_from_text("\n", None, (40, 10));
         let id = e.alloc_id();
-        assert!(matches!(Buffer::from_file(id, &p, (40, 10)), Err(crate::file::OpenError::Binary(_))));
+        assert!(matches!(Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)), Err(crate::file::OpenError::Binary(_))));
         let _ = std::fs::remove_file(&p);
     }
 

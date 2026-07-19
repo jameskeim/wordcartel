@@ -106,11 +106,11 @@ pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
 /// Allocates a FRESH id so an in-flight save/swap job for the replaced buffer merges via
 /// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
 /// (keep the user's work).
-pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
+pub fn open_into_current(editor: &mut Editor, fs: &dyn crate::fsx::Fs, path: &std::path::Path) {
     let old_id = editor.active().id; // capture BEFORE alloc so MRU can replace old→new
     let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer no-ops via by_id_mut(old_id)=None
     let area = editor.active().view.area;
-    match crate::editor::Buffer::from_file(id, path, area) {
+    match crate::editor::Buffer::from_file(id, fs, path, area) {
         Ok(b) => {
             let a = editor.active;
             // A17 T8 category (b): route through the single chokepoint. On a read-only buffer this
@@ -340,7 +340,7 @@ mod tests {
         std::fs::write(&p, "opened\n").unwrap();
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
         let old_id = e.active().id;
-        open_into_current(&mut e, &p);
+        open_into_current(&mut e, &crate::fsx::RealFs, &p);
         assert_ne!(e.active().id, old_id, "fresh id → stale in-flight jobs for old buffer are ignored");
         assert_eq!(e.active().document.buffer.to_string(), "opened\n");
         assert!(!e.active().document.dirty());
@@ -355,7 +355,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wc-oic-isdir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
-        open_into_current(&mut e, &dir);
+        open_into_current(&mut e, &crate::fsx::RealFs, &dir);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         e.set_status(crate::status::StatusKind::Info, "later ack");
@@ -373,7 +373,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         e.open_file_browser(&crate::test_support::test_fs(), &tx, dir.clone());
         // select "note.md" and simulate Enter via the browser's open path:
-        open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
+        open_into_current(&mut e, &crate::fsx::RealFs, &dir.join("note.md")); // the clean-path the Enter handler takes
         assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
         let _ = std::fs::remove_dir_all(&dir);
     }

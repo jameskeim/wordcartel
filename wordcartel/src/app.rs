@@ -494,9 +494,18 @@ pub(crate) fn first_frame_settle(editor: &mut Editor) {
 #[allow(clippy::too_many_lines)] // event-loop init + drive sequence — cohesive startup; the deadline machinery is already seamed to timers.rs
 pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // COMPOSITION ROOT for the filesystem seam — the first statement, before ANY filesystem
-    // work. Config discovery, theme resolution, session load, and the launch file open all
-    // happen below this line and all take `&*fs` after Tasks 6/7. Everything downstream gets
-    // a clone; tests substitute an Arc<FaultFs> here.
+    // work. Everything downstream gets a clone; tests substitute an Arc<FaultFs> here.
+    //
+    // WHAT ACTUALLY TAKES `&*fs` (do not over-claim — an earlier version of this comment
+    // asserted "config discovery, theme resolution, session load and the launch open all
+    // take `&*fs`", which was false for three of the four):
+    //   * the launch file open (`Buffer::from_file`) — document-class, threaded through.
+    //   * the `--config` existence probe, and every fs use inside the loop below.
+    // What does NOT: config layer discovery/`config::load`, `theme_resolve::resolve_theme`,
+    // and `state::load` still call their `RealFs` wrappers. That is a deliberate, recorded
+    // project decision (config-class reads, not document-class) — not an oversight. Each such
+    // wrapper call is marked with a `fs-chokepoint-allow:` clause and is enforced by
+    // `tests/fs_chokepoint.rs`'s wrapper-bypass layer.
     let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
         std::sync::Arc::new(crate::fsx::RealFs);
 
@@ -545,7 +554,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let mut editor = Editor::new_from_text("\n", None, area); // scratch host; the real buffer (if any) replaces slot 0 below
     if let Some(p) = path.as_deref() {
         let id = editor.active().id; // reuse slot 0's id for the launch buffer
-        match crate::editor::Buffer::from_file(id, p, area) {
+        match crate::editor::Buffer::from_file(id, &*fs, p, area) {
             Ok(b) => {
                 let was_new_file = b.document.path.is_some() && !crate::fsx::exists_via(&*fs, p);
                 // A17 T8 category (b): route the launch install through the single chokepoint. Slot 0
@@ -2196,7 +2205,7 @@ mod tests {
         let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
         let id = e.active().id;
         let before_count = e.buffers.len();
-        crate::workspace::open_as_new_buffer(&mut e, &target);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &target);
         assert_eq!(e.buffers.len(), before_count + 1, "buffer added additively, not replaced");
         assert_eq!(e.active().document.buffer.to_string(), "OPEN TARGET\n", "active is new file");
         assert_ne!(e.active().id, id, "switched to the newly opened buffer");
@@ -2233,7 +2242,7 @@ mod tests {
         let named = std::env::temp_dir().join(format!("wc-clean-named-{}.md", std::process::id()));
         std::fs::write(&named, "v1 content\n").unwrap();
         let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
-        crate::workspace::open_as_new_buffer(&mut e, &target);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &target);
         assert_eq!(e.active().document.buffer.to_string(), "OPEN TARGET\n", "active is opened file");
         assert!(e.pending_after_save.is_none());
         let _ = std::fs::remove_file(&target);
@@ -2249,7 +2258,7 @@ mod tests {
         let dir_path = std::path::PathBuf::from("/tmp");
         let mut e = Editor::new_from_text("content\n", None, (80, 24));
         let before_count = e.buffers.len();
-        crate::workspace::open_as_new_buffer(&mut e, &dir_path);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &dir_path);
         assert!(!e.status_text().is_empty(), "error status set on failure, got: {:?}", e.status_text());
         assert_eq!(e.buffers.len(), before_count, "no buffer added on open failure");
     }
