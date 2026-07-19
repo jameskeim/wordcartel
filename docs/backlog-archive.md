@@ -2322,3 +2322,46 @@ later decision.)
 drafting it becomes the thing writers hate about Word, and it violates the project's top priority.
 The E7 precedent governs: the cost lands in the summoned view.
 
+### C5 — File interface: unify save/write onto the picker + favorites/recent
+<!-- item: C5 -->
+
+**Observation (user, 2026-07-15):** file operations are UX-asymmetric. **Open** uses the rich
+`file_browser` **modal** (navigate dirs, `..`, substring-filter, select). **Save As** (`prompts::open_save_as`
+→ `MinibufferKind::SaveAs`) and **Write Block** use a **blind minibuffer text entry** — you type the path with
+no directory browsing, no visibility into what's already there, no favorites; overwrite is a confirm `Prompt`.
+Export target is the same. So **reading a file gets a picker; writing one makes you type a path blind.** Today's
+`file_browser` is minimal: open-only (list/filter/nav/select), **no save mode, no favorites, no recent, no
+projects, no create-new**.
+
+**Motivation:** writers are increasingly not CLI-native. The `~/projects/wordprocessing/beloved-features-report.md`
+survey names the target directly — Ulysses' library ("*no file names, no Finder management…*") and Scrivener's
+Binder are the most-cited beloved features; abstracting raw path management is the gap.
+
+**Scope — layers (this item = Layers 1–2):**
+- **Layer 1 (tactical, high-value):** give `file_browser` a **save/write mode** — a filename field + directory
+  nav — so **Save As**, **Write Block**, and the **export target** route through it instead of blind minibuffer
+  entry. Closes the asymmetry; mostly extends existing infra.
+- **Layer 2:** **favorites/pinned directories** + **recent files/dirs**, surfaced in the picker. Needs a
+  config/persistence surface and command-surface conformance for any settable list.
+- **Layer 3 (NOT this item):** "**projects**" (a manuscript root / working dir) = **S2** (directory-as-binder) +
+  the still-open **writing-unit question Q6** (single long doc vs book-as-directory), composing with **S1**.
+  Do not build "projects" ad-hoc in the picker — favorites are the cheap on-ramp; S1/S2 own the manuscript model.
+
+**Build-not-buy (decided 2026-07-15, same logic as A17 / C3):** extend the existing `file_browser` + the A6
+windowed-list painter + the `theme_picker`/palette pattern — do NOT adopt a file-picker crate. A crate re-does
+the easy part (list a dir) that's already done, and can't honor the theme/chrome elevation ladder,
+terminal-plain fallback, the command-surface contract (keymap/hints/palette), or no-silent-UI; dep-weight is an
+active constraint and the core is `#![forbid(unsafe_code)]`. The value is the writer-first integration
+(favorites/projects/persistence), which no generic widget provides. (Small utility crates for a *piece* —
+fuzzy-matching, path completion — are separately evaluable, but not a whole-picker dependency.)
+
+**Prior-art note:** the editor read *at source* for A17 was `sinelaw/n` (its messaging system, not its file ops);
+its file-operation internals are NOT captured here, and "Fresh" (as the user named it) is unresolved — research
+`n`/Fresh's picker if a concrete reference is wanted.
+
+**Relationships / sequencing:** a richer file interface adds overlay surface → land **after / conforming to
+`H21`** (the overlay-dispatch table) so it registers into the seam rather than adding another hand-parallel
+overlay (reinforces H21's value). Config/persistence surface for Layer 2. `S2`/`S1`/**Q6** own Layer 3.
+
+**Size:** M for Layers 1–2 (save-mode picker + favorites/persistence + command-surface wiring); L if it grows
+toward projects (which should be S2 instead). Good candidate for the Fable-first, writer-first pipeline.

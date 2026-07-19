@@ -3,7 +3,7 @@
 
 # Backlog
 
-**39 open · 67 shipped · 2 dropped**
+**38 open · 68 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -23,7 +23,6 @@ Blocking Effort P: **0**
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
 | PD | wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain | needs-design | feature | SM |  | wc.async — the deferred one-shot subprocess primitive (linter-arc effort d, but INDEPENDENT of the linter spine): a CLOSED Rust op-menu (wc.async{op,args,on_done}) + Msg::AsyncDone pump-drain + resource/security caps, with a formatter (prettier/fmt) or vale-CLI driver. The !Send constraint forces the closed-primitive shape (P3 F1-option-A). Depends ONLY on the shipped plugin system. Design: docs/design/prose-linters-design-space.md §2/§6 + effort-p3-grounding.md. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
-| C5 | File interface — unify save/write onto the picker + favorites/recent | needs-design | feature | M |  | UX asymmetry (user, 2026-07-15): OPEN uses the rich file_browser MODAL (nav/filter/select); SAVE-AS and WRITE-BLOCK use a blind minibuffer text-entry (type the path), + export target too. Reading gets a picker; writing makes you type a path with no browsing/visibility/favorites. Layer 1 (this item): give file_browser a SAVE/WRITE mode (filename field + dir nav) so Save As/Write Block/export route through it. Layer 2: favorites/pinned dirs + recent files/dirs (config-persisted, command-surface). BUILD-NOT-BUY (like A17/C3): extend the existing file_browser + list_window/A6 infra — a picker crate can't honor the theme ladder/terminal-plain/command-surface and dep-weight+forbid-unsafe forbid it; the value is the writer-first integration, not a generic list widget. For less-CLI-native writers (Ulysses 'no Finder management' / Scrivener Binder — see ~/projects/wordprocessing/beloved-features-report.md). RELATIONSHIPS: the 'projects' ambition = S2 (directory-as-binder) + the Q6 writing-unit question (single doc vs book-as-dir) — do NOT build projects ad-hoc in the picker; favorites are the cheap on-ramp, S1/S2 own the manuscript model. SEQUENCING: a richer file interface adds overlay surface → land after/conforming to H21 (overlay dispatch table). Prior-art editor studied at source = sinelaw/n (file-op internals not captured; 'Fresh' unresolved). |
 | E10 | Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle | needs-design | feature | M |  | Multi-engine linting effort (b): the ltex-ls-plus / LanguageTool provider + its JVM lifecycle — lazy-spawn on Review, Starting/'warming ltex…' status (no-silent-UI), idle-shutdown, never block the hot path. Reuses lsp_rpc.rs + the harper_ls.rs template; the ~300MB JVM 30s–2min warm-up is the only genuinely new risk. Builds on the SHIPPED diagnostics spine (harper-ls + selector); may need to finish the Vec/registry provider-seam generalization. Design: docs/design/prose-linters-design-space.md §6. |
 | E11 | Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand) | needs-design | feature | M |  | Multi-engine linting effort (c): the diagnostics VIEWING/ACTION delta — per-diagnostic 'learn more'/href + a detail region on DiagOverlay; per-engine (non-harper) dictionary/rule writers; the executeCommand relay; more-suggestions population. Consumes the SHIPPED-BUT-UNUSED Diagnostic.code/href fields. Parallelizable with E10. Design: docs/design/prose-linters-design-space.md §1/§6. |
 | E12 | Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows | needs-design | feature | M |  | Multi-engine linting effort (e), LAST/optional: plugins declare an LSP server + contribute dynamic engine-menu rows (MenuRowAction::Plugin widening). Only if plugin-authored engines materialize. Needs wc.async (PD) + the shipped spine + the deferred plugin-dynamic-menu-section effort. Design: docs/design/prose-linters-design-space.md §5/§6. |
@@ -53,10 +52,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>67 shipped</summary>
+<details><summary>68 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| C5 | File interface — unify save/write onto the picker + favorites/recent | 2026-07-19 | 30f502a |
 | S8 | Prose lenses — POS-driven stylistic X-rays (4-lens spine) | 2026-07-18 | 1570ea8 |
 | A16 | Format menu: drop redundant Transform entry | 2026-07-17 | 505f093 |
 | A21 | Overlay mouse interaction model — hover-highlights, wheel-scrolls-viewport | 2026-07-17 | 3f0bc11 |

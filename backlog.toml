@@ -1230,13 +1230,15 @@ created = "2026-07-14"
 [[item]]
 id = "C5"
 title = "File interface — unify save/write onto the picker + favorites/recent"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "C"
 hook = "UX asymmetry (user, 2026-07-15): OPEN uses the rich file_browser MODAL (nav/filter/select); SAVE-AS and WRITE-BLOCK use a blind minibuffer text-entry (type the path), + export target too. Reading gets a picker; writing makes you type a path with no browsing/visibility/favorites. Layer 1 (this item): give file_browser a SAVE/WRITE mode (filename field + dir nav) so Save As/Write Block/export route through it. Layer 2: favorites/pinned dirs + recent files/dirs (config-persisted, command-surface). BUILD-NOT-BUY (like A17/C3): extend the existing file_browser + list_window/A6 infra — a picker crate can't honor the theme ladder/terminal-plain/command-surface and dep-weight+forbid-unsafe forbid it; the value is the writer-first integration, not a generic list widget. For less-CLI-native writers (Ulysses 'no Finder management' / Scrivener Binder — see ~/projects/wordprocessing/beloved-features-report.md). RELATIONSHIPS: the 'projects' ambition = S2 (directory-as-binder) + the Q6 writing-unit question (single doc vs book-as-dir) — do NOT build projects ad-hoc in the picker; favorites are the cheap on-ramp, S1/S2 own the manuscript model. SEQUENCING: a richer file interface adds overlay surface → land after/conforming to H21 (overlay dispatch table). Prior-art editor studied at source = sinelaw/n (file-op internals not captured; 'Fresh' unresolved)."
-doc = "ux-backlog.md#c5"
+doc = "backlog-archive.md#c5"
 created = "2026-07-15"
+shipped_date = "2026-07-19"
+shipped_commit = "30f502a"
 
 [[item]]
 id = "H23"
