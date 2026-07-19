@@ -922,3 +922,55 @@ dispatch-table effort.
 
 *(Captured 2026-07-18 from C5 Task 5's review. See also [[H1]] — the god-object split this lint
 exists to prevent recurring.)*
+
+### H28 — Un-pumped picker tests assert unreachable states
+<!-- item: H28 -->
+
+Two tests — `save_as_empty_path_is_a_sticky_warning` and its Write-Block twin — pass only because
+they act on the picker **before pumping the async directory listing**. Once a listing lands on any
+non-root directory the warning they assert becomes unreachable, so they assert a state real usage
+never reaches.
+
+This is the class that hid a Critical through the whole C5 effort: every picker test pressed Enter
+without pumping, so a bug that **descended into the parent instead of saving** survived ten
+plan-gate rounds and twenty task reviews. The convention is now "pump the listing, drive the real
+intercept" — these two are the last holdouts.
+
+Either make them reachable (assert the warning in a state a writer can actually be in) or retire
+them. A test that passes for the wrong reason is worse than no test: it reports coverage of a path
+nobody is checking.
+
+### H29 — recovery::LAST_GOOD process-global race makes the test gate non-deterministic
+<!-- item: H29 -->
+
+`editor::tests::undo_and_redo_refresh_the_recovery_snapshot` fails intermittently — roughly 2 runs
+in 14 — on a race over the process-global `recovery::LAST_GOOD`. `git log -S` places it on `main`
+since **H22**; it is not a C5 regression, and C5 deliberately left it alone.
+
+It matters because it makes `cargo test` — a merge GATE — non-deterministic. Every effort since H22
+has had to tell its implementers and reviewers "this one is a known flake, re-run it, don't chase
+it," which is exactly the instruction that trains someone to re-run a *real* failure instead of
+reading it.
+
+Two sibling flakes fire only under parallel load and pass at `--test-threads=1`:
+`config::tests::files_type_filter_unknown_warns_and_defaults_documents` and
+`filter::tests::run_filter_non_zero_exit_carries_stderr` (the latter has a genuinely load-sensitive
+10s spawn budget). Worth triaging together — the fix for a process-global race and the fix for a
+timing budget differ, but the symptom a contributor sees is identical.
+
+### A22 — Write-Block Redirect exports the whole document, not the marked block
+<!-- item: A22 -->
+
+In Write-Block mode, choosing a destination whose extension pandoc can produce (`excerpt.html`,
+`report.docx`) redirects into the Export flow — and Export then exports the **whole document**, not
+the marked block the writer was working with.
+
+Pre-existing for a *typed* destination; C5's Row-2 format protection now also reaches it when the
+writer highlights an existing foreign-format file. It is not silent — the picker title changes to
+"Export" — so a writer who is reading has a cue. But the mode they started in promised a block
+operation, and what they get is a whole-document one.
+
+Two candidate resolutions, and the choice is a product call: either Export honours the marked block
+when the flow was entered from Write-Block, or the redirect states plainly that it is leaving block
+scope. Related: a Row-2 confirm onto a `.docx` target does not currently say the write would be
+plain markdown.

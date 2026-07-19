@@ -3,7 +3,7 @@
 
 # Backlog
 
-**36 open · 67 shipped · 2 dropped**
+**39 open · 67 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -32,6 +32,7 @@ Blocking Effort P: **0**
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. Inherits select_section from S4, and OWNS section transpose (deliberately cut from S4: outline::sections yields NESTED/overlapping ranges — the 'next section' after an H2 is usually its own H3 child, so naive swap-with-next corrupts the document; S1 must solve sibling identification + separator normalization anyway). |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
+| A22 | Write-Block Redirect exports the whole document, not the marked block | triage | feature | TBD |  | Write-Block Redirect exports the whole document, not the marked block |
 | B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | triage | feature | TBD |  | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) |
 | B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | triage | feature | TBD |  | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) |
 | B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | triage | feature | TBD |  | Scope::Sentence highlight window drifts from content-anchored select on indented prose |
@@ -41,6 +42,8 @@ Blocking Effort P: **0**
 | H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | triage | feature | TBD |  | Flaky test: filter::run_filter_non_zero_exit_carries_stderr. INVESTIGATED 2026-07-13: NOT reproducible in 85 runs (60 isolated + 25 full-parallel, 0 failures). run_subprocess reviewed — carefully written: concurrent drain, deadlock-safe (combined stdout+stderr limit_size), EPIPE-on-stdin handled by the subprocess crate, breaks to child.wait() only on genuine both-streams-EOF so err_buf holds all stderr. No clear race by inspection. MOST PLAUSIBLE vector: child.wait().unwrap_or(Undetermined) — if wait() ever yields Undetermined, code='Undetermined' has no '3', so the CODE assert fails (not the stderr one). NEXT: on recurrence, capture the actual panic message (which assert / 'got <other>') — it pinpoints code-vs-stderr. Do NOT weaken the test (would mask a real intermittent wait() result); do NOT guess-fix the deadlock-safe loop without a repro. |
 | H26 | fs-chokepoint guard: use-tree parsing for full soundness | triage | feature | TBD |  | fs-chokepoint guard: use-tree parsing for full soundness |
 | H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | triage | feature | TBD |  | dispatch signatures: pass DispatchCtx instead of 8 loose args |
+| H28 | Un-pumped picker tests assert unreachable states | triage | feature | TBD |  | Un-pumped picker tests assert unreachable states |
+| H29 | recovery::LAST_GOOD process-global race makes the test gate non-deterministic | triage | feature | TBD |  | recovery::LAST_GOOD process-global race makes the test gate non-deterministic |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
