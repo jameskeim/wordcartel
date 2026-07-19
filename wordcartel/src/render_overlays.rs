@@ -519,8 +519,18 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         // row, not the cramped border-title fallback. Only a genuinely tiny terminal falls
         // back to the title.
         let footer_rows = crate::chrome_geom::file_browser_footer_rows_shown(area, fb);
-        let dedicated_footer_row = footer.is_some() && footer_rows >= 1;
-        let footer_takes_title = footer.is_some() && !dedicated_footer_row;
+        // The footer STACK, in priority order and in the same order `file_browser_footer_rows`
+        // reserved rows for it: the resolved-target line first (§7.3's single highest-value
+        // writer-facing element), then the withholding disclosure (§7.4/§6.2). The disclosure
+        // was computed into `fb.disclosure` and read by nothing at all until this line (review
+        // finding C2) — a writer filtering to Documents saw a shorter list with no indication
+        // that their manuscript had been withheld, which is precisely the silent lie §7.4
+        // forbids. A terminal too small to grow the box gets `footer_rows == 0` and falls back
+        // to the border title, which can carry only the first line.
+        let mut footer_lines: Vec<String> = footer.iter().cloned().collect();
+        footer_lines.extend(crate::file_browser_listing::disclosure_lines(&fb.disclosure));
+        let dedicated_footer_rows = footer_rows.min(footer_lines.len());
+        let footer_takes_title = dedicated_footer_rows == 0 && !footer_lines.is_empty();
 
         frame.render_widget(Clear, ov_rect);
         frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
@@ -531,10 +541,8 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
             // No spare interior row: the footer — the safety disclosure that prevents
             // save-to-nowhere — wins the block's bottom edge over the n/total indicator,
             // which is mere navigational polish.
-            if let Some(ref line) = footer {
-                let truncated = elide_path_left(line, ov_w.saturating_sub(2) as usize);
-                block = block.title_bottom(Line::from(truncated));
-            }
+            let truncated = elide_path_left(&footer_lines[0], ov_w.saturating_sub(2) as usize);
+            block = block.title_bottom(Line::from(truncated));
         } else if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
             // Indicator composes with the existing dynamic title (file browser already uses top title).
             block = block.title_bottom(ind);
@@ -593,21 +601,25 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
                 );
             }
 
-            // The footer's dedicated row: the last interior row, immediately above the bottom
-            // border — full box width, so a long absolute path is not truncated to whatever a
-            // border title's corners leave (unlike `footer_takes_title`'s cramped fallback
-            // above). TEXT carries the meaning here (the arrow, the "exists" note), never
-            // colour alone — the terminal-plain / no-color constraint.
-            if dedicated_footer_row {
-                if let Some(ref line) = footer {
-                    let footer_row = ov_y + 2 + list_h as u16;
-                    let footer_area = Rect::new(ov_x + 1, footer_row, ov_w.saturating_sub(2), 1);
-                    let truncated = elide_path_left(line, footer_area.width as usize);
-                    frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(truncated, cs.ov_query))),
-                        footer_area,
-                    );
-                }
+            // The footer's dedicated rows: the last interior rows, immediately above the
+            // bottom border — full box width, so a long absolute path is not truncated to
+            // whatever a border title's corners leave (unlike `footer_takes_title`'s cramped
+            // fallback above). TEXT carries the meaning throughout (the arrow, the "exists"
+            // note, the counts), never colour alone — the terminal-plain / no-color constraint.
+            //
+            // The resolved target loses its LEFT end when it overflows (its filename and the
+            // "exists" note are what matter, and they are at the end); a disclosure line is a
+            // heading and loses its right end, the §11.3.1 rule-5 split.
+            for (i, line) in footer_lines.iter().take(dedicated_footer_rows).enumerate() {
+                let footer_row = ov_y + 2 + list_h as u16 + i as u16;
+                let footer_area = Rect::new(ov_x + 1, footer_row, ov_w.saturating_sub(2), 1);
+                let w = footer_area.width as usize;
+                let fitted = if footer.is_some() && i == 0 { elide_path_left(line, w) }
+                             else { line.chars().take(w).collect() };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
+                    footer_area,
+                );
             }
         }
     }
@@ -948,6 +960,60 @@ mod tests {
         let expected = ov_x + 1 + OV_QUERY_PREFIX_COLS + 5;
         assert_eq!(term.get_cursor_position().expect("caret").x, expected,
             "the caret must sit at `field_cursor`, not pinned to the empty query");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- the withholding disclosure reaches the SCREEN ----------------------------
+
+    /// C5 review finding C2. `filter_and_rank` computed `Disclosure { hidden_clutter,
+    /// hidden_type, capped_out, unreadable, .. }` into `fb.disclosure`, doc-commented
+    /// "everything the footer needs" — and there were ZERO production reads of it. A writer
+    /// filtering to Documents saw a shorter list with no indication that anything had been
+    /// withheld; a directory past `MAX_DIR_ENTRIES` likewise. Spec §7.4: "whenever either
+    /// toggle withholds anything, the footer carries a count … the sum of shown +
+    /// disclosed-withheld always equals what is really there", and its rationale — "a filter
+    /// that hides the path to your file is a filter that lies."
+    ///
+    /// The arithmetic guard (`disclosure_accounts_for_everything_withheld`) asserts the STRUCT
+    /// and stayed green for the whole effort while the feature was dead. This one drives the
+    /// real listing pipeline over a real directory and scrapes the drawn cell grid, per the
+    /// §11.3.1 amendment's rule 6.
+    ///
+    /// FAIL-VERIFY (mutation): drop the `footer_lines.extend(disclosure_lines(..))` line from
+    /// the painter — both count assertions fail against a screen that shows only the entries.
+    /// Confirmed, then reverted.
+    #[test]
+    fn the_withholding_disclosure_is_painted() {
+        let d = std::env::temp_dir().join(format!("wc-render-c2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("fixture dir");
+        // Two withheld by the CLUTTER toggle, three by the TYPE toggle, one shown.
+        for n in [".hidden-a", ".hidden-b"] { std::fs::write(d.join(n), "x").expect("seed"); }
+        for n in ["a.bin", "b.o", "c.zip"] { std::fs::write(d.join(n), "x").expect("seed"); }
+        std::fs::write(d.join("chapter.md"), "x").expect("seed");
+
+        let mut e = Editor::new_from_text("body\n", None, (100, 30));
+        assert!(!e.files_show_clutter, "precondition: clutter is hidden by default");
+        assert_eq!(e.files_type_filter, crate::config::FileTypeFilter::Documents,
+            "precondition: the Documents filter is on by default");
+        let _rx = crate::test_support::open_and_pump(&mut e, d.clone());
+
+        let fb = e.file_browser.as_ref().expect("picker open");
+        assert_eq!(fb.disclosure.hidden_clutter, 2, "precondition: the listing withheld the dotfiles");
+        assert_eq!(fb.disclosure.hidden_type, 3, "precondition: and the non-document extensions");
+
+        crate::derive::rebuild(&mut e);
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let screen = (0..30).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+
+        assert!(screen.contains("chapter.md"), "precondition: the kept entry is on screen:\n{screen}");
+        assert!(screen.contains("2 hidden (clutter)"),
+            "the clutter count must reach the writer, not just `fb.disclosure`:\n{screen}");
+        assert!(screen.contains("3 hidden (type)"),
+            "and so must the type count — shown + withheld accounts for what is there:\n{screen}");
 
         let _ = std::fs::remove_dir_all(&d);
     }

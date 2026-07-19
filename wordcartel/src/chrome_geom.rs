@@ -178,10 +178,14 @@ fn file_browser_has_footer_row(fb: &crate::file_browser::FileBrowser) -> bool {
         if !field.trim().is_empty())
 }
 
-/// How many dedicated interior rows the picker's footer area wants — today exactly the
-/// resolved-target line, when destination mode is showing one.
+/// How many dedicated interior rows the picker's footer area wants: the resolved-target line
+/// (destination mode with a non-empty field) plus one line per withholding disclosure
+/// (§7.4/§6.2). MUST stay equal to the number of lines the painter stacks there, or the box
+/// would be sized for rows nothing fills — the painter builds its stack in the same order and
+/// from the same two sources.
 pub(crate) fn file_browser_footer_rows(fb: &crate::file_browser::FileBrowser) -> usize {
     usize::from(file_browser_has_footer_row(fb))
+        + crate::file_browser_listing::disclosure_line_count(&fb.disclosure)
 }
 
 /// The picker's row ledger: `(interior content rows, entry-list rows)`. THE single source

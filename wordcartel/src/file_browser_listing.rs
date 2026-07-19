@@ -47,6 +47,50 @@ pub(crate) struct Disclosure {
     pub total_seen: usize,
 }
 
+/// How many lines [`disclosure_lines`] will produce, without building any of them.
+///
+/// The painter's geometry (`chrome_geom::file_browser_footer_rows`) needs the COUNT on every
+/// frame and the STRINGS only for the rows it actually paints; deriving the count from the
+/// same three conditions keeps the reservation and the content from drifting, and
+/// `disclosure_line_count_matches_the_lines` asserts they agree over the whole condition
+/// space rather than by inspection.
+pub(crate) fn disclosure_line_count(d: &Disclosure) -> usize {
+    usize::from(d.hidden_clutter > 0 || d.hidden_type > 0)
+        + usize::from(d.capped_out > 0)
+        + usize::from(d.unreadable > 0)
+}
+
+/// The withholding disclosure, one string per painted line, in paint order — spec §7.4
+/// ("whenever either toggle withholds anything, the footer carries a count") and §6.2 (the
+/// cap and the unreadable count get their OWN lines, because "the directory is large" and
+/// "something is wrong with the filesystem" are different facts).
+///
+/// Empty when nothing was withheld: a picker with nothing to confess adds no chrome. The
+/// governing law is that **shown + disclosed-withheld accounts for what is really there** —
+/// `disclosure_accounts_for_everything_withheld` asserts the arithmetic, and the render guard
+/// in `render_overlays` asserts the counts reach the screen.
+pub(crate) fn disclosure_lines(d: &Disclosure) -> Vec<String> {
+    let mut out = Vec::new();
+    if d.hidden_clutter > 0 || d.hidden_type > 0 {
+        let mut parts = Vec::new();
+        if d.hidden_clutter > 0 { parts.push(format!("{} hidden (clutter)", d.hidden_clutter)); }
+        if d.hidden_type > 0 { parts.push(format!("{} hidden (type)", d.hidden_type)); }
+        out.push(parts.join(", "));
+    }
+    if d.capped_out > 0 {
+        // The cap is on the LISTING, not on the filtered view (§6.2), so this counts what
+        // `list_dir` retained — everything it named minus what the cap dropped and what it
+        // could not name at all — never `shown`, which the filter has already narrowed.
+        let listed = d.total_seen.saturating_sub(d.capped_out).saturating_sub(d.unreadable);
+        out.push(format!("showing {listed} of {}", d.total_seen));
+    }
+    if d.unreadable > 0 {
+        let entry = if d.unreadable == 1 { "entry" } else { "entries" };
+        out.push(format!("{} {entry} could not be read", d.unreadable));
+    }
+    out
+}
+
 /// Dotfiles plus VCS/system directory names. NO gitignore semantics (decision 2): they
 /// carry near-zero value for this audience and a real hazard — a manuscript under an
 /// aggressive ignore file would vanish.
@@ -190,6 +234,55 @@ mod tests {
     }
     fn opts(show_clutter: bool, types: FileTypeFilter, destination: bool) -> FilterOpts {
         FilterOpts { show_clutter, types, destination }
+    }
+
+    /// `disclosure_line_count` is what `chrome_geom::file_browser_footer_rows` reserves box
+    /// rows with; `disclosure_lines` is what the painter stacks into them. If they disagree
+    /// the box is sized for rows nothing fills, or a disclosure is silently clipped — the
+    /// second failure being the very class C2 was. Swept over the whole condition space
+    /// (every subset of the three independent conditions) rather than spot-checked.
+    ///
+    /// FAIL-VERIFY: drop the `capped_out` clause from `disclosure_line_count`, watch this
+    /// fail on every case with a cap. Confirmed, then reverted.
+    #[test]
+    fn disclosure_line_count_matches_the_lines_it_predicts() {
+        for bits in 0..16u8 {
+            let d = Disclosure {
+                shown: 1,
+                hidden_clutter: usize::from(bits & 1 != 0),
+                hidden_type: usize::from(bits & 2 != 0),
+                capped_out: usize::from(bits & 4 != 0) * 5,
+                unreadable: usize::from(bits & 8 != 0) * 2,
+                total_seen: 99,
+            };
+            assert_eq!(disclosure_line_count(&d), disclosure_lines(&d).len(),
+                "the reservation and the painted stack must agree for {d:?}");
+        }
+        assert!(disclosure_lines(&Disclosure { shown: 3, total_seen: 3, ..Default::default() }).is_empty(),
+            "a listing that withheld nothing confesses nothing — and so takes no rows");
+    }
+
+    /// The two `unreadable` phrasings are a plural agreement, not two different facts.
+    #[test]
+    fn the_unreadable_disclosure_agrees_in_number() {
+        let one = Disclosure { unreadable: 1, total_seen: 1, ..Default::default() };
+        assert_eq!(disclosure_lines(&one), vec!["1 entry could not be read".to_string()]);
+        let many = Disclosure { unreadable: 3, total_seen: 3, ..Default::default() };
+        assert_eq!(disclosure_lines(&many), vec!["3 entries could not be read".to_string()]);
+    }
+
+    /// §6.2's cap line counts what the LISTING retained — total minus what the cap dropped
+    /// and what could not be named — never `shown`, which the filter has already narrowed.
+    /// Reporting `shown` there would make the two disclosures contradict each other.
+    #[test]
+    fn the_cap_disclosure_counts_the_listing_not_the_filtered_view() {
+        let d = Disclosure {
+            shown: 12, hidden_clutter: 3, hidden_type: 5, capped_out: 400, unreadable: 2,
+            total_seen: 422,
+        };
+        let lines = disclosure_lines(&d);
+        assert!(lines.contains(&"showing 20 of 422".to_string()),
+            "422 seen, 400 capped out, 2 unnameable -> 20 listed: {lines:?}");
     }
 
     #[test]
