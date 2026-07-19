@@ -49,6 +49,35 @@ pub enum RenderMode {
     Review,
 }
 
+/// A lineage HINT, not a uniqueness invariant (mirroring "path is not a uniqueness
+/// invariant"). 64 bits is sufficient because nothing keys on it: a collision means two
+/// documents share a hint no code consults, and it is not a security token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocumentId(pub u64);
+
+impl DocumentId {
+    /// Mint using std only. `RandomState::new()` is OS-seeded per instance; the
+    /// process-local counter guarantees two ids minted in the same nanosecond still differ.
+    ///
+    /// NO new dependency: decision 2 excludes `rand`/`getrandom`/`uuid`, and an earlier draft
+    /// of the spec said "128-bit random", which would have smuggled one in.
+    pub fn mint() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u128(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+        DocumentId(h.finish())
+    }
+
+    /// 16 hex digits. Stored as an OPAQUE STRING in both formats, never parsed back into a
+    /// fixed-width integer, so a future wider id needs no format migration.
+    pub fn to_hex(self) -> String { format!("{:016x}", self.0) }
+}
+
 #[derive(Debug, Clone)]
 pub struct Document {
     pub buffer: TextBuffer,
@@ -67,6 +96,11 @@ pub struct Document {
     /// Last-known on-disk fingerprint (captured at load, refreshed by the save
     /// merge). Used by dispatch_save to detect external modifications (§4.3).
     pub stored_fp: Option<crate::save::FileFingerprint>,
+    /// A lineage hint minted once at construction and never re-minted (not on
+    /// edit, not on save-to-a-new-path). Nothing reads it today — it rides the
+    /// session-state entry and the swap header for a future effort (snapshots)
+    /// to answer "which document is this?" across renames.
+    pub id: DocumentId,
 }
 
 impl Document {
@@ -222,6 +256,7 @@ impl Buffer {
             stored_fp: path.as_deref().and_then(crate::save::fingerprint),
             path,
             saved_version: Some(0),
+            id: DocumentId::mint(),
         };
         let view = View {
             scroll: 0,
@@ -1378,6 +1413,22 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_ids_are_distinct_and_stable() {
+        let a = DocumentId::mint();
+        let b = DocumentId::mint();
+        assert_ne!(a, b, "two ids minted back-to-back differ (the counter component)");
+        assert_eq!(a.to_hex().len(), 16, "16 hex digits");
+        // Stability across a MUTATION, not across two reads of the same expression — the
+        // latter is true unconditionally for a Copy field and asserts nothing.
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let id = e.active().document.id;
+        e.active_mut().document.version += 1;
+        e.active_mut().document.saved_version = Some(e.active().document.version);
+        assert_eq!(e.active().document.id, id,
+            "the id is minted once and survives edits/saves — it is not re-minted per version");
+    }
 
     #[test]
     fn set_status_shows_text_and_reveals_bar() {

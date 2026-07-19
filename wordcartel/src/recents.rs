@@ -137,7 +137,7 @@ mod tests {
         let mut s = crate::state::SessionState::default();
         let entry = |seq: u64| crate::state::StateEntry {
             cursor: 0, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq,
-            folds: vec![], block: None };
+            folds: vec![], block: None, ..Default::default() };
         s.entries.insert(gone.to_string_lossy().into_owned(), entry(9));
         s.entries.insert(live.to_string_lossy().into_owned(), entry(3));
 

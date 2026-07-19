@@ -82,7 +82,7 @@ pub fn pending(dirty: bool, version: u64, swapped_version: Option<u64>) -> bool 
     dirty && swapped_version != Some(version)
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SwapHeader {
     pub realpath: Option<String>,
     pub load_mtime_secs: Option<u64>,
@@ -91,6 +91,10 @@ pub struct SwapHeader {
     pub version: u64,
     pub ts_ms: u64,
     pub pid: u32,
+    /// C5 Task 25: the writing document's lineage hint (`DocumentId::to_hex`). `None` for a
+    /// pre-C5 swap file (backward-compatible) or when unset. Nothing reads it today — see
+    /// `editor::DocumentId`.
+    pub id: Option<String>,
 }
 
 fn opt_str(s: &Option<String>) -> String { s.clone().unwrap_or_else(|| "-".into()) }
@@ -98,11 +102,11 @@ fn opt_u64(n: Option<u64>) -> String { n.map(|x| x.to_string()).unwrap_or_else(|
 
 pub fn serialize(h: &SwapHeader, body: &str) -> String {
     format!(
-        "{FORMAT}\npath: {}\nfp: {}:{}\nhash: {:016x}\nversion: {}\nts: {}\npid: {}\n---\n{}",
+        "{FORMAT}\npath: {}\nfp: {}:{}\nhash: {:016x}\nversion: {}\nts: {}\npid: {}\nid: {}\n---\n{}",
         opt_str(&h.realpath),
         opt_u64(h.load_mtime_secs),
         opt_u64(h.load_size),
-        h.content_hash, h.version, h.ts_ms, h.pid, body,
+        h.content_hash, h.version, h.ts_ms, h.pid, opt_str(&h.id), body,
     )
 }
 
@@ -117,6 +121,7 @@ pub fn parse(text: &str) -> Option<(SwapHeader, String)> {
     let mut version = None;
     let mut ts_ms = None;
     let mut pid = None;
+    let mut id = None;
     for line in lines {
         let (k, v) = line.split_once(": ")?;
         match k {
@@ -130,6 +135,7 @@ pub fn parse(text: &str) -> Option<(SwapHeader, String)> {
             "version" => version = Some(v.parse().ok()?),
             "ts" => ts_ms = Some(v.parse().ok()?),
             "pid" => pid = Some(v.parse().ok()?),
+            "id" => id = if v == "-" { None } else { Some(v.to_string()) },
             _ => {}
         }
     }
@@ -142,6 +148,7 @@ pub fn parse(text: &str) -> Option<(SwapHeader, String)> {
             version: version?,
             ts_ms: ts_ms?,
             pid: pid?,
+            id,
         },
         body.to_string(),
     ))
@@ -385,6 +392,7 @@ pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {
         version: editor.active().document.version,
         ts_ms,
         pid: std::process::id(),
+        id: Some(editor.active().document.id.to_hex()),
     }
 }
 
@@ -407,7 +415,7 @@ pub fn assess(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>, current_file_byt
         None => return RecoveryDecision::Prompt(
             // Unparseable swap of unknown provenance → let the user decide.
             SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
-                content_hash: 0, version: 0, ts_ms: 0, pid: 0 },
+                content_hash: 0, version: 0, ts_ms: 0, pid: 0, ..Default::default() },
             String::new(),
         ),
     };
@@ -563,6 +571,7 @@ mod tests {
             version: 7,
             ts_ms: 1_700_000_123_456,
             pid: 4321,
+            ..Default::default()
         };
         let body = "body text\n";
         let text = serialize(&h, body);
@@ -572,14 +581,30 @@ mod tests {
     }
 
     #[test]
-    fn scratch_header_round_trips_with_none_fields() {
+    fn swap_header_with_an_id_round_trips() {   // renamed: no old reader is exercised here;
+        // backward compatibility is covered by `pre_c5_swap_without_an_id_line_still_parses`.
         let h = SwapHeader {
             realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(b"x"), version: 1, ts_ms: 5, pid: 9,
+            id: Some("00ff00ff00ff00ff".into()),
         };
-        let (h2, b2) = parse(&serialize(&h, "x")).unwrap();
-        assert_eq!(h2, h);
-        assert_eq!(b2, "x");
+        let text = serialize(&h, "x");
+        assert!(text.contains("id: 00ff00ff00ff00ff"), "the id is emitted as an opaque string");
+        let (h2, _) = parse(&text).expect("round-trips");
+        assert_eq!(h2.id.as_deref(), Some("00ff00ff00ff00ff"));
+    }
+
+    #[test]
+    fn pre_c5_swap_without_an_id_line_still_parses_and_recovers() {
+        // The backward-compatibility claim, ASSERTED rather than assumed. `parse` ignores
+        // unknown keys (`_ => {}`), which is what makes the id forward-compatible too.
+        let legacy = format!(
+            "{FORMAT}\npath: /home/u/notes.md\nfp: -:-\nhash: {:016x}\nversion: 7\nts: 1\npid: 9\n---\nbody\n",
+            fnv1a64(b"body\n"));
+        let (h, body) = parse(&legacy).expect("a pre-C5 swap must still parse");
+        assert_eq!(h.version, 7);
+        assert_eq!(body, "body\n");
+        assert!(h.id.is_none(), "no id line → None");
     }
 
     #[test]
@@ -590,6 +615,7 @@ mod tests {
             realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(b"first\n---\nsecond\n"),
             version: 1, ts_ms: 1, pid: 1,
+            ..Default::default()
         };
         let body = "first\n---\nsecond\n";
         let (h2, b2) = parse(&serialize(&h, body)).expect("must parse");
@@ -628,7 +654,7 @@ mod tests {
         let dir = state_dir().unwrap();
         let p = dir.join(format!("test-write-{}.swp", std::process::id()));
         let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
-            content_hash: fnv1a64(b"hello\n"), version: 1, ts_ms: 1, pid: 1 };
+            content_hash: fnv1a64(b"hello\n"), version: 1, ts_ms: 1, pid: 1, ..Default::default() };
         write_atomic(&p, &serialize(&h, "hello\n")).unwrap();
         let back = std::fs::read_to_string(&p).unwrap();
         let (h2, body) = parse(&back).unwrap();
@@ -656,7 +682,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wc-eq-{}.md", std::process::id()));
         let body = "same\n";
         let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
-            content_hash: fnv1a64(body.as_bytes()), version: 1, ts_ms: 1, pid: 1 };
+            content_hash: fnv1a64(body.as_bytes()), version: 1, ts_ms: 1, pid: 1, ..Default::default() };
         write_atomic(&swap_path(Some(&p)).unwrap(), &serialize(&h, body)).unwrap();
         // F on disk == swap body → swap adds nothing.
         assert!(matches!(assess(&crate::fsx::RealFs, Some(&p), Some(body.as_bytes())), RecoveryDecision::DiscardSilently));
@@ -668,7 +694,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wc-div-{}.md", std::process::id()));
         let body = "swap version\n";
         let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
-            content_hash: fnv1a64(body.as_bytes()), version: 9, ts_ms: 1, pid: 1 };
+            content_hash: fnv1a64(body.as_bytes()), version: 9, ts_ms: 1, pid: 1, ..Default::default() };
         write_atomic(&swap_path(Some(&p)).unwrap(), &serialize(&h, body)).unwrap();
         // F differs from swap → prompt, carrying the swap body for Recover.
         match assess(&crate::fsx::RealFs, Some(&p), Some(b"file version\n")) {
@@ -704,6 +730,7 @@ mod tests {
         let h = SwapHeader {
             realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(b"orphaned text\n"), version: 1, ts_ms: 42_000, pid: fake_pid,
+            ..Default::default()
         };
         write_atomic(&orphan_path, &serialize(&h, "orphaned text\n")).unwrap();
 
@@ -712,6 +739,7 @@ mod tests {
             realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(b"self text\n"), version: 1, ts_ms: 43_000,
             pid: std::process::id(),
+            ..Default::default()
         };
         write_atomic(&my_path, &serialize(&my_h, "self text\n")).unwrap();
 
@@ -737,6 +765,21 @@ mod tests {
         std::fs::write(&sp, "x".repeat(crate::limits::MAX_OPEN_BYTES as usize + 1)).unwrap();
         assert!(matches!(assess(&crate::fsx::RealFs, Some(&p), None), RecoveryDecision::OpenNormally));
         let _ = std::fs::remove_file(&sp);
+    }
+
+    #[test]
+    fn build_header_stamps_the_active_documents_id() {
+        // FAIL-VERIFY: drop `id` from `build_header`, watch this fail.
+        let p = scratch();
+        let e = crate::editor::Editor::new_from_text("body\n", Some(p.clone()), (80, 24));
+        let expected = e.active().document.id.to_hex();
+        let h = build_header(&e, "body\n", 1);
+        assert_eq!(h.id.as_deref(), Some(expected.as_str()),
+            "the swap header must carry the document's id");
+        // …and it survives a serialize/parse round trip in situ.
+        let (h2, _) = parse(&serialize(&h, "body\n")).expect("round-trips");
+        assert_eq!(h2.id, h.id);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
@@ -881,6 +924,7 @@ mod tests {
             load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(swap_body.as_bytes()),
             version: 1, ts_ms: 1, pid,
+            ..Default::default()
         };
         let sp = swap_path(Some(&p)).unwrap();
         write_atomic(&sp, &serialize(&h, swap_body)).unwrap();
@@ -935,7 +979,7 @@ mod tests {
 
         // realpath = None → no doc to compare against → excluded (fail closed).
         let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
-            content_hash: fnv1a64(b"x\n"), version: 1, ts_ms: 1, pid: DEAD_PID };
+            content_hash: fnv1a64(b"x\n"), version: 1, ts_ms: 1, pid: DEAD_PID, ..Default::default() };
         let none_swap = unique_dir("none").join("nopath.swp");
         write_atomic(&none_swap, &serialize(&h, "x\n")).unwrap();
         assert!(!swap_is_cleanable(&crate::fsx::RealFs, &none_swap), "a swap with no recorded realpath is excluded");

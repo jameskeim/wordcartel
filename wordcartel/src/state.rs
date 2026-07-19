@@ -30,6 +30,10 @@ pub struct StateEntry {
     /// 9a: persisted marked-block byte range [start, end). Defaulted so pre-9a session.toml loads.
     #[serde(default)]
     pub block: Option<(usize, usize)>,
+    /// C5 Task 25: the active document's lineage hint (`DocumentId::to_hex`) at persist time.
+    /// Defaulted so pre-C5 session.toml loads. Nothing reads it today — see `swap::SwapHeader::id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// Effort 6: the permanent *scratch* buffer's persisted content. Path-less, so it
@@ -182,6 +186,7 @@ mod tests {
                     seq: i,
                     folds: vec![],
                     block: None,
+                    ..Default::default()
                 },
                 3, // cap 3
             );
@@ -198,8 +203,8 @@ mod tests {
     fn next_seq_is_one_past_max() {
         let mut s = SessionState::default();
         assert_eq!(s.next_seq(), 1, "empty store → next_seq == 1");
-        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None });
-        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None });
+        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None, ..Default::default() });
+        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None, ..Default::default() });
         assert_eq!(s.next_seq(), 10, "entries at seq {{5,9}} → next_seq == 10");
     }
 
@@ -208,11 +213,11 @@ mod tests {
         // Simulate: loaded session has entries at seq 5 and 9 (from a prior run).
         // A new entry recorded at seq 10 (from next_seq()) must survive; seq 5 is evicted.
         let mut s = SessionState::default();
-        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None });
-        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None });
+        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None, ..Default::default() });
+        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None, ..Default::default() });
         let new_seq = s.next_seq(); // == 10
         assert_eq!(new_seq, 10);
-        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq, folds: vec![], block: None }, 2);
+        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq, folds: vec![], block: None, ..Default::default() }, 2);
         // Cap is 2: the freshest two must be /old-b (seq 9) and /new (seq 10); /old-a (seq 5) evicted.
         assert_eq!(s.entries.len(), 2, "pruned to cap");
         assert!(s.entries.contains_key("/new"), "newly-recorded entry must survive");
@@ -225,6 +230,20 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join("session.toml"), b"\xff not toml").unwrap();
         assert!(load_in(&dir).entries.is_empty());
+    }
+
+    #[test]
+    fn pre_c5_session_toml_without_id_still_deserializes() {
+        let toml = r#"
+[entries."/tmp/x.md"]
+cursor = 3
+scroll = 0
+mtime = 1
+size = 2
+seq = 1
+"#;
+        let s: SessionState = toml::from_str(toml).expect("must deserialize without id");
+        assert!(s.entries["/tmp/x.md"].id.is_none(), "missing id key → None, never an error");
     }
 
     #[test]
@@ -245,7 +264,7 @@ seq = 1
     #[test]
     fn folds_round_trip_through_toml() {
         let mut s = SessionState::default();
-        s.entries.insert("/tmp/x.md".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 1, size: 2, seq: 1, folds: vec![10, 42], block: None });
+        s.entries.insert("/tmp/x.md".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 1, size: 2, seq: 1, folds: vec![10, 42], block: None, ..Default::default() });
         let out = toml::to_string(&s).unwrap();
         let back: SessionState = toml::from_str(&out).unwrap();
         assert_eq!(back.entries["/tmp/x.md"].folds, vec![10, 42]);
@@ -274,6 +293,7 @@ seq = 1
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 1, size: 2, seq: 1, folds: vec![],
             block: Some((10, 42)),
+            ..Default::default()
         });
         let out = toml::to_string(&s).unwrap();
         let back: SessionState = toml::from_str(&out).unwrap();
@@ -307,6 +327,7 @@ seq = 1
         s.entries.insert("/a".into(), StateEntry {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 1, size: 1, seq: 1, folds: vec![], block: None,
+            ..Default::default()
         });
         s.scratch = Some(ScratchState { text: "x".repeat(crate::limits::MAX_SESSION_BYTES + 1), cursor: 0 });
         s.save_in(&d).unwrap();

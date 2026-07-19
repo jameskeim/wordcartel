@@ -896,6 +896,7 @@ mod tests {
                 realpath: Some(real.to_string_lossy().into_owned()),
                 load_mtime_secs: None, load_size: None,
                 content_hash: fnv1a64(swap_body.as_bytes()), version: 1, ts_ms: 1, pid: DEAD_PID,
+                ..Default::default()
             };
             let sp = swap_path(Some(&doc)).unwrap();
             write_atomic(&sp, &serialize(&h, swap_body)).unwrap();
@@ -917,6 +918,7 @@ mod tests {
             realpath: Some(std::fs::canonicalize(&doc_bad).unwrap().to_string_lossy().into_owned()),
             load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(b"UNSAVED EDIT\n"), version: 2, ts_ms: 2, pid: DEAD_PID,
+            ..Default::default()
         };
         write_atomic(&sp_bad, &serialize(&h_div, "UNSAVED EDIT\n")).unwrap();
 

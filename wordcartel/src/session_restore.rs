@@ -175,6 +175,7 @@ pub(crate) fn persist_session(
                     mtime, size, seq,
                     folds: editor.active().folds.folded().iter().copied().collect(),
                     block: editor.active().marked_block.map(|b| (b.start, b.end)),
+                    id: Some(editor.active().document.id.to_hex()),
                 };
                 session.record(canon.to_string_lossy().into_owned(), entry, cfg.state.max_entries);
             }
@@ -248,7 +249,7 @@ mod tests {
         let mut s = crate::state::SessionState::default();
         let entry = |c: usize| crate::state::StateEntry {
             cursor: c, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq: 1,
-            folds: vec![], block: None };
+            folds: vec![], block: None, ..Default::default() };
         s.entries.insert("/a.md".into(), entry(11));
         s.entries.insert("/x.md".into(), entry(22));
 
@@ -305,7 +306,7 @@ mod tests {
             .unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned();
         s.entries.insert(key(&p_a), crate::state::StateEntry {
             cursor: 7, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq: 1,
-            folds: vec![], block: None });
+            folds: vec![], block: None, ..Default::default() });
         let cfg = crate::config::Config::default();
         drain_session_migrations(&mut s, &mut e, &cfg);
 
@@ -382,7 +383,7 @@ mod tests {
         // unit-test the resume decision helper directly (no TTY):
         // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
         use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None };
+        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None, ..Default::default() };
         // identity match → restore (clamped to doc_len)
         assert_eq!(apply_resume(&e, (10,20), 100), Some((4,2)));
         assert_eq!(apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
@@ -398,7 +399,7 @@ mod tests {
         let mut marks = BTreeMap::new();
         marks.insert("a".to_string(), 6usize);
         marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None };
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None, ..Default::default() };
         load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
@@ -417,6 +418,7 @@ mod tests {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 10, size: 20, seq: 1, folds: vec![],
             block: Some((3, 8)),
+            ..Default::default()
         };
 
         // ── matching identity: guard passes → block restores with hidden=false ──
@@ -479,6 +481,7 @@ mod tests {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 10, size: 20, seq: 1, folds: vec![],
             block: Some((4, 8)), // start at EOF, end beyond EOF
+            ..Default::default()
         };
 
         // Real production restore path (post-staleness-guard).
@@ -502,6 +505,7 @@ mod tests {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 10, size: 20, seq: 1, folds: vec![],
             block: Some((1, 99)), // start in-range, end far past EOF
+            ..Default::default()
         };
         load_block_from_entry(&mut e2, &entry2);
         let b = e2.active().marked_block.expect("non-collapsing block restored");
@@ -521,6 +525,26 @@ mod tests {
         let sb = e.by_id(sid).unwrap();
         assert_eq!(sb.document.buffer.to_string(), "hello");
         assert_eq!(sb.document.selection.primary().head, 5, "cursor clamped to len");
+    }
+
+    // -------------------------------------------------------------------------
+    // C5 Task 25: DocumentId mint-and-stamp
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn persist_session_stamps_the_active_documents_id() {
+        // FAIL-VERIFY: remove the `id:` assignment in `persist_session`, watch this fail.
+        let p = std::env::temp_dir().join(format!("wc-idstamp-{}.md", std::process::id()));
+        std::fs::write(&p, b"x\n").expect("seed");
+        let e = crate::editor::Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
+        let expected = e.active().document.id.to_hex();
+        let mut s = crate::state::SessionState::default();
+        let cfg = crate::config::Config::default();
+        persist_session_for_test(&mut s, &e, &cfg, 1);
+        let key = std::fs::canonicalize(&p).expect("canon").to_string_lossy().into_owned();
+        assert_eq!(s.entries[&key].id.as_deref(), Some(expected.as_str()),
+            "the entry must carry the ACTIVE document's id, not a fresh or absent one");
+        let _ = std::fs::remove_file(&p);
     }
 
     // -------------------------------------------------------------------------
