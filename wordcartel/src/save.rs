@@ -131,6 +131,13 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
             // becomes fault-testable for the FIRST time. Calling `file::save_atomic` here —
             // which hardcodes `RealFs` internally — would silently discard that, and an
             // `Arc<FaultFs>` injected at `Ctx` would have no effect.
+            // §11.1: the Save-As completion status NAMES where the bytes landed, and it is the
+            // RESOLVED target it names — the point of naming it at all is that resolution may
+            // have sent the bytes somewhere other than the name the writer typed. (The title
+            // keeps the as-opened name, §7.6.2: "which document am I in" is a different
+            // question from "where did it go".) Cloned for the merge closure, which cannot
+            // borrow `write_path` out of this one.
+            let status_target = write_path.clone();
             let outcome = file::save_atomic_with_fs(&*fs, &write_path, &content);
             let new_fp = fingerprint_with_fs(&*fs, &write_path);
             JobResult {
@@ -187,12 +194,18 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                                 // (Codex pre-merge). Clearing errs toward writing a swap (durability-safe)
                                 // and re-arms the expedited SaveAs-still-editing checkpoint.
                                 b.swapped_version = None;
+                                // §11.1: Save-As names the resolved target; an ordinary save keeps
+                                // the concise wording (its destination is the document you are
+                                // already looking at, so naming it every time is noise).
+                                let named = if matches!(mode, SaveMode::SaveAs) {
+                                    format!(" to {}", status_target.display())
+                                } else { String::new() };
                                 if b.document.version == v {
-                                    status = "Saved".to_string();
+                                    status = format!("Saved{named}");
                                     crate::swap::delete(b.document.path.as_deref());
                                     if matches!(mode, SaveMode::SaveAs) { crate::swap::delete(prior_key.as_deref()); }
                                 } else {
-                                    status = format!("Saved v{v} (still editing)");
+                                    status = format!("Saved v{v}{named} (still editing)");
                                     // Staged re-key (Codex): the buffer was edited during the write
                                     // (now v+1). Delete the prior/scratch swap (its v content is now
                                     // ON DISK at `target`, and leaving a scratch swap would trigger a
@@ -1148,6 +1161,18 @@ mod tests {
         assert_eq!(e.active().document.stored_fp, crate::save::fingerprint(&resolved),
             "stored_fp must match the file actually written");
         assert!(!e.active().document.dirty(), "and the buffer is clean");
+        // 5. §11.1: the completion status NAMES the RESOLVED target. A bare "Saved" was
+        //    indistinguishable from an ordinary save, and naming the CHOSEN path here would be
+        //    the one place a writer is entitled to learn that resolution sent their bytes
+        //    somewhere other than the name they typed. This symlink fixture is exactly that
+        //    case, which is why the assertion lives in this test rather than a happier one.
+        //
+        //    FAIL-VERIFY: drop the `named` suffix in `do_save_to`'s Saved arm, watch this fail
+        //    (status is a bare "Saved"). Confirmed, then restored.
+        assert_eq!(e.status_text(), format!("Saved to {}", resolved.display()),
+            "a Save-As says where the bytes actually landed");
+        assert!(!e.status_text().contains(&link.display().to_string()),
+            "and names the RESOLVED target, not the link the writer typed: {}", e.status_text());
 
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
     }

@@ -92,25 +92,38 @@ pub fn open_save_as(editor: &mut crate::editor::Editor,
 /// confirm deletes the snapshot, not a re-scan. An empty enumeration (or no state dir) sets a
 /// status and raises NO prompt, so the user is never asked to confirm deleting nothing.
 pub fn open_clean_recovery(editor: &mut crate::editor::Editor, fs: &dyn crate::fsx::Fs) {
-    let files = match crate::swap::state_dir() {
-        Ok(dir) => crate::swap::cleanable_recovery_files(fs, &dir, &crate::swap::open_swap_paths(editor)),
-        Err(_) => Vec::new(),
+    // Both lists come from ONE `protected` set and one state dir, computed here — the only
+    // place holding both the seam handle and the dir. `raise_clean_recovery` formats; it does
+    // not re-scan, so the two lists can never describe different moments.
+    let (files, kept) = match crate::swap::state_dir() {
+        Ok(dir) => {
+            let protected = crate::swap::open_swap_paths(editor);
+            (crate::swap::cleanable_recovery_files(fs, &dir, &protected),
+             crate::swap::kept_recoverable(fs, &dir, &protected))
+        }
+        Err(_) => (Vec::new(), Vec::new()),
     };
-    raise_clean_recovery(editor, files);
+    raise_clean_recovery(editor, files, kept);
 }
 
 /// Snapshot-and-raise core of `open_clean_recovery`, split out so the count-0 / count-N
 /// branch is testable without depending on the shared real state dir. An empty snapshot sets
 /// a status and raises NO prompt; a non-empty one is stored verbatim into `pending_clean`
 /// (the TOCTOU-safe deletion unit) before the count-confirm modal opens.
-fn raise_clean_recovery(editor: &mut crate::editor::Editor, files: Vec<std::path::PathBuf>) {
+///
+/// `kept` is disclosure only — the orphans the sweep spared because they may hold unsaved
+/// work. It is never stored into `pending_clean` and never deleted; it only reaches the
+/// modal's text.
+fn raise_clean_recovery(editor: &mut crate::editor::Editor, files: Vec<std::path::PathBuf>,
+    kept: Vec<crate::swap::KeptRecoverable>)
+{
     if files.is_empty() {
         editor.set_status(crate::status::StatusKind::Info, "No recovery files to clean");
         return;
     }
     let n = files.len();
     editor.pending_clean = files;
-    editor.open_prompt(crate::prompt::Prompt::clean_recovery(n));
+    editor.open_prompt(crate::prompt::Prompt::clean_recovery(n, &kept));
 }
 
 /// Expand a user-typed path: `~/` prefix → home dir; relative → joined onto cwd.
@@ -824,7 +837,7 @@ mod tests {
     fn raise_clean_recovery_count_zero_sets_status_and_raises_no_prompt() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        raise_clean_recovery(&mut e, Vec::new());
+        raise_clean_recovery(&mut e, Vec::new(), Vec::new());
         assert!(e.prompt.is_none(), "count 0 raises NO prompt");
         assert!(e.pending_clean.is_empty());
         assert_eq!(e.status_text(), "No recovery files to clean");
@@ -835,7 +848,7 @@ mod tests {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let files = vec![std::path::PathBuf::from("/a.swp"), std::path::PathBuf::from("/b.md")];
-        raise_clean_recovery(&mut e, files.clone());
+        raise_clean_recovery(&mut e, files.clone(), Vec::new());
         assert_eq!(e.pending_clean, files, "the exact snapshot is stored for TOCTOU-safe deletion");
         let p = e.prompt.as_ref().expect("count>0 opens a confirm prompt");
         assert!(p.message.contains('2'), "message bears the count");
@@ -858,7 +871,7 @@ mod tests {
         std::fs::write(&b, "b").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone(), b.clone()]; // snapshot taken BEFORE the latecomer exists
-        e.open_prompt(crate::prompt::Prompt::clean_recovery(2));
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(2, &[]));
         // A new file appears after the prompt was raised.
         std::fs::write(&latecomer, "late").unwrap();
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
@@ -911,7 +924,7 @@ mod tests {
 
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![sp_ok.clone(), sp_bad.clone()]; // both cleanable at snapshot time
-        e.open_prompt(crate::prompt::Prompt::clean_recovery(2));
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(2, &[]));
 
         // Content race: rewrite sp_bad so its header now DIVERGES from the on-disk doc (assess → Prompt).
         let h_div = SwapHeader {
@@ -942,7 +955,7 @@ mod tests {
         std::fs::write(&a, "keep me").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone()];
-        e.open_prompt(crate::prompt::Prompt::clean_recovery(1));
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(1, &[]));
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
         resolve_prompt(crate::prompt::PromptAction::Cancel, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(a.exists(), "Cancel deletes nothing");
@@ -960,7 +973,7 @@ mod tests {
         std::fs::write(&a, "keep me").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone()];
-        e.open_prompt(crate::prompt::Prompt::clean_recovery(1));
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(1, &[]));
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
@@ -973,6 +986,63 @@ mod tests {
         assert!(e.pending_clean.is_empty(), "Esc clears the snapshot");
         assert!(e.prompt.is_none(), "Esc dismisses the prompt");
         let _ = std::fs::remove_file(&a);
+    }
+
+    /// C5 §11.3: the sweep's refusal to delete a diverged swap is only half the guarantee.
+    /// Silently sparing it left the writer with a state dir that never fully empties and no
+    /// way to learn which document was holding it open — so the modal NAMES the kept orphans
+    /// and says why. Nothing about the deletion set changes.
+    ///
+    /// FAIL-VERIFY: drop the `kept` block from `Prompt::clean_recovery`'s message, watch the
+    /// realpath assertion fail. Confirmed, then restored.
+    #[test]
+    fn the_clean_recovery_modal_names_kept_recoverable_files() {
+        use crate::editor::Editor;
+        use crate::swap::{fnv1a64, serialize, swap_path, write_atomic, SwapHeader};
+        const DEAD_PID: u32 = 999_999; // /proc/999999 does not exist
+        #[cfg(target_os = "linux")]
+        assert!(!crate::swap::pid_is_live(DEAD_PID), "test invariant: pid 999999 must not be live");
+
+        // A doc on disk plus its CANONICAL swap. `saved == swap_body` → assess DiscardSilently
+        // (valueless, swept); differing bodies → Prompt (recoverable, spared and reported).
+        //
+        // `ts_ms` is NOW, not the `1` the other swap fixtures use, and that matters: the modal
+        // names only the newest few (`KEPT_SHOWN`) and the shared real state dir routinely
+        // carries a dozen older orphans from prior sessions. A `ts_ms: 1` fixture sorts to the
+        // BOTTOM and gets elided, so the assertion below would fail on ambient machine state
+        // rather than on this behaviour. A just-written swap is also the realistic case.
+        let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
+        let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
+            let doc = std::env::temp_dir()
+                .join(format!("wc-kept-{}-{}.txt", std::process::id(), tag));
+            std::fs::write(&doc, saved).expect("seed doc");
+            let real = std::fs::canonicalize(&doc).expect("canon");
+            let h = SwapHeader {
+                realpath: Some(real.to_string_lossy().into_owned()),
+                load_mtime_secs: None, load_size: None,
+                content_hash: fnv1a64(swap_body.as_bytes()), version: 1, ts_ms: now_ms, pid: DEAD_PID,
+                ..Default::default()
+            };
+            let sp = swap_path(Some(&doc)).expect("swap path");
+            write_atomic(&sp, &serialize(&h, swap_body)).expect("write swap");
+            (doc, sp)
+        };
+        let (p_ok, sp_ok) = mk("ok", "same\n", "same\n");       // valueless
+        let (p_bad, sp_bad) = mk("bad", "file\n", "UNSAVED\n"); // diverged
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+
+        crate::prompts::open_clean_recovery(&mut e, &crate::fsx::RealFs);
+
+        let p = e.prompt.as_ref().expect("a confirm prompt is raised");
+        let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
+        assert!(p.message.contains(&real_bad),
+            "the modal must NAME the kept file by its recorded realpath: {:?}", p.message);
+        assert!(p.message.to_lowercase().contains("unsaved work"),
+            "and say why it is being kept: {:?}", p.message);
+        assert!(!e.pending_clean.contains(&sp_bad),
+            "the diverged swap is NEVER queued for deletion — the no-data-loss guarantee");
+        assert!(e.pending_clean.contains(&sp_ok), "the valueless one still is");
+        for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
     }
 
     #[test]

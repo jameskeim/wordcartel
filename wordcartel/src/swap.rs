@@ -286,6 +286,70 @@ pub(crate) fn recovery_path_still_cleanable(fs: &dyn crate::fsx::Fs, path: &Path
     recovery_file_is_cleanable(fs, dir, path, &fname.to_string_lossy(), protected, std::process::id())
 }
 
+/// A recovery artifact the sweep DELIBERATELY spares because it may hold unsaved work,
+/// carried with the detail a writer needs to go find it.
+///
+/// A diverged swap — one whose body is not what sits at its recorded document path — is the
+/// MOST recoverable object in the state dir, not the least, so `clean_recovery` refuses to
+/// offer it. Refusing silently left the writer with a state dir that never fully empties and
+/// no way to learn why; this is the visibility half of that guarantee.
+// `pub`, not `pub(crate)`: it appears in the signature of `Prompt::clean_recovery`, which is
+// `pub` like every other Prompt constructor. The ENUMERATOR below stays `pub(crate)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptRecoverable {
+    /// The document path the swap's header recorded (`SwapHeader::realpath`).
+    pub realpath: String,
+    /// When the swap was written, in wall-clock milliseconds (`SwapHeader::ts_ms`).
+    pub ts_ms: u64,
+}
+
+/// Enumerate the orphaned `*.swp` files in `dir` that `cleanable_recovery_files` spares
+/// because their content is still recoverable.
+///
+/// **Visibility only.** `cleanable_recovery_files`, `swap_is_cleanable` and their fail-closed
+/// rules are untouched: this walks the same directory listing and reports the swaps the shared
+/// oracle answered "not cleanable" for, so the two can never describe different sets.
+///
+/// Reported only when the swap identifies itself — the header parses and records a
+/// `realpath` — since an entry with neither a path nor a timestamp tells the writer nothing.
+/// A live writing pid is excluded too: that swap belongs to a running session, not to an
+/// orphan a writer could go rescue. `protected` (open buffers, this session's own scratch) is
+/// excluded for the same reason, and gathered exactly as the enumerator gathers it.
+///
+/// Ordered most-recently-written first, so the entry likeliest to matter heads a truncated
+/// list. Never used to decide a deletion.
+///
+/// # Examples
+///
+/// ```ignore
+/// let protected = crate::swap::open_swap_paths(editor);
+/// for k in crate::swap::kept_recoverable(fs, &state_dir, &protected) {
+///     eprintln!("keeping {} (written {})", k.realpath, k.ts_ms);
+/// }
+/// ```
+pub(crate) fn kept_recoverable(fs: &dyn crate::fsx::Fs, dir: &Path,
+    protected: &HashSet<PathBuf>) -> Vec<KeptRecoverable>
+{
+    let me = std::process::id();
+    let mut out = Vec::new();
+    // cap: None — the same uncapped startup/command-time scan `cleanable_recovery_files` runs,
+    // for the same reason: a cap here would silently hide orphans from the writer.
+    let Ok(listing) = fs.list_dir(dir, None) else { return out };
+    for e in listing.entries {
+        if !e.name.ends_with(".swp") { continue; }
+        let path = dir.join(&e.name);
+        if protected.contains(&path) { continue; }              // an open buffer's live swap
+        if recovery_file_is_cleanable(fs, dir, &path, &e.name, protected, me) { continue; }
+        let Some(raw) = read_swap_capped(fs, &path) else { continue };
+        let Some((header, _body)) = parse(&raw) else { continue };  // cannot identify itself
+        if pid_is_live(header.pid) { continue }                 // a running session owns it
+        let Some(realpath) = header.realpath else { continue }; // no document path to name
+        out.push(KeptRecoverable { realpath, ts_ms: header.ts_ms });
+    }
+    out.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms).then_with(|| a.realpath.cmp(&b.realpath)));
+    out
+}
+
 /// True iff a `*.swp` candidate is provably valueless (see `cleanable_recovery_files`).
 /// Every early return is a "keep" (fail closed).
 fn swap_is_cleanable(fs: &dyn crate::fsx::Fs, candidate: &Path) -> bool {
@@ -1019,6 +1083,41 @@ mod tests {
         let out = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &HashSet::new());
         assert!(out.contains(&sp_ok), "valueless swap is enumerated as cleanable");
         assert!(!out.contains(&sp_bad), "recoverable (Prompt) swap is NEVER enumerated — no data loss");
+        for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
+    }
+
+    /// The visibility half of the no-data-loss guarantee: a diverged swap holds content NOT on
+    /// disk at its recorded realpath — the MOST recoverable object in the state dir, never
+    /// swept — and `kept_recoverable` reports it so a writer can go extract or explicitly
+    /// discard it. The valueless twin, which the sweep DOES offer, must not appear.
+    ///
+    /// FAIL-VERIFY: drop the `recovery_file_is_cleanable` skip so every parseable swap is
+    /// reported, watch the "not reported as kept" assertion fail. Confirmed, then restored.
+    #[test]
+    fn kept_recoverable_count_reports_what_the_sweep_deliberately_spares() {
+        // Scan the dir the fixtures actually live in. `make_doc_with_swap` writes to
+        // `swap_path(...)` — the process state dir — so scanning a fresh `unique_dir` would
+        // have measured an empty directory and asserted about swaps that were never in it.
+        let dir = state_dir().expect("state dir");
+        let (p_ok, sp_ok) = make_doc_with_swap("same\n", "same\n", DEAD_PID);
+        let (p_bad, sp_bad) = make_doc_with_swap("file\n", "UNSAVED\n", DEAD_PID);
+        let protected = HashSet::new();
+        let cleanable = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &protected);
+        let kept = kept_recoverable(&crate::fsx::RealFs, &dir, &protected);
+        assert!(cleanable.contains(&sp_ok), "the valueless swap is still offered");
+        assert!(!cleanable.contains(&sp_bad), "the diverged swap is still NEVER offered");
+        // CONTAINMENT, not an exact count: the shared state dir may hold unrelated diverged
+        // swaps from other tests or a prior real session, and `kept.len() == 1` would fail
+        // for reasons that have nothing to do with this behaviour.
+        let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
+        let real_ok = std::fs::canonicalize(&p_ok).expect("canon").display().to_string();
+        let mine = kept.iter().find(|k| k.realpath.contains(&real_bad))
+            .expect("the diverged one is reported so the writer knows it exists");
+        assert!(!kept.iter().any(|k| k.realpath.contains(&real_ok)),
+            "and the valueless one is NOT reported as kept");
+        assert!(mine.ts_ms > 0, "and it carries the timestamp");
+        // Own fixtures only — `remove_dir_all(&dir)` here would delete the developer's real
+        // state dir (and any concurrent test's swaps) along with them.
         for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
     }
 

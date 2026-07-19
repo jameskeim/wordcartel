@@ -2,6 +2,36 @@
 //! decisions: quit-with-unsaved, external modification, swap recovery. Pure
 //! data; the resolver (app.rs) interprets the chosen PromptAction.
 
+/// How many kept-recoverable orphans `Prompt::clean_recovery` names before eliding the rest.
+/// Bounded so a state dir full of orphans cannot push the modal's own choices off-screen.
+const KEPT_SHOWN: usize = 5;
+
+/// Render `ts_ms` (wall-clock milliseconds) as its age relative to `now_ms`, e.g. `3 days ago`.
+///
+/// Relative rather than a calendar date on purpose: the crate has no date/timezone dependency,
+/// and an absolute stamp rendered in UTC would misreport the writer's own clock — the one
+/// reading that would actively mislead. Age is also the question being asked ("is this old
+/// enough that I no longer care?"). Coarsens upward through minutes/hours/days and never
+/// panics: a `ts_ms` in the future (a clock that went backwards, a file copied from another
+/// machine) saturates to `just now` rather than underflowing.
+///
+/// # Examples
+///
+/// ```ignore
+/// assert_eq!(format_age(10_000, 10_000), "just now");
+/// assert_eq!(format_age(3 * 86_400_000, 0), "3 days ago");
+/// ```
+fn format_age(now_ms: u64, ts_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(ts_ms) / 1_000;
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => plural(secs / 60, "minute"),
+        3_600..=86_399 => plural(secs / 3_600, "hour"),
+        _ => plural(secs / 86_400, "day"),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PromptAction {
     Cancel,
@@ -159,9 +189,28 @@ impl Prompt {
 
     /// H5 clean-recovery count-confirm, raised by the `clean_recovery` command over a
     /// snapshotted set of provably-valueless recovery files (`n` = the snapshot's length).
-    pub fn clean_recovery(n: usize) -> Prompt {
+    ///
+    /// `kept` names the orphaned swaps the sweep deliberately SPARED because they may still
+    /// hold unsaved work (`swap::kept_recoverable`). Nothing in `kept` is ever deleted — it is
+    /// disclosure, not a choice. Without it a writer saw a state dir that never fully empties
+    /// and had no way to learn which documents were holding it open, or how old they were.
+    /// Only the first `KEPT_SHOWN` are named; a modal that grew without bound would push the
+    /// choices themselves off a short terminal.
+    pub fn clean_recovery(n: usize, kept: &[crate::swap::KeptRecoverable]) -> Prompt {
+        let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
+        let mut message = format!("Delete {n} recovery file(s)? [Y]es · [C]ancel");
+        if !kept.is_empty() {
+            message.push_str(&format!("\n\nKeeping {} that may hold unsaved work:", kept.len()));
+            for k in kept.iter().take(KEPT_SHOWN) {
+                message.push_str(&format!("\n  {} (written {})",
+                    k.realpath, format_age(now_ms, k.ts_ms)));
+            }
+            if kept.len() > KEPT_SHOWN {
+                message.push_str(&format!("\n  \u{2026}and {} more", kept.len() - KEPT_SHOWN));
+            }
+        }
         Prompt {
-            message: format!("Delete {n} recovery file(s)? [Y]es · [C]ancel"),
+            message,
             choices: vec![
                 Choice { key: 'y', label: "Delete", action: PromptAction::CleanRecovery },
                 Choice { key: 'c', label: "Cancel", action: PromptAction::Cancel },
@@ -226,5 +275,51 @@ mod tests {
         assert_eq!(p.action_for('d'), Some(PromptAction::CloseDiscard { id }));
         assert_eq!(p.action_for('C'), Some(PromptAction::Cancel));
         assert_eq!(p.action_for('x'), None);
+    }
+
+    #[test]
+    fn format_age_coarsens_upward_and_never_underflows() {
+        assert_eq!(format_age(0, 0), "just now");
+        assert_eq!(format_age(59_000, 0), "just now", "sub-minute is not worth a number");
+        assert_eq!(format_age(60_000, 0), "1 minute ago", "singular, not '1 minutes'");
+        assert_eq!(format_age(150_000, 0), "2 minutes ago");
+        assert_eq!(format_age(3_600_000, 0), "1 hour ago");
+        assert_eq!(format_age(7_200_000, 0), "2 hours ago");
+        assert_eq!(format_age(86_400_000, 0), "1 day ago");
+        assert_eq!(format_age(3 * 86_400_000, 0), "3 days ago");
+        // A swap stamped in the FUTURE — a clock that went backwards, or a state dir copied
+        // from another machine. Must saturate, not underflow into a nonsense age.
+        assert_eq!(format_age(0, u64::MAX), "just now");
+    }
+
+    #[test]
+    fn clean_recovery_names_the_newest_kept_orphans_and_elides_the_rest() {
+        // The modal is the ONLY place a writer learns a diverged swap was spared, so it must
+        // name them — but bounded, or a state dir full of orphans pushes the [Y]es/[C]ancel
+        // choices off a short terminal. The list arrives newest-first from
+        // `swap::kept_recoverable`; the elision line must account for every one not shown.
+        let kept: Vec<crate::swap::KeptRecoverable> = (0..KEPT_SHOWN + 3)
+            .map(|i| crate::swap::KeptRecoverable {
+                realpath: format!("/docs/chapter-{i}.md"), ts_ms: 0,
+            }).collect();
+        let p = Prompt::clean_recovery(4, &kept);
+        assert!(p.message.starts_with("Delete 4 recovery file(s)?"), "{:?}", p.message);
+        assert!(p.message.contains(&format!("Keeping {} that may hold unsaved work", kept.len())),
+            "the FULL kept count is stated even though only some are named: {:?}", p.message);
+        for i in 0..KEPT_SHOWN {
+            assert!(p.message.contains(&format!("/docs/chapter-{i}.md")),
+                "orphan {i} is named: {:?}", p.message);
+        }
+        assert!(!p.message.contains(&format!("/docs/chapter-{}.md", KEPT_SHOWN)),
+            "past the cap, orphans are elided rather than named: {:?}", p.message);
+        assert!(p.message.contains("\u{2026}and 3 more"),
+            "and the elision accounts for exactly the unnamed remainder: {:?}", p.message);
+        // Disclosure never changes the decision surface.
+        assert_eq!(p.action_for('y'), Some(PromptAction::CleanRecovery));
+        assert_eq!(p.action_for('c'), Some(PromptAction::Cancel));
+
+        let none = Prompt::clean_recovery(4, &[]);
+        assert!(!none.message.contains("Keeping"),
+            "nothing spared → no disclosure block at all: {:?}", none.message);
     }
 }
