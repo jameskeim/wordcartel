@@ -127,8 +127,60 @@ pub(crate) fn classify_destination_enter(
     CommitOutcome::Commit { path: resolved, from_highlight: false }
 }
 
-/// Extensions that mean "this is an export, not a save".
+/// Extensions that mean "this is an export, not a save". These are exactly the formats
+/// pandoc PRODUCES for us (`registry.rs`'s export commands pass each of them to
+/// `export::run_export`), which is why an extension in this list can be answered with the
+/// Export flow rather than a bare refusal.
 const OUTPUT_EXTS: &[&str] = &["docx", "pdf", "html", "tex"];
+
+/// Extensions a Row-2 overwrite may target: markdown, or format-neutral plain text. A name
+/// with NO extension at all qualifies too (see `classify_highlight_target`).
+const OVERWRITABLE_EXTS: &[&str] = &["md", "markdown", "txt", "text"];
+
+/// The verdict for Row 2 — an empty-field Enter onto a HIGHLIGHTED EXISTING FILE.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HighlightVerdict {
+    /// Markdown or format-neutral text (or no extension at all) — write it EXACTLY as named,
+    /// with the ordinary overwrite-confirm. Extension policy must not rename it.
+    Write,
+    /// A foreign document format that pandoc can produce — refuse the save and offer Export.
+    ExportInstead(String),
+    /// Any other foreign document format — refuse. There is no alternate flow to offer.
+    Foreign(String),
+}
+
+/// Decide whether Row 2 may write markdown bytes over the highlighted file.
+///
+/// The hazard is NOT binary-versus-text: `.tex` is plain text and is still protected. It is
+/// that the file IS A DIFFERENT DOCUMENT FORMAT, so writing the buffer's markdown into it
+/// destroys the file's meaning while keeping its name — a `report.docx` that is no longer a
+/// docx, under a name that still claims to be one. Silent data loss with a plausible cover.
+///
+/// So Row 2 writes directly only onto markdown or format-neutral text, and refuses everything
+/// else. This is deliberately NOT `apply_extension_policy`: that classifies FIELD TEXT and may
+/// RENAME its input, which is exactly what Row 2 must never do (a highlighted `README` stays
+/// `README`; it does not become `README.md`).
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::path::Path;
+/// assert_eq!(classify_highlight_target(Path::new("/d/README")), HighlightVerdict::Write);
+/// assert_eq!(classify_highlight_target(Path::new("/d/notes.txt")), HighlightVerdict::Write);
+/// assert_eq!(classify_highlight_target(Path::new("/d/report.docx")),
+///     HighlightVerdict::ExportInstead("docx".into()));
+/// ```
+pub(crate) fn classify_highlight_target(path: &Path) -> HighlightVerdict {
+    // Same empty-extension filter `apply_extension_policy` applies: `notes.` has an embedded
+    // dot but no extension after it, and a dotfile (`.gitignore`) has none either — both are
+    // extensionless names, which are format-neutral and therefore writable.
+    let Some(ext) = path.extension().and_then(|e| e.to_str()).filter(|e| !e.is_empty())
+        else { return HighlightVerdict::Write };
+    let lower = ext.to_ascii_lowercase();
+    if OVERWRITABLE_EXTS.contains(&lower.as_str()) { return HighlightVerdict::Write; }
+    if OUTPUT_EXTS.contains(&lower.as_str()) { return HighlightVerdict::ExportInstead(lower); }
+    HighlightVerdict::Foreign(lower)
+}
 
 /// The verdict `apply_extension_policy` reaches for a SAVE destination's extension.
 #[derive(Debug, PartialEq, Eq)]
@@ -202,6 +254,41 @@ pub(crate) fn copy_name_into_field(field: &mut String, field_cursor: &mut usize,
     *field_cursor = field.len();
 }
 
+/// Abandon a save destination and hand the writer the Export flow for `ext` instead, seeded
+/// with `path` so their chosen target is not thrown away.
+///
+/// Shared by the two refusals that have somewhere to go: the typed-text `ExtVerdict::Redirect`
+/// (F4) and Row 2's `HighlightVerdict::ExportInstead`. `fallback_dir` is used only when `path`
+/// has no parent.
+// The full write-refusal context: everything `commit_destination` would otherwise inline twice.
+#[allow(clippy::too_many_arguments)]
+fn redirect_to_export(
+    editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    purpose: &crate::file_browser::DestinationPurpose,
+    path: &Path,
+    ext: String,
+    reason: &str,
+    fallback_dir: PathBuf,
+) {
+    editor.set_status_full(crate::status::StatusKind::Warning, reason.to_owned(),
+        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+    // A redirect IS an abandoned save — the write did not happen, and the writer is being
+    // offered a different feature. Same rule the `CommitOutcome::Nothing` empty-path arm
+    // applies: abandoning a save-then must abort the drain, or a LATER save could `.take()`
+    // this stale action and fire a `Quit` the writer no longer wants (Critical-1, Task 21).
+    if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
+        editor.pending_save_as = None;
+        editor.quit_drain = None;
+        editor.quit_drain_advance = false;
+    }
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(fallback_dir);
+    let field = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    editor.open_destination_picker(fs, msg_tx,
+        crate::file_browser::DestinationPurpose::Export { ext }, dir, field);
+}
+
 /// Execute a destination-mode Enter. THE single place a picker commit becomes a write.
 ///
 /// Dispatches on `DestinationPurpose`, so adding a future destination consumer is one arm
@@ -258,33 +345,36 @@ pub(crate) fn commit_destination(
             // `CommitOutcome::Commit::from_highlight`).
             let chosen = match &purpose {
                 crate::file_browser::DestinationPurpose::Export { .. } => raw,
-                _ if from_highlight => raw,
+                // Row 2 — the target is a file the writer highlighted on screen, so its name
+                // is already the answer and policy could only move the write somewhere else.
+                // But the name is not the ONLY question: markdown bytes must not land inside
+                // a foreign document format (see `classify_highlight_target`).
+                _ if from_highlight => match classify_highlight_target(&raw) {
+                    HighlightVerdict::Write => raw,
+                    HighlightVerdict::ExportInstead(ext) => {
+                        let reason = format!(
+                            "{} is a {ext} file \u{2014} opening Export instead",
+                            raw.display());
+                        redirect_to_export(editor, fs, msg_tx, &purpose, &raw, ext, &reason, dir);
+                        return;
+                    }
+                    HighlightVerdict::Foreign(ext) => {
+                        editor.set_status_full(crate::status::StatusKind::Warning,
+                            format!("{} is a {ext} file \u{2014} saving markdown over it would \
+                                     destroy it", raw.display()),
+                            crate::status::StatusLifetime::Sticky,
+                            crate::status::StatusSource::Host, None);
+                        return;
+                    }
+                },
                 _ => match apply_extension_policy(&raw) {
                     ExtVerdict::Defaulted(p) | ExtVerdict::Honoured(p) => p,
                     ExtVerdict::Redirect { path, ext } => {
                         // F4: refuse the save, explain, and carry the typed path into the
                         // export destination picker — advice with somewhere to go.
-                        editor.set_status_full(crate::status::StatusKind::Warning,
-                            format!("{ext} is an export format \u{2014} opening Export instead"),
-                            crate::status::StatusLifetime::Sticky,
-                            crate::status::StatusSource::Host, None);
-                        // A Redirect IS an abandoned save — the write did not happen, and
-                        // the writer is being offered a different feature. Same rule the
-                        // `CommitOutcome::Nothing` empty-path arm above applies: abandoning
-                        // a save-then must abort the drain, or a LATER save could `.take()`
-                        // this stale action and fire a `Quit` the writer no longer wants
-                        // (Critical-1, Task 21 fix round).
-                        if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
-                            editor.pending_save_as = None;
-                            editor.quit_drain = None;
-                            editor.quit_drain_advance = false;
-                        }
-                        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(dir);
-                        let field = path.file_name()
-                            .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        editor.open_destination_picker(fs, msg_tx,
-                            crate::file_browser::DestinationPurpose::Export { ext },
-                            dir, field);
+                        let reason =
+                            format!("{ext} is an export format \u{2014} opening Export instead");
+                        redirect_to_export(editor, fs, msg_tx, &purpose, &path, ext, &reason, dir);
                         return;
                     }
                     ExtVerdict::Refused(path) => {
@@ -690,6 +780,158 @@ mod tests {
             "the overwrite-confirm — Row 2's whole safety argument — must actually be raised");
         assert!(e.prompt.is_some(), "and the writer must be looking at it");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Drive a REAL Row-2 gesture: open a Save-As destination picker on `d`, pump the async
+    /// listing, arrow the highlight onto `name`, and press Enter with an empty field — all
+    /// through the live intercept, since every defect this arm has shipped lived in the
+    /// composition rather than in one function's return value. Panics if the highlight cannot
+    /// be parked on `name`, so a listing/filter change cannot make these tests vacuous.
+    ///
+    /// `types` is the writer's file-type filter: the default `Documents` hides a `.odp`
+    /// entirely, so a Foreign-arm case has to be driven with `All`, exactly as a writer would.
+    fn row2_enter_onto(d: &std::path::Path, name: &str, types: crate::config::FileTypeFilter)
+        -> (crate::editor::Editor, std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
+        let mut e = crate::editor::Editor::new_from_text("markdown body\n", None, (80, 24));
+        e.files_type_filter = types;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.to_path_buf(), String::new());
+        crate::test_support::pump_listing(&mut e, &rx);
+        for _ in 0..12 {
+            let on_it = e.file_browser.as_ref()
+                .and_then(|fb| fb.entries.get(fb.selected))
+                .is_some_and(|r| r.name == name);
+            if on_it { break; }
+            crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Down);
+        }
+        {
+            let fb = e.file_browser.as_ref().expect("picker open");
+            assert_eq!(fb.entries.get(fb.selected).map(|r| r.name.as_str()), Some(name),
+                "precondition: the highlight is parked on the seeded file");
+            assert!(fb.highlight_is_navigated(), "precondition: the writer moved it there");
+            assert_eq!(fb.mode.filter_text(&fb.query), "",
+                "precondition: the field is empty — this is Row 2, not Row 4");
+        }
+        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+        (e, fs)
+    }
+
+    /// Ratified amendment (§8, Row 2): markdown and format-neutral text targets are written
+    /// EXACTLY as named — the format-protection guard must not accidentally catch them, and
+    /// extension policy still must not rename them.
+    ///
+    /// FAIL-VERIFY: drop `OVERWRITABLE_EXTS` from `classify_highlight_target` (so `.md`/`.txt`
+    /// fall through to `Foreign`), watch both cases fail with no overwrite prompt raised.
+    #[test]
+    fn row2_onto_markdown_or_plain_text_targets_that_exact_file() {
+        for name in ["notes.md", "notes.txt"] {
+            let d = tmp("row2-writable");
+            std::fs::write(d.join(name), b"prior text\n").expect("seed");
+            let (e, _fs) = row2_enter_onto(&d, name, crate::config::FileTypeFilter::Documents);
+            assert_eq!(std::fs::read_to_string(d.join(name)).expect("still there"),
+                "prior text\n", "nothing is written until the writer confirms");
+            assert_eq!(e.pending_save_overwrite.as_deref(),
+                Some(std::fs::canonicalize(d.join(name)).expect("canon").as_path()),
+                "{name}: the ordinary overwrite-confirm must be raised for a text target");
+            assert!(e.prompt.is_some(), "{name}: and the writer must be looking at it");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// Ratified amendment (§8, Row 2). Row 2 used to write the buffer's markdown over ANY
+    /// highlighted file — including a `report.docx`, producing a file that lies about its own
+    /// format under a name that still claims to be one. Where pandoc can PRODUCE the format,
+    /// the refusal offers the Export flow rather than a dead end.
+    ///
+    /// FAIL-VERIFY: return `HighlightVerdict::Write` unconditionally from
+    /// `classify_highlight_target`, watch this fail (the docx bytes replaced by the buffer
+    /// body and no Export picker).
+    #[test]
+    fn row2_onto_a_foreign_format_pandoc_writes_offers_export_instead() {
+        let d = tmp("row2-docx");
+        std::fs::write(d.join("report.docx"), b"PK\x03\x04 not really a docx\n").expect("seed");
+        let (e, _fs) = row2_enter_onto(&d, "report.docx", crate::config::FileTypeFilter::Documents);
+        assert_eq!(std::fs::read(d.join("report.docx")).expect("still there"),
+            b"PK\x03\x04 not really a docx\n",
+            "markdown bytes must never land inside a foreign document format");
+        assert!(e.pending_save_overwrite.is_none(),
+            "the save is refused outright — not queued behind a confirm");
+        let fb = e.file_browser.as_ref().expect("the Export destination picker replaces it");
+        assert!(matches!(&fb.mode, crate::file_browser::BrowseMode::Destination {
+            purpose: crate::file_browser::DestinationPurpose::Export { ext }, .. }
+            if ext == "docx"), "the refusal hands the writer the Export flow for that format");
+        assert!(e.status().map_or("", |s| s.text()).contains("docx"),
+            "and says why — no silent UI: {:?}", e.status().map_or("", |s| s.text()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ratified amendment (§8, Row 2). `.tex` is plain TEXT and is still protected: the hazard
+    /// is that the file is a different DOCUMENT FORMAT, not that it is binary. pandoc does
+    /// produce `.tex`, so this one also earns the Export offer.
+    ///
+    /// FAIL-VERIFY: as above — with the guard removed the thesis source is overwritten.
+    #[test]
+    fn row2_onto_a_plain_text_foreign_format_is_still_refused() {
+        let d = tmp("row2-tex");
+        std::fs::write(d.join("thesis.tex"), b"\\documentclass{article}\n").expect("seed");
+        let (e, _fs) = row2_enter_onto(&d, "thesis.tex", crate::config::FileTypeFilter::Documents);
+        assert_eq!(std::fs::read_to_string(d.join("thesis.tex")).expect("still there"),
+            "\\documentclass{article}\n",
+            "plain text is not the test — being a foreign document format is");
+        assert!(e.pending_save_overwrite.is_none(), "the save is refused, not queued");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A refused Row 2 must leave the filesystem exactly as it found it — in particular it
+    /// must not fall back to policy and create a `report.docx.md` / `report.md` beside the
+    /// file it declined to overwrite.
+    ///
+    /// FAIL-VERIFY: route the `ExportInstead`/`Foreign` arms into `apply_extension_policy`
+    /// instead of returning, watch the extra file appear.
+    #[test]
+    fn a_refused_row2_creates_no_file_at_all() {
+        // `.docx` takes the ExportInstead arm, `.odp` the Foreign one — a refusal writes
+        // nothing on EITHER path. `.odp` is invisible under the default Documents filter, so
+        // it is driven with the All filter, exactly as the writer who could reach it would.
+        for (name, seed, types) in [
+            ("report.docx", &b"docx bytes\n"[..], crate::config::FileTypeFilter::Documents),
+            ("slides.odp", &b"odp bytes\n"[..], crate::config::FileTypeFilter::All)] {
+            let d = tmp("row2-nofile");
+            std::fs::write(d.join(name), seed).expect("seed");
+            let (e, _fs) = row2_enter_onto(&d, name, types);
+            let mut left: Vec<String> = std::fs::read_dir(&d).expect("read")
+                .filter_map(|r| r.ok().map(|x| x.file_name().to_string_lossy().into_owned()))
+                .collect();
+            left.sort();
+            assert_eq!(left, vec![name.to_owned()],
+                "{name}: a refusal writes nothing anywhere");
+            assert!(e.status().map_or("", |s| s.text()).contains(name.rsplit('.').next().expect("ext")),
+                "{name}: the refusal names the reason: {:?}", e.status().map_or("", |s| s.text()));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn classify_highlight_target_allows_only_markdown_and_neutral_text() {
+        for ok in ["README", "notes.md", "NOTES.MD", "readme.markdown", "log.txt", "log.text",
+                   "notes.", ".gitignore"] {
+            assert_eq!(classify_highlight_target(Path::new(ok)), HighlightVerdict::Write,
+                "{ok} is markdown or format-neutral text");
+        }
+        for (name, ext) in [("report.docx", "docx"), ("paper.pdf", "pdf"),
+                            ("thesis.tex", "tex"), ("page.HTML", "html")] {
+            assert_eq!(classify_highlight_target(Path::new(name)),
+                HighlightVerdict::ExportInstead(ext.to_owned()),
+                "{name} is a format pandoc can produce — offer Export");
+        }
+        for (name, ext) in [("slides.odp", "odp"), ("sheet.xlsx", "xlsx"), ("photo.png", "png")] {
+            assert_eq!(classify_highlight_target(Path::new(name)),
+                HighlightVerdict::Foreign(ext.to_owned()),
+                "{name} is a foreign format with no Export flow to offer");
+        }
     }
 
     #[test]
