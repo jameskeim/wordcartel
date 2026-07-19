@@ -39,43 +39,122 @@ pub struct Discovered {
     pub skipped: Vec<LoadReport>,
 }
 
-/// Filesystem-facing discovery layer (Task 6) — scans `dir` for single-file `<name>.lua` and
-/// `<name>/init.lua` plugins, `disable`-filters, and bounded-reads each source. Deterministic:
-/// candidates are sorted lexicographically BY STEM before reading, so load order (and hence any
-/// cross-plugin collision report) never depends on `read_dir`'s OS-dependent enumeration order.
+/// Rider 3 (spec §5.2): is this entry PLAUSIBLY a plugin that could not be loaded?
+///
+/// A rule, not a list, and deliberately narrow. `discover`'s contract says a found candidate
+/// is "named, never silently dropped" — but reporting every unloadable file would flood the
+/// report with `README.md` and make it useless. So: a `.lua` name of any non-`File` kind, or
+/// a broken symlink (which we cannot classify and which is always actionable in a plugins
+/// directory). A loadable `File`/`Dir` is not "unloadable" and returns false — those load.
+pub(crate) fn is_plausible_plugin(name: &str, kind: crate::fsx::EntryKind, broken: bool) -> bool {
+    use crate::fsx::EntryKind;
+    if broken { return true; }
+    match kind {
+        EntryKind::File | EntryKind::Dir => false,
+        EntryKind::Other | EntryKind::Unknown => {
+            std::path::Path::new(name).extension().and_then(|e| e.to_str()) == Some("lua")
+        }
+    }
+}
+
+/// Filesystem-facing discovery layer (Task 6, Decision 12) — scans `dir` for single-file
+/// `<name>.lua` and `<name>/init.lua` plugins, `disable`-filters, and bounded-reads each source.
+/// Deterministic: candidates are sorted lexicographically BY STEM before reading, so load order
+/// (and hence any cross-plugin collision report) never depends on `read_dir`'s OS-dependent
+/// enumeration order.
 ///
 /// A missing/unreadable `dir` (no plugins installed — the common case) is not a failure: it
 /// yields an empty `Discovered`, no warning. A candidate that IS found but is over
 /// [`PLUGIN_MAX_SOURCE_BYTES`] or fails to read/decode goes to `skipped` — named, never silently
-/// dropped — and is excluded from `sources` (the caller never sees its content). This function
-/// does not touch the `Fs` trait (write-only seam) or the string-core `load_sources`: it only
-/// reads bytes and hands `(stem, source)` pairs onward.
+/// dropped — and is excluded from `sources` (the caller never sees its content).
+///
+/// This function reads through the `Fs` seam (C5) and hands `(stem, source)` pairs onward;
+/// it does not touch the string-core `load_sources`.
 pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
+    discover_with_fs(&crate::fsx::RealFs, dir, disable)
+}
+
+/// The `Fs`-seamed core of [`discover`] (Decision 12): entries are classified with
+/// [`crate::fsx::EntryKind`] — which FOLLOWS symlinks — instead of the old non-following
+/// `entry.file_type()`, so a symlinked `.lua` file or a symlinked plugin directory now loads
+/// exactly like a real one. That closes a real inconsistency: `init.is_file()` (below) always
+/// followed symlinks, so a real directory whose `init.lua` was itself a symlink already loaded
+/// under the old code — while a symlinked plugin directory or `.lua` file did not. The trust
+/// boundary was already porous; this makes it uniform rather than adding a new one.
+pub(crate) fn discover_with_fs(fs: &dyn crate::fsx::Fs, dir: &Path, disable: &[String])
+    -> Discovered
+{
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else { continue };
-            if file_type.is_file() {
-                if path.extension().and_then(|e| e.to_str()) == Some("lua") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        candidates.push((stem.to_string(), path));
+    let mut unloadable: Vec<LoadReport> = Vec::new();
+    // cap: None — discovery is uncapped today, and capping it would drop plausible plugins
+    // past the cap: neither loaded nor named, the exact silent drop rider 3 eliminates.
+    if let Ok(listing) = fs.list_dir(dir, None) {
+        for e in listing.entries {
+            let path = dir.join(&e.name);
+            match e.kind {
+                // Rider 2: the .lua arm matches kind == File, NEVER "not a directory" — a
+                // fifo named x.lua is Other and must not become a candidate.
+                crate::fsx::EntryKind::File => {
+                    // The UTF-8 decision is made on the RAW name. `e.name` is already
+                    // lossy-converted, so `to_str()` on a path built from it would always
+                    // succeed and the invalid-UTF-8 branch would be unreachable — the plugin
+                    // would be loaded under a mangled stem instead of reported (spec §5.2
+                    // rider 3 requires it be reported, by name).
+                    let raw = std::path::Path::new(&e.raw_name);
+                    if raw.extension().and_then(|x| x.to_str()) == Some("lua") {
+                        match raw.file_stem().and_then(|s| s.to_str()) {
+                            Some(stem) => candidates.push((stem.to_string(), path)),
+                            None => unloadable.push(LoadReport {
+                                // Reported with the LOSSY name — it is all we can display,
+                                // and "named, never silently dropped" is satisfied.
+                                plugin: e.name.clone(), hooks: 0,
+                                result: Err("plugin name is not valid UTF-8".into()),
+                            }),
+                        }
                     }
                 }
-            } else if file_type.is_dir() {
-                let init = path.join("init.lua");
-                if init.is_file() {
-                    if let Some(stem) = path.file_name().and_then(|s| s.to_str()) {
-                        candidates.push((stem.to_string(), init));
+                crate::fsx::EntryKind::Dir => {
+                    let init = path.join("init.lua");
+                    if crate::fsx::is_file_via(fs, &init) {
+                        if let Some(stem) = path.file_name().and_then(|s| s.to_str()) {
+                            candidates.push((stem.to_string(), init));
+                        } else {
+                            unloadable.push(LoadReport {
+                                plugin: e.name.clone(), hooks: 0,
+                                result: Err("plugin directory name is not valid UTF-8".into()),
+                            });
+                        }
                     }
                 }
+                crate::fsx::EntryKind::Other | crate::fsx::EntryKind::Unknown => {}
             }
+            // Rider 1 + rider 3: anything plausibly a plugin that did NOT become a candidate
+            // is reported by name rather than falling off the end of the loop.
+            if is_plausible_plugin(&e.name, e.kind, e.broken) {
+                unloadable.push(LoadReport {
+                    plugin: e.name.clone(), hooks: 0,
+                    result: Err(if e.broken {
+                        "symlink cannot be resolved".to_string()
+                    } else {
+                        "not a loadable plugin file".to_string()
+                    }),
+                });
+            }
+        }
+        // The one case where "named" degrades honestly: an entry the iterator could not read
+        // has no name to report, so it can only ever be a count.
+        if listing.unreadable > 0 {
+            unloadable.push(LoadReport {
+                plugin: format!("<{} unreadable directory entries>", listing.unreadable),
+                hooks: 0,
+                result: Err("directory entries could not be read".into()),
+            });
         }
     }
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut sources = Vec::new();
-    let mut skipped = Vec::new();
+    let mut skipped = unloadable;
     let mut i = 0;
     while i < candidates.len() {
         let stem = candidates[i].0.clone();
@@ -101,7 +180,7 @@ pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
             continue;
         }
         let path = &candidates[i].1;
-        match crate::file::bounded_read_opt(path, PLUGIN_MAX_SOURCE_BYTES) {
+        match crate::file::bounded_read_opt_with_fs(fs, path, PLUGIN_MAX_SOURCE_BYTES) {
             Some(bytes) => match String::from_utf8(bytes) {
                 Ok(src) => sources.push((stem, src)),
                 Err(_) => skipped.push(LoadReport {
@@ -794,5 +873,96 @@ mod tests {
             lua.globals().get::<String>("RESULT").unwrap(), "nil",
             "an over-cap config key degrades to wc.config == nil, not a load failure"
         );
+    }
+
+    fn unique_plugin_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "wc-plug-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), label));
+        std::fs::create_dir_all(&d).expect("create dir");
+        d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_follows_symlinked_plugins_both_shapes() {
+        // DECISION 12. Today a symlink to a .lua file and a symlink to a plugin directory
+        // are BOTH silently ignored — neither is_file() nor is_dir() under the non-following
+        // entry.file_type(). Both must now load.
+        let d = unique_plugin_dir("d12-follow");
+        let store = d.join("store");
+        std::fs::create_dir_all(store.join("dirplug")).expect("seed");
+        std::fs::write(store.join("single.lua"), "-- single\n").expect("seed");
+        std::fs::write(store.join("dirplug").join("init.lua"), "-- dir\n").expect("seed");
+        let plugins = d.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("seed");
+        std::os::unix::fs::symlink(store.join("single.lua"), plugins.join("linked.lua"))
+            .expect("link->file");
+        std::os::unix::fs::symlink(store.join("dirplug"), plugins.join("linkeddir"))
+            .expect("link->dir");
+
+        let got = discover_with_fs(&crate::fsx::RealFs, &plugins, &[]);
+        let stems: Vec<&str> = got.sources.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(stems.contains(&"linked"), "symlinked .lua must load: {stems:?}");
+        assert!(stems.contains(&"linkeddir"), "symlinked plugin DIR must load: {stems:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_still_loads_a_real_dir_with_a_symlinked_init() {
+        // The pre-existing half of the inconsistency: `init.is_file()` already FOLLOWS, so
+        // this loads today. Decision 12 converges the two halves — it must not invert this.
+        let d = unique_plugin_dir("d12-init");
+        std::fs::create_dir_all(d.join("plugins").join("p")).expect("seed");
+        std::fs::write(d.join("real_init.lua"), "-- real\n").expect("seed");
+        std::os::unix::fs::symlink(d.join("real_init.lua"),
+            d.join("plugins").join("p").join("init.lua")).expect("link");
+        let got = discover_with_fs(&crate::fsx::RealFs, &d.join("plugins"), &[]);
+        assert!(got.sources.iter().any(|(s, _)| s == "p"),
+            "a real dir with a symlinked init.lua must still load");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_reports_plausible_plugins_and_stays_silent_about_the_rest() {
+        // RIDER 3. The contract says a found candidate is "named, never silently dropped".
+        // Following symlinks closes the biggest class but not all of them, so the rule is:
+        // report anything PLAUSIBLY a plugin that cannot be loaded — and nothing else, or
+        // the report floods with README.md and becomes useless.
+        let d = unique_plugin_dir("d12-rider3");
+        let p = d.join("plugins");
+        std::fs::create_dir_all(&p).expect("seed");
+        std::os::unix::fs::symlink(p.join("gone.lua"), p.join("dangling.lua")).expect("broken");
+        std::fs::write(p.join("README.md"), "not a plugin\n").expect("seed");
+        std::fs::create_dir_all(p.join("just_a_dir")).expect("seed");
+
+        let got = discover_with_fs(&crate::fsx::RealFs, &p, &[]);
+        let named: Vec<&str> = got.skipped.iter().map(|r| r.plugin.as_str()).collect();
+
+        assert!(named.contains(&"dangling.lua"),
+            "a broken symlink in the plugins dir is reported BY NAME: {named:?}");
+        assert!(!named.contains(&"README.md"),
+            "an ordinary non-plugin file stays silent — the qualifier is what bounds the report");
+        assert!(!named.contains(&"just_a_dir"),
+            "an ordinary subdirectory without init.lua stays silent");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn is_plausible_plugin_rule() {
+        use crate::fsx::EntryKind::*;
+        // Loadable shapes are NOT "plausible but unloadable" — they load.
+        assert!(!is_plausible_plugin("ok.lua", File, false));
+        assert!(!is_plausible_plugin("somedir", Dir, false));
+        // Plausible but unloadable — reported.
+        assert!(is_plausible_plugin("x.lua", Other, false), "a fifo named x.lua");
+        assert!(is_plausible_plugin("x.lua", Unknown, false), "type probe failed");
+        assert!(is_plausible_plugin("whatever", Unknown, true), "a broken symlink, any name");
+        // Not plausible — silent.
+        assert!(!is_plausible_plugin("README.md", File, false));
+        assert!(!is_plausible_plugin("notes.txt", Other, false));
     }
 }
