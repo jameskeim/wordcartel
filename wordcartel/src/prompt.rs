@@ -1,6 +1,16 @@
-//! Generic single-line modal (spec §5.3). Reserved for destructive/ambiguous
-//! decisions: quit-with-unsaved, external modification, swap recovery. Pure
-//! data; the resolver (app.rs) interprets the chosen PromptAction.
+//! Generic modal (spec §5.3, as amended by C5 — see below). Reserved for
+//! destructive/ambiguous decisions: quit-with-unsaved, external modification, swap
+//! recovery. Pure data; the resolver (app.rs) interprets the chosen PromptAction.
+//!
+//! **The question is one line; the disclosure is a box.** `message` is the single
+//! status-row line carrying the question and its choice keys — that half of §5.3's
+//! original "single-line modal" law is unchanged, and it is why the prompt keeps its one
+//! truthful `RenderSite::StatusRow` entry in the H21 `OVERLAYS` table. C5 §11.3 needed a
+//! prompt to *disclose* structured, multi-line information (which recovery files are being
+//! spared, and how old they are), which a one-row string cannot hold: it was truncated at
+//! the terminal width and the disclosure never reached the screen. `detail` is that seam —
+//! typed lines painted in a bordered box above the status row. Prompts with an empty
+//! `detail` render exactly as they always have.
 
 /// How many kept-recoverable orphans `Prompt::clean_recovery` names before eliding the rest.
 /// Bounded so a state dir full of orphans cannot push the modal's own choices off-screen.
@@ -72,7 +82,18 @@ pub struct Choice {
 
 #[derive(Clone, Debug)]
 pub struct Prompt {
+    /// The single status-row line: the question plus its bracketed choice keys.
     pub message: String,
+    /// Optional structured disclosure, one entry per rendered line, painted as a bordered
+    /// box directly ABOVE the status row (`render_overlays::paint_prompt_detail`).
+    ///
+    /// Empty for every prompt that has nothing to disclose, and an empty `detail` paints
+    /// **nothing at all** — a prompt without one is byte-identical on screen to the
+    /// pre-`detail` rendering. Structured lines belong here rather than `\n`-smuggled into
+    /// `message`, which is truncated to one row and would silently swallow them (C5 review
+    /// finding C1). The box's own height is bounded by the live frame, so a long `detail`
+    /// can never push the choices off a short terminal.
+    pub detail: Vec<String>,
     pub choices: Vec<Choice>,
 }
 
@@ -89,6 +110,7 @@ impl Prompt {
     pub fn quit_confirm() -> Prompt {
         Prompt {
             message: "Unsaved changes: [S]ave & quit · [Q]uit anyway · [C]ancel".into(),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 's', label: "Save & quit", action: PromptAction::SaveAndQuit },
                 Choice { key: 'q', label: "Quit anyway", action: PromptAction::QuitAnyway },
@@ -101,6 +123,7 @@ impl Prompt {
     pub fn quit_multi(n: usize) -> Prompt {
         Prompt {
             message: format!("{n} buffer(s) unsaved: [A]ll save · [R]eview each · [C]ancel"),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'a', label: "Save all",    action: PromptAction::QuitSaveAll },
                 Choice { key: 'r', label: "Review each",  action: PromptAction::QuitReviewEach },
@@ -113,6 +136,7 @@ impl Prompt {
     pub fn quit_review_buffer(name: &str) -> Prompt {
         Prompt {
             message: format!("{name}: [S]ave · [D]iscard · [C]ancel"),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 's', label: "Save",    action: PromptAction::ReviewSave },
                 Choice { key: 'd', label: "Discard", action: PromptAction::ReviewDiscard },
@@ -125,6 +149,7 @@ impl Prompt {
         Prompt {
             // Save-as ([S]) is deferred to Effort 5 — omitted from the choices.
             message: "File changed on disk: [R]eload · [O]verwrite  (Save-as: Effort 5)".into(),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'r', label: "Reload",    action: PromptAction::Reload },
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::Overwrite },
@@ -135,6 +160,7 @@ impl Prompt {
     pub fn swap_recovery() -> Prompt {
         Prompt {
             message: "Recovery file found: [R]ecover · [D]iscard · [O]pen original".into(),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'r', label: "Recover",       action: PromptAction::Recover },
                 Choice { key: 'd', label: "Discard swap",  action: PromptAction::DiscardSwap },
@@ -147,6 +173,7 @@ impl Prompt {
         use crate::transform::TransformKind;
         Prompt {
             message: "transform: [r]eflow  [u]nwrap  [v]entilate".into(),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'r', label: "Reflow",    action: PromptAction::Transform(TransformKind::Reflow) },
                 Choice { key: 'u', label: "Unwrap",    action: PromptAction::Transform(TransformKind::Unwrap) },
@@ -158,6 +185,7 @@ impl Prompt {
     pub fn save_overwrite(target: &std::path::Path) -> Prompt {
         Prompt {
             message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteSaveAs },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
@@ -168,6 +196,7 @@ impl Prompt {
     pub fn write_block_overwrite(target: &std::path::Path) -> Prompt {
         Prompt {
             message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteWriteBlock },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
@@ -178,6 +207,7 @@ impl Prompt {
     pub fn export_overwrite(target: &std::path::Path) -> Prompt {
         Prompt {
             message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteExport },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
@@ -192,26 +222,31 @@ impl Prompt {
     /// hold unsaved work (`swap::kept_recoverable`). Nothing in `kept` is ever deleted — it is
     /// disclosure, not a choice. Without it a writer saw a state dir that never fully empties
     /// and had no way to learn which documents were holding it open, or how old they were.
-    /// Only the first `KEPT_SHOWN` are named; a modal that grew without bound would push the
-    /// choices themselves off a short terminal.
+    ///
+    /// The disclosure goes in `detail`, NOT in `message`: `message` is painted into the single
+    /// status ROW, so the earlier `\n`-smuggled form was truncated at the terminal width and no
+    /// realpath or age ever reached the writer (C5 review finding C1). Only the first
+    /// `KEPT_SHOWN` are named — a list that grew without bound would drive the box past the
+    /// frame — and the remainder is accounted for by an explicit elision line.
     ///
     /// `now_ms` is the caller's wall clock, threaded from the injected `Clock` like every other
     /// timed shell path — this constructor stays pure data so a `TestClock` journey renders a
     /// deterministic age.
     pub fn clean_recovery(n: usize, kept: &[crate::swap::KeptRecoverable], now_ms: u64) -> Prompt {
-        let mut message = format!("Delete {n} recovery file(s)? [Y]es · [C]ancel");
+        let message = format!("Delete {n} recovery file(s)? [Y]es · [C]ancel");
+        let mut detail: Vec<String> = Vec::new();
         if !kept.is_empty() {
-            message.push_str(&format!("\n\nKeeping {} that may hold unsaved work:", kept.len()));
+            detail.push(format!("Keeping {} that may hold unsaved work:", kept.len()));
             for k in kept.iter().take(KEPT_SHOWN) {
-                message.push_str(&format!("\n  {} (written {})",
-                    k.realpath, format_age(now_ms, k.ts_ms)));
+                detail.push(format!("  {} (written {})", k.realpath, format_age(now_ms, k.ts_ms)));
             }
             if kept.len() > KEPT_SHOWN {
-                message.push_str(&format!("\n  \u{2026}and {} more", kept.len() - KEPT_SHOWN));
+                detail.push(format!("  \u{2026}and {} more", kept.len() - KEPT_SHOWN));
             }
         }
         Prompt {
             message,
+            detail,
             choices: vec![
                 Choice { key: 'y', label: "Delete", action: PromptAction::CleanRecovery },
                 Choice { key: 'c', label: "Cancel", action: PromptAction::Cancel },
@@ -223,6 +258,7 @@ impl Prompt {
     pub fn close_confirm(name: &str, id: crate::editor::BufferId) -> Prompt {
         Prompt {
             message: format!("close {name}: [S]ave & close · [D]iscard · [C]ancel"),
+            detail: Vec::new(),
             choices: vec![
                 Choice { key: 's', label: "Save & close", action: PromptAction::CloseSave { id } },
                 Choice { key: 'd', label: "Discard",      action: PromptAction::CloseDiscard { id } },
@@ -293,12 +329,20 @@ mod tests {
         assert_eq!(format_age(0, u64::MAX), "just now");
     }
 
+    /// The DATA half of the kept-orphan disclosure: what `clean_recovery` composes, and the
+    /// structural law that the question stays on one line while the disclosure goes to
+    /// `detail`. It is deliberately **not** the proof that any of this is visible — that
+    /// claim is only checkable against a drawn screen, and asserting it here is exactly the
+    /// mistake finding C1 caught. The screen proofs are
+    /// `render::tests::the_prompt_detail_box_actually_paints_the_realpath_and_the_age`,
+    /// `..._paints_the_elision_line_past_the_cap`, and
+    /// `prompts::tests::the_clean_recovery_modal_names_kept_recoverable_files`.
     #[test]
     fn clean_recovery_names_the_newest_kept_orphans_and_elides_the_rest() {
         // The modal is the ONLY place a writer learns a diverged swap was spared, so it must
-        // name them — but bounded, or a state dir full of orphans pushes the [Y]es/[C]ancel
-        // choices off a short terminal. The list arrives newest-first from
-        // `swap::kept_recoverable`; the elision line must account for every one not shown.
+        // name them — but bounded, or the disclosure box outgrows a short terminal. The list
+        // arrives newest-first from `swap::kept_recoverable`; the elision line must account
+        // for every one not shown.
         let kept: Vec<crate::swap::KeptRecoverable> = (0..KEPT_SHOWN + 3)
             .map(|i| crate::swap::KeptRecoverable {
                 realpath: format!("/docs/chapter-{i}.md"), ts_ms: 0,
@@ -306,25 +350,31 @@ mod tests {
         // The injected clock's reading is a parameter, so the age is deterministic and
         // assertable — three days after every fixture's `ts_ms: 0`.
         let p = Prompt::clean_recovery(4, &kept, 3 * 86_400_000);
-        assert!(p.message.starts_with("Delete 4 recovery file(s)?"), "{:?}", p.message);
-        assert!(p.message.contains("(written 3 days ago)"),
-            "each named orphan carries its age, stamped against the injected clock: {:?}", p.message);
-        assert!(p.message.contains(&format!("Keeping {} that may hold unsaved work", kept.len())),
-            "the FULL kept count is stated even though only some are named: {:?}", p.message);
+        // The question and its choices stay a SINGLE line: that half of §5.3 is unchanged, and
+        // it is what keeps the prompt's one `RenderSite::StatusRow` entry truthful.
+        assert_eq!(p.message, "Delete 4 recovery file(s)? [Y]es · [C]ancel");
+        let detail = p.detail.join("\n");
+        assert!(detail.contains("(written 3 days ago)"),
+            "each named orphan carries its age, stamped against the injected clock: {detail:?}");
+        assert!(detail.contains(&format!("Keeping {} that may hold unsaved work", kept.len())),
+            "the FULL kept count is stated even though only some are named: {detail:?}");
         for i in 0..KEPT_SHOWN {
-            assert!(p.message.contains(&format!("/docs/chapter-{i}.md")),
-                "orphan {i} is named: {:?}", p.message);
+            assert!(detail.contains(&format!("/docs/chapter-{i}.md")), "orphan {i} is named: {detail:?}");
         }
-        assert!(!p.message.contains(&format!("/docs/chapter-{}.md", KEPT_SHOWN)),
-            "past the cap, orphans are elided rather than named: {:?}", p.message);
-        assert!(p.message.contains("\u{2026}and 3 more"),
-            "and the elision accounts for exactly the unnamed remainder: {:?}", p.message);
+        assert!(!detail.contains(&format!("/docs/chapter-{}.md", KEPT_SHOWN)),
+            "past the cap, orphans are elided rather than named: {detail:?}");
+        assert!(detail.contains("\u{2026}and 3 more"),
+            "and the elision accounts for exactly the unnamed remainder: {detail:?}");
+        assert_eq!(p.detail.len(), KEPT_SHOWN + 2,
+            "one header line, {KEPT_SHOWN} named orphans, one elision line — each its OWN entry, \
+             never newlines inside one: {:?}", p.detail);
         // Disclosure never changes the decision surface.
         assert_eq!(p.action_for('y'), Some(PromptAction::CleanRecovery));
         assert_eq!(p.action_for('c'), Some(PromptAction::Cancel));
 
         let none = Prompt::clean_recovery(4, &[], 3 * 86_400_000);
-        assert!(!none.message.contains("Keeping"),
-            "nothing spared → no disclosure block at all: {:?}", none.message);
+        assert!(none.detail.is_empty(),
+            "nothing spared → no disclosure at all, so no box is painted: {:?}", none.detail);
+        assert!(!none.message.contains("Keeping"), "{:?}", none.message);
     }
 }

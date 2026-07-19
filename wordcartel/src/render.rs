@@ -428,6 +428,15 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
         vec![Span::styled(truncated, status_style)]
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+
+    // A prompt carrying structured `detail` (C5 §11.3 — which recovery files are being kept,
+    // and how old they are) paints it as a bordered box ABOVE this row; the question and its
+    // choices stay on the row itself. `message` is truncated to one row, so a disclosure
+    // smuggled into it never reached the screen (review finding C1). Empty `detail` — every
+    // other prompt in the app — paints nothing, so this is inert for them.
+    if let Some(ref prompt) = editor.prompt {
+        crate::render_overlays::paint_prompt_detail(frame, prompt, area, status_row, cs);
+    }
 }
 
 /// Phase 12 — the hardware cursor: search-field / minibuffer / normal-caret arms,
@@ -1066,6 +1075,173 @@ mod tests {
             "status row must show prompt message, got: {:?}",
             status_row
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompt `detail` — the disclosure box above the status row (C5 §11.3,
+    // amending §5.3). These assert on the DRAWN SCREEN on purpose: the defect
+    // they replace shipped because both of its guards asserted on the message
+    // STRING, which agreed with itself while production painted one truncated
+    // row and disclosed nothing (review finding C1).
+    // -----------------------------------------------------------------------
+
+    /// The whole rendered screen as one newline-joined string.
+    fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height).map(|y| row_string(buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Build the clean-recovery prompt over `n` kept orphans, all written `days` ago.
+    fn clean_recovery_editor(n: usize, days: u64, w: u16, h: u16) -> Editor {
+        let kept: Vec<crate::swap::KeptRecoverable> = (0..n)
+            .map(|i| crate::swap::KeptRecoverable {
+                realpath: format!("/docs/chapter-{i}.md"), ts_ms: 0,
+            }).collect();
+        let mut e = Editor::new_from_text("x\n", None, (w, h));
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(4, &kept, days * 86_400_000));
+        derive::rebuild(&mut e);
+        e
+    }
+
+    #[test]
+    fn the_prompt_detail_box_actually_paints_the_realpath_and_the_age() {
+        // §11.3's requirement is that the writer be TOLD which recovery files are being
+        // kept — with enough to act on: which file, and how old. Composing that text is
+        // not delivering it; only pixels are. FAIL-VERIFY: make `paint_prompt_detail`
+        // return before painting (or paint an empty `detail`), watch these fail.
+        let mut e = clean_recovery_editor(3, 3, 80, 24);
+        let buf = render_to_buffer(&mut e, 80, 24);
+        let screen = screen_text(&buf);
+
+        assert!(screen.contains("/docs/chapter-0.md"),
+            "the kept file's realpath must reach the SCREEN, not just the prompt struct:\n{screen}");
+        assert!(screen.contains("3 days ago"),
+            "and so must its age — the writer's whole basis for acting on it:\n{screen}");
+        assert!(screen.contains("may hold unsaved work"),
+            "and the reason it was spared:\n{screen}");
+        // The choices stay on the status row: the box discloses, it never relocates the decision.
+        let status_row = row_string(&buf, 23);
+        assert!(status_row.contains("[Y]es") && status_row.contains("[C]ancel"),
+            "the choices stay on the status row: {status_row:?}");
+        assert!(!status_row.contains("/docs/chapter-0.md"),
+            "and the disclosure is NOT crammed into that row: {status_row:?}");
+    }
+
+    #[test]
+    fn the_prompt_detail_box_paints_the_elision_line_past_the_cap() {
+        // `KEPT_SHOWN` bounds how many orphans are named; the remainder must still be
+        // ACCOUNTED FOR on screen, or a writer reads the box as an exhaustive list and
+        // wrongly concludes the rest were deleted. FAIL-VERIFY: drop the elision arm from
+        // `Prompt::clean_recovery`, watch this fail.
+        let mut e = clean_recovery_editor(8, 3, 80, 24); // KEPT_SHOWN(5) + 3
+        let screen = screen_text(&render_to_buffer(&mut e, 80, 24));
+
+        assert!(screen.contains("\u{2026}and 3 more"),
+            "the unnamed remainder is accounted for on screen:\n{screen}");
+        assert!(screen.contains("Keeping 8 that may hold unsaved work"),
+            "and the FULL kept count is stated even though only some are named:\n{screen}");
+        assert!(!screen.contains("/docs/chapter-5.md"),
+            "past the cap the orphans are elided, not named:\n{screen}");
+    }
+
+    #[test]
+    fn a_prompt_without_detail_paints_nothing_beyond_the_status_row() {
+        // A regression here would touch EVERY modal in the app, so this is the guard that
+        // an empty `detail` is genuinely inert. The claim is falsifiable and non-circular:
+        // the screen under a detail-less prompt must differ from the no-prompt screen on
+        // the status ROW ONLY. FAIL-VERIFY: drop `paint_prompt_detail`'s `None` early-out
+        // so a zero-line box paints, watch the row-equality fail.
+        let mut with = Editor::new_from_text("hello\nworld\n", None, (60, 10));
+        with.active_mut().document.version = 1;
+        with.open_prompt(crate::prompt::Prompt::quit_confirm());
+        derive::rebuild(&mut with);
+        let mut without = Editor::new_from_text("hello\nworld\n", None, (60, 10));
+        without.active_mut().document.version = 1;
+        derive::rebuild(&mut without);
+
+        let a = render_to_buffer(&mut with, 60, 10);
+        let b = render_to_buffer(&mut without, 60, 10);
+        for y in 0..9u16 {
+            assert_eq!(row_string(&a, y), row_string(&b, y),
+                "row {y} must be untouched by a prompt that has no detail to disclose");
+        }
+        assert_ne!(row_string(&a, 9), row_string(&b, 9),
+            "precondition: the prompt IS live and did change the status row");
+        // And every constructor in the app agrees it has nothing to disclose.
+        for p in [
+            crate::prompt::Prompt::quit_confirm(),
+            crate::prompt::Prompt::quit_multi(2),
+            crate::prompt::Prompt::quit_review_buffer("draft.md"),
+            crate::prompt::Prompt::external_mod(),
+            crate::prompt::Prompt::swap_recovery(),
+            crate::prompt::Prompt::transform_chooser(),
+            crate::prompt::Prompt::save_overwrite(std::path::Path::new("/tmp/a.md")),
+            crate::prompt::Prompt::write_block_overwrite(std::path::Path::new("/tmp/a.md")),
+            crate::prompt::Prompt::export_overwrite(std::path::Path::new("/tmp/a.md")),
+            crate::prompt::Prompt::close_confirm("draft.md", crate::editor::BufferId(0)),
+            crate::prompt::Prompt::clean_recovery(4, &[], 0),
+        ] {
+            assert!(p.detail.is_empty(), "no existing prompt gained a disclosure: {:?}", p.message);
+        }
+    }
+
+    #[test]
+    fn a_narrow_box_truncates_headings_on_the_right_and_paths_on_the_left() {
+        // Found live at 60 columns, not by any synthetic test: the heading rendered as
+        // "…ng 18 that may hold unsaved work:", because every line was being elided from the
+        // LEFT. That is right for the path items — the filename and the trailing age are the
+        // whole point of them — and exactly wrong for a heading, whose meaning is at its
+        // start. FAIL-VERIFY: send every line through `elide_path_left`, watch the heading
+        // assertion fail; send every line through `.take(inner_w)`, watch the age fail.
+        let kept: Vec<crate::swap::KeptRecoverable> = (0..3)
+            .map(|i| crate::swap::KeptRecoverable {
+                realpath: format!("/home/writer/projects/the-book/drafts/chapter-{i}.md"),
+                ts_ms: 0,
+            }).collect();
+        let mut e = Editor::new_from_text("x\n", None, (60, 20));
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(4, &kept, 3 * 86_400_000));
+        derive::rebuild(&mut e);
+        let screen = screen_text(&render_to_buffer(&mut e, 60, 20));
+
+        assert!(screen.contains("Keeping 3 that may hold"),
+            "the heading keeps its OPENING words when it must be cut:\n{screen}");
+        assert!(screen.contains("chapter-0.md (written 3 days ago)"),
+            "and a path item keeps its filename AND its age:\n{screen}");
+        assert!(!screen.contains("/home/writer/projects"),
+            "precondition: the paths genuinely do not fit, so elision really ran:\n{screen}");
+    }
+
+    #[test]
+    fn the_prompt_detail_box_never_panics_or_overflows_a_tiny_terminal() {
+        // The box is bottom-anchored against the status row, so every degenerate size is a
+        // subtraction waiting to underflow. A long path exercises the elision path at the
+        // same time. Nothing here may panic, and nothing may paint past the frame.
+        let long = "/home/writer/projects/the-book/drafts/revision-seven/chapter one.md";
+        let kept: Vec<crate::swap::KeptRecoverable> = (0..8)
+            .map(|_| crate::swap::KeptRecoverable { realpath: long.into(), ts_ms: 0 }).collect();
+        for (w, h) in [(1u16, 1u16), (2, 1), (3, 2), (4, 3), (10, 4), (20, 5), (80, 6), (200, 24)] {
+            let mut e = Editor::new_from_text("x\n", None, (w, h));
+            e.open_prompt(crate::prompt::Prompt::clean_recovery(4, &kept, 3 * 86_400_000));
+            derive::rebuild(&mut e);
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, &mut e)).unwrap(); // must not panic at any size
+            let buf = term.backend().buffer();
+            assert_eq!(buf.area.width, w, "{w}x{h}: the painter must not resize the frame");
+            assert_eq!(buf.area.height, h);
+        }
+    }
+
+    #[test]
+    fn a_detail_box_too_tall_for_the_frame_announces_what_it_dropped() {
+        // On a short terminal the box is clamped to the rows available above the status row.
+        // Silently stopping mid-list would misreport the kept set as smaller than it is, so
+        // the last visible row becomes a count of everything the box could not show.
+        let mut e = clean_recovery_editor(8, 3, 80, 7); // 7 rows: the 7-line detail cannot fit
+        let screen = screen_text(&render_to_buffer(&mut e, 80, 7));
+        assert!(screen.contains("\u{2026}and"),
+            "a clamped box says how many lines it dropped:\n{screen}");
+        let status_row = row_string(&render_to_buffer(&mut e, 80, 7), 6);
+        assert!(status_row.contains("[Y]es"),
+            "and the choices are never pushed off the screen by it: {status_row:?}");
     }
 
     /// When the minibuffer is open, the status row must show <prompt><text>.

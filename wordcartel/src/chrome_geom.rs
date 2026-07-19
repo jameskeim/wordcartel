@@ -92,6 +92,35 @@ pub(crate) fn palette_overlay_rect(area: Rect, row_count: usize) -> Rect {
     Rect::new(ov_x, ov_y, ov_w, ov_h)
 }
 
+/// Bounding rect for a prompt's `detail` disclosure box, or `None` when there is no room
+/// (or nothing to show). The box is horizontally sized and centred exactly like
+/// `palette_overlay_rect` — same width ladder, same centring — but is **bottom-anchored so
+/// its lower border sits immediately above `status_row`**, because the prompt's question and
+/// choices stay on the status row itself (spec §5.3 as amended by C5 §11.3).
+///
+/// Height is `lines + 2` (the two borders), **clamped to the rows actually available above
+/// the status row**. That clamp is what makes the box safe on a short terminal: it can never
+/// grow past the frame, never overlap the status row it is disclosing for, and — since a
+/// prompt with more `detail` than fits is truncated rather than expanded — never push the
+/// choices off-screen. `None` is returned rather than a degenerate rect whenever fewer than
+/// three rows are free (two borders plus at least one line of content) or the width ladder
+/// cannot yield an interior, so callers have no zero-sized rect to paint into.
+pub(crate) fn prompt_detail_rect(area: Rect, status_row: u16, lines: usize) -> Option<Rect> {
+    if lines == 0 { return None; }
+    // Rows strictly above the status row and inside `area`. `checked_sub` (not saturating)
+    // because a status row above `area.y` means the caller's geometry is nonsense, not that
+    // the box should be pinned to the top.
+    let avail = status_row.checked_sub(area.y)?;
+    if avail < 3 { return None; }
+    let ov_w = palette_overlay_rect(area, lines).width;
+    if ov_w < 3 { return None; } // two borders plus at least one interior column
+    // `avail >= 3` ⇒ `body >= 1` and `ov_h <= avail`, so `status_row - ov_h >= area.y`.
+    let body = u16::try_from(lines).unwrap_or(u16::MAX).min(avail - 2);
+    let ov_h = body + 2;
+    let ov_x = area.x.saturating_add((area.width.saturating_sub(ov_w)) / 2);
+    Some(Rect::new(ov_x, status_row - ov_h, ov_w, ov_h))
+}
+
 /// Return the zero-based list row index that `(col, row)` hits, or `None`.
 /// The list starts at `ov_y + 2` and has at most `palette.rows.len()` entries.
 /// Returns an ABSOLUTE row index (accounting for `scroll_top`).
@@ -361,6 +390,55 @@ pub(crate) fn search_field_click(area: Rect, s: &crate::search_overlay::SearchSt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- prompt_detail_rect ------------------------------------------------------
+
+    #[test]
+    fn prompt_detail_rect_sits_directly_above_the_status_row_and_shares_the_overlay_width() {
+        let area = Rect::new(0, 0, 80, 24);
+        let r = prompt_detail_rect(area, 23, 5).expect("ample room");
+        assert_eq!(r.y + r.height, 23,
+            "the box's bottom border sits immediately above the status row, never on it");
+        assert_eq!(r.height, 7, "5 lines plus two borders");
+        assert_eq!(r.width, palette_overlay_rect(area, 5).width,
+            "same width ladder as every other overlay box");
+        assert_eq!(r.x, palette_overlay_rect(area, 5).x, "and the same centring");
+    }
+
+    #[test]
+    fn prompt_detail_rect_is_none_when_there_is_nothing_to_show() {
+        assert_eq!(prompt_detail_rect(Rect::new(0, 0, 80, 24), 23, 0), None);
+    }
+
+    #[test]
+    fn prompt_detail_rect_clamps_to_the_rows_above_the_status_row() {
+        // A 7-line detail on a 7-row terminal: the status row is row 6, leaving 6 rows, so
+        // the box may occupy at most 4 content rows. It must SHRINK, never overlap the
+        // status row and never grow past the top of the frame.
+        let area = Rect::new(0, 0, 80, 7);
+        let r = prompt_detail_rect(area, 6, 7).expect("four rows still fit");
+        assert_eq!(r.height, 6, "clamped to the six rows above the status row");
+        assert_eq!(r.y, 0, "and pinned at the top of the frame, not above it");
+        assert_eq!(r.y + r.height, 6);
+    }
+
+    #[test]
+    fn prompt_detail_rect_refuses_degenerate_geometry_rather_than_returning_a_bad_rect() {
+        // Fewer than three free rows cannot hold two borders and a line of content; a
+        // zero-height box would be a painter's out-of-bounds waiting to happen.
+        for (w, h, status_row) in [(80u16, 3u16, 2u16), (80, 2, 1), (80, 1, 0), (1, 24, 23)] {
+            let area = Rect::new(0, 0, w, h);
+            let got = prompt_detail_rect(area, status_row, 5);
+            if let Some(r) = got {
+                assert!(r.width >= 3 && r.height >= 3, "{w}x{h}: no degenerate rect: {r:?}");
+                assert!(r.y + r.height <= status_row, "{w}x{h}: never over the status row");
+                assert!(r.x + r.width <= w, "{w}x{h}: never past the right edge");
+            }
+        }
+        // A status row above the area's own origin is nonsense geometry, not a reason to
+        // pin the box to the top: refuse it.
+        assert_eq!(prompt_detail_rect(Rect::new(0, 10, 80, 14), 4, 3), None);
+    }
 
     /// palette_overlay_rect sizes height to the actual row count, not fixed-15.
     #[test]

@@ -998,8 +998,15 @@ mod tests {
     /// way to learn which document was holding it open — so the modal NAMES the kept orphans
     /// and says why. Nothing about the deletion set changes.
     ///
-    /// FAIL-VERIFY: drop the `kept` block from `Prompt::clean_recovery`'s message, watch the
-    /// realpath assertion fail. Confirmed, then restored.
+    /// This guard asserts on the **drawn screen**, not on the prompt struct. Its previous form
+    /// checked `p.message` and passed for weeks while production rendered that message into the
+    /// single status ROW, truncated at the terminal width — so no realpath and no age ever
+    /// reached anyone (C5 review finding C1). A disclosure test that never renders cannot tell
+    /// a delivered disclosure from a composed one.
+    ///
+    /// FAIL-VERIFY: drop the `kept` block from `Prompt::clean_recovery`, or make
+    /// `render_overlays::paint_prompt_detail` return before painting — watch the realpath
+    /// assertion fail. Confirmed, then restored.
     #[test]
     fn the_clean_recovery_modal_names_kept_recoverable_files() {
         use crate::editor::Editor;
@@ -1038,12 +1045,31 @@ mod tests {
 
         crate::prompts::open_clean_recovery(&mut e, &crate::fsx::RealFs, &TestClock(0));
 
-        let p = e.prompt.as_ref().expect("a confirm prompt is raised");
+        assert!(e.prompt.is_some(), "a confirm prompt is raised");
         let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
-        assert!(p.message.contains(&real_bad),
-            "the modal must NAME the kept file by its recorded realpath: {:?}", p.message);
-        assert!(p.message.to_lowercase().contains("unsaved work"),
-            "and say why it is being kept: {:?}", p.message);
+
+        // Render the REAL frame and read the disclosure off the cell grid. 120 columns keeps
+        // the box interior (the `palette_overlay_rect` width ladder caps at 80, so 78 columns
+        // of text) wider than this fixture's path, so an assertion failure means the
+        // disclosure is missing — not merely elided.
+        crate::derive::rebuild(&mut e);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+            .expect("test terminal");
+        term.draw(|f| crate::render::render(f, &mut e)).expect("draw");
+        let screen = {
+            let buf = term.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>().join("\n")
+        };
+        assert!(real_bad.chars().count() + 20 < 78,
+            "test fixture precondition: the path must fit the box interior unelided: {real_bad}");
+        assert!(screen.contains(&real_bad),
+            "the modal must NAME the kept file by its recorded realpath, ON SCREEN:\n{screen}");
+        assert!(screen.to_lowercase().contains("unsaved work"),
+            "and say why it is being kept:\n{screen}");
+        assert!(screen.contains("(written "),
+            "and how old it is — the writer's basis for acting on it:\n{screen}");
         assert!(!e.pending_clean.contains(&sp_bad),
             "the diverged swap is NEVER queued for deletion — the no-data-loss guarantee");
         assert!(e.pending_clean.contains(&sp_ok), "the valueless one still is");

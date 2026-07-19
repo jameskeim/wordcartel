@@ -401,6 +401,66 @@ fn elide_path_left(line: &str, width: usize) -> String {
     format!("\u{2026}{tail}")
 }
 
+/// Paint a prompt's `detail` disclosure box directly above the status row.
+///
+/// **Not an `OVERLAYS`-table painter.** The prompt's row in `overlays.rs` is, and stays,
+/// `RenderSite::StatusRow`: its question and choices are painted on the status row by
+/// `render::paint_status`, which calls this at the end of its own pass. The box is body
+/// painted *for* that one overlay, not a second render site — `RenderSite` keeps its
+/// single-valued axis and H21's render-coverage test is untouched (spec §5.3 as amended by
+/// C5 §11.3).
+///
+/// A prompt with an **empty `detail` paints nothing at all**, so every prompt that has no
+/// disclosure renders exactly as it did before this seam existed.
+///
+/// Degenerate geometry is handled by refusing to paint rather than by clamping into a
+/// zero-sized rect: `prompt_detail_rect` returns `None` when fewer than three rows are free
+/// above the status row. When the box is shorter than `detail`, the last visible row becomes
+/// an `…and N more` count so a truncated disclosure announces itself instead of just
+/// stopping.
+///
+/// **Which end a too-long line loses depends on its indent**, and the rule is the same one
+/// the eye already reads off the box: a **flush-left line is a heading** (`Keeping 18 that
+/// may hold unsaved work:`) whose meaning is at its START, so it truncates on the right; an
+/// **indented line is an item** — path-shaped, with the filename and the trailing age at its
+/// END — so it elides from the LEFT via `elide_path_left`. Eliding a heading from the left
+/// produced the observed `…ng 18 that may hold unsaved work:` on a 60-column terminal.
+pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Prompt,
+    area: Rect, status_row: u16, cs: &ChromeStyles)
+{
+    let lines = &prompt.detail;
+    let Some(ov_rect) = crate::chrome_geom::prompt_detail_rect(area, status_row, lines.len())
+    else { return };
+
+    frame.render_widget(Clear, ov_rect);
+    frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).border_style(cs.overlay_border),
+        ov_rect,
+    );
+
+    let inner_w = ov_rect.width.saturating_sub(2) as usize;
+    let body_h = ov_rect.height.saturating_sub(2) as usize;
+    for (i, row) in (0..body_h).enumerate() {
+        // The final visible row turns into a count when the box could not hold the rest.
+        let text = if body_h < lines.len() && i + 1 == body_h {
+            format!("\u{2026}and {} more", lines.len() - body_h + 1)
+        } else {
+            lines[i].clone()
+        };
+        let fitted = if text.starts_with(' ') {
+            elide_path_left(&text, inner_w)          // item: keep the filename and the age
+        } else {
+            text.chars().take(inner_w).collect()     // heading: keep the opening words
+        };
+        let y = ov_rect.y + 1 + row as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
+            Rect::new(ov_rect.x + 1, y, inner_w as u16, 1),
+        );
+    }
+}
+
 pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
     let h = area.height;
