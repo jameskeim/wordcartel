@@ -148,10 +148,34 @@ pub(crate) fn classify_enter(e: &FileEntry, dir: &std::path::Path) -> EnterOutco
 /// Shows the POST-POLICY name so the `.md` that policy appends is visible before commit, and
 /// the RESOLVED path when a symlink changed it — resolution should be visible up front, not
 /// discovered in a confirm dialog.
+///
+/// MUST agree with what Enter actually does, so this calls `classify_destination_enter` — the
+/// SAME decision table Enter consults (or will, once Task 21 wires it live) — rather than
+/// re-deriving "will this write" from `apply_extension_policy` alone. Without this, a field
+/// naming an EXISTING directory (row 3 of the table) would fall straight into the write-path
+/// branches below and the footer would confidently state a destination Enter will never reach
+/// — Enter descends there instead, creating nothing.
 pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option<String> {
     let BrowseMode::Destination { field, purpose, .. } = &fb.mode else { return None };
     if field.trim().is_empty() { return None; }
-    let typed = crate::file_browser_commit::resolve_field(&fb.dir, field);
+    let highlighted = fb.entries.get(fb.selected);
+    let typed = match crate::file_browser_commit::classify_destination_enter(fs, &fb.dir, field, highlighted) {
+        // Rows 1 and 3 — Enter descends, it does not write. Say so plainly rather than
+        // showing a would-be write target that Enter will never produce.
+        crate::file_browser_commit::CommitOutcome::Descend(target) => {
+            return Some(format!(
+                "\u{2192} {}{} \u{2014} an existing directory; Enter opens it, nothing is written",
+                target.display(), std::path::MAIN_SEPARATOR));
+        }
+        // Row 2 with no eligible highlighted file, or an empty field with nothing to fall
+        // back on — Enter is inert. The `field.trim().is_empty()` guard above already
+        // excludes the only way this arm is reachable, but the match stays exhaustive so a
+        // future change to the table cannot silently grow a fifth, unhandled case.
+        crate::file_browser_commit::CommitOutcome::Nothing => return None,
+        // Row 4 (the ordinary case) or row 2's explicit overwrite — a genuine write target,
+        // continue through the extension policy exactly as before.
+        crate::file_browser_commit::CommitOutcome::Commit(path) => path,
+    };
     // An export destination's extension is fixed by the format — policy does not apply.
     let after_policy = if matches!(purpose, DestinationPurpose::Export { .. }) {
         typed
@@ -808,6 +832,130 @@ mod tests {
                 "the footer names the RESOLVED write target, not the link the writer typed: {line}");
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn footer_shows_a_descend_not_a_write_for_a_field_naming_an_existing_directory() {
+        // CRITICAL — Row 3 of `classify_destination_enter`. A bare field that names an
+        // EXISTING directory makes Enter descend into it, not create a file beside it. The
+        // footer must say so plainly rather than showing `.../chapter-one.md`, a destination
+        // Enter will never write to.
+        //
+        // FAIL-VERIFY: comment out the Row-3 directory check in
+        // `file_browser_commit::classify_destination_enter` (so Row 4 always wins), rerun —
+        // this fails, asserting the confidently-false `.../chapter-one.md` write target
+        // instead. Confirmed, then restored.
+        let d = std::env::temp_dir().join(format!("wc-footer-descend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("chapter-one")).expect("seed dir");
+        let fb = FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: "chapter-one".into(), field_cursor: 11,
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
+        assert!(line.contains(&d.join("chapter-one").display().to_string()),
+            "names the directory Enter will actually descend into: {line}");
+        assert!(!line.contains(".md"), "must NOT claim a `.md` file will be written: {line}");
+        assert!(line.contains("directory") && line.contains("nothing is written"),
+            "must say Enter descends and writes nothing: {line}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn footer_shows_the_redirect_note_for_an_output_extension() {
+        // IMPORTANT 3 — the `Redirect` branch had no assertion; the reviewer hand-verified it.
+        let d = std::env::temp_dir().join(format!("wc-footer-redirect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let fb = FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: "book.docx".into(), field_cursor: 9,
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
+        assert!(line.contains(&d.join("book.docx").display().to_string()),
+            "the redirect note carries the typed path forward: {line}");
+        assert!(line.contains("docx is an export format"), "names the reason: {line}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn footer_shows_the_refused_note_for_a_trailing_separator() {
+        // IMPORTANT 3 — the `Refused` branch had no assertion; the reviewer hand-verified it.
+        // No directory named `sub` actually exists here, so Row 3 does not intercept this —
+        // it falls through to Row 4 and `apply_extension_policy` sees the trailing separator.
+        let d = std::env::temp_dir().join(format!("wc-footer-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let fb = FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: "sub/".into(), field_cursor: 4,
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
+        assert!(line.contains("sub"), "names the field as typed: {line}");
+        assert!(line.contains("names a directory, not a file"), "names the reason: {line}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn footer_shows_the_broken_symlink_note() {
+        // IMPORTANT 3 — the `BrokenSymlink` branch had no assertion; the reviewer
+        // hand-verified it. The target of `dangling.md` never exists, so `resolve_write_destination`
+        // must refuse rather than silently offer to write through it.
+        let d = std::env::temp_dir().join(format!("wc-footer-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        std::os::unix::fs::symlink(d.join("nowhere.md"), d.join("dangling.md")).expect("symlink");
+        let fb = FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: "dangling.md".into(), field_cursor: 11,
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
+        assert!(line.contains(&d.join("dangling.md").display().to_string()),
+            "names the broken link itself, not a made-up target: {line}");
+        assert!(line.contains("symlink cannot be resolved"), "names the reason: {line}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn footer_is_absent_for_a_whitespace_only_field() {
+        // MINOR — `field.trim().is_empty()` already handles this; pin it so a future change
+        // to the guard can't silently start showing a footer for pure whitespace.
+        let fb = FileBrowser {
+            dir: std::env::temp_dir(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs, field: "   ".into(), field_cursor: 3,
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(),
+            "a whitespace-only field is empty, and names no target");
     }
 
     #[test]

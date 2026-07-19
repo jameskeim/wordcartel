@@ -15,7 +15,7 @@ use crate::{
     render::ChromeStyles,
     chrome_geom::{
         menu_bar_layout, menu_bar_layout_cats, menu_dropdown_rect,
-        palette_overlay_rect, windowed_indicator, file_browser_list_h,
+        palette_overlay_rect, windowed_indicator, file_browser_list_h, file_browser_overlay_rect,
     },
 };
 
@@ -382,6 +382,25 @@ pub(crate) fn paint_cursor_picker(frame: &mut Frame, editor: &mut Editor, cs: &C
     }
 }
 
+/// Truncate a footer PATH to `width` columns from the LEFT, preserving the TAIL and marking
+/// the elision — the opposite of the `.chars().take(n)` right-truncation used elsewhere in this
+/// file for query/list text.
+///
+/// A path's highest-value component is its filename, which sits at the far RIGHT; the leading
+/// directories are the most expendable part. Right-truncating (as this footer briefly did)
+/// silently drops the filename — the one piece of the "where will this land" disclosure that
+/// matters most, and the whole reason the footer exists. `width == 0` yields nothing; `width ==
+/// 1` yields the marker alone, since even one column of real path text plus a marker cannot fit.
+fn elide_path_left(line: &str, width: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= width { return line.to_string(); }
+    if width == 0 { return String::new(); }
+    if width == 1 { return "\u{2026}".to_string(); }
+    let keep = width - 1; // reserve one column for the leading "…" marker
+    let tail: String = chars[chars.len() - keep..].iter().collect();
+    format!("\u{2026}{tail}")
+}
+
 pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
     let h = area.height;
@@ -394,14 +413,15 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         crate::app::keep_overlay_visible(h, fb.selected, fb.entries.len(), &mut fb.scroll_top);
     }
     if let Some(ref fb) = editor.file_browser {
-        let ov_rect = palette_overlay_rect(area, fb.entries.len());
+        // Sizes the box to CONTENT — but reserves a row for the resolved-target footer when
+        // one is showing, even for a listing too small to otherwise need it (an empty or
+        // freshly created directory). Single-sourced with `chrome_geom::file_browser_row_at`
+        // so hit-testing can never disagree with what gets painted here (the A21 hazard).
+        let ov_rect = file_browser_overlay_rect(area, fb);
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        // The RAW row budget (before the footer's reservation) — used only to decide
-        // whether a dedicated footer row exists at all (see `dedicated_footer_row` below).
-        let raw_list_h = crate::list_window::list_h_for(fb.entries.len(), h);
         // The list's ACTUAL row budget — single-sourced with `chrome_geom::file_browser_row_at`
         // so hit-testing can never disagree with what gets painted here (the A21 hazard).
         let list_h = file_browser_list_h(area, fb) as usize;
@@ -411,12 +431,15 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         // exists). `None` in select mode or with an empty field. Rendered against the real
         // filesystem — this is a read-only display probe, not a fault-injectable write path.
         let footer = crate::file_browser::footer_target(&crate::fsx::RealFs, fb);
-        // A dedicated content row exists for the footer only when the box has room for one
-        // (raw_list_h > 0 — i.e. `list_h_for` already reserved at least one interior row before
-        // the footer's own reservation ran). In a terminal too cramped for that, the footer
-        // takes over the block's bottom-edge TITLE instead of losing to `windowed_indicator` —
-        // the safety disclosure wins the one available edge over navigational polish.
-        let dedicated_footer_row = footer.is_some() && raw_list_h > 0;
+        // A dedicated content row exists for the footer only when the BOX (sized above,
+        // reservation included) actually has room for one — `ov_h >= 4` is exactly the guard
+        // the rendering below already uses to enter the interior-content branch. Gating on the
+        // TERMINAL'S available height (via `file_browser_overlay_rect`) rather than on how many
+        // entries the directory happens to contain is the point: an empty directory on an
+        // ordinary terminal must still get the dedicated row, not the cramped border-title
+        // fallback. Only a genuinely tiny terminal (one `file_browser_overlay_rect` cannot grow
+        // past, however small the content) falls back to the title.
+        let dedicated_footer_row = footer.is_some() && ov_h >= 4;
         let footer_takes_title = footer.is_some() && !dedicated_footer_row;
 
         frame.render_widget(Clear, ov_rect);
@@ -429,7 +452,7 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
             // save-to-nowhere — wins the block's bottom edge over the n/total indicator,
             // which is mere navigational polish.
             if let Some(ref line) = footer {
-                let truncated: String = line.chars().take(ov_w.saturating_sub(2) as usize).collect();
+                let truncated = elide_path_left(line, ov_w.saturating_sub(2) as usize);
                 block = block.title_bottom(Line::from(truncated));
             }
         } else if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
@@ -489,7 +512,7 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
                 if let Some(ref line) = footer {
                     let footer_row = ov_y + 2 + list_h as u16;
                     let footer_area = Rect::new(ov_x + 1, footer_row, ov_w.saturating_sub(2), 1);
-                    let truncated: String = line.chars().take(footer_area.width as usize).collect();
+                    let truncated = elide_path_left(line, footer_area.width as usize);
                     frame.render_widget(
                         Paragraph::new(Line::from(Span::styled(truncated, cs.ov_query))),
                         footer_area,
@@ -685,5 +708,97 @@ pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyl
                 &mut list_state,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+    use crate::file_browser::{BrowseMode, DestinationPurpose, FileBrowser};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn row_text(term: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area().width;
+        (0..w).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    fn empty_destination_fb(dir: std::path::PathBuf, field: &str) -> FileBrowser {
+        FileBrowser {
+            dir, query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: field.into(), field_cursor: field.len(),
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        }
+    }
+
+    // ---- `elide_path_left` ---------------------------------------------------------
+
+    #[test]
+    fn elide_path_left_keeps_the_tail_and_marks_the_elision() {
+        let long = "/home/writer/projects/my-book/drafts-v2/chapter one.md";
+        let got = elide_path_left(long, 24);
+        assert_eq!(got.chars().count(), 24, "fits exactly in the given width: {got}");
+        assert!(got.starts_with('\u{2026}'), "the elision is marked with a leading ellipsis: {got}");
+        assert!(got.ends_with("chapter one.md"),
+            "the FILENAME — the highest-value part of the path — survives: {got}");
+        assert!(!got.contains("home"),
+            "the leading, most-expendable directories are what's dropped, not the tail: {got}");
+    }
+
+    #[test]
+    fn elide_path_left_is_a_no_op_when_it_already_fits() {
+        assert_eq!(elide_path_left("short.md", 40), "short.md");
+    }
+
+    #[test]
+    fn elide_path_left_degenerate_widths_never_panic() {
+        assert_eq!(elide_path_left("anything", 0), "", "zero columns show nothing");
+        assert_eq!(elide_path_left("anything", 1), "\u{2026}", "one column shows only the marker");
+    }
+
+    // ---- the height, not the listing size, gates the cramped fallback -------------
+
+    #[test]
+    fn an_empty_listing_still_gets_a_dedicated_footer_row_on_an_ordinary_terminal() {
+        // IMPORTANT 2 — `footer_takes_title` used to be gated on the LISTING's size
+        // (`list_h_for(fb.entries.len(), h)`), so a listing with zero entries — a freshly
+        // created, still-empty project folder; a listing that has not arrived yet — forced
+        // the footer into the cramped border-title path REGARDLESS of how spacious the
+        // terminal actually was. An 80x24 terminal has ample room for a dedicated row.
+        //
+        // FAIL-VERIFY: revert `dedicated_footer_row` to `footer.is_some() && raw_list_h > 0`
+        // where `raw_list_h = list_window::list_h_for(fb.entries.len(), h)` (the pre-fix
+        // form), watch this fail — the footer text lands in the title row instead of its own
+        // dedicated row. Confirmed, then restored.
+        let dir = std::env::temp_dir().join(format!("wc-render-empty-{}", std::process::id()));
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.file_browser = Some(empty_destination_fb(dir.clone(), "new-chapter"));
+        crate::derive::rebuild(&mut e);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = {
+            let fb = e.file_browser.as_ref().expect("open");
+            crate::chrome_geom::file_browser_overlay_rect(area, fb)
+        };
+        assert!(ov_rect.height >= 4,
+            "precondition: the box must grow to hold a dedicated footer row on this terminal");
+        let title_row = ov_rect.y + ov_rect.height - 1;
+        // list_h is 0 for an empty listing, so the dedicated row sits right after the query row.
+        let footer_row = ov_rect.y + 2;
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).unwrap();
+
+        assert!(row_text(&term, footer_row).contains("new-chapter.md"),
+            "the footer text must land in its OWN dedicated row: {:?}", row_text(&term, footer_row));
+        assert!(!row_text(&term, title_row).contains("new-chapter"),
+            "and must NOT be squeezed into the border title instead: {:?}", row_text(&term, title_row));
     }
 }

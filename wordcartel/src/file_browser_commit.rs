@@ -8,7 +8,10 @@ use crate::file_browser::FileEntry;
 use crate::fsx::{EntryKind, Fs};
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode Enter/commit path; forward reference
+/// What Enter/the footer preview should do with the current field + highlighted entry.
+/// `file_browser::footer_target` calls `classify_destination_enter` directly so the footer can
+/// never state a destination Enter will not actually reach — Task 21 additionally wires this
+/// into the LIVE Enter/commit path (`Commit`/`Descend` are not yet actioned there).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CommitOutcome {
     Descend(PathBuf),
@@ -42,7 +45,10 @@ pub(crate) fn resolve_field(dir: &Path, field: &str) -> PathBuf {
 /// | 2 | field empty AND highlighted entry is a file | Commit to that file |
 /// | 3 | field resolves to an EXISTING directory     | Descend into it     |
 /// | 4 | otherwise                                   | Commit dir + field  |
-#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode Enter path; forward reference
+///
+/// The sole source of truth for "what will Enter do" — `file_browser::footer_target` calls this
+/// directly so the resolved-target footer can never state a destination Enter will not actually
+/// reach (a bare field naming an EXISTING directory must be shown as a descend, never a write).
 pub(crate) fn classify_destination_enter(
     fs: &dyn Fs,
     dir: &Path,

@@ -163,10 +163,34 @@ pub(crate) fn file_browser_list_h(area: Rect, fb: &crate::file_browser::FileBrow
     raw.saturating_sub(reserved) as u16
 }
 
+/// The file browser's overlay box — like `palette_overlay_rect`, but ALSO reserves height for
+/// the resolved-target footer row when one is showing.
+///
+/// `palette_overlay_rect(area, fb.entries.len())` sizes the box to content alone. For a small
+/// or empty listing (a freshly created, still-empty project folder; a listing that has not
+/// arrived yet) that leaves NO slack for the footer's own row, so the painter fell back to the
+/// cramped border-title footer regardless of how much room the TERMINAL actually had — the
+/// fallback was gated on what the directory happened to contain, not on the space available.
+/// Reserving a row here whenever the footer wants one — capped by the SAME `list_h_for` the
+/// painter already uses, so a genuinely tiny terminal still degrades correctly — fixes that at
+/// the one place both the painter and the hit-test below read the box height from.
+///
+/// Single-sourced with the hit-test (`file_browser_row_at`/`file_browser_row_origin`) so the
+/// two can never disagree on where the box's bottom edge is (the A21 hazard).
+pub(crate) fn file_browser_overlay_rect(area: Rect, fb: &crate::file_browser::FileBrowser) -> Rect {
+    let raw = crate::list_window::list_h_for(fb.entries.len(), area.height);
+    // `file_browser_list_h` already reserves one of these rows for the footer when it can;
+    // growing the box is only needed when the content itself would otherwise leave zero rows
+    // for it (`raw == 0`) — content that already fills or exceeds the budget just lends the
+    // footer one of its own rows, unchanged from before this fix.
+    let box_row_budget = if file_browser_has_footer_row(fb) { raw.max(1) } else { raw };
+    palette_overlay_rect(area, box_row_budget)
+}
+
 /// Return the absolute list-row index that `(col, row)` hits in the file browser,
 /// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
 pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrowser, col: u16, row: u16) -> Option<usize> {
-    let r = palette_overlay_rect(area, fb.entries.len());
+    let r = file_browser_overlay_rect(area, fb);
     let list_top = r.y.saturating_add(2);
     let list_h = file_browser_list_h(area, fb);
     if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
@@ -181,7 +205,7 @@ pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrow
 /// duplicating the geometry.
 #[allow(dead_code)] // test-only today — no production caller needs the inverse of the hit-test
 pub(crate) fn file_browser_row_origin(area: Rect, fb: &crate::file_browser::FileBrowser, row_index: usize) -> (u16, u16) {
-    let r = palette_overlay_rect(area, fb.entries.len());
+    let r = file_browser_overlay_rect(area, fb);
     let list_top = r.y.saturating_add(2);
     (r.x.saturating_add(1), list_top + row_index as u16)
 }
