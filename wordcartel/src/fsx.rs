@@ -712,18 +712,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn is_file_via_rejects_a_fifo_and_a_dir() {
+    fn is_file_via_rejects_a_socket_and_a_dir() {
         // `!is_dir` is NOT "regular file". config_layer_paths, plugin discovery, and the
-        // clipboard PATH search all ask `is_file()`, and a fifo answering `true` would turn
-        // "skip it" into a blocking read.
-        // MUST create a real fifo. Without one, `is_file_via` implemented as `!st.is_dir` —
-        // the exact defect this test's own comment warns about — passes every assertion
-        // (file→true, dir→false, missing→Err→false). The fifo is the only case that separates
-        // the two implementations.
+        // clipboard PATH search all ask `is_file()`, and a special file answering `true` would
+        // turn "skip it" into a blocking read.
+        // MUST create a real filesystem entry that is neither a regular file nor a directory.
+        // Without one, `is_file_via` implemented as `!st.is_dir` — the exact defect this test's
+        // own comment warns about — passes every assertion (file→true, dir→false,
+        // missing→Err→false). That third kind of entry is the only case that separates the two
+        // implementations.
         //
         // FAIL-VERIFY: implement `is_file_via` as `matches!(fs.stat(p), Ok(st) if !st.is_dir)`,
-        // watch the fifo assertion fail.
-        let d = unique_dir("isfile-fifo");
+        // watch the socket assertion fail.
+        let d = unique_dir("isfile-socket");
         let f = d.join("plain.txt");
         std::fs::write(&f, b"x").expect("seed");
         assert!(is_file_via(&RealFs, &f), "regular file");
@@ -731,19 +732,22 @@ mod tests {
         assert!(!is_file_via(&RealFs, &d.join("absent")), "a missing path is false, not an error");
         #[cfg(unix)]
         {
-            let fifo = d.join("pipe");
-            // DEVIATION from the brief's literal `unsafe { libc::mkfifo(...) }`: this crate's
-            // `#![forbid(unsafe_code)]` (wordcartel/src/lib.rs:1) makes that block a hard
-            // compile error, and `forbid` cannot be locally overridden with `#[allow(...)]`.
-            // `nix::unistd::mkfifo` is a SAFE wrapper around the identical syscall (nix 0.29 is
-            // already in the lock transitively; added as a direct dev-dependency under `[fs]`
-            // feature) — same mandatory, non-skippable fifo creation the brief calls for, none
-            // of this crate's unsafe code.
-            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o644))
-                .expect("mkfifo must succeed — this IS the guard, not an optional extra");
-            assert!(!is_file_via(&RealFs, &fifo),
-                "a FIFO is NOT a regular file — the one assertion an `!is_dir` implementation \
+            let sock_path = d.join("sock");
+            // A Unix domain socket, like a fifo, is neither a regular file nor a directory —
+            // exactly the property under test — but `std::os::unix::net::UnixListener::bind`
+            // creates one with zero `unsafe` and zero new dependencies (this effort's C5
+            // standing constraint is zero new deps; a fifo would need `libc::mkfifo`, which
+            // needs `unsafe` this crate's `#![forbid(unsafe_code)]` rules out, or a `nix` dev-
+            // dependency this effort chose not to add). Bind it to a variable and keep it alive
+            // for the duration of the assertion below — dropping the listener can unlink the
+            // socket file on some platforms, which would turn this into a "missing path" case
+            // instead of the "special file" case the test needs.
+            let listener = std::os::unix::net::UnixListener::bind(&sock_path)
+                .expect("bind must succeed — this IS the guard, not an optional extra");
+            assert!(!is_file_via(&RealFs, &sock_path),
+                "a socket is NOT a regular file — the one assertion an `!is_dir` implementation \
                  fails, and the reason this test exists");
+            drop(listener);
         }
         let _ = std::fs::remove_dir_all(&d);
     }

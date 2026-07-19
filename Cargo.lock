@@ -6524,7 +6524,6 @@ dependencies = [
  "dirs 5.0.1",
  "lsp-types",
  "mlua",
- "nix",
  "nucleo-matcher",
  "proptest",
  "ratatui",
