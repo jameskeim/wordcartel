@@ -2796,7 +2796,7 @@ mod tests {
         let first_list_row = rect.y + 2;
         let row_text = row_string(&buf, first_list_row);
         let entry = &e.file_browser.as_ref().unwrap().entries[scroll_top];
-        let expected = if entry.is_dir { format!("{}/", entry.name) } else { entry.name.clone() };
+        let expected = if matches!(entry.kind, crate::fsx::EntryKind::Dir) { format!("{}/", entry.name) } else { entry.name.clone() };
         assert!(row_text.contains(expected.as_str()),
             "first visible row must be entries[{scroll_top}] = {expected:?}, got: {row_text:?}");
         // Indicator present.

@@ -566,6 +566,12 @@ pub struct Editor {
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
     /// File browser overlay state. XOR with all other overlays.
     pub file_browser: Option<crate::file_browser::FileBrowser>,
+    /// File-browser clutter filter (dotfiles + VCS dirs hidden by default). Task 23 adds
+    /// the setter/command/persistence; this task just seeds the field and consumes it.
+    pub files_show_clutter: bool,
+    /// File-browser type filter (Documents by default). Task 23 adds the setter/command/
+    /// persistence; this task just seeds the field and consumes it.
+    pub files_type_filter: crate::config::FileTypeFilter,
     /// Caret-shape picker overlay state (C1 T6 field/stub; T7 fills in the picker's
     /// logic). XOR with all other overlays.
     pub cursor_picker: Option<crate::cursor_picker::CursorPicker>,
@@ -686,6 +692,8 @@ impl Editor {
             outline: None,
             theme_picker: None,
             file_browser: None,
+            files_show_clutter: false,
+            files_type_filter: crate::config::FileTypeFilter::default(),
             cursor_picker: None,
             splash: None,
             theme: wordcartel_core::theme::default(),
@@ -913,10 +921,18 @@ impl Editor {
     pub fn open_file_browser(&mut self, fs: &dyn crate::fsx::Fs, dir: std::path::PathBuf) {
         crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
+        let opts = crate::file_browser_listing::FilterOpts {
+            show_clutter: self.files_show_clutter,
+            types: self.files_type_filter,
+            destination: false,
+        };
         self.file_browser = Some(crate::file_browser::FileBrowser {
-            dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
+            dir, query: String::new(), listing: Vec::new(), total_seen: 0, unreadable: 0,
+            entries: Vec::new(), disclosure: Default::default(), selected: 0, scroll_top: 0,
         });
-        if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fs, fb); }
+        if let Some(fb) = self.file_browser.as_mut() {
+            crate::file_browser_listing::refetch(fs, fb, opts);
+        }
     }
 
     /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.

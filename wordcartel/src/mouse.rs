@@ -1376,7 +1376,8 @@ mod tests {
             "theme_picker open must block arming");
         assert!(fire(&|e| { e.file_browser = Some(crate::file_browser::FileBrowser {
             dir: std::path::PathBuf::from("."), query: String::new(),
-            entries: vec![], selected: 0, scroll_top: 0,
+            listing: vec![], total_seen: 0, unreadable: 0,
+            entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
         }); }).is_none(), "file_browser open must block arming");
         assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
             "dropdown open must block arming");
@@ -2194,7 +2195,7 @@ mod tests {
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
         e.open_file_browser(&crate::fsx::RealFs, dir.clone());
         let idx = e.file_browser.as_ref().unwrap().entries.iter()
-            .position(|en| en.name == "subdir" && en.is_dir)
+            .position(|en| en.name == "subdir" && matches!(en.kind, crate::fsx::EntryKind::Dir))
             .expect("subdir must appear in entries");
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rect = crate::chrome_geom::palette_overlay_rect(area, e.file_browser.as_ref().unwrap().entries.len());

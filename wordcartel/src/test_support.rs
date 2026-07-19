@@ -174,3 +174,71 @@ impl Fs for FaultFs {
         self.inner.list_dir(path, cap)
     }
 }
+
+// ---------------------------------------------------------------------------
+// File-browser keystroke helpers (C5 Task 12) — reused by Tasks 13-26.
+//
+// Every test claiming a keystroke reaches something must drive the real entry point; a
+// direct call to the handler is the vacuous-guard pattern this plan has had to correct
+// repeatedly. These live here rather than in one task's `mod tests` for two reasons:
+// helpers inside a `#[cfg(test)] mod tests` are not reachable from another module's tests
+// at all, and `test_support` is already the crate's sanctioned home for exactly this
+// (`press`, `key_char`, `install_enabled_harper`).
+//
+// They route through `crate::file_browser::intercept`, the intercept's home as of this
+// task. Task 18 moves the intercept into `file_browser_intercept.rs` and updates this ONE
+// call path — noted there as an explicit step, since every keystroke test in the effort
+// depends on it.
+// ---------------------------------------------------------------------------
+
+/// Drive ANY key through the real intercept, exactly as `reduce` would. `press_char_fb`
+/// and `press_enter_fb` are thin wrappers; tests needing Tab or Esc use this directly.
+pub(crate) fn press_key_fb(e: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    tx: &std::sync::mpsc::Sender<crate::app::Msg>, code: crossterm::event::KeyCode)
+{
+    use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    let reg = crate::registry::Registry::builtins();
+    let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+    let ex = crate::jobs::InlineExecutor::default();
+    let clk = crate::test_support::TestClock(0);
+    let ctx = crate::overlays::DispatchCtx {
+        reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: tx, fs };
+    let ev = Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press, state: KeyEventState::NONE });
+    // Task 18 repoints this to `crate::file_browser_intercept::intercept`.
+    let _ = crate::file_browser::intercept(crate::app::Msg::Input(ev), e, &ctx);
+}
+
+/// One printable character through the intercept.
+pub(crate) fn press_char_fb(e: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    tx: &std::sync::mpsc::Sender<crate::app::Msg>, c: char)
+{ press_key_fb(e, fs, tx, crossterm::event::KeyCode::Char(c)); }
+
+/// Enter through the intercept.
+#[allow(dead_code)] // Task 12 introduces this; Tasks 13-26 are its first callers.
+pub(crate) fn press_enter_fb(e: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    tx: &std::sync::mpsc::Sender<crate::app::Msg>)
+{ press_key_fb(e, fs, tx, crossterm::event::KeyCode::Enter); }
+
+/// True when the process can read a mode-000 directory (root / CAP_DAC_OVERRIDE), which
+/// voids the premise of any chmod-based unreadability test. Tests that would otherwise
+/// assert a false negative skip loudly on this rather than passing vacuously.
+#[allow(dead_code)] // Task 12 introduces this; Tasks 13-26 are its first callers.
+pub(crate) fn nix_privileged() -> bool {
+    let d = std::env::temp_dir().join(format!("wc-priv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    if std::fs::create_dir_all(&d).is_err() { return false; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000));
+        let readable = std::fs::read_dir(&d).is_ok();
+        let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&d);
+        return readable;
+    }
+    #[allow(unreachable_code)] { let _ = std::fs::remove_dir_all(&d); false }
+}

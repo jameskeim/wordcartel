@@ -435,7 +435,7 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
                 let highlight_style = cs.overlay_selected;
                 let end = (fb.scroll_top + list_h).min(fb.entries.len());
                 let items: Vec<ListItem> = fb.entries[fb.scroll_top..end].iter().map(|e| {
-                    let label = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
+                    let label = if matches!(e.kind, crate::fsx::EntryKind::Dir) { format!("{}/", e.name) } else { e.name.clone() };
                     let truncated: String = label.chars().take(list_area.width as usize).collect();
                     ListItem::new(Line::from(truncated))
                 }).collect();

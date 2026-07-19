@@ -120,6 +120,17 @@ pub enum CaretShape { #[default] Default, Block, Beam, Underline }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardProvider { Auto, Native, Osc52, Off }
 
+/// Which file types the picker lists. Two-state rather than a bool so it carries NAMED
+/// states for the `MenuMark::Value` representative and the two set-per-state commands
+/// (command-surface contract, law 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FileTypeFilter {
+    /// What `file::open` can actually open, plus output siblings in destination mode.
+    #[default]
+    Documents,
+    All,
+}
+
 /// Menu bar configuration section.
 #[derive(Debug, Clone)]
 pub struct MenuConfig { pub bar: MenuBarMode }

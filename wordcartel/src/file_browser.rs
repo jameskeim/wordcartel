@@ -9,52 +9,45 @@ use crossterm::event::Event;
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub name: String,
-    pub is_dir: bool,
+    /// RESOLVED classification from the seam. `File`/`Dir` can BOTH be false — a fifo is
+    /// `Other`, an unclassifiable entry is `Unknown`. Consumers match exhaustively on this
+    /// rather than testing "is it a directory", so neither falls into a file branch.
+    pub kind: crate::fsx::EntryKind,
+    pub is_symlink: bool,
+    pub broken: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileBrowser {
     pub dir: PathBuf,
     pub query: String,
+    /// UNFILTERED contents of `dir`, fetched ONCE per directory. The keystroke path filters
+    /// this, never the filesystem — `rebuild_entries` used to re-run `read_dir` on every
+    /// character typed.
+    pub listing: Vec<crate::fsx::DirEntryInfo>,
+    pub total_seen: usize,
+    pub unreadable: usize,
+    /// Derived view: filtered, ranked, with the synthetic "..".
     pub entries: Vec<FileEntry>,
+    /// `pub(crate)`, not `pub`: `Disclosure` is itself `pub(crate)` (an internal cache
+    /// detail), so a `pub` field here would leak a private type through a public struct
+    /// (`private_interfaces`, a build-clean GATE). Every consumer is in-crate.
+    pub(crate) disclosure: crate::file_browser_listing::Disclosure,
     pub selected: usize,
     /// First visible row index — drives the windowed painter (A6).
     pub scroll_top: usize,
 }
 
-/// Rebuild `entries` from `dir`: synthetic ".." first (unless at root), then directories,
-/// then files, each alphabetical; substring-filtered (case-insensitive) by `query`.
-///
-/// Classification comes from the seam, which RESOLVES symlinks — so a symlink to a
-/// directory is a directory here (spec §4.9). `EntryKind::Other` and `Unknown` sort with
-/// files for now; Task 14 gives them their own markers and refusals.
-pub(crate) fn rebuild_entries(fs: &dyn crate::fsx::Fs, fb: &mut FileBrowser) {
-    let q = fb.query.to_ascii_lowercase();
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    if let Ok(listing) = fs.list_dir(&fb.dir, Some(crate::limits::MAX_DIR_ENTRIES)) {
-        for e in listing.entries {
-            if !q.is_empty() && !e.name.to_ascii_lowercase().contains(&q) {
-                continue;
-            }
-            match e.kind {
-                crate::fsx::EntryKind::Dir => dirs.push(e.name),
-                _ => files.push(e.name),
-            }
-        }
+/// The options this browser filters by, derived from the editor's persisted
+/// clutter/type-filter settings. `destination` is always `false` here — every caller in
+/// this task is a select (Open) path; a future destination-mode caller (Save-As, Export)
+/// passes `true` explicitly instead of this helper.
+fn current_filter_opts(editor: &crate::editor::Editor) -> crate::file_browser_listing::FilterOpts {
+    crate::file_browser_listing::FilterOpts {
+        show_clutter: editor.files_show_clutter,
+        types: editor.files_type_filter,
+        destination: false,
     }
-    dirs.sort();
-    files.sort();
-    fb.entries = Vec::new();
-    if fb.dir.parent().is_some() {
-        fb.entries.push(FileEntry { name: "..".into(), is_dir: true });
-    }
-    fb.entries.extend(dirs.into_iter().map(|name| FileEntry { name, is_dir: true }));
-    fb.entries.extend(files.into_iter().map(|name| FileEntry { name, is_dir: false }));
-    if fb.selected >= fb.entries.len() {
-        fb.selected = fb.entries.len().saturating_sub(1);
-    }
-    fb.scroll_top = fb.scroll_top.min(fb.entries.len().saturating_sub(1));
 }
 
 /// Execute the selected file-browser entry — the shared Enter path for the keyboard
@@ -62,7 +55,7 @@ pub(crate) fn rebuild_entries(fs: &dyn crate::fsx::Fs, fb: &mut FileBrowser) {
 /// guarding against unreadable targets, or opens a file through the dirty-guard path.
 pub(crate) fn file_browser_enter(fs: &dyn crate::fsx::Fs, editor: &mut crate::editor::Editor) {
     let chosen = editor.file_browser.as_ref().and_then(|fb| {
-        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+        fb.entries.get(fb.selected).map(|e| (e.name.clone(), matches!(e.kind, crate::fsx::EntryKind::Dir)))
     });
     if let Some((name, is_dir)) = chosen {
         if is_dir {
@@ -78,12 +71,13 @@ pub(crate) fn file_browser_enter(fs: &dyn crate::fsx::Fs, editor: &mut crate::ed
                 // (Some(0): this is a readability probe, not a listing — retention isn't
                 // needed, only whether the directory can be opened at all).
                 if fs.list_dir(&target, Some(0)).is_ok() {
+                    let opts = current_filter_opts(editor);
                     if let Some(fb) = editor.file_browser.as_mut() {
                         fb.dir = target;
                         fb.query.clear();
                         fb.selected = 0;
                         fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
-                        crate::file_browser::rebuild_entries(fs, fb);
+                        crate::file_browser_listing::refetch(fs, fb, opts);
                     }
                 } else {
                     editor.set_status_full(crate::status::StatusKind::Error, format!("cannot read directory: {}", target.display()),
@@ -111,9 +105,10 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     }
     if let Msg::Input(Event::Paste(text)) = &msg {
         let ah = editor.active().view.area.1;
+        let opts = current_filter_opts(editor);
         if let Some(fb) = editor.file_browser.as_mut() {
             fb.query.push_str(text);
-            crate::file_browser::rebuild_entries(&**ctx.fs, fb);
+            crate::file_browser_listing::rederive(fb, opts);
             crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
         }
         return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
@@ -133,9 +128,10 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 }
                 KeyCode::Backspace => {
                     let ah = editor.active().view.area.1;
+                    let opts = current_filter_opts(editor);
                     if let Some(fb) = editor.file_browser.as_mut() {
                         fb.query.pop();
-                        crate::file_browser::rebuild_entries(&**ctx.fs, fb);
+                        crate::file_browser_listing::rederive(fb, opts);
                         crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                     }
                 }
@@ -144,9 +140,10 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
                 {
                     let ah = editor.active().view.area.1;
+                    let opts = current_filter_opts(editor);
                     if let Some(fb) = editor.file_browser.as_mut() {
                         fb.query.push(c);
-                        crate::file_browser::rebuild_entries(&**ctx.fs, fb);
+                        crate::file_browser_listing::rederive(fb, opts);
                         crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                     }
                 }
@@ -163,22 +160,36 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
 mod tests {
     use super::*;
 
+    fn empty_fb(dir: PathBuf) -> FileBrowser {
+        FileBrowser {
+            dir, query: String::new(), listing: vec![], total_seen: 0, unreadable: 0,
+            entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
+        }
+    }
+
+    fn default_opts() -> crate::file_browser_listing::FilterOpts {
+        crate::file_browser_listing::FilterOpts {
+            show_clutter: false, types: crate::config::FileTypeFilter::Documents, destination: false,
+        }
+    }
+
     #[test]
-    fn rebuild_entries_dirs_first_with_dotdot_and_filter() {
+    fn refetch_dirs_first_with_dotdot_and_query_filter() {
         let dir = std::env::temp_dir().join(format!("wc-fb-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("alpha.md"), "x").unwrap();
         std::fs::write(dir.join("beta.txt"), "x").unwrap();
-        let mut fb = FileBrowser { dir: dir.clone(), query: String::new(), entries: vec![], selected: 0, scroll_top: 0 };
-        rebuild_entries(&crate::fsx::RealFs, &mut fb);
+        let mut fb = empty_fb(dir.clone());
+        crate::file_browser_listing::refetch(&crate::fsx::RealFs, &mut fb, default_opts());
         assert_eq!(fb.entries[0].name, "..", "parent first");
         let names: Vec<_> = fb.entries.iter().map(|e| e.name.as_str()).collect();
         let sub_i = names.iter().position(|n| *n == "sub").unwrap();
         let alpha_i = names.iter().position(|n| *n == "alpha.md").unwrap();
         assert!(sub_i < alpha_i, "directories sort before files");
-        fb.query = "alpha".into(); rebuild_entries(&crate::fsx::RealFs, &mut fb);
+        fb.query = "alpha".into();
+        crate::file_browser_listing::rederive(&mut fb, default_opts());
         assert!(fb.entries.iter().any(|e| e.name == "alpha.md"));
-        assert!(!fb.entries.iter().any(|e| e.name == "beta.txt"), "substring filter");
+        assert!(!fb.entries.iter().any(|e| e.name == "beta.txt"), "query filters out non-matching names");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -202,8 +213,7 @@ mod tests {
 
         let mut e = Editor::new_from_text("x\n", None, (40, 12));
         e.open_file_browser(&crate::fsx::RealFs, parent.clone());
-        // Rebuild entries so "secret" appears in the list.
-        if let Some(fb) = e.file_browser.as_mut() { rebuild_entries(&crate::fsx::RealFs, fb); }
+        // open_file_browser already fetched+derived entries; "secret" is in the list.
         // Select the "secret" entry (skip ".." which is index 0).
         if let Some(fb) = e.file_browser.as_mut() {
             let idx = fb.entries.iter().position(|en| en.name == "secret").expect("secret dir in entries");
@@ -258,7 +268,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rebuild_entries_treats_a_symlinked_directory_as_a_directory() {
+    fn refetch_treats_a_symlinked_directory_as_a_directory() {
         // §4.9 REGRESSION. `DirEntry::file_type()` does not follow symlinks, so a symlink to
         // a directory reported is_dir == false: it sorted with FILES, rendered without the
         // trailing '/', and Enter routed it to file::open, which returned "is a directory".
@@ -270,18 +280,72 @@ mod tests {
         std::fs::write(dir.join("plain.md"), b"x").expect("seed file");
         std::os::unix::fs::symlink(dir.join("real_sub"), dir.join("link_sub")).expect("symlink");
 
-        let mut fb = FileBrowser {
-            dir: dir.clone(), query: String::new(), entries: vec![], selected: 0, scroll_top: 0,
-        };
-        rebuild_entries(&crate::fsx::RealFs, &mut fb);
+        let mut fb = empty_fb(dir.clone());
+        crate::file_browser_listing::refetch(&crate::fsx::RealFs, &mut fb, default_opts());
 
         let link = fb.entries.iter().find(|e| e.name == "link_sub").expect("link listed");
-        assert!(link.is_dir, "a symlink to a directory MUST classify as a directory");
+        assert!(matches!(link.kind, crate::fsx::EntryKind::Dir),
+            "a symlink to a directory MUST classify as a directory");
 
         let names: Vec<&str> = fb.entries.iter().map(|e| e.name.as_str()).collect();
         let link_i = names.iter().position(|n| *n == "link_sub").expect("present");
         let file_i = names.iter().position(|n| *n == "plain.md").expect("present");
         assert!(link_i < file_i, "and therefore sorts with the directories, before files");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dominant responsiveness defect: a query keystroke performs no directory read.
+    /// Counted through the seam, not timed — a timing test would be flaky and would not
+    /// fail if someone reintroduced the syscall on a fast disk.
+    #[test]
+    fn a_query_keystroke_performs_no_directory_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingFs { inner: crate::fsx::RealFs, calls: AtomicUsize }
+        impl crate::fsx::Fs for CountingFs {
+            fn create_excl(&self, p: &std::path::Path, m: u32)
+                -> std::io::Result<Box<dyn crate::fsx::WriteSync>> { self.inner.create_excl(p, m) }
+            fn existing_mode(&self, p: &std::path::Path) -> Option<u32> { self.inner.existing_mode(p) }
+            fn rename(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> { self.inner.rename(a, b) }
+            fn sync_dir(&self, d: &std::path::Path) -> std::io::Result<()> { self.inner.sync_dir(d) }
+            fn remove_file(&self, p: &std::path::Path) -> std::io::Result<()> { self.inner.remove_file(p) }
+            fn read_capped(&self, p: &std::path::Path, l: u64) -> std::io::Result<Option<Vec<u8>>> {
+                self.inner.read_capped(p, l)
+            }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> { self.inner.stat(p) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing>
+            {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.list_dir(p, cap)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("wc-fb-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        for n in ["alpha.md", "beta.md", "gamma.md"] {
+            std::fs::write(dir.join(n), b"x").expect("seed");
+        }
+        // Wrapped in an `Arc<CountingFs>` FIRST, then coerced to the trait-object Arc the
+        // intercept needs — both point at the SAME counter, so `counting.calls` still
+        // reads live after the trait-object clone is handed to the keystroke path.
+        let counting = std::sync::Arc::new(CountingFs { inner: crate::fsx::RealFs, calls: AtomicUsize::new(0) });
+        let mut fb = empty_fb(dir.clone());
+        crate::file_browser_listing::refetch(&*counting, &mut fb, default_opts());
+        assert_eq!(counting.calls.load(Ordering::Relaxed), 1, "one fetch on open");
+
+        // Keystrokes go through the REAL intercept — mutating `fb.query` and calling
+        // `rederive` by hand would prove nothing about the path a writer's typing takes, and
+        // would still pass if the intercept re-fetched on every character.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 12));
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::app::Msg>();
+        let fs_arc: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> = counting.clone();
+        e.file_browser = Some(fb);
+        for c in ['a', 'l', 'p'] { crate::test_support::press_char_fb(&mut e, &fs_arc, &tx, c); }
+        assert_eq!(counting.calls.load(Ordering::Relaxed), 1,
+            "THREE keystrokes through the intercept performed ZERO additional list_dir calls");
+        assert!(e.file_browser.as_ref().unwrap().entries.iter().any(|x| x.name == "alpha.md"),
+            "and the filter still works");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

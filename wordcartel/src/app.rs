@@ -4231,7 +4231,7 @@ mod tests {
         assert_eq!(fb.selected, 15, "PgDn must land on index 15 (d14)");
         assert!(fb.scroll_top > 0, "PgDn must advance scroll_top past 0");
         assert_eq!(fb.entries[fb.selected].name, "d14", "selected entry must be d14");
-        assert!(fb.entries[fb.selected].is_dir, "d14 must be a directory");
+        assert!(matches!(fb.entries[fb.selected].kind, crate::fsx::EntryKind::Dir), "d14 must be a directory");
         // Enter → descend into d14. No panic, selected and scroll_top reset.
         crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         let fb = e.file_browser.as_ref().expect("file browser must remain open after descend into dir");
