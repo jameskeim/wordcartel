@@ -56,37 +56,87 @@ fn current_filter_opts(editor: &crate::editor::Editor) -> crate::file_browser_li
     }
 }
 
+/// `ls -F`-style label, composed with the directory slash.
+///
+/// TEXT suffixes, not colours, so they survive terminal-plain / no-color mode — the
+/// project's standing constraint on every affordance.
+pub(crate) fn entry_label(e: &FileEntry) -> String {
+    let slash = if matches!(e.kind, crate::fsx::EntryKind::Dir) { "/" } else { "" };
+    let link = if e.is_symlink { "@" } else { "" };
+    let broken = if e.broken { " (broken)" } else { "" };
+    format!("{}{slash}{link}{broken}", e.name)
+}
+
+/// What Enter does with a selected entry.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnterOutcome {
+    Descend(std::path::PathBuf),
+    Open(std::path::PathBuf),
+    /// Shown, marked, and refused — with the reason, which differs between an unopenable
+    /// special file and an unresolvable entry.
+    Refuse(String),
+}
+
+/// What Enter does with an entry. An exhaustive match on `kind`, so `Other` and `Unknown`
+/// cannot fall into a branch meant for files.
+pub(crate) fn classify_enter(e: &FileEntry, dir: &std::path::Path) -> EnterOutcome {
+    if e.name == ".." {
+        // The LOGICAL parent — `fb.dir` is deliberately not canonicalized, so this returns
+        // where the writer actually came from rather than a symlink target's real parent.
+        return EnterOutcome::Descend(
+            dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.to_path_buf()));
+    }
+    match e.kind {
+        crate::fsx::EntryKind::Dir => EnterOutcome::Descend(dir.join(&e.name)),
+        crate::fsx::EntryKind::File => EnterOutcome::Open(dir.join(&e.name)),
+        // A fifo/socket/device is CLASSIFIED — we know what it is, and we know
+        // `file::open` on it would block. Shown, marked, refused.
+        crate::fsx::EntryKind::Other => EnterOutcome::Refuse(
+            format!("{} cannot be opened — not a regular file", e.name)),
+        // Unclassifiable, including every broken symlink. "cannot be resolved", never
+        // "target is gone": `broken` also covers permission denial and resolution loops.
+        crate::fsx::EntryKind::Unknown => EnterOutcome::Refuse(if e.broken {
+            format!("{} — symlink cannot be resolved", e.name)
+        } else {
+            format!("{} — type could not be determined", e.name)
+        }),
+    }
+}
+
 /// Execute the selected file-browser entry — the shared Enter path for the keyboard
 /// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. "..")
 /// by spawning an off-thread listing (Task 13) — `fb.dir`/`query`/`selected`/`scroll_top`
 /// do NOT move here; they move together in `apply_listing_done`'s success arm, so an
-/// unreadable target costs the writer nothing. Or opens a file through the dirty-guard path.
+/// unreadable target costs the writer nothing. Opens a file through the dirty-guard path.
+/// Refuses `Other`/`Unknown` entries with a status message — shown, marked, refused, never
+/// silently skipped — and leaves the picker open so the writer can pick something else.
 pub(crate) fn file_browser_enter(
+    editor: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
-    editor: &mut crate::editor::Editor,
 ) {
     let chosen = editor.file_browser.as_ref().and_then(|fb| {
-        fb.entries.get(fb.selected).map(|e| (e.name.clone(), matches!(e.kind, crate::fsx::EntryKind::Dir)))
+        fb.entries.get(fb.selected).cloned().map(|e| (e, fb.dir.clone()))
     });
-    if let Some((name, is_dir)) = chosen {
-        if is_dir {
-            let target = editor.file_browser.as_ref().map(|fb| {
-                if name == ".." {
-                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
-                } else {
-                    fb.dir.join(&name)
-                }
-            });
-            if let Some(target) = target {
-                if let Some(fb) = editor.file_browser.as_mut() {
-                    start_listing(fb, target, fs, msg_tx);
-                }
+    let Some((entry, dir)) = chosen else { return };
+    match classify_enter(&entry, &dir) {
+        EnterOutcome::Descend(target) => {
+            if let Some(fb) = editor.file_browser.as_mut() {
+                // Does NOT touch fb.dir / query / selected / scroll_top. All four move
+                // together in `apply_listing_done`'s success arm, so an unreadable target
+                // leaves the writer exactly where they were — with their query intact.
+                start_listing(fb, target, fs, msg_tx);
             }
-        } else {
-            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+        }
+        EnterOutcome::Open(path) => {
             editor.file_browser = None;
             crate::workspace::open_as_new_buffer(editor, &path);
+        }
+        EnterOutcome::Refuse(msg) => {
+            // Shown and marked, but not actioned — and the picker STAYS OPEN so the writer
+            // can pick something else.
+            editor.set_status_full(crate::status::StatusKind::Warning, msg,
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 }
@@ -116,7 +166,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             use crossterm::event::KeyCode;
             match k.code {
                 KeyCode::Esc => { editor.file_browser = None; }
-                KeyCode::Enter => { file_browser_enter(ctx.fs, ctx.msg_tx, editor); }
+                KeyCode::Enter => { file_browser_enter(editor, ctx.fs, ctx.msg_tx); }
                 c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
@@ -264,6 +314,58 @@ mod tests {
         crate::file_browser_listing::FilterOpts {
             show_clutter: false, types: crate::config::FileTypeFilter::Documents, destination: false,
         }
+    }
+
+    fn fe(name: &str, kind: crate::fsx::EntryKind, is_symlink: bool, broken: bool) -> FileEntry {
+        FileEntry { name: name.into(), kind, is_symlink, broken }
+    }
+
+    #[test]
+    fn entry_labels_follow_ls_f_and_survive_no_color() {
+        use crate::fsx::EntryKind::*;
+        // TEXT suffixes, never colour — the terminal-plain constraint. This also restores
+        // the trailing '/' that a symlinked directory used to lose entirely (§4.9).
+        assert_eq!(entry_label(&fe("drafts", Dir, false, false)), "drafts/");
+        assert_eq!(entry_label(&fe("linked", Dir, true, false)), "linked/@");
+        assert_eq!(entry_label(&fe("notes.md", File, false, false)), "notes.md");
+        assert_eq!(entry_label(&fe("alias.md", File, true, false)), "alias.md@");
+        assert_eq!(entry_label(&fe("dangling.md", Unknown, true, true)), "dangling.md@ (broken)");
+    }
+
+    #[test]
+    fn classify_enter_covers_every_kind_exhaustively() {
+        use crate::fsx::EntryKind::*;
+        let d = std::path::Path::new("/tmp/wc-classify");
+        assert_eq!(classify_enter(&fe("sub", Dir, false, false), d),
+            EnterOutcome::Descend(d.join("sub")));
+        assert_eq!(classify_enter(&fe("sub", Dir, true, false), d),
+            EnterOutcome::Descend(d.join("sub")), "a symlinked dir descends like any dir");
+        assert_eq!(classify_enter(&fe("n.md", File, false, false), d),
+            EnterOutcome::Open(d.join("n.md")));
+
+        // A fifo must be REFUSED, and for a concrete reason: file::open on a fifo BLOCKS.
+        match classify_enter(&fe("pipe", Other, false, false), d) {
+            EnterOutcome::Refuse(msg) => assert!(msg.to_lowercase().contains("cannot be opened"),
+                "the reason must name the openability problem, got {msg:?}"),
+            other => panic!("a fifo must be refused, got {other:?}"),
+        }
+        // An unresolvable entry is refused with a DIFFERENT reason — the pair of facts the
+        // old bool model could not separate.
+        match classify_enter(&fe("dangling.md", Unknown, true, true), d) {
+            EnterOutcome::Refuse(msg) => assert!(msg.to_lowercase().contains("cannot be resolved"),
+                "must say cannot-be-resolved, NOT 'target is gone' — broken also covers \
+                 permission and loop failures, got {msg:?}"),
+            other => panic!("a broken link must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotdot_descends_to_the_logical_parent() {
+        let d = std::path::Path::new("/tmp/wc-classify/sub");
+        assert_eq!(classify_enter(&fe("..", crate::fsx::EntryKind::Dir, false, false), d),
+            EnterOutcome::Descend(std::path::PathBuf::from("/tmp/wc-classify")),
+            "'..' walks the LOGICAL parent — fb.dir is deliberately not canonicalized, so a \
+             writer who descended through a symlink leaves by the path they came in on");
     }
 
     /// Test-only stand-in for the deleted synchronous `refetch`: one `list_dir` call, then

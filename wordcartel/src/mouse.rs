@@ -514,7 +514,7 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
                 fb.selected = idx;
                 crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
             }
-            crate::file_browser::file_browser_enter(ctx.fs, ctx.msg_tx, editor);
+            crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
         } else if !inside {
             editor.file_browser = None; // click-away closes
         }
