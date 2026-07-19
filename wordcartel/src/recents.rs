@@ -22,7 +22,6 @@ pub struct RecentRow {
 /// canonical-path-keyed map, so recents is nearly free. `fs` is a parameter (not `RealFs`
 /// reached for directly) so tests, and the availability-probe thread below, can drive this
 /// through the same seam the rest of the crate uses.
-#[allow(dead_code)] // wired in a later C5 task; exercised directly by this module's tests today
 pub(crate) fn rows_from(session: &crate::state::SessionState, fs: &dyn crate::fsx::Fs)
     -> Vec<RecentRow>
 {
@@ -38,7 +37,6 @@ pub(crate) fn rows_from(session: &crate::state::SessionState, fs: &dyn crate::fs
 /// `session.entries`' keys, ranked by `seq` descending — the pure half of `rows_from`,
 /// with no filesystem access. `open_recent` uses this to show every row immediately,
 /// before availability has been probed at all.
-#[allow(dead_code)] // wired in a later C5 task; called from `open_recent` below
 pub(crate) fn ranked_paths(session: &crate::state::SessionState) -> Vec<std::path::PathBuf> {
     let mut v: Vec<(u64, std::path::PathBuf)> = session.entries.iter()
         .map(|(k, e)| (e.seq, std::path::PathBuf::from(k)))
@@ -59,7 +57,6 @@ pub(crate) fn ranked_paths(session: &crate::state::SessionState) -> Vec<std::pat
 /// the rows are re-marked in place when the spawned probe's `Msg::RecentsProbed` lands,
 /// under the SAME epoch discipline `start_listing`/`apply_listing_done` use for directory
 /// listings.
-#[allow(dead_code)] // wired to a command/keybinding in a later C5 task
 pub(crate) fn open_recent(editor: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>)
