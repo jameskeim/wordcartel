@@ -302,10 +302,25 @@ pub fn resolve_prompt(
             // `pending_save_overwrite`'s `resolved` for exactly this reconstruction. No
             // re-resolution here: re-running `resolve_write_destination` against a target
             // that no longer matches what the writer confirmed would be the wrong check.
-            if let (Some(resolved), Some(chosen)) =
-                (editor.pending_save_overwrite.take(), editor.pending_save_as_chosen.take())
-            {
-                perform_save_as(editor, chosen, resolved, ex, clock, msg_tx, fs);
+            match (editor.pending_save_overwrite.take(), editor.pending_save_as_chosen.take()) {
+                (Some(resolved), Some(chosen)) =>
+                    perform_save_as(editor, chosen, resolved, ex, clock, msg_tx, fs),
+                // The pair is written and cleared together everywhere today, so this is
+                // unreachable — but the arm had no `else`, which made a HALF-cleared pair a
+                // silent no-op: the writer presses [O]verwrite on a save they explicitly
+                // confirmed and nothing whatsoever happens, on the one surface where "nothing
+                // happened" is indistinguishable from "it saved". A future site that clears
+                // one field without the other now fails LOUDLY instead (review finding M6).
+                //
+                // A status rather than a `debug_assert!`: this is the confirm step of a save,
+                // and panicking the shell on the keystroke that was supposed to write the
+                // writer's document is a worse outcome than telling them it did not.
+                _ => {
+                    editor.set_status_full(crate::status::StatusKind::Warning,
+                        "save-as overwrite: the confirmed target was lost \u{2014} nothing was written".to_string(),
+                        crate::status::StatusLifetime::Sticky,
+                        crate::status::StatusSource::Host, None);
+                }
             }
         }
         PromptAction::OverwriteWriteBlock => {

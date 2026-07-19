@@ -1033,6 +1033,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// C5 review finding M6. `resolve_prompt`'s `OverwriteSaveAs` arm was an
+    /// `if let (Some, Some)` with no `else`, so a HALF-cleared state pair turned [O]verwrite
+    /// into a silent no-op: the writer confirms an overwrite and nothing whatsoever happens,
+    /// on the one surface where "nothing happened" is indistinguishable from "it saved". The
+    /// pair is written and cleared together everywhere today — the point is to convert a
+    /// latent silent-failure class into a loud one before some future site introduces it.
+    ///
+    /// Reached by clearing exactly one half (standing in for that future site) and pressing
+    /// [O] through the REAL prompt intercept.
+    ///
+    /// FAIL-VERIFY: restore the `if let (Some, Some) = ... { }` form with no else, watch the
+    /// status assertion fail against an untouched status line. Confirmed, then reverted.
+    #[test]
+    fn a_half_cleared_overwrite_pair_refuses_loudly_instead_of_doing_nothing() {
+        let d = tmp("overwrite-half-cleared");
+        std::fs::write(d.join("taken.md"), b"old\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "taken.md".into());
+        crate::test_support::pump_listing(&mut e, &rx);
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        assert!(e.pending_save_overwrite.is_some() && e.pending_save_as_chosen.is_some(),
+            "precondition: the modal is up with both halves armed");
+
+        // The future site this guard exists for: one half goes, the other stays.
+        e.pending_save_as_chosen = None;
+
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+        let o = crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Char('o'), modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE });
+        crate::prompts::intercept(crate::app::Msg::Input(o), &mut e, &ctx);
+        for out in ex.drain() { crate::jobs_apply::apply_outcome(out, &mut e); }
+
+        assert_eq!(std::fs::read_to_string(d.join("taken.md")).expect("read"), "old\n",
+            "nothing is written — the target was lost, and guessing at it would be worse");
+        assert!(e.status_text().to_lowercase().contains("nothing was written"),
+            "and the writer is TOLD, rather than left to assume the save landed: {:?}",
+            e.status_text());
+        assert!(e.pending_save_overwrite.is_none(),
+            "the surviving half is drained too, so a later confirm cannot pair it with a \
+             different chosen path");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// CRITICAL-1 regression: the `Redirect` arm used to leave `pending_save_as` and
     /// `quit_drain` armed while it reopened an Export picker. A `Redirect` IS an abandoned
     /// save — the write never happened, and the writer is being offered a different feature
