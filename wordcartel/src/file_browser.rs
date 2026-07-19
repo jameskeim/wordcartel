@@ -320,8 +320,10 @@ pub(crate) fn click_commit_or_copy(editor: &mut crate::editor::Editor) {
     let Some(entry) = fb.entries.get(fb.selected).cloned() else { return };
     match &mut fb.mode {
         // Recents mirrors Select: no field to populate, the caller's `file_browser_enter`
-        // does the opening (mouse wiring for Recents is a later task; this arm exists only
-        // so the match stays exhaustive rather than absorbing a future mode silently).
+        // does the opening — for both the keyboard Enter arm and the mouse click arm (C5
+        // Task 24 fix I1), which now gate on the same `!is_destination()` check. This arm
+        // exists only so the match stays exhaustive rather than absorbing a future mode
+        // silently.
         BrowseMode::Select | BrowseMode::Recents => { /* caller invokes file_browser_enter — unchanged */ }
         BrowseMode::Destination { field, field_cursor, .. } => {
             if matches!(entry.kind, crate::fsx::EntryKind::File) {

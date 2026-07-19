@@ -522,14 +522,18 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
                 // key). See `FileBrowser::navigated_name`.
                 fb.navigated_name = fb.entries.get(idx).map(|e| e.name.clone());
             }
-            // THE CLICK DIVERGENCE (C5 Task 18, decision 9): `click_commit_or_copy` runs in
-            // BOTH modes (a harmless no-op in Select — its own arm defers to the caller), but
-            // `file_browser_enter` — the path that actually opens/descends — fires ONLY in
-            // Select mode. A single click in Destination mode must never reach a write.
+            // THE CLICK DIVERGENCE (C5 Task 18, decision 9; widened C5 Task 24 fix I1):
+            // `click_commit_or_copy` runs in ALL THREE modes (a harmless no-op in Select/Recents
+            // — its own arm defers to the caller), but `file_browser_enter` — the path that
+            // actually opens/descends — must fire in Select AND Recents, and NEVER in
+            // Destination. This mirrors the keyboard Enter arm in `file_browser_intercept.rs`
+            // exactly: that arm gates on `is_destination()`, not on `BrowseMode::Select`, which
+            // is why Enter always opened a recents row while a click on the same row silently
+            // did nothing. A single click in Destination mode must still never reach a write.
             crate::file_browser::click_commit_or_copy(editor);
-            let is_select = editor.file_browser.as_ref()
-                .is_some_and(|fb| matches!(fb.mode, crate::file_browser::BrowseMode::Select));
-            if is_select {
+            let is_destination = editor.file_browser.as_ref()
+                .is_some_and(|fb| fb.mode.is_destination());
+            if !is_destination {
                 crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
             }
         } else if !inside {
@@ -2233,6 +2237,91 @@ mod tests {
         assert!(e.file_browser.as_ref().is_some_and(|fb| fb.dir == sub),
             "click on dir must descend into it; dir={:?}", e.file_browser.as_ref().map(|fb| &fb.dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Open the recents picker the way `recents::open_recent` really does — rows show
+    /// immediately as optimistically available (`open_recents_pending`), then the caller
+    /// pumps the availability probe's result via `apply_recents_probed`. This is the SAME
+    /// pump discipline every other picker test performs for `Msg::ListingDone`
+    /// (`test_support::pump_listing`), applied to the recents probe instead.
+    fn open_recents_and_pump(e: &mut Editor, rows: Vec<crate::recents::RecentRow>) {
+        e.open_recents_pending(rows.iter().map(|r| r.path.clone()).collect());
+        let epoch = crate::file_browser::next_epoch();
+        if let Some(fb) = e.file_browser.as_mut() { fb.awaiting_epoch = epoch; }
+        crate::recents::apply_recents_probed(e, epoch, rows);
+    }
+
+    /// Task 24 fix I1: a click on an AVAILABLE recents row must open it, exactly like Enter
+    /// does — driven through the REAL mouse dispatch (`handle`), not by calling
+    /// `file_browser_enter`/`click_commit_or_copy` directly (the exact class of test this
+    /// effort already got burned by once — see `file_browser_commit.rs`'s
+    /// `a_click_on_a_file_in_destination_mode_copies_the_name_and_does_not_commit`).
+    ///
+    /// FAIL-VERIFY: restore the old `is_select` gate (`matches!(fb.mode, BrowseMode::Select)`
+    /// instead of `!is_destination()`), watch this fail — the row highlights and nothing
+    /// opens, the exact dead affordance Adjudication 2 diagnosed.
+    #[test]
+    fn click_on_an_available_recents_row_opens_it_like_enter() {
+        let d = std::env::temp_dir().join(format!("wc-t24-recents-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let live = d.join("live.md");
+        std::fs::write(&live, "loaded\n").unwrap();
+
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        open_recents_and_pump(&mut e,
+            vec![crate::recents::RecentRow { path: live.clone(), available: true }]);
+        assert!(matches!(
+            e.file_browser.as_ref().expect("recents picker open").mode,
+            crate::file_browser::BrowseMode::Recents));
+
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::chrome_geom::palette_overlay_rect(area,
+            e.file_browser.as_ref().unwrap().entries.len());
+        let click_row = rect.y + 2; // row 0, scroll_top is 0
+        let d_ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d_ev, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+
+        assert!(e.file_browser.is_none(),
+            "a click on an available recents row must open it and close the picker, exactly \
+             as Enter does");
+        assert_eq!(e.active().document.path.as_deref(), Some(live.as_path()),
+            "the clicked recent file must be the one that opened");
+        assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Task 24 fix I1 (the other half): a click on an UNAVAILABLE recents row must refuse,
+    /// exactly like Enter does (`classify_enter`'s `Refuse` arm) — the picker stays open and
+    /// nothing opens, rather than silently doing nothing OR opening a path that no longer
+    /// exists.
+    #[test]
+    fn click_on_an_unavailable_recents_row_refuses_like_enter() {
+        let d = std::env::temp_dir().join(format!("wc-t24-recents-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let gone = d.join("gone.md"); // deliberately never created
+
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        open_recents_and_pump(&mut e,
+            vec![crate::recents::RecentRow { path: gone.clone(), available: false }]);
+
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::chrome_geom::palette_overlay_rect(area,
+            e.file_browser.as_ref().unwrap().entries.len());
+        let click_row = rect.y + 2;
+        let d_ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d_ev, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+
+        assert!(e.file_browser.is_some(),
+            "an unavailable row must refuse — the picker stays open, exactly like Enter");
+        assert_eq!(e.active().document.buffer.to_string(), "hello\n", "nothing was opened");
+        let status = e.status().expect("a refusal must be reported on the status line");
+        assert_eq!(status.kind(), crate::status::StatusKind::Warning);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // -----------------------------------------------------------------------
