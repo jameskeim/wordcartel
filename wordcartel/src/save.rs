@@ -28,6 +28,7 @@ pub struct FileFingerprint {
 /// conflict check). `mtime`/`size` come from `metadata`, `hash` from a separate
 /// bounded read (no single-syscall guarantee across the three fields).
 pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     fingerprint_with_fs(&crate::fsx::RealFs, path)
 }
 
@@ -202,7 +203,9 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                                 } else { String::new() };
                                 if b.document.version == v {
                                     status = format!("Saved{named}");
+                                    // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
                                     crate::swap::delete(b.document.path.as_deref());
+                                    // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
                                     if matches!(mode, SaveMode::SaveAs) { crate::swap::delete(prior_key.as_deref()); }
                                 } else {
                                     status = format!("Saved v{v}{named} (still editing)");
@@ -215,6 +218,7 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                                     // v→v+1 keystrokes is bounded by the normal swap cadence (the same
                                     // window normal editing has between periodic swap writes).
                                     if matches!(mode, SaveMode::SaveAs) {
+                                        // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
                                         crate::swap::delete(prior_key.as_deref());
                                         b.last_swap_at = None;
                                     }
@@ -357,6 +361,7 @@ pub fn overwrite_save(ctx: &mut Ctx) {
 /// (fresh Document, not `apply`): there is no incremental delta and history is reset.
 pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let Some(path) = editor.active().document.path.clone() else { return };
+    // fs-chokepoint-allow: (w) external-mod Reload — takes no `fs`; flagged at C5's gate, not migrated here
     let text = match crate::file::open(&path) {
         Ok(t) => t,
         Err(e) => {
@@ -413,6 +418,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = fingerprint(&path);
     editor.set_status(crate::status::StatusKind::Info, "Reloaded");
+    // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
     crate::swap::delete(editor.active().document.path.as_deref());
 }
 

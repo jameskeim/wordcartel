@@ -71,6 +71,7 @@ pub(crate) fn is_plausible_plugin(name: &str, kind: crate::fsx::EntryKind, broke
 /// This function reads through the `Fs` seam (C5) and hands `(stem, source)` pairs onward;
 /// it does not touch the string-core `load_sources`.
 pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     discover_with_fs(&crate::fsx::RealFs, dir, disable)
 }
 

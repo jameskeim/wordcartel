@@ -435,6 +435,7 @@ pub fn config_layer_paths(
     xdg_config_dir: Option<&Path>,
     anchor_dir: &Path,
 ) -> Vec<PathBuf> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     config_layer_paths_with_fs(&crate::fsx::RealFs, cli, xdg_config_dir, anchor_dir)
 }
 
@@ -480,6 +481,7 @@ pub(crate) fn config_layer_paths_with_fs(
 /// build_keymap applies them in precedence order (Codex plan-review fix).
 #[allow(clippy::too_many_lines)] // config parse — one arm per config key
 pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     load_with_fs(&crate::fsx::RealFs, paths)
 }
 

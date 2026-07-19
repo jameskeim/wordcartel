@@ -173,6 +173,7 @@ pub fn swap_path(doc_path: Option<&Path>) -> io::Result<PathBuf> {
 
 /// Best-effort delete of a document's swap file.
 pub fn delete(doc_path: Option<&Path>) {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     delete_with_fs(&crate::fsx::RealFs, doc_path)
 }
 
@@ -412,6 +413,7 @@ fn tmp_is_cleanable(fs: &dyn crate::fsx::Fs, dir: &Path, candidate: &Path, fname
 /// own. Skip our own pid and live pids; return the newest valid non-empty
 /// orphan as (file path, header, body).
 pub fn find_orphan_scratch_swap() -> Option<(std::path::PathBuf, SwapHeader, String)> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     find_orphan_scratch_swap_in(&crate::fsx::RealFs, &state_dir().ok()?)
 }
 
@@ -445,6 +447,7 @@ fn find_orphan_scratch_swap_in(fs: &dyn crate::fsx::Fs, dir: &std::path::Path)
 /// Thin `RealFs` wrapper for callers with no `fs` in scope (notably
 /// `recovery::write_dump`, which runs from the panic hook).
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     write_atomic_with_fs(&crate::fsx::RealFs, path, content)
 }
 

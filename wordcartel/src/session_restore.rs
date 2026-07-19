@@ -59,6 +59,7 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
     if let Ok(canon) = std::fs::canonicalize(path) {
         let key = canon.to_string_lossy().into_owned();
         if let Some(entry) = session.entries.get(&key) {
+            // fs-chokepoint-allow: (w) session/state metadata — config-class, not document content
             if let Some(identity) = crate::state::file_identity(path) {
                 let doc_len = editor.active().document.buffer.len();
                 if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
@@ -167,6 +168,7 @@ pub(crate) fn persist_session(
     if let Some(raw_path) = editor.active().document.path.as_deref() {
         // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
         if let Ok(canon) = std::fs::canonicalize(raw_path) {
+            // fs-chokepoint-allow: (w) session/state metadata — config-class, not document content
             if let Some((mtime, size)) = crate::state::file_identity(raw_path) {
                 let entry = crate::state::StateEntry {
                     cursor: editor.active().document.selection.primary().head,

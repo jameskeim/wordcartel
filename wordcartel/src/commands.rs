@@ -466,6 +466,9 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                     let topic = crate::status::StatusTopic::Save(buffer_id, v);
                     editor.set_progress(topic, "Saving\u{2026}");
                     let content = editor.active().document.buffer.to_string();
+                    // `commands::run` takes no `fs`; threading one is a command-dispatch signature
+                    // change — reported at C5's merge gate rather than decided there.
+                    // fs-chokepoint-allow: (w) synchronous Save fallback, deliberately not injected
                     match file::save_atomic(&path, &content) {
                         Ok(file::SaveOutcome::Saved) => {
                             editor.active_mut().document.mark_saved(v);

@@ -536,6 +536,7 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         // shown live so a writer never saves not knowing where it went (§ the reason this task
         // exists). `None` in select mode or with an empty field. Rendered against the real
         // filesystem — this is a read-only display probe, not a fault-injectable write path.
+        // fs-chokepoint-allow: (w) read-only display probe — painters take no `fs` by design (§5.2 ownership)
         let footer = crate::file_browser::footer_target(&crate::fsx::RealFs, fb);
         // How many dedicated footer rows the BOX was actually sized for — read from the same
         // ledger that sized it, never re-derived from a height guard here, or the painter and

@@ -495,17 +495,10 @@ pub(crate) fn first_frame_settle(editor: &mut Editor) {
 pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // COMPOSITION ROOT for the filesystem seam — the first statement, before ANY filesystem
     // work. Everything downstream gets a clone; tests substitute an Arc<FaultFs> here.
-    //
-    // WHAT ACTUALLY TAKES `&*fs` (do not over-claim — an earlier version of this comment
-    // asserted "config discovery, theme resolution, session load and the launch open all
-    // take `&*fs`", which was false for three of the four):
-    //   * the launch file open (`Buffer::from_file`) — document-class, threaded through.
-    //   * the `--config` existence probe, and every fs use inside the loop below.
-    // What does NOT: config layer discovery/`config::load`, `theme_resolve::resolve_theme`,
-    // and `state::load` still call their `RealFs` wrappers. That is a deliberate, recorded
-    // project decision (config-class reads, not document-class) — not an oversight. Each such
-    // wrapper call is marked with a `fs-chokepoint-allow:` clause and is enforced by
-    // `tests/fs_chokepoint.rs`'s wrapper-bypass layer.
+    // Takes `&*fs`: the launch open, the `--config` probe, the swap-assess read, the loop.
+    // Does NOT: `config::load` / `resolve_theme` / `state::load`, deliberately left on their
+    // `RealFs` wrappers (config-class, not document content) and marked `(w)` for layer 4 of
+    // `tests/fs_chokepoint.rs`. This comment used to claim all four took `&*fs`; three never did.
     let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
         std::sync::Arc::new(crate::fsx::RealFs);
 
@@ -534,8 +527,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             all_paths.insert(idx, op.clone());
         }
     }
-    let (baseline_cfg, _baseline_warns) = config::load(&hand_paths); // WITHOUT overrides
-    let (cfg, mut warns) = config::load(&all_paths);                  // production config
+    let (baseline_cfg, _baseline_warns) = config::load(&hand_paths); // fs-chokepoint-allow: (w) config-class
+    let (cfg, mut warns) = config::load(&all_paths);                  // fs-chokepoint-allow: (w) config-class
     if let Some(c) = &cli.config_path {
         if !crate::fsx::is_file_via(&*fs, c) {
             warns.push(format!("config: --config path not found: {}", c.display()));
@@ -626,7 +619,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let (canvas_mode, canvas_warn) = crate::theme_resolve::parse_canvas(&cfg.theme.canvas);
     if let Some(w) = canvas_warn { warns.push(w); }
     editor.canvas = canvas_mode;
-    let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env, chrome_disp);
+    let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env, chrome_disp); // fs-chokepoint-allow: (w) config-class
     editor.theme = resolved.theme;
     editor.depth = resolved.depth;
     editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
@@ -634,7 +627,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // D1+A5 Task 4: baseline resolve (WITHOUT the overrides layer) + three snapshots.
     // baseline_cfg was loaded above from hand_paths only; the overrides file is NOT in it.
-    let baseline_resolved = crate::theme_resolve::resolve_theme(
+    let baseline_resolved = crate::theme_resolve::resolve_theme( // fs-chokepoint-allow: (w) config-class
         &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
     let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
     // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
@@ -659,7 +652,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // Load the personal dictionary from disk (missing/unreadable/over-cap/invalid-UTF-8 → empty; no abort).
     if let Some(dict_path) = &cfg.diagnostics.dictionary {
-        if let Some(text) = crate::file::bounded_read_opt(dict_path, crate::limits::MAX_OPEN_BYTES)
+        if let Some(text) = crate::file::bounded_read_opt(dict_path, crate::limits::MAX_OPEN_BYTES) // fs-chokepoint-allow: (w) config-class
             .and_then(|bytes| String::from_utf8(bytes).ok())
         {
             editor.dictionary = text.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -675,11 +668,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         // (Narrow behavior change: a >64 MiB file whose bytes match the swap hash
         // would previously DiscardSilently; it now Prompts. Safe direction.)
         let file_bytes = editor.active().document.path.as_deref()
-            .and_then(|p| crate::file::bounded_read_opt(p, crate::limits::MAX_OPEN_BYTES));
+            .and_then(|p| crate::file::bounded_read_opt_with_fs(&*fs, p, crate::limits::MAX_OPEN_BYTES));
         match crate::swap::assess(&*fs, editor.active().document.path.as_deref(), file_bytes.as_deref()) {
             crate::swap::RecoveryDecision::OpenNormally => {}
             crate::swap::RecoveryDecision::DiscardSilently => {
-                crate::swap::delete(editor.active().document.path.as_deref());
+                crate::swap::delete(editor.active().document.path.as_deref()); // fs-chokepoint-allow: (w) swap cleanup, not migrated
             }
             crate::swap::RecoveryDecision::Prompt(_h, body) => {
                 editor.active_mut().pending_swap_body = Some(body);
@@ -687,7 +680,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                 editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
             }
         }
-    } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() {
+    } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() { // fs-chokepoint-allow: (w) swap cleanup, not migrated
         editor.active_mut().pending_swap_body = Some(body);
         editor.active_mut().pending_swap_path = Some(sp);
         editor.open_prompt(crate::prompt::Prompt::swap_recovery());

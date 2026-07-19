@@ -6,6 +6,14 @@
 //! filesystem access not in the allow-list below, where every entry cites the exemption
 //! clause it claims.
 //!
+//! FOUR LAYERS, not three. Layers 1-3 catch RAW filesystem access (`use std::fs`, a
+//! fully-qualified `std::fs::…`, an inherent `Path` method). Layer 4 catches the
+//! **wrapper-bypass class**: production code calling an IN-CRATE wrapper that constructs
+//! `RealFs` internally. That call contains no raw token at all, so layers 1-3 are blind to
+//! it — which is how the file picker shipped holding `ctx.fs` and discarding it, with this
+//! gate reporting clean through 26 tasks and two review layers. Layer 4's wrapper set is
+//! derived from the source, never listed, and its markers use the `(w)` tag.
+//!
 //! HONEST LIMITS (spec §2.3): the scan is textual, so it can flag a token in a comment or
 //! string; `#[cfg(test)]` stripping is heuristic; and the import gate covers the ORDINARY
 //! `std::fs` import spellings, not nested-group / renamed-in-group / leading-root `::std::fs`
@@ -150,6 +158,134 @@ fn offenders_in(src: &str) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Layer 4 — the WRAPPER-BYPASS class.
+//
+// WHY THIS LAYER EXISTS, stated plainly: the three layers above scan for raw `std::fs`
+// tokens, and a production call into an IN-CRATE wrapper that constructs `RealFs` inside
+// itself contains no such token. So `crate::file::open(p)` — which reaches `RealFs`
+// unconditionally — passed the gate while bypassing the injected seam entirely.
+//
+// That is not hypothetical. It is exactly how the picker's Open path shipped holding
+// `ctx.fs` and discarding it, through 26 tasks and two review layers, with this gate
+// reporting clean. A gate that does not enforce what it claims is worse than no gate,
+// because it is *believed*.
+//
+// The wrapper set is DERIVED, never listed: any production fn whose own body names
+// `fsx::RealFs` outside an `Arc::new(...)` composition root is a wrapper. Deriving it means
+// a wrapper added next year is covered the day it is written — a hand-written list would
+// have to be remembered, and the whole failure being fixed here is a thing nobody remembered.
+// `Arc::new(RealFs)` is excluded on purpose: that is the shape of a composition root, which
+// HANDS the seam downstream rather than swallowing it.
+// ---------------------------------------------------------------------------
+
+/// A `RealFs`-hardcoding wrapper: the module it lives in and its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Wrapper { module: String, name: String }
+
+/// True for a production line that pins `RealFs` inline (`&crate::fsx::RealFs`,
+/// `crate::fsx::RealFs.stat(..)`) rather than composing it into an `Arc` for injection.
+fn pins_realfs(line: &str) -> bool {
+    let t = line.trim();
+    if t.starts_with("//") { return false; }
+    t.contains("fsx::RealFs") && !t.contains("Arc::new(")
+}
+
+/// Collect the `RealFs`-hardcoding wrappers defined in one production module.
+///
+/// Item-level scan: a top-level `fn` (column 0, optionally `pub`/`pub(crate)`) owns every
+/// line until the next top-level `fn`. Deliberately coarse — it over-attributes a nested
+/// helper's `RealFs` to its enclosing fn, which can only make the gate stricter, never laxer.
+fn wrappers_in(module: &str, src: &str) -> Vec<Wrapper> {
+    let prod = strip_test_modules(src);
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    let mut pinned = false;
+    let flush = |cur: &mut Option<String>, pinned: &mut bool, out: &mut Vec<Wrapper>| {
+        if let (Some(name), true) = (cur.take(), *pinned) {
+            out.push(Wrapper { module: module.to_string(), name });
+        }
+        *pinned = false;
+    };
+    for line in prod.lines() {
+        if let Some(name) = top_level_fn_name(line) {
+            flush(&mut current, &mut pinned, &mut out);
+            current = Some(name);
+        }
+        if pins_realfs(line) { pinned = true; }
+    }
+    flush(&mut current, &mut pinned, &mut out);
+    out
+}
+
+/// The name of a top-level (column-0) `fn` declared on this line, if any.
+fn top_level_fn_name(line: &str) -> Option<String> {
+    if line.starts_with(' ') || line.starts_with('\t') { return None; }
+    let rest = line
+        .strip_prefix("pub ")
+        .or_else(|| line.strip_prefix("pub(crate) ").or_else(|| line.strip_prefix("pub(super) ")))
+        .unwrap_or(line);
+    let rest = rest.strip_prefix("fn ")?;
+    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Production hits in `module`'s source that bypass the seam via a `RealFs` wrapper —
+/// either by CALLING one (`crate::file::open(..)` / `file::open(..)`) or by pinning
+/// `RealFs` inline itself. Both need a marker; each marker names why that site is legitimate.
+///
+/// A wrapper's OWN body is not a bypass of itself, so calls are matched only in qualified
+/// (`module::name(`) form. Unqualified same-module calls are a disclosed gap — the same
+/// class of gap the header already discloses for `use`-tree spellings.
+fn wrapper_offenders_in(module: &str, src: &str, wrappers: &[Wrapper]) -> Vec<String> {
+    let prod = strip_test_modules(src);
+    let lines: Vec<&str> = prod.lines().collect();
+    let mut out = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with("//") { continue; }
+        let mut hit: Option<String> = None;
+        if pins_realfs(line) {
+            hit = Some("pins `RealFs` inline — the injected seam cannot reach here".to_string());
+        } else {
+            for w in wrappers {
+                if w.module == module { continue; } // a wrapper's own module is its definition site
+                if t.contains(&format!("{}::{}(", w.module, w.name)) {
+                    hit = Some(format!("calls `{}::{}` — a wrapper that hardcodes `RealFs`",
+                        w.module, w.name));
+                    break;
+                }
+            }
+        }
+        let Some(what) = hit else { continue };
+        let marked_here = marker_allows_a_wrapper(lines[n]);
+        let marked_above = n > 0 && marker_allows_a_wrapper(lines[n - 1]);
+        if marked_here || marked_above { continue; }
+        out.push(format!("  line {}: {what} — {}", n + 1, t));
+    }
+    out
+}
+
+/// A layer-4 marker names either a §2.3 clause `(a)`–`(g)`, or the tag **`(w)`** —
+/// *wrapper by decision*: a `RealFs`-hardcoding wrapper whose call site is deliberately not
+/// injected. `(w)` is NOT a new §2.3 clause and does not widen the rule; it records the two
+/// standing project decisions that put a site outside injection — config-class reads (small
+/// config/theme/session files, not document-class content — CLAUDE.md) and ownership
+/// exceptions (no `fs` in scope, spec §5.2's ownership table).
+///
+/// `(w)` alone is not enough: it must be followed by prose. A tag with no reason is the
+/// unexplained silence this whole marker convention exists to prevent, and `(w)` is the tag
+/// most likely to be reached for reflexively.
+fn marker_allows_a_wrapper(line: &str) -> bool {
+    if marker_names_a_clause(line) { return true; }
+    line.split_once(ALLOW_MARKER)
+        .map(|(_, rest)| {
+            let r = rest.trim_start();
+            r.starts_with("(w)") && !r["(w)".len()..].trim().is_empty()
+        })
+        .unwrap_or(false)
+}
+
 fn crate_src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -193,6 +329,59 @@ fn production_sources_route_filesystem_access_through_the_seam() {
          \x20   // fs-chokepoint-allow: (b) directory provisioning for the state dir\n\n\
          Whole-file exemption (EXEMPT_MODULES) is for files where EVERY raw call shares one \
          clause; it is not a way to silence a single new call.",
+        failures.join("\n\n"));
+}
+
+/// Collect every production source in scope for the scan, as `(module-name, source)`.
+fn production_modules() -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    walk(&crate_src(), &mut files);
+    files.sort();
+    files.into_iter()
+        .filter(|f| {
+            let name = rel(f);
+            name != "src/e2e.rs" && name != "src/test_support.rs"
+                && !EXEMPT_MODULES.iter().any(|(a, _)| *a == name)
+        })
+        .map(|f| {
+            let module = f.file_stem().and_then(|s| s.to_str()).expect("stem").to_string();
+            (module, std::fs::read_to_string(&f).expect("read source"))
+        })
+        .collect()
+}
+
+#[test]
+fn production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper() {
+    // THE GAP THAT LET C5's HEADLINE BUG SHIP. See the layer-4 header above.
+    let modules = production_modules();
+    let wrappers: Vec<Wrapper> = modules.iter()
+        .flat_map(|(m, src)| wrappers_in(m, src))
+        .collect();
+
+    // The derivation must actually find wrappers. If a refactor renames `fn` shapes or
+    // `RealFs` moves, `wrappers` silently empties and every call site below passes for the
+    // wrong reason — the vacuous-guardrail failure this effort kept producing.
+    assert!(wrappers.iter().any(|w| w.module == "file" && w.name == "open"),
+        "the wrapper derivation found no `file::open` — it has stopped seeing wrappers and \
+         this whole layer is now vacuous: {wrappers:?}");
+
+    let mut failures = Vec::new();
+    for (module, src) in &modules {
+        let hits = wrapper_offenders_in(module, src, &wrappers);
+        if !hits.is_empty() {
+            failures.push(format!("src/{module}.rs:\n{}", hits.join("\n")));
+        }
+    }
+
+    assert!(failures.is_empty(),
+        "production code reaches the filesystem through a `RealFs`-hardcoding wrapper, \
+         bypassing the injected seam.\n\n{}\n\n\
+         If an injected `fs` is in scope, THREAD IT — call the `*_with_fs` seam instead \
+         (this is C1: the picker held `ctx.fs` and dropped it).\n\
+         If the site is deliberately not injected, mark it on the line or directly above:\n\
+         \x20   // fs-chokepoint-allow: (w) config-class read — not document content\n\n\
+         `(w)` must be followed by a reason. A §2.3 clause letter (a)-(g) also works where \
+         one genuinely applies.",
         failures.join("\n\n"));
 }
 
@@ -300,6 +489,72 @@ fn a_marker_without_a_clause_is_not_an_exemption() {
     let ok = "fn f(p: &std::path::Path) {\n    // fs-chokepoint-allow: (c) canonicalize\n    \
               let _ = std::fs::read(p);\n}\n";
     assert!(offenders_in(ok).is_empty(), "a clause-naming marker exempts its line");
+}
+
+#[test]
+fn layer_four_detects_a_wrapper_call_that_layers_one_to_three_are_blind_to() {
+    // The C1 SHAPE, reduced. `file.rs` defines `open` as a `RealFs` wrapper; another module
+    // calls it. There is no `std::fs` token anywhere in the caller — run the raw-access
+    // scanner over it and it reports clean, which is precisely the false all-clear this
+    // layer exists to end.
+    let file_rs = "\
+pub fn open(p: &std::path::Path) -> Vec<u8> {\n\
+    open_with_fs(&crate::fsx::RealFs, p)\n\
+}\n";
+    let caller = "\
+pub fn enter(fs: &dyn crate::fsx::Fs, p: &std::path::Path) {\n\
+    let _ = crate::file::open(p);\n\
+}\n";
+    let wrappers = wrappers_in("file", file_rs);
+    assert_eq!(wrappers, vec![Wrapper { module: "file".into(), name: "open".into() }],
+        "the wrapper must be DERIVED from `file.rs`'s body, not assumed");
+
+    assert!(offenders_in(caller).is_empty(),
+        "premise: layers 1-3 see nothing here — no raw `std::fs`, no inherent Path method. \
+         If this ever fails, the layer-4 rationale needs rewriting, not the code.");
+    let hits = wrapper_offenders_in("file_browser", caller, &wrappers);
+    assert!(hits.iter().any(|h| h.contains("file::open")),
+        "layer 4 must flag the wrapper call that layers 1-3 cannot see: {hits:?}");
+}
+
+#[test]
+fn layer_four_wrapper_derivation_excludes_an_arc_composition_root() {
+    // `Arc::new(RealFs)` is the composition root — it HANDS the seam downstream. Treating it
+    // as a wrapper would flag `app::run` and, transitively, `main`, which is noise that
+    // teaches readers to stop reading the failure.
+    let root = "\
+pub fn run(cli: Cli) {\n\
+    let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =\n\
+        std::sync::Arc::new(crate::fsx::RealFs);\n\
+    drive(&*fs);\n\
+}\n";
+    assert!(wrappers_in("app", root).is_empty(),
+        "an Arc composition root is not a wrapper: {:?}", wrappers_in("app", root));
+}
+
+#[test]
+fn layer_four_markers_must_carry_a_reason() {
+    // `(w)` is the tag a reader reaches for reflexively, so a bare one must not silence a
+    // hit. FAIL-VERIFY: drop the emptiness check in `marker_allows_a_wrapper` and the loop
+    // below fails on `(w)`.
+    let wrappers = vec![Wrapper { module: "file".into(), name: "open".into() }];
+    for bad in ["(w)", "(w)   ", "trust me", "(z) nope"] {
+        let src = format!("fn f(p: &std::path::Path) {{\n    // fs-chokepoint-allow: {bad}\n    \
+                           let _ = crate::file::open(p);\n}}\n");
+        assert!(!wrapper_offenders_in("caller", &src, &wrappers).is_empty(),
+            "marker {bad:?} carries no reason and must NOT silence a wrapper bypass");
+    }
+    let ok = "fn f(p: &std::path::Path) {\n    \
+              // fs-chokepoint-allow: (w) config-class read — not document content\n    \
+              let _ = crate::file::open(p);\n}\n";
+    assert!(wrapper_offenders_in("caller", ok, &wrappers).is_empty(),
+        "a `(w)` marker with a reason exempts its line");
+    // A genuine §2.3 clause letter works too, for a site a clause really covers.
+    let clause = "fn f(p: &std::path::Path) {\n    \
+                  // fs-chokepoint-allow: (a) subprocess-owned IO\n    \
+                  let _ = crate::file::open(p);\n}\n";
+    assert!(wrapper_offenders_in("caller", clause, &wrappers).is_empty(),
+        "a clause letter is also a valid layer-4 marker");
 }
 
 #[test]

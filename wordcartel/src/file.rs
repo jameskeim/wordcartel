@@ -81,6 +81,7 @@ fn map_open_io_err(fs: &dyn crate::fsx::Fs, e: std::io::Error, label: &str, path
 }
 
 pub fn open(path: &Path) -> Result<String, OpenError> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     open_with_fs(&crate::fsx::RealFs, path)
 }
 
@@ -132,6 +133,7 @@ pub(crate) fn open_bounded_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: 
 /// file exceeds `limit` OR any open/read error occurs — every caller treats `None` as
 /// its existing safe degradation. Mirrors `open`'s `.take(limit + 1)` + `len > limit`.
 pub fn bounded_read_opt(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     bounded_read_opt_with_fs(&crate::fsx::RealFs, path, limit)
 }
 
@@ -148,6 +150,7 @@ pub(crate) fn bounded_read_opt_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, lim
 }
 
 pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     save_atomic_with_fs(&crate::fsx::RealFs, path, content)
 }
 
@@ -188,6 +191,7 @@ pub(crate) fn save_atomic_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content:
 // ---------------------------------------------------------------------------
 
 pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     save_atomic_bytes_with_fs(&crate::fsx::RealFs, path, content)
 }
 

@@ -57,6 +57,7 @@ pub(crate) fn rederive_theme_if_requested(
         }
         crate::settings::ThemeIdentity::File => theme_cfg.clone(),
     };
+    // fs-chokepoint-allow: (w) config-class read — theme files, not document content
     let resolved = crate::theme_resolve::resolve_theme(&effective, env, editor.chrome_disposition);
     editor.depth = resolved.depth; // re-seed depth (cheap; cold path)
     editor.apply_theme(resolved.theme);

@@ -181,6 +181,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         let word = editor.active().document.buffer.slice(a..b).to_string();
         editor.dictionary.insert(word.clone());
         match editor.diag_cfg.dictionary.clone() {
+            // fs-chokepoint-allow: (w) config-class read — the personal dictionary, not document content
             Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
                 Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
                 Err(e) => editor.set_status_full(crate::status::StatusKind::Error, format!("add to dictionary failed: {e}"),

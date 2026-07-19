@@ -222,6 +222,7 @@ pub fn retain_unignored(editor: &mut Editor) {
 /// Append `word` to the personal dictionary file (create if missing).
 /// Returns `Ok(())` on success, `Err(e)` on IO failure (caller shows status).
 pub fn append_word_to_dict(path: &std::path::Path, word: &str) -> std::io::Result<()> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     append_word_to_dict_with_fs(&crate::fsx::RealFs, path, word)
 }
 

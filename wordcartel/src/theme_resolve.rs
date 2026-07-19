@@ -159,6 +159,7 @@ pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
 /// Resolve order (D1+D5): base pick/construct → [Ansi16 sentinel-fill | derive_chrome(disp)] →
 /// user styles → cue glyph. User chrome overrides land LAST, over the depth policy.
 pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot, disp: ChromeDisposition) -> ResolvedTheme {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     resolve_theme_with_fs(&crate::fsx::RealFs, tc, env, disp)
 }
 

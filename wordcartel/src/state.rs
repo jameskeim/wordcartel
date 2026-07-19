@@ -94,6 +94,7 @@ impl SessionState {
                 return Ok(()); // metadata alone over cap (shouldn't happen) → skip persist
             }
         }
+        // fs-chokepoint-allow: (w) session persistence — config-class state file, not document content
         crate::file::save_atomic_bytes(&dir.join("session.toml"), text.as_bytes())
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -107,6 +108,7 @@ impl SessionState {
 /// Load from a specific directory (testable variant). Corrupt/missing/over-cap → empty.
 /// The read is bounded at MAX_SESSION_BYTES+1 so a huge file is never fully slurped.
 pub fn load_in(dir: &Path) -> SessionState {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     load_in_with_fs(&crate::fsx::RealFs, dir)
 }
 
@@ -130,6 +132,7 @@ pub fn load() -> SessionState {
 
 /// Return the (mtime_secs, size) identity of a file, or None on error.
 pub fn file_identity(path: &Path) -> Option<(i64, u64)> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
     file_identity_with_fs(&crate::fsx::RealFs, path)
 }
 
