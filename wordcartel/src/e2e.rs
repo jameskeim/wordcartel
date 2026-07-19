@@ -1211,10 +1211,10 @@ fn journey_row0_click_unrevealed_edits_text() {
 /// A6 journey: opening the palette and pressing End reaches the LAST registered
 /// command without filtering, and Enter dispatches it.
 ///
-/// The last command is `save_settings` (D1+A5 T3 registration order) — benign and
-/// observable: dispatch sets `settings_save_requested = true`. The reach-without-typing
-/// property is the contract; selected must be within the visible window
-/// (selected - scroll_top < 15) before Enter.
+/// The last command is `plugin_list` (P2 Task 8b registration order) — benign and
+/// observable: dispatch writes a plugin-inventory summary to the status line. The
+/// reach-without-typing property is the contract; selected must be within the visible
+/// window (selected - scroll_top < 15) before Enter.
 #[test]
 fn journey_palette_end_reaches_last_command() {
     // A tall document keeps the palette's row math honest under scrolling.

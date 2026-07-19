@@ -629,6 +629,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_ignores_unrecognised_header_keys() {
+        // FORWARD-compat, the mirror of `parse_accepts_a_pre_id_swap_header`'s backward case.
+        // The `_ => {}` arm exists so a FUTURE effort can stamp a new header key without
+        // stranding the recovery of a swap written by a build that already understands it —
+        // exactly what made stamping `id` (Task 25) safe. Nothing pinned that until now: the
+        // legacy fixture carries no unrecognised key, so it could not have caught a `parse`
+        // that rejected one.
+        //
+        // FAIL-VERIFY: change the catch-all to `_ => return None`, watch this fail while the
+        // rest of the suite stays green. Confirmed, then restored.
+        let future = format!(
+            "{FORMAT}\npath: /home/u/notes.md\nfp: -:-\nhash: {:016x}\nversion: 7\nts: 1\n\
+             pid: 9\nid: 00112233445566778899aabbccddeeff\nsnapshot: 42\n---\nbody\n",
+            fnv1a64(b"body\n"));
+        let (h, body) = parse(&future).expect("an unrecognised header key must not strand recovery");
+        assert_eq!(body, "body\n", "the BODY — the unsaved work — still comes back intact");
+        assert_eq!(h.version, 7, "and every key this build does understand is still read");
+        assert_eq!(h.realpath.as_deref(), Some("/home/u/notes.md"));
+        assert_eq!(h.id.as_deref(), Some("00112233445566778899aabbccddeeff"),
+            "including one added by a previous effort, unaffected by the newer unknown key");
+    }
+
+    #[test]
     fn cadence_idle_debounce_fires_after_t_idle() {
         // Edited at 1000, never swapped. At 1000+T_idle it is due.
         assert!(!due(1000 + T_IDLE_MS - 1, Some(1000), None));
