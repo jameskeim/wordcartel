@@ -947,7 +947,7 @@ impl Editor {
         crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
         let mut fb = crate::file_browser::FileBrowser {
-            dir: dir.clone(), query: String::new(),
+            dir: dir.clone(), query: String::new(), mode: crate::file_browser::BrowseMode::Select,
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
             awaiting_epoch: 0, pending_dir: None,

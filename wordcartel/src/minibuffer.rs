@@ -38,40 +38,47 @@ pub struct Minibuffer {
 }
 
 impl Minibuffer {
-    pub fn insert(&mut self, c: char) {
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
+    pub fn insert(&mut self, c: char) { text_insert(&mut self.text, &mut self.cursor, c); }
+    pub fn backspace(&mut self) { text_backspace(&mut self.text, &mut self.cursor); }
+    pub fn left(&mut self) { text_left(&self.text, &mut self.cursor); }
+    pub fn right(&mut self) { text_right(&self.text, &mut self.cursor); }
+}
 
-    pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.text[..self.cursor]
-            .chars()
-            .next_back()
-            .map(char::len_utf8)
-            .unwrap_or(0);
-        self.cursor -= prev;
-        self.text.replace_range(self.cursor..self.cursor + prev, "");
-    }
+// ---------------------------------------------------------------------------
+// UTF-8-codepoint-safe cursor arithmetic — free functions over (&mut String, &mut usize)
+// so the file-browser destination field (`file_browser::BrowseMode::Destination`) reuses
+// this rather than growing a second hand-written cursor (C5 Task 18). `Minibuffer`'s own
+// insert/backspace/left/right above are one-line delegations, so both callers share ONE
+// implementation.
+// ---------------------------------------------------------------------------
 
-    pub fn left(&mut self) {
-        if self.cursor > 0 {
-            let p = self.text[..self.cursor]
-                .chars()
-                .next_back()
-                .unwrap()
-                .len_utf8();
-            self.cursor -= p;
-        }
-    }
+/// Insert `c` at `cursor`, advancing by its UTF-8 length.
+pub(crate) fn text_insert(text: &mut String, cursor: &mut usize, c: char) {
+    text.insert(*cursor, c);
+    *cursor += c.len_utf8();
+}
 
-    pub fn right(&mut self) {
-        if self.cursor < self.text.len() {
-            let n = self.text[self.cursor..].chars().next().unwrap().len_utf8();
-            self.cursor += n;
-        }
+/// Delete the codepoint before `cursor`.
+pub(crate) fn text_backspace(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 { return; }
+    let prev = text[..*cursor].chars().next_back().expect("cursor > 0 implies a char");
+    *cursor -= prev.len_utf8();
+    text.remove(*cursor);
+}
+
+/// Move one codepoint left.
+pub(crate) fn text_left(text: &str, cursor: &mut usize) {
+    if *cursor > 0 {
+        let prev = text[..*cursor].chars().next_back().expect("cursor > 0 implies a char");
+        *cursor -= prev.len_utf8();
+    }
+}
+
+/// Move one codepoint right.
+pub(crate) fn text_right(text: &str, cursor: &mut usize) {
+    if *cursor < text.len() {
+        let next = text[*cursor..].chars().next().expect("cursor < len implies a char");
+        *cursor += next.len_utf8();
     }
 }
 
@@ -152,6 +159,34 @@ mod tests {
         assert_eq!((m.text.as_str(), m.cursor), ("abc", 3));
         m.left(); m.backspace();
         assert_eq!((m.text.as_str(), m.cursor), ("ac", 1));
+    }
+
+    #[test]
+    fn destination_field_edits_are_utf8_codepoint_safe() {
+        // Byte lengths: 'a'=1, 'é'=2, '中'=3, '🙂'=4. Every assertion is on the BYTE cursor,
+        // because that is what a naive `cursor += 1` gets wrong.
+        let mut f = String::new();
+        let mut c = 0usize;
+        for ch in ['a', 'é', '中', '🙂'] { text_insert(&mut f, &mut c, ch); }
+        assert_eq!(f, "aé中🙂");
+        assert_eq!(c, 1 + 2 + 3 + 4, "cursor advances by UTF-8 length, not by 1 per char");
+
+        text_left(&f, &mut c);                       // back over 🙂 (4 bytes)
+        assert_eq!(c, 1 + 2 + 3);
+        text_left(&f, &mut c);                       // back over 中 (3)
+        assert_eq!(c, 1 + 2);
+        text_right(&f, &mut c);                      // forward over 中
+        assert_eq!(c, 1 + 2 + 3);
+
+        text_backspace(&mut f, &mut c);              // delete 中
+        assert_eq!(f, "aé🙂", "the codepoint BEFORE the cursor is removed whole");
+        assert_eq!(c, 1 + 2);
+
+        // Boundary: left at 0 and right at len are no-ops, never a panic or a split codepoint.
+        c = 0; text_left(&f, &mut c); assert_eq!(c, 0);
+        c = f.len(); text_right(&f, &mut c); assert_eq!(c, f.len());
+        c = 0; text_backspace(&mut f, &mut c);
+        assert_eq!(f, "aé🙂", "backspace at 0 is a no-op");
     }
 
     fn enter_key() -> crossterm::event::KeyEvent {

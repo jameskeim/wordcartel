@@ -139,7 +139,7 @@ pub(crate) static OVERLAYS: &[OverlayRow] = &[
         intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None, mouse: crate::mouse::mouse_cursor_picker,
         render: RenderSite::Frame(crate::render_overlays::paint_cursor_picker) },
     OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
-        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser,
+        intercept: crate::file_browser_intercept::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser,
         render: RenderSite::Frame(crate::render_overlays::paint_file_browser) },
     OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
         intercept: crate::prompts::intercept, close: |e| e.prompt = None, mouse: crate::mouse::mouse_prompt,

@@ -127,12 +127,27 @@ pub(crate) fn filter_and_rank(
     (rows, Disclosure { shown, hidden_clutter, hidden_type, capped_out, unreadable, total_seen })
 }
 
-/// Re-derive `entries`/`disclosure` from the CACHED listing. This is the keystroke path and
-/// it performs NO filesystem access.
-pub(crate) fn rederive(fb: &mut FileBrowser, opts: FilterOpts) {
+/// Re-derive `entries`/`disclosure` from the CACHED listing. The keystroke path — NO
+/// filesystem access.
+///
+/// Takes the two EDITOR-owned options only. The filter text and the destination flag are
+/// derived from `fb.mode` here, because a caller that passed them could pass the wrong ones:
+/// every path that rebuilds entries (initial listing, descend, field edit, filter-toggle
+/// change) would otherwise have to remember, and `apply_listing_done` did not.
+pub(crate) fn rederive(fb: &mut FileBrowser, show_clutter: bool, types: FileTypeFilter) {
+    let opts = FilterOpts {
+        show_clutter,
+        types,
+        // Destination mode also shows output-format siblings so a writer sees what they
+        // might clobber (spec §7.4).
+        destination: fb.mode.is_destination(),
+    };
+    // DUAL DUTY: the field IS the filter in destination mode; the query is in the others.
+    // `filter_text` is the single place that mapping lives.
+    let text = fb.mode.filter_text(&fb.query).to_string();
     let at_root = fb.dir.parent().is_none();
     let (rows, d) = filter_and_rank(
-        &fb.listing, at_root, &fb.query, opts, fb.total_seen, fb.unreadable);
+        &fb.listing, at_root, &text, opts, fb.total_seen, fb.unreadable);
     fb.entries = rows;
     fb.disclosure = d;
     if fb.selected >= fb.entries.len() {
@@ -229,5 +244,80 @@ mod tests {
         assert!(is_clutter(".jj"));
         assert!(!is_clutter("notes.md"));
         assert!(!is_clutter("Makefile"), "no gitignore semantics — decision 2");
+    }
+
+    /// Feed one printable character through the real intercept.
+    fn press_char(e: &mut crate::editor::Editor,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        tx: &std::sync::mpsc::Sender<crate::app::Msg>, c: char)
+    {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let ctx = crate::overlays::DispatchCtx {
+            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: tx, fs };
+        let ev = Event::Key(KeyEvent {
+            code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let _ = crate::file_browser_intercept::intercept(crate::app::Msg::Input(ev), e, &ctx);
+    }
+
+    #[test]
+    fn typing_in_destination_mode_narrows_the_listing_to_matching_files() {
+        // Spec §7.4's overwrite awareness: the field is simultaneously the filename-to-be
+        // AND a live filter, so typing `chap` reveals existing chapter files a writer might
+        // clobber. This failed silently when `apply_listing_done` hardcoded
+        // `destination: false` and re-derived from the (empty) `query`.
+        //
+        // FAIL-VERIFY: make `rederive` filter on `fb.query` instead of
+        // `fb.mode.filter_text(...)`, watch this fail, then revert.
+        let d = std::env::temp_dir().join(format!("wc-destfilter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        for n in ["chapter-one.md", "chapter-two.md", "notes.md", "outline.md"] {
+            std::fs::write(d.join(n), b"x").expect("seed");
+        }
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Construct the destination browser from THIS task's own types and start the listing
+        // directly — `Editor::open_destination_picker` belongs to Task 21, and using it here
+        // would be a forward reference that blocks this task under TDD.
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Destination {
+                purpose: crate::file_browser::DestinationPurpose::SaveAs,
+                field: String::new(), field_cursor: 0,
+            },
+            listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        crate::file_browser::start_listing(&mut fb, d.clone(), &fs, &tx);
+        e.file_browser = Some(fb);
+        // The listing arrives asynchronously — pump it, exactly as the run loop would.
+        crate::test_support::pump_listing(&mut e, &rx);
+        assert!(e.file_browser.as_ref().expect("open").entries.len() >= 4,
+            "precondition: all four files listed before typing");
+
+        // Type through the REAL intercept, one keystroke at a time.
+        for c in ['c', 'h', 'a', 'p'] { press_char(&mut e, &fs, &tx, c); }
+
+        let names: Vec<String> = e.file_browser.as_ref().expect("still open")
+            .entries.iter().map(|r| r.name.clone()).collect();
+        assert!(names.iter().any(|n| n == "chapter-one.md"),
+            "existing chapter files must be REVEALED as the writer types: {names:?}");
+        assert!(names.iter().any(|n| n == "chapter-two.md"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "notes.md"),
+            "non-matching files must be filtered out: {names:?}");
+        // And the field still holds what was typed — it is dual-duty, not consumed.
+        match &e.file_browser.as_ref().expect("open").mode {
+            crate::file_browser::BrowseMode::Destination { field, .. } =>
+                assert_eq!(field, "chap", "the field is the filename-to-be as well as the filter"),
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -3,8 +3,6 @@
 //! Mirrors the theme picker (theme_picker.rs) / command palette.
 
 use std::path::PathBuf;
-use crate::app::Msg;
-use crossterm::event::Event;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -17,10 +15,51 @@ pub struct FileEntry {
     pub broken: bool,
 }
 
+/// What a destination is FOR. The commit path dispatches on this, so adding a future
+/// destination consumer is one variant plus one arm the compiler demands — a registration
+/// seam, not a growing hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestinationPurpose {
+    SaveAs,
+    WriteBlock,
+    Export { ext: String },
+}
+
+/// Select mode chooses an existing entry; destination mode navigates AND names.
+///
+/// Not a second `OverlayId`: two overlays would duplicate the intercept, painter, mouse fn,
+/// and geometry, and would have to be kept in lockstep by hand — the hand-parallel pathology
+/// H21 removed.
+#[derive(Debug, Clone)]
+pub enum BrowseMode {
+    Select,
+    Destination {
+        purpose: DestinationPurpose,
+        /// DUAL-DUTY: simultaneously the filename-to-be and a live filter over the listing,
+        /// so typing `chap` narrows to existing chapter files — overwrite awareness for free.
+        field: String,
+        /// Byte offset into `field`.
+        field_cursor: usize,
+    },
+}
+
+impl BrowseMode {
+    pub fn is_destination(&self) -> bool { matches!(self, BrowseMode::Destination { .. }) }
+    /// The text the listing filter should use: the query in select mode, the field in
+    /// destination mode. One accessor so the two modes cannot drift apart.
+    pub fn filter_text<'a>(&'a self, query: &'a str) -> &'a str {
+        match self { BrowseMode::Select => query,
+                     BrowseMode::Destination { field, .. } => field }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileBrowser {
     pub dir: PathBuf,
     pub query: String,
+    /// Select vs destination — see [`BrowseMode`]. Determines both what Enter/click/Tab do
+    /// and (via `filter_text`) what the listing filter reads.
+    pub mode: BrowseMode,
     /// UNFILTERED contents of `dir`, fetched ONCE per directory. The keystroke path filters
     /// this, never the filesystem — `rebuild_entries` used to re-run `read_dir` on every
     /// character typed.
@@ -42,18 +81,6 @@ pub struct FileBrowser {
     /// succeeds, so the picker shows where the writer actually is until they have actually
     /// arrived — and an unreadable directory never moves them at all.
     pub pending_dir: Option<PathBuf>,
-}
-
-/// The options this browser filters by, derived from the editor's persisted
-/// clutter/type-filter settings. `destination` is always `false` here — every caller in
-/// this task is a select (Open) path; a future destination-mode caller (Save-As, Export)
-/// passes `true` explicitly instead of this helper.
-fn current_filter_opts(editor: &crate::editor::Editor) -> crate::file_browser_listing::FilterOpts {
-    crate::file_browser_listing::FilterOpts {
-        show_clutter: editor.files_show_clutter,
-        types: editor.files_type_filter,
-        destination: false,
-    }
 }
 
 /// Directory-listing label in the spirit of `ls -F` — a trailing mark declares what an
@@ -153,67 +180,27 @@ pub(crate) fn file_browser_enter(
     }
 }
 
-/// File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
-/// fall through to normal handling while the browser stays open (mirrors theme_picker).
-pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
-    if editor.file_browser.is_none() { return crate::app::Handled::Pass(msg); }
-    // Drop an async clipboard-paste result that arrives while the browser is open —
-    // it must not land in the document behind the overlay (Codex I6, mirror palette).
-    if matches!(&msg, Msg::ClipboardPaste { .. }) {
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
-    }
-    if let Msg::Input(Event::Paste(text)) = &msg {
-        let ah = editor.active().view.area.1;
-        let opts = current_filter_opts(editor);
-        if let Some(fb) = editor.file_browser.as_mut() {
-            fb.query.push_str(text);
-            crate::file_browser_listing::rederive(fb, opts);
-            crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-        }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
-    }
-    if let Msg::Input(Event::Key(k)) = &msg {
-        if k.kind == crossterm::event::KeyEventKind::Press {
-            use crossterm::event::KeyCode;
-            match k.code {
-                KeyCode::Esc => { editor.file_browser = None; }
-                KeyCode::Enter => { file_browser_enter(editor, ctx.fs, ctx.msg_tx); }
-                c if crate::list_window::list_nav_key(c).is_some() => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
-                            ah, fb.entries.len(), &mut fb.selected, &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::Backspace => {
-                    let ah = editor.active().view.area.1;
-                    let opts = current_filter_opts(editor);
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.query.pop();
-                        crate::file_browser_listing::rederive(fb, opts);
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::Char(c)
-                    if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                        && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
-                {
-                    let ah = editor.active().view.area.1;
-                    let opts = current_filter_opts(editor);
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.query.push(c);
-                        crate::file_browser_listing::rederive(fb, opts);
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                _ => {}
+/// The shared click-commit path for `mouse::mouse_file_browser`'s `Down(Left)` arm.
+///
+/// SELECT mode selects and commits, as it always has — the caller invokes
+/// `file_browser_enter` separately (this fn's `Select` arm is a deliberate no-op). DESTINATION
+/// mode copies the highlighted file's name into the field and stops: a single click must never
+/// reach a write. The stakes are asymmetric — a mis-click in select mode opens the wrong file
+/// (close the buffer), a mis-click in destination mode would land on the overwrite path for an
+/// existing file. The inconsistency between the two modes IS the safety property; do not
+/// "unify" them.
+pub(crate) fn click_commit_or_copy(editor: &mut crate::editor::Editor) {
+    let Some(fb) = editor.file_browser.as_mut() else { return };
+    let Some(entry) = fb.entries.get(fb.selected).cloned() else { return };
+    match &mut fb.mode {
+        BrowseMode::Select => { /* caller invokes file_browser_enter — unchanged */ }
+        BrowseMode::Destination { field, field_cursor, .. } => {
+            if matches!(entry.kind, crate::fsx::EntryKind::File) {
+                crate::file_browser_commit::copy_name_into_field(field, field_cursor, &entry.name);
             }
+            // Dir/Other/Unknown: the click has already moved the highlight; nothing else.
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
-    // Non-key msg falls through to normal handling while the browser stays open.
-    crate::app::Handled::Pass(msg)
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -300,13 +287,13 @@ pub(crate) fn apply_listing_done(
             return;
         }
     }
-    let opts = crate::file_browser_listing::FilterOpts {
-        show_clutter: editor.files_show_clutter,
-        types: editor.files_type_filter,
-        destination: false,
-    };
+    // The destination flag and filter text are both derived from `fb.mode` INSIDE
+    // `rederive` — this site used to hardcode `destination: false`, which silently defeated
+    // §7.4's overwrite-awareness filter on every initial open and every descend while in
+    // destination mode (the field never gets a chance to filter until the first keystroke).
+    let (show_clutter, types) = (editor.files_show_clutter, editor.files_type_filter);
     if let Some(fb) = editor.file_browser.as_mut() {
-        crate::file_browser_listing::rederive(fb, opts);
+        crate::file_browser_listing::rederive(fb, show_clutter, types);
     }
 }
 
@@ -316,16 +303,17 @@ mod tests {
 
     fn empty_fb(dir: PathBuf) -> FileBrowser {
         FileBrowser {
-            dir, query: String::new(), listing: vec![], total_seen: 0, unreadable: 0,
+            dir, query: String::new(), mode: BrowseMode::Select,
+            listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
             awaiting_epoch: 0, pending_dir: None,
         }
     }
 
-    fn default_opts() -> crate::file_browser_listing::FilterOpts {
-        crate::file_browser_listing::FilterOpts {
-            show_clutter: false, types: crate::config::FileTypeFilter::Documents, destination: false,
-        }
+    /// The two editor-owned filter options `rederive` now takes directly (Task 18) — no
+    /// `FilterOpts` construction at call sites; the destination flag comes from `fb.mode`.
+    fn default_opts() -> (bool, crate::config::FileTypeFilter) {
+        (false, crate::config::FileTypeFilter::Documents)
     }
 
     fn fe(name: &str, kind: crate::fsx::EntryKind, is_symlink: bool, broken: bool) -> FileEntry {
@@ -434,12 +422,12 @@ mod tests {
     /// Test-only stand-in for the deleted synchronous `refetch`: one `list_dir` call, then
     /// derive. Production now fetches only off-thread (`start_listing` + `apply_listing_done`);
     /// these listing-pipeline tests still want a one-shot synchronous fetch to seed `fb.listing`.
-    fn seed_listing(fs: &dyn crate::fsx::Fs, fb: &mut FileBrowser, opts: crate::file_browser_listing::FilterOpts) {
+    fn seed_listing(fs: &dyn crate::fsx::Fs, fb: &mut FileBrowser, opts: (bool, crate::config::FileTypeFilter)) {
         match fs.list_dir(&fb.dir, Some(crate::limits::MAX_DIR_ENTRIES)) {
             Ok(l) => { fb.listing = l.entries; fb.total_seen = l.total_seen; fb.unreadable = l.unreadable; }
             Err(_) => { fb.listing = Vec::new(); fb.total_seen = 0; fb.unreadable = 0; }
         }
-        crate::file_browser_listing::rederive(fb, opts);
+        crate::file_browser_listing::rederive(fb, opts.0, opts.1);
     }
 
     #[test]
@@ -456,7 +444,8 @@ mod tests {
         let alpha_i = names.iter().position(|n| *n == "alpha.md").unwrap();
         assert!(sub_i < alpha_i, "directories sort before files");
         fb.query = "alpha".into();
-        crate::file_browser_listing::rederive(&mut fb, default_opts());
+        let (sc, tf) = default_opts();
+        crate::file_browser_listing::rederive(&mut fb, sc, tf);
         assert!(fb.entries.iter().any(|e| e.name == "alpha.md"));
         assert!(!fb.entries.iter().any(|e| e.name == "beta.txt"), "query filters out non-matching names");
         let _ = std::fs::remove_dir_all(&dir);

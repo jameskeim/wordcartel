@@ -63,6 +63,8 @@ pub mod theme_cmds;
 pub mod settings;
 pub mod file_browser;
 pub mod file_browser_listing;
+pub mod file_browser_commit;
+pub mod file_browser_intercept;
 pub mod splash;
 pub mod blocks_marked;
 pub mod scratch;

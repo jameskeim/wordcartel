@@ -514,7 +514,16 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
                 fb.selected = idx;
                 crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
             }
-            crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
+            // THE CLICK DIVERGENCE (C5 Task 18, decision 9): `click_commit_or_copy` runs in
+            // BOTH modes (a harmless no-op in Select — its own arm defers to the caller), but
+            // `file_browser_enter` — the path that actually opens/descends — fires ONLY in
+            // Select mode. A single click in Destination mode must never reach a write.
+            crate::file_browser::click_commit_or_copy(editor);
+            let is_select = editor.file_browser.as_ref()
+                .is_some_and(|fb| matches!(fb.mode, crate::file_browser::BrowseMode::Select));
+            if is_select {
+                crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
+            }
         } else if !inside {
             editor.file_browser = None; // click-away closes
         }
@@ -1376,6 +1385,7 @@ mod tests {
             "theme_picker open must block arming");
         assert!(fire(&|e| { e.file_browser = Some(crate::file_browser::FileBrowser {
             dir: std::path::PathBuf::from("."), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
             awaiting_epoch: 0, pending_dir: None,

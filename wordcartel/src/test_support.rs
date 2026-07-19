@@ -206,8 +206,7 @@ pub(crate) fn press_key_fb(e: &mut crate::editor::Editor,
         reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: tx, fs };
     let ev = Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
         kind: KeyEventKind::Press, state: KeyEventState::NONE });
-    // Task 18 repoints this to `crate::file_browser_intercept::intercept`.
-    let _ = crate::file_browser::intercept(crate::app::Msg::Input(ev), e, &ctx);
+    let _ = crate::file_browser_intercept::intercept(crate::app::Msg::Input(ev), e, &ctx);
 }
 
 /// One printable character through the intercept.
