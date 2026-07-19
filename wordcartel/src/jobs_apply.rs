@@ -326,7 +326,7 @@ pub(crate) fn apply_export_done(
     }
     match result {
         Ok(crate::export::ExportResult::Bytes(bytes)) => {
-            match file::save_atomic_bytes(&target, &bytes) {
+            match file::save_atomic_bytes_with_fs(fs, &target, &bytes) {
                 Ok(()) => {
                     let status = format!("exported {}", target.display());
                     editor.set_status(crate::status::StatusKind::Info, status);
@@ -963,6 +963,23 @@ mod tests {
         assert!(e.status_text().contains("export write failed"));
         assert_sticky_error_survives_info(&mut e);
         let _ = std::fs::remove_file(&parent);
+    }
+
+    /// C5 Task 8: export Bytes write is fault-injectable through the seam.
+    /// The HTML export write now routes through save_atomic_bytes_with_fs(fs, …)
+    /// instead of reaching around to the hardwired RealFs wrapper. This test
+    /// proves the seam is alive by injecting a fault at the create step.
+    #[test]
+    fn apply_export_done_bytes_write_is_fault_injectable() {
+        use crate::editor::Editor;
+        let target = std::env::temp_dir().join(format!("wc-c4-exportbytes-fault-{}.html", std::process::id()));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        // Inject a create failure via FaultFs: the write will fail before touching disk.
+        let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Create);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, &ff);
+        // The failure must surface as a Sticky Error in the status.
+        assert!(e.status_text().contains("export write failed"), "got: {}", e.status_text());
+        assert_sticky_error_survives_info(&mut e);
     }
 
     #[test]
