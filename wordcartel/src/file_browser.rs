@@ -240,7 +240,7 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
     let BrowseMode::Destination { field, purpose, .. } = &fb.mode else { return None };
     if field.trim().is_empty() { return None; }
     let highlighted = fb.entries.get(fb.selected);
-    let (typed, from_highlight) = match crate::file_browser_commit::classify_destination_enter(
+    let typed = match crate::file_browser_commit::classify_destination_enter(
         fs, &fb.dir, field, highlighted, fb.highlight_is_navigated()) {
         // Rows 1 and 3 — Enter descends, it does not write. Say so plainly rather than
         // showing a would-be write target that Enter will never produce.
@@ -256,14 +256,19 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
         crate::file_browser_commit::CommitOutcome::Nothing => return None,
         // Row 4 (the ordinary case) or row 2's explicit overwrite — a genuine write target,
         // continue through the extension policy exactly as before.
-        crate::file_browser_commit::CommitOutcome::Commit { path, from_highlight } =>
-            (path, from_highlight),
+        // `from_highlight` is deliberately ignored here: it is only ever `true` on Row 2, which
+        // `classify_destination_enter` reaches solely from an EMPTY field — and the
+        // `field.trim().is_empty()` guard above already returned `None` for that. So the footer
+        // never states a Row-2 destination at all; Row 2's disclosure is the overwrite-confirm
+        // prompt instead. (Relaxing the empty-field guard is what would make a Row-2 footer
+        // possible; a policy bypass would have to come back with it — see §8.)
+        crate::file_browser_commit::CommitOutcome::Commit { path, from_highlight: _ } => path,
     };
-    // An export destination's extension is fixed by the format — policy does not apply; nor
-    // does it apply to Row 2's highlighted existing file, which has no field text to classify
-    // (§8). Both bypasses mirror `commit_destination`'s exactly, because the footer's whole
-    // contract is to state the destination Enter will ACTUALLY reach.
-    let after_policy = if matches!(purpose, DestinationPurpose::Export { .. }) || from_highlight {
+    // An export destination's extension is fixed by the format — policy does not apply. This
+    // is the one bypass the footer shares with `commit_destination`; the latter's second
+    // bypass (Row 2's highlighted existing file, which has no field text to classify — §8) is
+    // unreachable from here, per the note on the `Commit` arm above.
+    let after_policy = if matches!(purpose, DestinationPurpose::Export { .. }) {
         typed
     } else {
         match crate::file_browser_commit::apply_extension_policy(&typed) {
