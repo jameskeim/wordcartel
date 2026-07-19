@@ -1223,52 +1223,121 @@ cargo test -p wordcartel --lib session_restore::tests::file_browser_enter_on_fil
 ## Task 7 — soak validation, full gates, smoke
 
 ### Files
-None modified. This task produces a report only. If it finds a failure, **stop and report** — do
-not fix in this task.
+None modified (except a gitignored marker under `target/`, removed in 7.6). This task produces a
+report only. If it finds a failure, **stop and report** — do not fix in this task.
+
+### This task is the effort's evidence — read this before running anything
+
+Every step here exists to *prove* something, so the dangerous failure mode is not a wrong answer
+but a **confident** one: a step that prints "pass" while the thing it names is false. That has
+already happened three times in this effort (the spec's T7, Task 3's guard, and step 7.4 below),
+so each step is written to distinguish "the thing is true" from "I looked in the wrong place" or
+"I measured nothing." Two concrete traps this task defends against, both verified on this machine:
+
+- **A run that tests nothing looks identical to a clean run.** `"$BIN" some_filter_matching_nothing`
+  prints `test result: ok. 0 passed; …; 1768 filtered out` and **exits 0**. A soak loop counting
+  only exit codes would report `failed runs: 0 / 60` having executed no tests at all.
+- **A grep over zero log files prints nothing**, which is indistinguishable from a grep that found
+  no failures. Log counts are therefore asserted, not assumed.
+
+If any assertion below fails, report it as a failure — do not adjust the assertion.
 
 ### Steps
 
-**7.1 — Full workspace gates.**
+**7.0 — Baseline the real state dir and start the clock.** Run this FIRST; 7.4 compares against
+it. The marker lives under gitignored `target/` so it survives between shell invocations without
+touching anything of the user's.
+```sh
+REAL="${XDG_STATE_HOME:-$HOME/.local/state}/wordcartel"
+mkdir -p target && touch target/.wc-effort1-runstart
+echo "real state dir under test: $REAL"
+if [ -e "$REAL" ]; then
+  echo "BASELINE: present"
+  ls -la --time-style=full-iso "$REAL"
+else
+  echo "BASELINE: absent"
+fi
 ```
-cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo build -p wordcartel && cargo test --workspace --no-run
+Paste the output. Note whether it was present or absent — 7.4's pass condition differs.
+
+**7.1 — Full workspace gates, with exit codes.** Bare `cargo` output can be misread: a workspace
+that fails to COMPILE emits no `test result:` lines at all, and `cargo build` succeeds *with*
+warnings. Capture status explicitly rather than eyeballing.
+```sh
+G=$(mktemp -d)                          # own scratch dir, removed at the end of this step
+cargo test --workspace 2>&1 | tee "$G/test.log" | tail -30
+echo "cargo test exit: ${PIPESTATUS[0]}"
+grep -h "^test result:" "$G/test.log" | sed 's/; finished in.*//' | sort | uniq -c
+
+cargo clippy --workspace --all-targets 2>&1 | tee "$G/clippy.log" | tail -20
+echo "clippy exit: ${PIPESTATUS[0]}"
+echo "clippy warnings: $(grep -c '^warning' "$G/clippy.log")  errors: $(grep -c '^error' "$G/clippy.log")"
+
+cargo build -p wordcartel 2>&1 | tee "$G/build.log" | tail -10
+echo "build exit: ${PIPESTATUS[0]}  warnings: $(grep -c '^warning' "$G/build.log")"
+cargo test --workspace --no-run 2>&1 | tail -5
+echo "test --no-run exit: $?"
+rm -rf "$G"
 ```
-All green/clean/warning-free. Paste the `test result:` lines and the clippy summary.
+Required: all four exit codes `0`; clippy warnings **and** errors both `0`; build warnings `0`;
+and the `test result:` tally showing every suite `ok` with a non-zero passed count. Paste all of
+it. (A `test result:` line reading `0 passed` for the `wordcartel` lib means the run was filtered
+or the wrong target — that is a failure, not a pass.)
 
 **7.2 — Repro-basis soak, 60× at DEFAULT threading.** This is the exact condition that produced
 the baseline failures (3/60 for the editor test, 4/60 for the filter test):
 ```sh
 BIN=$(pick_bin)
 [ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FATAL: bad harness"; exit 1; }
-echo "harness: $BIN"; "$BIN" --list 2>/dev/null | tail -1
+EXPECTED=$("$BIN" --list 2>/dev/null | tail -1 | grep -oE '^[0-9]+')
+echo "harness: $BIN  (declares ${EXPECTED:-?} tests)"
+[ "${EXPECTED:-0}" -gt 1700 ] || { echo "FATAL: harness declares only ${EXPECTED:-0} tests"; exit 1; }
+
 SOAK=$(mktemp -d)                       # own scratch dir, removed at the end of this step
 fails=0
 for i in $(seq 1 60); do
   "$BIN" >"$SOAK/soak-$i.log" 2>&1 || fails=$((fails+1))
 done
 echo "failed runs: $fails / 60"
+echo "logs written: $(ls "$SOAK"/soak-*.log 2>/dev/null | wc -l) / 60"
+# THE load-bearing assertion: one distinct result line, seen 60 times, with the full test count.
+# Catches a filtered/zero-test run, a wrong binary, and any failure — none of which a bare exit
+# code or an empty grep would distinguish from success.
+grep -h "^test result:" "$SOAK"/soak-*.log | sed 's/; finished in.*//' | sort | uniq -c
 grep -h "^test .* FAILED\|panicked at" "$SOAK"/soak-*.log | sort | uniq -c
 rm -rf "$SOAK"
 ```
-Required: `failed runs: 0 / 60`, and the grep empty. **No `--test-threads` flag anywhere.**
+Required, all four: `failed runs: 0 / 60`; `logs written: 60 / 60`; **exactly one** `test result:`
+line, with count `60` and `NNNN passed` matching the declared harness total (not `0 passed`); and
+the FAILED/panicked grep empty. **No `--test-threads` flag anywhere.**
 
 **7.3 — Contention soak, 6 rounds × 6 concurrent processes.** This is the condition under which
 the filter test failed 14/36 (~39%):
 ```sh
 BIN=$(pick_bin)
 [ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FATAL: bad harness"; exit 1; }
-echo "harness: $BIN"
+EXPECTED=$("$BIN" --list 2>/dev/null | tail -1 | grep -oE '^[0-9]+')
+echo "harness: $BIN  (declares ${EXPECTED:-?} tests)"
+[ "${EXPECTED:-0}" -gt 1700 ] || { echo "FATAL: harness declares only ${EXPECTED:-0} tests"; exit 1; }
+
 CONT=$(mktemp -d)                       # own scratch dir, removed at the end of this step
+fails=0
 for r in $(seq 1 6); do
-  for p in $(seq 1 6); do "$BIN" >"$CONT/cont-$r-$p.log" 2>&1 & done
-  wait                                  # waits only on THIS shell's background jobs
+  pids=""
+  for p in $(seq 1 6); do "$BIN" >"$CONT/cont-$r-$p.log" 2>&1 & pids="$pids $!"; done
+  # Wait on each PID individually: a bare `wait` discards exit codes, so a run killed by a signal
+  # (OOM, SIGKILL) that never wrote a FAILED line would be invisible to the greps below.
+  for pid in $pids; do wait "$pid" || fails=$((fails+1)); done
 done
+echo "failed runs: $fails / 36"
+echo "logs written: $(ls "$CONT"/cont-*.log 2>/dev/null | wc -l) / 36"
+grep -h "^test result:" "$CONT"/cont-*.log | sed 's/; finished in.*//' | sort | uniq -c
 grep -h "^test .* FAILED\|panicked at" "$CONT"/cont-*.log | sort | uniq -c
-grep -l "FAILED" "$CONT"/cont-*.log | wc -l
 rm -rf "$CONT"
 ```
-Required: zero failures across all 36 runs. Specifically confirm none of these appear:
+Required, all four: `failed runs: 0 / 36`; `logs written: 36 / 36`; **exactly one** `test result:`
+line with count `36` and the full `NNNN passed` total; and the FAILED/panicked grep empty.
+Specifically confirm none of these appear:
 `filter::tests::run_filter_non_zero_exit_carries_stderr`,
 `editor::tests::undo_and_redo_refresh_the_recovery_snapshot`,
 `prompts::tests::the_clean_recovery_modal_names_kept_recoverable_files`,
@@ -1277,23 +1346,62 @@ Required: zero failures across all 36 runs. Specifically confirm none of these a
 mapping; they are not this effort's targets, but their absence is worth recording, and their
 presence is worth reporting.)
 
-**7.4 — Real state dir untouched.** After all of the above:
+**7.4 — Real state dir untouched.** This is the check that certifies the isolation half's central
+claim, so it must not be able to pass for the wrong reason. Two failure modes it previously had:
+it hardcoded `~/.local/state/wordcartel`, so with `XDG_STATE_HOME` set it inspected a directory
+the code never uses and printed a pass; and it treated "absent" and "present but modified" as the
+same result, checking neither mtimes nor the 7.0 baseline. Read-only — this step must never
+create, modify or delete anything under `$REAL`.
+```sh
+REAL="${XDG_STATE_HOME:-$HOME/.local/state}/wordcartel"
+echo "inspecting: $REAL"
+[ -e target/.wc-effort1-runstart ] || { echo "FATAL: 7.0 baseline marker missing — rerun 7.0"; exit 1; }
+if [ -e "$REAL" ]; then
+  echo "RESULT: present"
+  ls -la --time-style=full-iso "$REAL"
+  echo "entries modified since 7.0: $(find "$REAL" -newer target/.wc-effort1-runstart 2>/dev/null | wc -l)  (must be 0)"
+else
+  echo "RESULT: absent"
+fi
 ```
-ls -la --time-style=full-iso ~/.local/state/wordcartel 2>/dev/null || echo "(does not exist — pass)"
-```
-Nothing may have been created or modified by the test runs.
+**Pass conditions — state which one applies, and note that they are different results:**
+- 7.0 said *absent* and this says `RESULT: absent` → pass (nothing created).
+- 7.0 said *present* and this says `RESULT: present` with `entries modified since 7.0: 0` → pass
+  (nothing written).
+- **`entries modified since 7.0` is non-zero → FAILURE.** Something in the suite reached the real
+  state dir. Report the paths `find` listed; do not rationalize it.
+- 7.0 said *absent* but this says `RESULT: present` → **FAILURE**, the suite created it.
 
-**7.5 — PTY smoke suite (mandatory-run, advisory-pass).**
-```
-scripts/smoke/run.sh
-```
-Quote the one-line summary **verbatim** (e.g. `smoke: 9/9 PASS`, or `smoke: FAIL s3 — advisory`,
-or `smoke: SKIP — …`). A red result does **not** block the merge but MUST be surfaced explicitly
-as an advisory finding. Note the smoke suite drives the real `wcartel` binary against the **real**
-state dir — that is deliberate and correct, and is where real-state-dir behaviour is proven.
+Note `find -newer` compares mtime, so a file rewritten with identical content still counts as
+modified — which is what we want, since the concern is writes, not content drift.
 
-**7.6 — Report.** No commit unless a `.history` file changed. Summarize: gate results, both soak
-results with counts, the state-dir listing, the verbatim smoke line, and any advisory finding.
+**7.5 — PTY smoke suite (mandatory-run, advisory-pass).** Run it AFTER 7.4: the smoke suite drives
+the real `wcartel` binary against the **real** state dir — deliberately, since that is where
+real-state-dir behaviour is proven end-to-end — so running it first would legitimately touch
+`$REAL` and make 7.4's result unreadable.
+```sh
+scripts/smoke/run.sh 2>&1 | tail -20
+echo "smoke exit: ${PIPESTATUS[0]}"
+```
+Quote the one-line summary **verbatim** (e.g. `smoke: 9/9 PASS`, `smoke: FAIL s3 — advisory`, or
+`smoke: SKIP — …`). **If no `smoke:` line appears at all, that is not a pass** — the script failed
+before summarizing (missing `tmux`, build failure); report that, with the exit code. A red result
+does **not** block the merge but MUST be surfaced explicitly as an advisory finding. A `SKIP` is
+also not a pass — it means the suite did not run; say so plainly rather than filing it as green.
+
+**7.6 — Clean up and report.**
+```sh
+rm -f target/.wc-effort1-runstart
+```
+No commit unless `scripts/smoke/.history` changed (it is gitignored, so normally nothing to
+commit). Report, with output pasted rather than summarized:
+- 7.1: four exit codes, the `test result:` tally, clippy warning/error counts, build warnings.
+- 7.2 / 7.3: `failed runs`, `logs written`, the single `test result:` line with its count, and the
+  FAILED/panicked grep for each.
+- 7.4: which pass condition applied, and the `entries modified since 7.0` number.
+- 7.5: the verbatim `smoke:` line and exit code.
+- Any advisory finding, stated as such.
+- Confirm no step was re-run with a weakened assertion to obtain a pass.
 
 ---
 
@@ -1320,6 +1428,27 @@ Check these specifically; each is a defect this effort's review rounds actually 
 
 ## History
 
+- 2026-07-19 (rev 3) — **Missed instance of the rev-2 class, plus a full false-pass audit of Task
+  7.** Step 7.4 still hardcoded `~/.local/state/wordcartel`: with `XDG_STATE_HOME` set it inspected
+  a directory the code never uses and printed `(does not exist — pass)` — a **false pass on the
+  one check that certifies the isolation half's central claim**. Fixed to the `REAL=` form, given
+  a 7.0 baseline to compare against, and given explicit, distinct pass conditions (absent→absent,
+  or present with `find -newer` = 0); "present but modified" and "created during the run" are now
+  named failures rather than silently reading as passes. Then re-read every Task 7 step against
+  "could this print pass while the thing it names is false?" and hardened four more: **7.1** ran
+  bare cargo commands whose exit codes were never captured (a workspace that fails to compile
+  emits no `test result:` lines at all, and `cargo build` succeeds *with* warnings) — now captures
+  four exit codes plus clippy/build warning counts; **7.2 and 7.3** counted only exit codes and
+  grepped logs, both of which pass vacuously — verified on this machine that a filtered run prints
+  `test result: ok. 0 passed; … 1768 filtered out` and **exits 0**, so a soak could report
+  `failed runs: 0 / 60` having executed nothing, and a grep over zero log files is
+  indistinguishable from a grep that found no failures; both now assert the declared harness test
+  count, the log count, and a single `test result:` line seen exactly 60/36 times with the full
+  passed total. **7.3** additionally used a bare `wait`, discarding background exit codes so a
+  signal-killed run that wrote no FAILED line was invisible; it now waits per-PID. **7.5** treated
+  a missing `smoke:` summary line and a `SKIP` as passes; both are now explicitly not-a-pass.
+  Also added a preamble naming the pattern (three occurrences so far: the spec's T7, Task 3's
+  guard, 7.4) and fixed two fixed-`/tmp` paths I introduced *while* hardening 7.1.
 - 2026-07-19 (rev 2) — **Codex plan gate round 1 folded; all four accepted.** IMPORTANT 1: the
   fd-0 probe used `pkill -x sleep`, which would terminate the developer's unrelated processes on
   their real machine. Rewritten to `setsid` + `kill -- -PGID`, killing only groups the probe
