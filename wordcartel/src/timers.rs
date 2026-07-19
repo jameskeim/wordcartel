@@ -197,7 +197,7 @@ pub(crate) fn pre_recv(editor: &mut Editor, now: u64) { save_timeout_tick(editor
 /// `Msg::Tick` arm — the per-dispatch `_due` predicates re-check the gate at fire
 /// time, so a wake for one subsystem never fires another prematurely.
 pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
-    msg_tx: &std::sync::mpsc::Sender<Msg>) {
+    msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     let now = clock.now_ms();
     if crate::swap::pending(
         editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
@@ -206,7 +206,7 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
         && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
     {
         editor.active_mut().swap_in_flight = true;
-        let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+        let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
         crate::swap::dispatch_swap_write(&mut ctx);
     }
     // Dispatch diagnostics if due.

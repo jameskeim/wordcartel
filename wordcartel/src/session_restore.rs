@@ -55,9 +55,11 @@ pub fn load_block_from_entry(editor: &mut Editor, entry: &crate::state::StateEnt
 /// with only `&mut Editor`. No-op if there is no matching/non-stale session entry.
 pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
     let session = crate::state::load();
+    // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
     if let Ok(canon) = std::fs::canonicalize(path) {
         let key = canon.to_string_lossy().into_owned();
         if let Some(entry) = session.entries.get(&key) {
+            // fs-chokepoint-allow: (w) session/state metadata — config-class, not document content
             if let Some(identity) = crate::state::file_identity(path) {
                 let doc_len = editor.active().document.buffer.len();
                 if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
@@ -105,11 +107,11 @@ pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
 /// Allocates a FRESH id so an in-flight save/swap job for the replaced buffer merges via
 /// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
 /// (keep the user's work).
-pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
+pub fn open_into_current(editor: &mut Editor, fs: &dyn crate::fsx::Fs, path: &std::path::Path) {
     let old_id = editor.active().id; // capture BEFORE alloc so MRU can replace old→new
     let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer no-ops via by_id_mut(old_id)=None
     let area = editor.active().view.area;
-    match crate::editor::Buffer::from_file(id, path, area) {
+    match crate::editor::Buffer::from_file(id, fs, path, area) {
         Ok(b) => {
             let a = editor.active;
             // A17 T8 category (b): route through the single chokepoint. On a read-only buffer this
@@ -164,7 +166,9 @@ pub(crate) fn persist_session(
     // Per-file entry for the active buffer (unchanged): only when it has a real,
     // canonicalizable path. Scratch/new buffers contribute no per-file entry.
     if let Some(raw_path) = editor.active().document.path.as_deref() {
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
         if let Ok(canon) = std::fs::canonicalize(raw_path) {
+            // fs-chokepoint-allow: (w) session/state metadata — config-class, not document content
             if let Some((mtime, size)) = crate::state::file_identity(raw_path) {
                 let entry = crate::state::StateEntry {
                     cursor: editor.active().document.selection.primary().head,
@@ -173,6 +177,7 @@ pub(crate) fn persist_session(
                     mtime, size, seq,
                     folds: editor.active().folds.folded().iter().copied().collect(),
                     block: editor.active().marked_block.map(|b| (b.start, b.end)),
+                    id: Some(editor.active().document.id.to_hex()),
                 };
                 session.record(canon.to_string_lossy().into_owned(), entry, cfg.state.max_entries);
             }
@@ -187,10 +192,148 @@ pub fn persist_session_for_test(s: &mut crate::state::SessionState, e: &crate::e
     persist_session(s, e, cfg, seq);
 }
 
+/// Apply every queued Save-As session-entry migration, FIFO.
+///
+/// FIFO is required, not incidental: with merge-time capture each entry's `from` is the
+/// previous entry's `to`, so any other order strands the chain.
+///
+/// Best-effort — this is hygiene, not a durability guarantee. A migration whose `from` key
+/// is already absent is a silent no-op, never an error and never a reason to fail a persist.
+pub(crate) fn drain_session_migrations(
+    session: &mut crate::state::SessionState,
+    editor: &mut crate::editor::Editor,
+    cfg: &crate::config::Config,
+) {
+    while let Some(m) = editor.pending_session_migrations.pop_front() {
+        // Both endpoints are LOGICAL paths (Middle B); canonicalizing here is what makes a
+        // symlinked destination converge on the same key as its target.
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
+        let from_key = std::fs::canonicalize(&m.from)
+            .unwrap_or_else(|_| m.from.clone()).to_string_lossy().into_owned();
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
+        let to_key = std::fs::canonicalize(&m.to)
+            .unwrap_or_else(|_| m.to.clone()).to_string_lossy().into_owned();
+        if from_key == to_key { continue; }
+        let Some(mut entry) = session.entries.remove(&from_key) else { continue };
+        entry.seq = session.next_seq();
+        session.record(to_key, entry, cfg.state.max_entries);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestClock;
+    use crate::jobs::{Executor, InlineExecutor};
+    use crate::registry::Ctx;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    struct Z; impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+    fn tx() -> std::sync::mpsc::Sender<crate::app::Msg> {
+        std::sync::mpsc::channel().0
+    }
+    fn scratch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wcartel-sessmig-{}-{}.md",
+            std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    #[test]
+    fn two_migrations_in_one_drain_batch_both_apply() {
+        // FAIL-VERIFY: swap the queue for an `Option` slot, watch this fail, then revert.
+        //
+        // FAILS AGAINST AN `Option` SLOT. `app::fold_and_continue` drains the executor in a
+        // LOOP (`for o in ex.drain() { apply_job_outcome(…) }`), so several ready save jobs
+        // merge before app::run next reaches a persist point. A single slot would keep only
+        // the last, silently losing the first writer's marks with no error.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let cfg = crate::config::Config::default();
+        let mut s = crate::state::SessionState::default();
+        let entry = |c: usize| crate::state::StateEntry {
+            cursor: c, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq: 1,
+            folds: vec![], block: None, ..Default::default() };
+        s.entries.insert("/a.md".into(), entry(11));
+        s.entries.insert("/x.md".into(), entry(22));
+
+        e.pending_session_migrations.push_back(crate::editor::SessionMigration {
+            from: "/a.md".into(), to: "/b.md".into() });
+        e.pending_session_migrations.push_back(crate::editor::SessionMigration {
+            from: "/x.md".into(), to: "/y.md".into() });
+
+        drain_session_migrations(&mut s, &mut e, &cfg);
+
+        assert!(s.entries.contains_key("/b.md"), "first migration applied");
+        assert!(s.entries.contains_key("/y.md"), "second migration applied — NOT clobbered");
+        assert_eq!(s.entries["/b.md"].cursor, 11, "and it carried the cursor across");
+        assert_eq!(s.entries["/y.md"].cursor, 22);
+        assert!(!s.entries.contains_key("/a.md") && !s.entries.contains_key("/x.md"),
+            "the old keys are gone — the point is to remove the stale duplicate");
+        assert!(e.pending_session_migrations.is_empty(), "the queue drains fully");
+    }
+
+    #[test]
+    fn overlapping_same_source_save_as_chains_correctly() {
+        // DRIVES THE REAL DISPATCH. An earlier version hand-enqueued (a->b, b->c) — the
+        // already-correct sequence — so it passed even if `do_save_to` never captured
+        // anything. It guarded nothing, which is exactly what it was split out to prevent.
+        //
+        // FAIL-VERIFY: move the capture back to dispatch time (bind `prior_key` before the
+        // job and use it for the migration), watch this fail with an entry stranded at /b.md.
+        let p_a = scratch();
+        let p_b = scratch();
+        let p_c = scratch();
+        std::fs::write(&p_a, b"body\n").expect("seed");
+        let mut e = Editor::new_from_text("body\n", Some(p_a.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+
+        // TWO Save-As dispatched from the SAME source before either merge lands. This is the
+        // ordering dispatch-time capture gets wrong: it would record (a->b, a->c).
+        {
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex,
+                msg_tx: tx(), fs: std::sync::Arc::clone(&fs) };
+            crate::save::do_save_to(&mut ctx,
+                crate::save::SaveTarget::same(p_b.clone()), crate::save::SaveMode::SaveAs);
+            crate::save::do_save_to(&mut ctx,
+                crate::save::SaveTarget::same(p_c.clone()), crate::save::SaveMode::SaveAs);
+        }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        // The queue the MERGES produced — not one we wrote by hand.
+        let mut s = crate::state::SessionState::default();
+        let key = |p: &std::path::Path| std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned();
+        s.entries.insert(key(&p_a), crate::state::StateEntry {
+            cursor: 7, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq: 1,
+            folds: vec![], block: None, ..Default::default() });
+        let cfg = crate::config::Config::default();
+        drain_session_migrations(&mut s, &mut e, &cfg);
+
+        assert!(s.entries.contains_key(&key(&p_c)),
+            "the chain must land at the FINAL path — dispatch-time capture strands it at /b");
+        assert_eq!(s.entries[&key(&p_c)].cursor, 7, "carrying the original cursor through both hops");
+        assert!(!s.entries.contains_key(&key(&p_a)), "no stale source entry");
+        assert!(!s.entries.contains_key(&key(&p_b)), "no stranded intermediate entry");
+        assert_eq!(s.entries.len(), 1, "exactly ONE entry survives");
+        for f in [&p_a, &p_b, &p_c] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn a_migration_whose_source_is_gone_is_a_silent_no_op() {
+        // Hygiene, not a durability guarantee: never an error, never a reason to fail a
+        // persist.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let cfg = crate::config::Config::default();
+        let mut s = crate::state::SessionState::default();
+        e.pending_session_migrations.push_back(crate::editor::SessionMigration {
+            from: "/never-existed.md".into(), to: "/z.md".into() });
+        drain_session_migrations(&mut s, &mut e, &cfg);
+        assert!(s.entries.is_empty(), "nothing invented");
+        assert!(e.pending_session_migrations.is_empty(), "still drained");
+    }
 
     #[test]
     fn open_into_current_replaces_with_fresh_id_and_clean() {
@@ -199,7 +342,7 @@ mod tests {
         std::fs::write(&p, "opened\n").unwrap();
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
         let old_id = e.active().id;
-        open_into_current(&mut e, &p);
+        open_into_current(&mut e, &crate::fsx::RealFs, &p);
         assert_ne!(e.active().id, old_id, "fresh id → stale in-flight jobs for old buffer are ignored");
         assert_eq!(e.active().document.buffer.to_string(), "opened\n");
         assert!(!e.active().document.dirty());
@@ -214,7 +357,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wc-oic-isdir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
-        open_into_current(&mut e, &dir);
+        open_into_current(&mut e, &crate::fsx::RealFs, &dir);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         e.set_status(crate::status::StatusKind::Info, "later ack");
@@ -229,9 +372,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.md"), "loaded\n").unwrap();
         let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
-        e.open_file_browser(dir.clone());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        e.open_file_browser(&crate::test_support::test_fs(), &tx, dir.clone());
         // select "note.md" and simulate Enter via the browser's open path:
-        open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
+        open_into_current(&mut e, &crate::fsx::RealFs, &dir.join("note.md")); // the clean-path the Enter handler takes
         assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -241,7 +385,7 @@ mod tests {
         // unit-test the resume decision helper directly (no TTY):
         // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
         use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None };
+        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None, ..Default::default() };
         // identity match → restore (clamped to doc_len)
         assert_eq!(apply_resume(&e, (10,20), 100), Some((4,2)));
         assert_eq!(apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
@@ -257,7 +401,7 @@ mod tests {
         let mut marks = BTreeMap::new();
         marks.insert("a".to_string(), 6usize);
         marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None };
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None, ..Default::default() };
         load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
@@ -276,6 +420,7 @@ mod tests {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 10, size: 20, seq: 1, folds: vec![],
             block: Some((3, 8)),
+            ..Default::default()
         };
 
         // ── matching identity: guard passes → block restores with hidden=false ──
@@ -338,6 +483,7 @@ mod tests {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 10, size: 20, seq: 1, folds: vec![],
             block: Some((4, 8)), // start at EOF, end beyond EOF
+            ..Default::default()
         };
 
         // Real production restore path (post-staleness-guard).
@@ -361,6 +507,7 @@ mod tests {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 10, size: 20, seq: 1, folds: vec![],
             block: Some((1, 99)), // start in-range, end far past EOF
+            ..Default::default()
         };
         load_block_from_entry(&mut e2, &entry2);
         let b = e2.active().marked_block.expect("non-collapsing block restored");
@@ -380,6 +527,26 @@ mod tests {
         let sb = e.by_id(sid).unwrap();
         assert_eq!(sb.document.buffer.to_string(), "hello");
         assert_eq!(sb.document.selection.primary().head, 5, "cursor clamped to len");
+    }
+
+    // -------------------------------------------------------------------------
+    // C5 Task 25: DocumentId mint-and-stamp
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn persist_session_stamps_the_active_documents_id() {
+        // FAIL-VERIFY: remove the `id:` assignment in `persist_session`, watch this fail.
+        let p = std::env::temp_dir().join(format!("wc-idstamp-{}.md", std::process::id()));
+        std::fs::write(&p, b"x\n").expect("seed");
+        let e = crate::editor::Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
+        let expected = e.active().document.id.to_hex();
+        let mut s = crate::state::SessionState::default();
+        let cfg = crate::config::Config::default();
+        persist_session_for_test(&mut s, &e, &cfg, 1);
+        let key = std::fs::canonicalize(&p).expect("canon").to_string_lossy().into_owned();
+        assert_eq!(s.entries[&key].id.as_deref(), Some(expected.as_str()),
+            "the entry must carry the ACTIVE document's id, not a fresh or absent one");
+        let _ = std::fs::remove_file(&p);
     }
 
     // -------------------------------------------------------------------------

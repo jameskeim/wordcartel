@@ -5,7 +5,6 @@
 // the file on disk at resume time; a mismatch → discard (never restore stale state).
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +30,10 @@ pub struct StateEntry {
     /// 9a: persisted marked-block byte range [start, end). Defaulted so pre-9a session.toml loads.
     #[serde(default)]
     pub block: Option<(usize, usize)>,
+    /// C5 Task 25: the active document's lineage hint (`DocumentId::to_hex`) at persist time.
+    /// Defaulted so pre-C5 session.toml loads. Nothing reads it today — see `swap::SwapHeader::id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// Effort 6: the permanent *scratch* buffer's persisted content. Path-less, so it
@@ -91,6 +94,7 @@ impl SessionState {
                 return Ok(()); // metadata alone over cap (shouldn't happen) → skip persist
             }
         }
+        // fs-chokepoint-allow: (w) session persistence — config-class state file, not document content
         crate::file::save_atomic_bytes(&dir.join("session.toml"), text.as_bytes())
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -104,13 +108,17 @@ impl SessionState {
 /// Load from a specific directory (testable variant). Corrupt/missing/over-cap → empty.
 /// The read is bounded at MAX_SESSION_BYTES+1 so a huge file is never fully slurped.
 pub fn load_in(dir: &Path) -> SessionState {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    load_in_with_fs(&crate::fsx::RealFs, dir)
+}
+
+pub(crate) fn load_in_with_fs(fs: &dyn crate::fsx::Fs, dir: &Path) -> SessionState {
     let path = dir.join("session.toml");
-    let Ok(f) = std::fs::File::open(&path) else { return SessionState::default() };
-    let mut text = String::new();
     let cap = crate::limits::MAX_SESSION_BYTES as u64;
-    if f.take(cap + 1).read_to_string(&mut text).is_err() || text.len() as u64 > cap {
-        return SessionState::default(); // unreadable or over-cap → empty (graceful)
-    }
+    let Ok(Some(bytes)) = fs.read_capped(&path, cap) else {
+        return SessionState::default(); // missing, unreadable, or over-cap → empty (graceful)
+    };
+    let Ok(text) = String::from_utf8(bytes) else { return SessionState::default() };
     toml::from_str(&text).unwrap_or_default()
 }
 
@@ -124,14 +132,24 @@ pub fn load() -> SessionState {
 
 /// Return the (mtime_secs, size) identity of a file, or None on error.
 pub fn file_identity(path: &Path) -> Option<(i64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
-    let mtime = m
-        .modified()
-        .ok()
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    file_identity_with_fs(&crate::fsx::RealFs, path)
+}
+
+/// Seam-taking core of [`file_identity`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn file_identity_with_fs(fs: &dyn crate::fsx::Fs, path: &Path) -> Option<(i64, u64)> {
+    let st = fs.stat(path).ok()?;
+    // SAME guard as `save::fingerprint`, and for the same reason: today's
+    // `std::fs::metadata(path).ok()?` FAILS for a broken symlink, so this returns None.
+    // The seam's `stat` SUCCEEDS for one, so without this the session-restore staleness
+    // check would receive a (mtime = 0, len = 0) identity — which matches nothing and
+    // silently discards resume state, or worse matches a genuinely empty file.
+    if st.broken { return None; }
+    let mtime = st.mtime
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Some((mtime, m.len()))
+    Some((mtime, st.len))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +189,7 @@ mod tests {
                     seq: i,
                     folds: vec![],
                     block: None,
+                    ..Default::default()
                 },
                 3, // cap 3
             );
@@ -187,8 +206,8 @@ mod tests {
     fn next_seq_is_one_past_max() {
         let mut s = SessionState::default();
         assert_eq!(s.next_seq(), 1, "empty store → next_seq == 1");
-        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None });
-        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None });
+        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None, ..Default::default() });
+        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None, ..Default::default() });
         assert_eq!(s.next_seq(), 10, "entries at seq {{5,9}} → next_seq == 10");
     }
 
@@ -197,11 +216,11 @@ mod tests {
         // Simulate: loaded session has entries at seq 5 and 9 (from a prior run).
         // A new entry recorded at seq 10 (from next_seq()) must survive; seq 5 is evicted.
         let mut s = SessionState::default();
-        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None });
-        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None });
+        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![], block: None, ..Default::default() });
+        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![], block: None, ..Default::default() });
         let new_seq = s.next_seq(); // == 10
         assert_eq!(new_seq, 10);
-        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq, folds: vec![], block: None }, 2);
+        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq, folds: vec![], block: None, ..Default::default() }, 2);
         // Cap is 2: the freshest two must be /old-b (seq 9) and /new (seq 10); /old-a (seq 5) evicted.
         assert_eq!(s.entries.len(), 2, "pruned to cap");
         assert!(s.entries.contains_key("/new"), "newly-recorded entry must survive");
@@ -214,6 +233,20 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join("session.toml"), b"\xff not toml").unwrap();
         assert!(load_in(&dir).entries.is_empty());
+    }
+
+    #[test]
+    fn pre_c5_session_toml_without_id_still_deserializes() {
+        let toml = r#"
+[entries."/tmp/x.md"]
+cursor = 3
+scroll = 0
+mtime = 1
+size = 2
+seq = 1
+"#;
+        let s: SessionState = toml::from_str(toml).expect("must deserialize without id");
+        assert!(s.entries["/tmp/x.md"].id.is_none(), "missing id key → None, never an error");
     }
 
     #[test]
@@ -234,7 +267,7 @@ seq = 1
     #[test]
     fn folds_round_trip_through_toml() {
         let mut s = SessionState::default();
-        s.entries.insert("/tmp/x.md".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 1, size: 2, seq: 1, folds: vec![10, 42], block: None });
+        s.entries.insert("/tmp/x.md".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 1, size: 2, seq: 1, folds: vec![10, 42], block: None, ..Default::default() });
         let out = toml::to_string(&s).unwrap();
         let back: SessionState = toml::from_str(&out).unwrap();
         assert_eq!(back.entries["/tmp/x.md"].folds, vec![10, 42]);
@@ -263,6 +296,7 @@ seq = 1
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 1, size: 2, seq: 1, folds: vec![],
             block: Some((10, 42)),
+            ..Default::default()
         });
         let out = toml::to_string(&s).unwrap();
         let back: SessionState = toml::from_str(&out).unwrap();
@@ -296,6 +330,7 @@ seq = 1
         s.entries.insert("/a".into(), StateEntry {
             cursor: 0, scroll: 0, marks: Default::default(),
             mtime: 1, size: 1, seq: 1, folds: vec![], block: None,
+            ..Default::default()
         });
         s.scratch = Some(ScratchState { text: "x".repeat(crate::limits::MAX_SESSION_BYTES + 1), cursor: 0 });
         s.save_in(&d).unwrap();
@@ -309,5 +344,21 @@ seq = 1
         let d = tmp();
         std::fs::write(d.join("session.toml"), "x".repeat(crate::limits::MAX_SESSION_BYTES + 1)).unwrap();
         assert!(load_in(&d).entries.is_empty(), "over-cap session.toml → empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_on_a_broken_symlink_is_none() {
+        // Without the guard this returns Some((0, 0)) — an identity that silently discards
+        // resume state, or matches a genuinely empty file.
+        //
+        // FAIL-VERIFY: delete the `if st.broken` line, watch this fail, then revert.
+        let d = std::env::temp_dir().join(format!("wc-fid-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let link = d.join("dangling.md");
+        std::os::unix::fs::symlink(d.join("gone.md"), &link).expect("symlink");
+        assert!(file_identity_with_fs(&crate::fsx::RealFs, &link).is_none(),
+            "a broken symlink must yield None, exactly as metadata().ok()? did");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

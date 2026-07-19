@@ -34,6 +34,7 @@ pub(crate) fn load_phase(
         warns.push("plugins: no config directory found (set [plugins].dir)".into());
         return Vec::new();
     };
+    // fs-chokepoint-allow: (w) config-class read — a small config file, not document content
     let disc = crate::plugin::load::discover(&dir, &plugins.disable);
     let mut inventory = Vec::new();
     for r in &disc.skipped {
@@ -88,6 +89,7 @@ pub(crate) fn perform_reload(
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     { editor.borrow_mut().plugins_reload_requested = false; }              // 1. clear the flag
+    // fs-chokepoint-allow: (w) config-class read — a small config file, not document content
     let (cfg, _warns) = crate::config::load(all_paths);                    // 2. re-read config…
     let plugins = cfg.plugins;                                             //    …take ONLY [plugins]
     *host = crate::plugin::host::PluginHost::null();                       // 3. tear down the VM

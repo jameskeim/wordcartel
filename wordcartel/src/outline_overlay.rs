@@ -94,7 +94,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         editor.set_status_full(crate::status::StatusKind::Warning, "document changed; outline closed",
                             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                         editor.outline = None;
-                        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+                        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
                     }
                     let target = editor.outline.as_ref()
                         .and_then(|o| o.rows.get(o.selected))
@@ -133,7 +133,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
     }
     // Non-key messages fall through to normal handlers below.
     crate::app::Handled::Pass(msg)

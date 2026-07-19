@@ -81,7 +81,8 @@ impl PluginHost {
     /// next frame would let a hostile cascade starve every subsequent frame instead of one.
     pub fn pump(&mut self, editor: &Rc<RefCell<Editor>>, reg: &crate::registry::Registry,
                 ex: &dyn crate::jobs::Executor, clock: &dyn Clock,
-                msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+                msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+                fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
         if self.lua.is_none() {
             // Null-host discipline (P2 §3d): fire sites push events/dispatches UNCONDITIONALLY
             // (they don't know whether a VM is live), so under `--no-plugins` these queues would
@@ -121,7 +122,7 @@ impl PluginHost {
             for d in dispatches {
                 if self.cap_tripped(units, start, editor) { return; }
                 units += 1;
-                self.drain_one_dispatch(editor, reg, ex, clock, msg_tx, &d);
+                self.drain_one_dispatch(editor, reg, ex, clock, msg_tx, &d, fs);
             }
             for c in calls {
                 if self.cap_tripped(units, start, editor) { return; }
@@ -211,7 +212,7 @@ impl PluginHost {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = crate::test_support::TestClock::new(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        self.pump(editor, &reg, &ex, &clock, &tx);
+        self.pump(editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     }
 
     /// Between-units cap check for the pump's re-drain loop (§5c) — `true` means EITHER cap
@@ -241,6 +242,7 @@ impl PluginHost {
     /// synchronously inside that borrow (builtin handlers never call Lua); a `Plugin` entry
     /// enqueues a `PluginCall` back onto `editor.pending_plugin_calls`, picked up by the next
     /// re-drain iteration. The borrow drops before any Lua runs.
+    #[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
     fn drain_one_dispatch(
         &self,
         editor: &Rc<RefCell<Editor>>,
@@ -249,13 +251,15 @@ impl PluginHost {
         clock: &dyn Clock,
         msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
         d: &crate::plugin::PluginDispatch,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     ) {
         let Some(id) = reg.resolve_name(&d.name) else {
             crate::plugin::plugin_error(editor, &d.origin, &format!("unknown command '{}'", d.name));
             return;
         };
         let mut e = editor.borrow_mut();
-        let mut ctx = crate::registry::Ctx { editor: &mut e, clock, executor: ex, msg_tx: msg_tx.clone() };
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock, executor: ex, msg_tx: msg_tx.clone(),
+            fs: std::sync::Arc::clone(fs) };
         reg.dispatch_with_arg(id, &mut ctx, d.arg.clone());
     }
 
@@ -416,7 +420,7 @@ mod tests {
         let reg = Registry::builtins();
         let ex = crate::jobs::InlineExecutor::default();
         let (tx, _rx) = std::sync::mpsc::channel();
-        host.pump(editor, &reg, &ex, clock, &tx);
+        host.pump(editor, &reg, &ex, clock, &tx, &crate::test_support::test_fs());
     }
 
     // -----------------------------------------------------------------------
@@ -664,7 +668,7 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(10_000);
         let (tx, _rx) = std::sync::mpsc::channel();
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
         let e = editor.borrow();
         assert_eq!(e.pending_plugin_timers.len(), 1, "the timer must remain armed under a bridge-None host");
         assert!(!e.pending_plugin_timers[0].pending, "a bridge-None pump must never mark a timer pending");

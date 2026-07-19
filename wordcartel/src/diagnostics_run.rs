@@ -222,12 +222,39 @@ pub fn retain_unignored(editor: &mut Editor) {
 /// Append `word` to the personal dictionary file (create if missing).
 /// Returns `Ok(())` on success, `Err(e)` on IO failure (caller shows status).
 pub fn append_word_to_dict(path: &std::path::Path, word: &str) -> std::io::Result<()> {
-    use std::io::Write;
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    append_word_to_dict_with_fs(&crate::fsx::RealFs, path, word)
+}
+
+/// Append `word` as a line to the personal dictionary — READ, append in memory, then
+/// ATOMIC REPLACE.
+///
+/// This was the only durable write in the app outside `atomic_replace`: an
+/// `OpenOptions::append` + `writeln!`, non-atomic, uncapped, with no symlink guard. A torn
+/// append could leave a half-written line; the atomic form cannot. Behaviour preserved:
+/// the parent directory is still created (see `append_word_to_dict_creates_parent_dir`).
+pub(crate) fn append_word_to_dict_with_fs(fs: &dyn crate::fsx::Fs, path: &std::path::Path,
+    word: &str) -> std::io::Result<()>
+{
     if let Some(parent) = path.parent() {
+        // fs-chokepoint-allow: (b) directory provisioning for the dictionary's parent
         std::fs::create_dir_all(parent)?;
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{}", word)
+    // Symlink refusal, matching every other durable write.
+    if matches!(fs.stat(path), Ok(st) if st.is_symlink) {
+        return Err(std::io::Error::other("refusing to write through symlink"));
+    }
+    // Read what is there (missing/over-cap → start empty, the same degradation the old
+    // create(true).append(true) had for a missing file).
+    let mut buf = crate::file::bounded_read_opt_with_fs(fs, path, crate::limits::MAX_OPEN_BYTES)
+        .unwrap_or_default();
+    if !buf.is_empty() && !buf.ends_with(b"\n") { buf.push(b'\n'); }
+    buf.extend_from_slice(word.as_bytes());
+    buf.push(b'\n');
+    crate::fsx::atomic_replace(fs, path, &buf, crate::fsx::WriteOpts {
+        mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
+        dir_fsync: true,
+    })
 }
 
 /// Version-gated apply: store only if `version` is still current for `buffer_id`. Routes into
@@ -531,6 +558,56 @@ mod tests {
 
         // Clean up after test
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn append_word_to_dict_is_atomic_and_preserves_existing_words() {
+        // The append becomes read -> append in memory -> atomic_replace, so a torn write
+        // is impossible. Existing content must survive verbatim.
+        let d = std::env::temp_dir().join(format!("wc-dict-atomic-{}", std::process::id()));
+        let p = d.join("dictionary.txt");
+        let _ = std::fs::remove_dir_all(&d);
+        append_word_to_dict_with_fs(&crate::fsx::RealFs, &p, "alpha").expect("first append");
+        append_word_to_dict_with_fs(&crate::fsx::RealFs, &p, "beta").expect("second append");
+        let got = std::fs::read_to_string(&p).expect("read back");
+        assert_eq!(got, "alpha\nbeta\n", "both words present, newline-terminated, in order");
+
+        // ATOMICITY, actually observed. The assertion above passes identically under the OLD
+        // non-atomic `OpenOptions::append` + `writeln!` — appending twice produces the same
+        // bytes either way. What separates them is a FAILED write: the atomic form leaves the
+        // previous contents intact, the append form leaves a torn file.
+        //
+        // FAIL-VERIFY: restore the append implementation, watch this fail with "alpha\nbeta\ngam".
+        let ff = crate::test_support::FaultFs::new(
+            crate::test_support::FaultAt::Write { after: 3 });
+        let err = append_word_to_dict_with_fs(&ff, &p, "gamma")
+            .expect_err("an injected mid-write failure must surface");
+        let _ = err;
+        assert_eq!(std::fs::read_to_string(&p).expect("read back"), "alpha\nbeta\n",
+            "a FAILED append leaves the dictionary exactly as it was — no torn line. This is \
+             the property `atomic_replace` buys and the old append could not.");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_word_to_dict_refuses_a_symlinked_dictionary() {
+        // The append gains the symlink guard every other durable write has. Writing through
+        // the link would replace it with a regular file and destroy the link.
+        let d = std::env::temp_dir().join(format!("wc-dict-link-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("dir");
+        let real = d.join("real.txt");
+        let link = d.join("dict.txt");
+        std::fs::write(&real, "existing\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = append_word_to_dict_with_fs(&crate::fsx::RealFs, &link, "nope")
+            .expect_err("symlinked dictionary must be refused");
+        assert!(err.to_string().to_lowercase().contains("symlink"), "got {err}");
+        assert!(link.symlink_metadata().expect("lstat").file_type().is_symlink(),
+            "the link must survive — that is what the refusal protects");
+        assert_eq!(std::fs::read_to_string(&real).expect("read"), "existing\n",
+            "target untouched");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ------------------------------------------------------------------

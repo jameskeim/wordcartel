@@ -25,6 +25,7 @@ pub mod jobs;
 pub mod jobs_apply;
 pub mod save;
 pub mod app;   // App::run + the testable App::step (Task 12)
+pub mod startup;   // config → fresh Editor seeding, lifted out of app::run
 pub mod swap;
 pub mod timers;
 pub mod recovery;
@@ -62,6 +63,9 @@ pub mod theme_picker;
 pub mod theme_cmds;
 pub mod settings;
 pub mod file_browser;
+pub mod file_browser_listing;
+pub mod file_browser_commit;
+pub mod file_browser_intercept;
 pub mod splash;
 pub mod blocks_marked;
 pub mod scratch;
@@ -72,6 +76,7 @@ pub mod cursor_style;
 pub mod cursor_picker;
 pub mod status;
 pub mod status_view;
+pub mod recents;
 pub(crate) mod list_window;
 #[cfg(test)] pub(crate) mod test_support;
 #[cfg(test)] mod e2e;

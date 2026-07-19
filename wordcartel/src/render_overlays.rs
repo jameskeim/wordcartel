@@ -15,7 +15,7 @@ use crate::{
     render::ChromeStyles,
     chrome_geom::{
         menu_bar_layout, menu_bar_layout_cats, menu_dropdown_rect,
-        palette_overlay_rect, windowed_indicator,
+        palette_overlay_rect, windowed_indicator, file_browser_list_h, file_browser_overlay_rect,
     },
 };
 
@@ -382,6 +382,131 @@ pub(crate) fn paint_cursor_picker(frame: &mut Frame, editor: &mut Editor, cs: &C
     }
 }
 
+/// Truncate a footer PATH to `width` columns from the LEFT, preserving the TAIL and marking
+/// the elision — the opposite of the `.chars().take(n)` right-truncation used elsewhere in this
+/// file for query/list text.
+///
+/// A path's highest-value component is its filename, which sits at the far RIGHT; the leading
+/// directories are the most expendable part. Right-truncating (as this footer briefly did)
+/// silently drops the filename — the one piece of the "where will this land" disclosure that
+/// matters most, and the whole reason the footer exists. `width == 0` yields nothing; `width ==
+/// 1` yields the marker alone, since even one column of real path text plus a marker cannot fit.
+fn elide_path_left(line: &str, width: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= width { return line.to_string(); }
+    if width == 0 { return String::new(); }
+    if width == 1 { return "\u{2026}".to_string(); }
+    let keep = width - 1; // reserve one column for the leading "…" marker
+    let tail: String = chars[chars.len() - keep..].iter().collect();
+    format!("\u{2026}{tail}")
+}
+
+/// Paint a prompt's `detail` disclosure box directly above the status row.
+///
+/// **Not an `OVERLAYS`-table painter.** The prompt's row in `overlays.rs` is, and stays,
+/// `RenderSite::StatusRow`: its question and choices are painted on the status row by
+/// `render::paint_status`, which calls this at the end of its own pass. The box is body
+/// painted *for* that one overlay, not a second render site — `RenderSite` keeps its
+/// single-valued axis and H21's render-coverage test is untouched (spec §5.3 as amended by
+/// C5 §11.3).
+///
+/// A prompt with an **empty `detail` paints nothing at all**, so every prompt that has no
+/// disclosure renders exactly as it did before this seam existed.
+///
+/// Degenerate geometry is handled by refusing to paint rather than by clamping into a
+/// zero-sized rect: `prompt_detail_rect` returns `None` when fewer than three rows are free
+/// above the status row. When the box is shorter than `detail`, the last visible row becomes
+/// an `…and N more` count so a truncated disclosure announces itself instead of just
+/// stopping.
+///
+/// **Which end a too-long line loses depends on its indent**, and the rule is the same one
+/// the eye already reads off the box: a **flush-left line is a heading** (`Keeping 18 that
+/// may hold unsaved work:`) whose meaning is at its START, so it truncates on the right; an
+/// **indented line is an item** — path-shaped, with the filename and the trailing age at its
+/// END — so it elides from the LEFT via `elide_path_left`. Eliding a heading from the left
+/// produced the observed `…ng 18 that may hold unsaved work:` on a 60-column terminal.
+pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Prompt,
+    area: Rect, status_row: u16, cs: &ChromeStyles)
+{
+    let lines = &prompt.detail;
+    let Some(ov_rect) = crate::chrome_geom::prompt_detail_rect(area, status_row, lines.len())
+    else { return };
+
+    frame.render_widget(Clear, ov_rect);
+    frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).border_style(cs.overlay_border),
+        ov_rect,
+    );
+
+    let inner_w = ov_rect.width.saturating_sub(2) as usize;
+    let body_h = ov_rect.height.saturating_sub(2) as usize;
+    for i in 0..body_h {
+        // The final visible row turns into a count when the box could not hold the rest.
+        // The count is orphan ITEMS, never `detail` lines: line 0 is the heading (never an
+        // orphan), and a dropped line may itself already be `clean_recovery`'s own elision
+        // (`  …and N more`) — that one line speaks for N orphans, not one, so it is weighed
+        // by its own count rather than counted as a single entry. Indented like every other
+        // item, matching `clean_recovery`'s own elision line rather than sitting flush like
+        // a heading.
+        let text = if body_h < lines.len() && i + 1 == body_h {
+            let orphans: usize = lines[i.max(1)..].iter().map(|l| elided_weight(l)).sum();
+            format!("  \u{2026}and {orphans} more")
+        } else {
+            lines[i].clone()
+        };
+        let fitted = if text.starts_with(' ') {
+            elide_path_left(&text, inner_w)          // item: keep the filename and the age
+        } else {
+            text.chars().take(inner_w).collect()     // heading: keep the opening words
+        };
+        let y = ov_rect.y + 1 + i as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
+            Rect::new(ov_rect.x + 1, y, inner_w as u16, 1),
+        );
+    }
+}
+
+/// How many orphan items one `detail` line accounts for. An elision line — `…and N more`,
+/// however indented — already speaks for `N` orphans; every other line names exactly one.
+/// Lets the box-clamp count in `paint_prompt_detail` re-total the true unnamed remainder
+/// when it clamps past `clean_recovery`'s own `KEPT_SHOWN` elision line, instead of
+/// undercounting it as a single dropped entry.
+fn elided_weight(line: &str) -> usize {
+    line.trim_start()
+        .strip_prefix("\u{2026}and ")
+        .and_then(|rest| rest.strip_suffix(" more"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1)
+}
+
+/// The picker's border title: what this dialog IS, and where it is pointed.
+///
+/// Built unconditionally as `" Open: {dir} "` until C5 review finding I2 — so a Save-As
+/// destination dialog, the branch's highest-risk write surface, announced itself as an OPEN
+/// dialog, and Recents claimed to be opening the last listing's directory, which is not even
+/// where its rows live. Combined with the field being invisible (C1), nothing on the
+/// destination screen said that Enter might write.
+///
+/// An exhaustive match on both axes, so a future `BrowseMode` or `DestinationPurpose` has to
+/// declare its own title rather than inheriting a wrong one.
+fn file_browser_title(fb: &crate::file_browser::FileBrowser) -> String {
+    use crate::file_browser::{BrowseMode, DestinationPurpose};
+    let dir = fb.dir.display();
+    match &fb.mode {
+        BrowseMode::Select => format!(" Open: {dir} "),
+        // Recents rows are SYNTHESIZED from the session store, not read from `fb.dir` — so
+        // naming a directory here would be a lie about where the writer is looking.
+        BrowseMode::Recents => " Recent files ".to_string(),
+        BrowseMode::Destination { purpose, .. } => match purpose {
+            DestinationPurpose::SaveAs => format!(" Save As: {dir} "),
+            DestinationPurpose::WriteBlock => format!(" Write Block to: {dir} "),
+            DestinationPurpose::Export { ext } => format!(" Export .{ext} to: {dir} "),
+        },
+    }
+}
+
 pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
     let h = area.height;
@@ -394,37 +519,93 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         crate::app::keep_overlay_visible(h, fb.selected, fb.entries.len(), &mut fb.scroll_top);
     }
     if let Some(ref fb) = editor.file_browser {
-        let ov_rect = palette_overlay_rect(area, fb.entries.len());
+        // Sizes the box to CONTENT — but reserves a row for the resolved-target footer when
+        // one is showing, even for a listing too small to otherwise need it (an empty or
+        // freshly created directory). Single-sourced with `chrome_geom::file_browser_row_at`
+        // so hit-testing can never disagree with what gets painted here (the A21 hazard).
+        let ov_rect = file_browser_overlay_rect(area, fb);
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        let list_h = crate::list_window::list_h_for(fb.entries.len(), h);
+        // The list's ACTUAL row budget — single-sourced with `chrome_geom::file_browser_row_at`
+        // so hit-testing can never disagree with what gets painted here (the A21 hazard).
+        let list_h = file_browser_list_h(area, fb) as usize;
+
+        // The resolved-target footer: the post-policy, post-resolution absolute write target,
+        // shown live so a writer never saves not knowing where it went (§ the reason this task
+        // exists). `None` in select mode or with an empty field. Rendered against the real
+        // filesystem — this is a read-only display probe, not a fault-injectable write path.
+        // fs-chokepoint-allow: (w) read-only display probe — painters take no `fs` by design (§5.2 ownership)
+        let footer = crate::file_browser::footer_target(&crate::fsx::RealFs, fb);
+        // How many dedicated footer rows the BOX was actually sized for — read from the same
+        // ledger that sized it, never re-derived from a height guard here, or the painter and
+        // the geometry could disagree about the row the mouse hit-test skips. Gating on the
+        // TERMINAL'S available height rather than on how many entries the directory happens to
+        // contain is the point: an empty directory on an ordinary terminal still gets its own
+        // row, not the cramped border-title fallback. Only a genuinely tiny terminal falls
+        // back to the title.
+        let footer_rows = crate::chrome_geom::file_browser_footer_rows_shown(area, fb);
+        // The footer STACK, in priority order and in the same order `file_browser_footer_rows`
+        // reserved rows for it: the resolved-target line first (§7.3's single highest-value
+        // writer-facing element), then the withholding disclosure (§7.4/§6.2). The disclosure
+        // was computed into `fb.disclosure` and read by nothing at all until this line (review
+        // finding C2) — a writer filtering to Documents saw a shorter list with no indication
+        // that their manuscript had been withheld, which is precisely the silent lie §7.4
+        // forbids. A terminal too small to grow the box gets `footer_rows == 0` and falls back
+        // to the border title, which can carry only the first line.
+        let mut footer_lines: Vec<String> = footer.iter().cloned().collect();
+        footer_lines.extend(crate::file_browser_listing::disclosure_lines(&fb.disclosure));
+        let dedicated_footer_rows = footer_rows.min(footer_lines.len());
+        let footer_takes_title = dedicated_footer_rows == 0 && !footer_lines.is_empty();
 
         frame.render_widget(Clear, ov_rect);
         frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
-        let title = format!(" Open: {} ", fb.dir.display());
+        let title = file_browser_title(fb);
         let mut block = Block::default().borders(Borders::ALL).title(title)
             .border_style(cs.overlay_border);
-        // Indicator composes with the existing dynamic title (file browser already uses top title).
-        if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
+        if footer_takes_title {
+            // No spare interior row: the footer — the safety disclosure that prevents
+            // save-to-nowhere — wins the block's bottom edge over the n/total indicator,
+            // which is mere navigational polish.
+            // Same which-end rule as the dedicated rows below (§11.3.1 rule 5), applied to the
+            // one line the title can carry: line 0 is the resolved target only when there IS a
+            // target line, and a path loses its LEFT end. With no target (select/recents mode)
+            // line 0 is a disclosure — a heading, whose meaning is its leading counts — so it
+            // loses its RIGHT end instead.
+            let w = ov_w.saturating_sub(2) as usize;
+            let truncated = if footer.is_some() { elide_path_left(&footer_lines[0], w) }
+                            else { footer_lines[0].chars().take(w).collect() };
+            block = block.title_bottom(Line::from(truncated));
+        } else if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
+            // Indicator composes with the existing dynamic title (file browser already uses top title).
             block = block.title_bottom(ind);
         }
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
             let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-            let query_display = format!("> {}", fb.query);
+            // The MODE's own text source, never `fb.query` unconditionally: destination mode
+            // types into `fb.mode`'s `field`, so painting the query row from `fb.query` left a
+            // writer naming a Save-As/Write-Block/Export target typing into an invisible
+            // string — the field, the caret and the whole `field_cursor` machinery had no
+            // visual representation at all (C5 review finding C1). `filter_text` is the same
+            // accessor the listing filter reads, so the row can never show text the filter is
+            // not using. An empty field paints as a bare `> `, which §7.2's Row 2 safety
+            // rationale requires to be VISIBLY empty.
+            let field_text = fb.mode.filter_text(&fb.query);
+            let query_display = format!("> {field_text}");
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
 
-            // B11: end-of-query caret.
+            // B11: the text caret — at the end of a select-mode query, at `field_cursor` in
+            // destination mode (where Left/Right/Home actually move it).
             // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
             let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
-                + fb.query.chars().count();
+                + fb.mode.caret_chars(&fb.query);
             if caret_col < (query_area.x + query_area.width) as usize {
                 frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
             }
@@ -435,7 +616,7 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
                 let highlight_style = cs.overlay_selected;
                 let end = (fb.scroll_top + list_h).min(fb.entries.len());
                 let items: Vec<ListItem> = fb.entries[fb.scroll_top..end].iter().map(|e| {
-                    let label = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
+                    let label = crate::file_browser::entry_label(e);
                     let truncated: String = label.chars().take(list_area.width as usize).collect();
                     ListItem::new(Line::from(truncated))
                 }).collect();
@@ -451,6 +632,27 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
                     List::new(items).highlight_style(highlight_style),
                     list_area,
                     &mut list_state,
+                );
+            }
+
+            // The footer's dedicated rows: the last interior rows, immediately above the
+            // bottom border — full box width, so a long absolute path is not truncated to
+            // whatever a border title's corners leave (unlike `footer_takes_title`'s cramped
+            // fallback above). TEXT carries the meaning throughout (the arrow, the "exists"
+            // note, the counts), never colour alone — the terminal-plain / no-color constraint.
+            //
+            // The resolved target loses its LEFT end when it overflows (its filename and the
+            // "exists" note are what matter, and they are at the end); a disclosure line is a
+            // heading and loses its right end, the §11.3.1 rule-5 split.
+            for (i, line) in footer_lines.iter().take(dedicated_footer_rows).enumerate() {
+                let footer_row = ov_y + 2 + list_h as u16 + i as u16;
+                let footer_area = Rect::new(ov_x + 1, footer_row, ov_w.saturating_sub(2), 1);
+                let w = footer_area.width as usize;
+                let fitted = if footer.is_some() && i == 0 { elide_path_left(line, w) }
+                             else { line.chars().take(w).collect() };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
+                    footer_area,
                 );
             }
         }
@@ -641,6 +843,433 @@ pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyl
                 list_area,
                 &mut list_state,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+    use crate::file_browser::{BrowseMode, DestinationPurpose, FileBrowser};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn row_text(term: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area().width;
+        (0..w).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// The rectangle the painter ACTUALLY drew, recovered from the cell grid by finding the
+    /// box-drawing corners. Nothing else paints on these fresh single-widget backends, so the
+    /// four corner glyphs occur exactly once each. Panics with the screen dump if a corner is
+    /// missing — a silent `None` here would turn a real geometry regression into a skipped
+    /// assertion, which is the failure mode this helper exists to close.
+    fn drawn_box_rect(term: &Terminal<TestBackend>) -> Rect {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area().width, buf.area().height);
+        let find = |glyph: &str| -> (u16, u16) {
+            for y in 0..h {
+                for x in 0..w {
+                    if buf[(x, y)].symbol() == glyph { return (x, y); }
+                }
+            }
+            panic!("the painter drew no {glyph} corner; screen:\n{}",
+                (0..h).map(|y| row_text(term, y)).collect::<Vec<_>>().join("\n"));
+        };
+        let (x0, y0) = find("\u{250c}");                 // ┌
+        let (x1, _)  = find("\u{2510}");                 // ┐
+        let (_, y1)  = find("\u{2514}");                 // └
+        Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+
+    fn empty_destination_fb(dir: std::path::PathBuf, field: &str) -> FileBrowser {
+        FileBrowser {
+            dir, query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: field.into(), field_cursor: field.len(),
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+        }
+    }
+
+    // ---- `elide_path_left` ---------------------------------------------------------
+
+    #[test]
+    fn elide_path_left_keeps_the_tail_and_marks_the_elision() {
+        let long = "/home/writer/projects/my-book/drafts-v2/chapter one.md";
+        let got = elide_path_left(long, 24);
+        assert_eq!(got.chars().count(), 24, "fits exactly in the given width: {got}");
+        assert!(got.starts_with('\u{2026}'), "the elision is marked with a leading ellipsis: {got}");
+        assert!(got.ends_with("chapter one.md"),
+            "the FILENAME — the highest-value part of the path — survives: {got}");
+        assert!(!got.contains("home"),
+            "the leading, most-expendable directories are what's dropped, not the tail: {got}");
+    }
+
+    #[test]
+    fn elide_path_left_is_a_no_op_when_it_already_fits() {
+        assert_eq!(elide_path_left("short.md", 40), "short.md");
+    }
+
+    #[test]
+    fn elide_path_left_degenerate_widths_never_panic() {
+        assert_eq!(elide_path_left("anything", 0), "", "zero columns show nothing");
+        assert_eq!(elide_path_left("anything", 1), "\u{2026}", "one column shows only the marker");
+    }
+
+    // ---- the destination field reaches the SCREEN ---------------------------------
+
+    /// C5 review finding C1. The intercept routes destination-mode typing into
+    /// `BrowseMode::Destination`'s `field`, but the painter unconditionally drew
+    /// `format!("> {}", fb.query)` — which stays empty in destination mode. A writer naming a
+    /// Save-As target therefore typed into a string with NO visual representation: the query
+    /// row showed a bare `> `, and the hardware caret stayed pinned at the prefix while
+    /// Backspace/Left/Right edited text nobody could see. Spec §7.2 requires the writer to
+    /// "see the name land in the field", and Row 2's safety rationale requires a VISIBLY
+    /// empty field to distinguish itself from Row 4.
+    ///
+    /// Twenty-six tasks missed it because every field guard asserted `field` on the STRUCT or
+    /// read the resolved-target footer. This one scrapes the drawn cell grid, drives every
+    /// keystroke through the real intercept, and pumps the real async listing first — so it
+    /// fails the moment the painter stops rendering the mode's own text source.
+    ///
+    /// FAIL-VERIFY (mutation): restore the painter's `format!("> {}", fb.query)` — the
+    /// "chapter" assertion fails on a bare `> ` row. Separately restore the caret's
+    /// `fb.query.chars().count()` — the caret assertion fails, reporting column 3 (the
+    /// prefix) instead of 7. Both confirmed, then reverted.
+    #[test]
+    fn the_destination_field_and_its_caret_are_painted_in_the_query_row() {
+        let d = std::env::temp_dir().join(format!("wc-render-field-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("fixture dir");
+        let mut e = Editor::new_from_text("body\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Opened with an EMPTY field — exactly what a writer sees invoking Save-As fresh.
+        e.open_destination_picker(&fs, &tx, DestinationPurpose::SaveAs, d.clone(), String::new());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let area = Rect::new(0, 0, 80, 24);
+        // The box's origin is re-read after every render, never cached: a non-empty field
+        // brings the resolved-target footer with it, and the box grows for that row.
+        let query_row = |e: &Editor| crate::chrome_geom::file_browser_overlay_rect(
+            area, e.file_browser.as_ref().expect("picker open")).y + 1;
+
+        // (a) An empty field paints a VISIBLY empty row — §7.2 Row 2's safety rationale.
+        crate::derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let empty_row = row_text(&term, query_row(&e));
+        assert_eq!(empty_row.trim_matches(|c| c == ' ' || c == '\u{2502}'), ">",
+            "an empty field must paint as a bare prompt, nothing more: {empty_row:?}");
+
+        // (b) Type through the REAL intercept — no handler call, no struct poke.
+        for c in ['c', 'h', 'a', 'p', 't', 'e', 'r'] {
+            crate::test_support::press_char_fb(&mut e, &fs, &tx, c);
+        }
+        crate::derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let row = row_text(&term, query_row(&e));
+        assert!(row.contains("chapter"),
+            "the typed filename must reach the SCREEN, not just `fb.mode`'s field: {row:?}");
+
+        // (c) The caret tracks `field_cursor`, not the (empty) query. Two Lefts put it
+        //     between `chapt` and `er`; the painter must place it five columns past the
+        //     `> ` prefix, not at the prefix itself.
+        for _ in 0..2 { crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Left); }
+        crate::derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let ov_x = {
+            let fb = e.file_browser.as_ref().expect("picker open");
+            crate::chrome_geom::file_browser_overlay_rect(area, fb).x
+        };
+        let expected = ov_x + 1 + OV_QUERY_PREFIX_COLS + 5;
+        assert_eq!(term.get_cursor_position().expect("caret").x, expected,
+            "the caret must sit at `field_cursor`, not pinned to the empty query");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- the title says which dialog this is --------------------------------------
+
+    /// C5 review finding I2: the title was built unconditionally as `" Open: {dir} "`, so a
+    /// Save-As destination dialog — the branch's highest-risk write surface — presented itself
+    /// as an open dialog, and Recents claimed to be opening the last listing's directory. This
+    /// scrapes the DRAWN title row per mode rather than asserting on `file_browser_title`'s
+    /// return value, since the painter ignoring the helper is the failure it must catch.
+    ///
+    /// FAIL-VERIFY: restore `format!(" Open: {} ", fb.dir.display())` in the painter — every
+    /// case but Select fails. Confirmed, then reverted.
+    #[test]
+    fn each_picker_mode_is_titled_for_what_it_actually_does() {
+        let dir = std::env::temp_dir().join(format!("wc-render-title-{}", std::process::id()));
+        let cases: [(BrowseMode, &str, &str); 5] = [
+            (BrowseMode::Select, "Open:", "Save"),
+            (BrowseMode::Recents, "Recent files", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::SaveAs,
+                field: String::new(), field_cursor: 0 }, "Save As:", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::WriteBlock,
+                field: String::new(), field_cursor: 0 }, "Write Block to:", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into() },
+                field: String::new(), field_cursor: 0 }, "Export .pdf to:", "Open:"),
+        ];
+        for (mode, expected, forbidden) in cases {
+            let mut e = Editor::new_from_text("x\n", None, (80, 24));
+            let mut fb = empty_destination_fb(dir.clone(), "");
+            fb.mode = mode;
+            e.file_browser = Some(fb);
+            crate::derive::rebuild(&mut e);
+            let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+            let top = drawn_box_rect(&term).y;
+            let row = row_text(&term, top);
+            assert!(row.contains(expected),
+                "the drawn title must say {expected:?}: {row:?}");
+            assert!(!row.contains(forbidden),
+                "and must not still say {forbidden:?}: {row:?}");
+        }
+    }
+
+    // ---- the withholding disclosure reaches the SCREEN ----------------------------
+
+    /// C5 review finding C2. `filter_and_rank` computed `Disclosure { hidden_clutter,
+    /// hidden_type, capped_out, unreadable, .. }` into `fb.disclosure`, doc-commented
+    /// "everything the footer needs" — and there were ZERO production reads of it. A writer
+    /// filtering to Documents saw a shorter list with no indication that anything had been
+    /// withheld; a directory past `MAX_DIR_ENTRIES` likewise. Spec §7.4: "whenever either
+    /// toggle withholds anything, the footer carries a count … the sum of shown +
+    /// disclosed-withheld always equals what is really there", and its rationale — "a filter
+    /// that hides the path to your file is a filter that lies."
+    ///
+    /// The arithmetic guard (`disclosure_accounts_for_everything_withheld`) asserts the STRUCT
+    /// and stayed green for the whole effort while the feature was dead. This one drives the
+    /// real listing pipeline over a real directory and scrapes the drawn cell grid, per the
+    /// §11.3.1 amendment's rule 6.
+    ///
+    /// FAIL-VERIFY (mutation): drop the `footer_lines.extend(disclosure_lines(..))` line from
+    /// the painter — both count assertions fail against a screen that shows only the entries.
+    /// Confirmed, then reverted.
+    #[test]
+    fn the_withholding_disclosure_is_painted() {
+        let d = std::env::temp_dir().join(format!("wc-render-c2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("fixture dir");
+        // Two withheld by the CLUTTER toggle, three by the TYPE toggle, one shown.
+        for n in [".hidden-a", ".hidden-b"] { std::fs::write(d.join(n), "x").expect("seed"); }
+        for n in ["a.bin", "b.o", "c.zip"] { std::fs::write(d.join(n), "x").expect("seed"); }
+        std::fs::write(d.join("chapter.md"), "x").expect("seed");
+
+        let mut e = Editor::new_from_text("body\n", None, (100, 30));
+        assert!(!e.files_show_clutter, "precondition: clutter is hidden by default");
+        assert_eq!(e.files_type_filter, crate::config::FileTypeFilter::Documents,
+            "precondition: the Documents filter is on by default");
+        let _rx = crate::test_support::open_and_pump(&mut e, d.clone());
+
+        let fb = e.file_browser.as_ref().expect("picker open");
+        assert_eq!(fb.disclosure.hidden_clutter, 2, "precondition: the listing withheld the dotfiles");
+        assert_eq!(fb.disclosure.hidden_type, 3, "precondition: and the non-document extensions");
+
+        crate::derive::rebuild(&mut e);
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let screen = (0..30).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+
+        assert!(screen.contains("chapter.md"), "precondition: the kept entry is on screen:\n{screen}");
+        assert!(screen.contains("2 hidden (clutter)"),
+            "the clutter count must reach the writer, not just `fb.disclosure`:\n{screen}");
+        assert!(screen.contains("3 hidden (type)"),
+            "and so must the type count — shown + withheld accounts for what is there:\n{screen}");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// C5 re-gate finding M-R2: on a terminal too small to grow the box the footer's first
+    /// line moves into the border title, and that fallback elided it from the LEFT
+    /// unconditionally. In select mode there is no resolved-target line, so line 0 is a
+    /// DISCLOSURE — a heading whose counts sit at its start — and the writer saw
+    /// `…den (type)` with the numbers cut off. Same heading-vs-item rule as the dedicated
+    /// rows (§11.3.1 rule 5), which is where the direction is decided correctly.
+    ///
+    /// FAIL-VERIFY (mutation): restore the unconditional
+    /// `elide_path_left(&footer_lines[0], w)` in the `footer_takes_title` arm — the leading
+    /// counts vanish behind an ellipsis and this fails. Confirmed, then reverted.
+    #[test]
+    fn the_cramped_title_fallback_truncates_a_disclosure_heading_from_the_right() {
+        let dir = std::env::temp_dir().join(format!("wc-render-mr2-{}", std::process::id()));
+        let mut e = Editor::new_from_text("x\n", None, (34, 4));
+        let mut fb = empty_destination_fb(dir, "");
+        fb.mode = BrowseMode::Select;           // no resolved-target line: line 0 is the disclosure
+        // A real listing, so the fallback below is provably driven by the terminal's height
+        // (`list_h_for` floors at `height - 4`) and not by an empty directory.
+        fb.entries = (0..6).map(|i| crate::file_browser::FileEntry {
+            name: format!("ch{i}.md"), kind: crate::fsx::EntryKind::File,
+            is_symlink: false, broken: false,
+        }).collect();
+        fb.disclosure = crate::file_browser_listing::Disclosure {
+            hidden_clutter: 1234, hidden_type: 5678, ..Default::default()
+        };
+        e.file_browser = Some(fb);
+        crate::derive::rebuild(&mut e);
+
+        let area = Rect::new(0, 0, 34, 4);
+        assert_eq!(crate::chrome_geom::file_browser_footer_rows_shown(
+            area, e.file_browser.as_ref().expect("open")), 0,
+            "precondition: this terminal is too small for a dedicated footer row");
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(34, 4)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let screen = (0..4).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+
+        assert!(screen.contains("1234 hidden (clutter)"),
+            "a heading keeps its OPENING — the counts are the whole point:\n{screen}");
+        assert!(!screen.contains('\u{2026}'),
+            "and it is cut on the right, not marked with a left-elision ellipsis:\n{screen}");
+    }
+
+    // ---- the footer GROWS the box; it does not confiscate a list row ---------------
+
+    /// C5 review finding M5, found live at 100x30: a filtered destination listing with two
+    /// entries painted only ONE of them plus a `1/2` windowed indicator. The footer's row was
+    /// taken out of the list's budget rather than added to the box, so a picker whose whole
+    /// job is to show a writer what they might clobber hid half of it — on a terminal with
+    /// twenty spare rows. Superset of T20's deferred "a 1-row listing loses its only visible
+    /// row" Minor, which is the degenerate case of the same arithmetic.
+    ///
+    /// FAIL-VERIFY (mutation): restore `file_browser_rows`'s pre-fix budget
+    /// (`box_rows = raw.max(reserved)`, i.e. grow only when the content leaves nothing) —
+    /// `chapter-two.md` vanishes from the screen and the `1/2` indicator appears. Confirmed,
+    /// then reverted.
+    #[test]
+    fn a_two_entry_destination_listing_shows_both_entries_alongside_the_footer() {
+        let dir = std::env::temp_dir().join(format!("wc-render-m5-{}", std::process::id()));
+        let mut e = Editor::new_from_text("x\n", None, (100, 30));
+        let mut fb = empty_destination_fb(dir, "chapter");
+        fb.entries = ["chapter-one.md", "chapter-two.md"].iter().map(|n| {
+            crate::file_browser::FileEntry {
+                name: (*n).into(), kind: crate::fsx::EntryKind::File,
+                is_symlink: false, broken: false,
+            }
+        }).collect();
+        e.file_browser = Some(fb);
+        crate::derive::rebuild(&mut e);
+
+        let area = Rect::new(0, 0, 100, 30);
+        assert_eq!(crate::chrome_geom::file_browser_list_h(area, e.file_browser.as_ref().expect("open")), 2,
+            "the list keeps a row per entry — the footer's row comes from the box, not the list");
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let screen = (0..30).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+
+        assert!(screen.contains("chapter-one.md"), "the first entry is drawn:\n{screen}");
+        assert!(screen.contains("chapter-two.md"),
+            "and so is the second — the footer must not cost the writer an entry:\n{screen}");
+        assert!(!screen.contains("1/2"),
+            "and nothing is windowed away, so no n/total indicator is drawn:\n{screen}");
+    }
+
+    // ---- the height, not the listing size, gates the cramped fallback -------------
+
+    #[test]
+    fn an_empty_listing_still_gets_a_dedicated_footer_row_on_an_ordinary_terminal() {
+        // IMPORTANT 2 — `footer_takes_title` used to be gated on the LISTING's size
+        // (`list_h_for(fb.entries.len(), h)`), so a listing with zero entries — a freshly
+        // created, still-empty project folder; a listing that has not arrived yet — forced
+        // the footer into the cramped border-title path REGARDLESS of how spacious the
+        // terminal actually was. An 80x24 terminal has ample room for a dedicated row.
+        //
+        // FAIL-VERIFY: revert `dedicated_footer_row` to `footer.is_some() && raw_list_h > 0`
+        // where `raw_list_h = list_window::list_h_for(fb.entries.len(), h)` (the pre-fix
+        // form), watch this fail — the footer text lands in the title row instead of its own
+        // dedicated row. Confirmed, then restored.
+        let dir = std::env::temp_dir().join(format!("wc-render-empty-{}", std::process::id()));
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.file_browser = Some(empty_destination_fb(dir.clone(), "new-chapter"));
+        crate::derive::rebuild(&mut e);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = {
+            let fb = e.file_browser.as_ref().expect("open");
+            crate::chrome_geom::file_browser_overlay_rect(area, fb)
+        };
+        assert!(ov_rect.height >= 4,
+            "precondition: the box must grow to hold a dedicated footer row on this terminal");
+        let title_row = ov_rect.y + ov_rect.height - 1;
+        // list_h is 0 for an empty listing, so the dedicated row sits right after the query row.
+        let footer_row = ov_rect.y + 2;
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).unwrap();
+
+        assert!(row_text(&term, footer_row).contains("new-chapter.md"),
+            "the footer text must land in its OWN dedicated row: {:?}", row_text(&term, footer_row));
+        assert!(!row_text(&term, title_row).contains("new-chapter"),
+            "and must NOT be squeezed into the border title instead: {:?}", row_text(&term, title_row));
+    }
+
+    // ---- the DRAWN box is the one chrome_geom describes ---------------------------
+
+    #[test]
+    fn the_painted_box_occupies_exactly_file_browser_overlay_rect() {
+        // `file_browser_overlay_rect` is the single source the footer reservation, the mouse
+        // hit-test (`file_browser_row_at`) and its inverse (`file_browser_row_origin`) all read
+        // the box geometry from. That contract is worth only as much as the painter's actual
+        // obedience to it: every other test here scrapes CONTENT at a row derived from the same
+        // function, so a painter that computed its own — even a differently-WRONG own — box
+        // could still line those assertions up. This one scrapes the drawn border itself.
+        //
+        // Both fixtures are checked because they discriminate different mistakes. The empty
+        // destination listing is where `file_browser_overlay_rect` and the plain
+        // `palette_overlay_rect(area, entries.len())` it wraps genuinely DISAGREE (the footer
+        // reservation grows the box), so it catches a painter that dropped the reservation. The
+        // populated select listing pins x/width/height for the ordinary case, where the two
+        // agree on height and only a hand-rolled inset would show up.
+        //
+        // FAIL-VERIFY: replace the painter's `file_browser_overlay_rect(area, fb)` with
+        // `palette_overlay_rect(area, fb.entries.len())` — the empty case fails on height.
+        // Then instead inset it by one column (`ov_rect.x + 1`) — both cases fail on x.
+        // Confirmed for both, then restored.
+        let dir = std::env::temp_dir().join(format!("wc-render-rect-{}", std::process::id()));
+        let area = Rect::new(0, 0, 80, 24);
+
+        let mut empty = Editor::new_from_text("x\n", None, (80, 24));
+        empty.file_browser = Some(empty_destination_fb(dir.clone(), "new-chapter"));
+
+        let mut populated = Editor::new_from_text("x\n", None, (80, 24));
+        let mut fb = empty_destination_fb(dir.clone(), "");
+        fb.mode = BrowseMode::Select;
+        fb.entries = (0..7).map(|i| crate::file_browser::FileEntry {
+            name: format!("chapter-{i}.md"), kind: crate::fsx::EntryKind::File,
+            is_symlink: false, broken: false,
+        }).collect();
+        populated.file_browser = Some(fb);
+
+        for (label, e) in [("empty destination", &mut empty), ("populated select", &mut populated)] {
+            crate::derive::rebuild(e);
+            let expected = {
+                let fb = e.file_browser.as_ref().expect("open");
+                crate::chrome_geom::file_browser_overlay_rect(area, fb)
+            };
+            let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| paint_file_browser(f, e, &cs)).expect("draw");
+
+            assert_eq!(drawn_box_rect(&term), expected,
+                "{label}: the border the painter actually drew must BE \
+                 file_browser_overlay_rect — the rect the hit-test and footer both trust");
         }
     }
 }

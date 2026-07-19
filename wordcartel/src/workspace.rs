@@ -128,14 +128,17 @@ pub fn active_is_reusable_throwaway(editor: &Editor) -> bool {
 }
 
 /// Open `path` additively: reuse a throwaway active buffer in-place, else push a new buffer and switch.
-pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
+///
+/// Takes the `fs` seam (C5 §2.3): the picker's Enter arm holds the injected handle, so the
+/// document read behind it must be fault-injectable rather than falling back to `RealFs`.
+pub fn open_as_new_buffer(editor: &mut Editor, fs: &dyn crate::fsx::Fs, path: &std::path::Path) {
     if active_is_reusable_throwaway(editor) {
-        crate::session_restore::open_into_current(editor, path); // replace-in-place seam
+        crate::session_restore::open_into_current(editor, fs, path); // replace-in-place seam
         return;
     }
     let id = editor.alloc_id();
     let area = editor.active().view.area;
-    match crate::editor::Buffer::from_file(id, path, area) {
+    match crate::editor::Buffer::from_file(id, fs, path, area) {
         Ok(b) => {
             editor.buffers.push(b);
             let idx = editor.buffers.len() - 1;
@@ -425,7 +428,7 @@ mod tests {
         assert_eq!(e.buffers.len(), 2);
         let tmp = std::env::temp_dir().join(format!("wc-open-{}.md", std::process::id()));
         std::fs::write(&tmp, "file body\n").unwrap();
-        open_as_new_buffer(&mut e, &tmp);
+        open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp);
         assert_eq!(e.buffers.len(), 2, "throwaway reused, not added");
         assert_eq!(e.active().document.buffer.to_string(), "file body\n");
         let _ = std::fs::remove_file(&tmp);
@@ -443,7 +446,7 @@ mod tests {
         assert!(e.mru.contains(&old_id), "throwaway id must be in MRU before open");
         // open_as_new_buffer takes the reuse path → calls open_into_current
         assert!(active_is_reusable_throwaway(&e), "pre-condition: active must be throwaway");
-        open_as_new_buffer(&mut e, &tmp);
+        open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp);
         let new_id = e.active().id;
         assert_ne!(new_id, old_id, "fresh id allocated for new buffer");
         assert!(!e.mru.contains(&old_id), "ghost old throwaway id must NOT remain in MRU");
@@ -460,7 +463,7 @@ mod tests {
         e.install_scratch(); // active is real (non-throwaway) → open_as_new_buffer's own Err arm fires
         let dir = std::env::temp_dir().join(format!("wc-open-isdir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        open_as_new_buffer(&mut e, &dir);
+        open_as_new_buffer(&mut e, &crate::fsx::RealFs, &dir);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         e.set_status(crate::status::StatusKind::Info, "later ack");
@@ -474,7 +477,7 @@ mod tests {
         e.install_scratch();
         let tmp = std::env::temp_dir().join(format!("wc-open2-{}.md", std::process::id()));
         std::fs::write(&tmp, "second\n").unwrap();
-        open_as_new_buffer(&mut e, &tmp);
+        open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp);
         assert_eq!(e.buffers.len(), 3, "added a new buffer");
         assert_eq!(e.active().document.buffer.to_string(), "second\n");
         let _ = std::fs::remove_file(&tmp);
@@ -528,7 +531,7 @@ mod tests {
         e.install_scratch();
         let tmp = std::env::temp_dir().join(format!("wc-c-{}.md", std::process::id()));
         std::fs::write(&tmp, "second\n").unwrap();
-        open_as_new_buffer(&mut e, &tmp); // [a.md(0), scratch(1), second(2)] active=2
+        open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp); // [a.md(0), scratch(1), second(2)] active=2
         switch_to(&mut e, 0); // active a.md
         close_buffer(&mut e); // remove index 0 → neighbor shifts into slot 0
         assert!(

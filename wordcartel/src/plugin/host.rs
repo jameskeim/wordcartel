@@ -1073,7 +1073,7 @@ mod tests {
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
         let sel = editor.borrow().active().document.selection.primary();
         assert_eq!((sel.anchor, sel.head), (0, 5), "select_all must select the whole 5-byte buffer");
@@ -1101,7 +1101,7 @@ mod tests {
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
         assert_eq!(whole_text(&editor), "Xhi",
             "one pump cycle must re-drain the enqueued dispatch through to b.cmd's wc.insert");
@@ -1131,7 +1131,7 @@ mod tests {
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
         assert!(editor.borrow().minibuffer.is_none(), "a directly-supplied arg must never open the prompt");
         assert_eq!(whole_text(&editor), "hiX",
@@ -1161,7 +1161,7 @@ mod tests {
         // Palette-style dispatch, no arg in hand — case 3: opens the PluginArg prompt.
         {
             let mut e = editor.borrow_mut();
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             let r = reg.dispatch(id, &mut ctx);
             assert_eq!(r, crate::commands::CommandResult::Handled);
         }
@@ -1182,13 +1182,13 @@ mod tests {
         let msg = crate::app::Msg::Input(crossterm::event::Event::Key(enter));
         {
             let mut e = editor.borrow_mut();
-            let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &crate::test_support::test_fs() };
             crate::minibuffer::intercept(msg, &mut e, &ctx);
         }
         assert!(editor.borrow().minibuffer.is_none());
         assert_eq!(editor.borrow().pending_plugin_calls.len(), 1);
 
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
         assert_eq!(whole_text(&editor), "25hi", "the callback must receive the collected \"25\" arg");
     }
 
@@ -1223,7 +1223,7 @@ mod tests {
         });
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
         let e = editor.borrow();
         assert!(e.palette.is_none(), "the previously-open palette must be closed by close_all");
@@ -1272,7 +1272,7 @@ mod tests {
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
         let status = editor.borrow().status_text().to_string();
         assert!(status.contains("t.cmd"), "status must name the origin: {status}");
@@ -1357,7 +1357,7 @@ mod tests {
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
         let e = editor.borrow();
         assert!(e.pending_plugin_calls.is_empty(), "the chain-cap trip must clear the call queue");
@@ -1398,7 +1398,7 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
         let started = std::time::Instant::now();
-        host.pump(&editor, &reg, &ex, &clock, &tx);
+        host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
         let elapsed = started.elapsed();
 
         let e = editor.borrow();

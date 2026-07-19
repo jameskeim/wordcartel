@@ -24,6 +24,8 @@ pub(crate) struct DispatchCtx<'a> {
     pub(crate) ex: &'a dyn crate::jobs::Executor,
     pub(crate) clock: &'a dyn wordcartel_core::history::Clock,
     pub(crate) msg_tx: &'a std::sync::mpsc::Sender<Msg>,
+    /// The filesystem seam (owned handle — the listing thread clones it in).
+    pub(crate) fs: &'a std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 }
 
 /// Every input overlay, exhaustive. A new overlay is a new variant; `row()` then forces it
@@ -137,7 +139,7 @@ pub(crate) static OVERLAYS: &[OverlayRow] = &[
         intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None, mouse: crate::mouse::mouse_cursor_picker,
         render: RenderSite::Frame(crate::render_overlays::paint_cursor_picker) },
     OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
-        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser,
+        intercept: crate::file_browser_intercept::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser,
         render: RenderSite::Frame(crate::render_overlays::paint_file_browser) },
     OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
         intercept: crate::prompts::intercept, close: |e| e.prompt = None, mouse: crate::mouse::mouse_prompt,
@@ -249,8 +251,16 @@ mod tests {
         e.pending_mark = Some(crate::editor::MarkPending::Set);
         let key = KeyEvent { code: KeyCode::Char('a'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE };
-        crate::app::reduce(crate::app::Msg::Input(crossterm::event::Event::Key(key)),
-            &mut e, &reg, &km, &ex, &clock, &tx);
+        crate::app::reduce(
+        crate::app::Msg::Input(crossterm::event::Event::Key(key)),
+            &mut e,
+            &reg,
+            &km,
+            &ex,
+            &clock,
+            &tx,
+        &crate::test_support::test_fs(),
+        );
         assert!(e.splash.is_none(), "splash dismissed first");
         assert!(e.pending_mark.is_some(), "the mark was NOT consumed — splash preceded marks");
     }
@@ -273,7 +283,7 @@ mod tests {
         // A move onto row 0 (menu-bar dwell region) and the right edge (scrollbar region).
         for (col, row) in [(5u16, 0u16), (39u16, 5u16)] {
             let ev = MouseEvent { kind: MouseEventKind::Moved, column: col, row, modifiers: KeyModifiers::NONE };
-            crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx);
+            crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx, &crate::test_support::test_fs());
         }
         assert!(e.mouse.menu_reveal_due.is_none(), "no menu dwell armed under splash");
         assert!(e.mouse.scrollbar_reveal_due.is_none(), "no scrollbar dwell armed under splash");
@@ -297,7 +307,7 @@ mod tests {
         // would move the caret; under the palette it is consumed (close-away or no-op).
         let ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 11,
             modifiers: KeyModifiers::NONE };
-        crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx);
+        crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx, &crate::test_support::test_fs());
         // Either the palette closed (click-away) or stayed; in NEITHER case did the editor
         // caret jump to the clicked cell — the event never reached the editor gesture path.
         assert_eq!(crate::nav::head(&e), before, "click under palette did not move the caret");
@@ -336,7 +346,7 @@ mod tests {
             ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
-            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(std::path::PathBuf::from(".")))),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
             ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
@@ -356,8 +366,7 @@ mod tests {
             let v0 = e.active().document.version;
             let key = KeyEvent { code: KeyCode::Char('z'), modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press, state: KeyEventState::NONE };
-            crate::app::reduce(crate::app::Msg::Input(Event::Key(key)), &mut e, &reg, &km,
-                &ex, &clock, &tx);
+            crate::app::reduce(crate::app::Msg::Input(Event::Key(key)), &mut e, &reg, &km, &ex, &clock, &tx, &crate::test_support::test_fs());
             assert_eq!(e.active().document.version, v0, "{name}: key-Press did not edit the buffer");
             // (c) the overlay's OWN mouse slot, called directly, does not panic and does not
             // mutate the buffer on a stray text-band Down-left click (see the doc comment
@@ -370,7 +379,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: no active overlay to find its mouse slot"));
             let (w, h) = e.active().view.area;
             let area = ratatui::layout::Rect::new(0, 0, w, h);
-            let ctx = DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            let ctx = DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &crate::test_support::test_fs() };
             let v0 = e.active().document.version;
             let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
                 column: 6, row: 9, modifiers: KeyModifiers::NONE };
@@ -404,7 +413,7 @@ mod tests {
             ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
-            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(std::path::PathBuf::from(".")))),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
             ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
@@ -420,7 +429,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: no active overlay"));
             let (w, h) = e.active().view.area;
             let area = ratatui::layout::Rect::new(0, 0, w, h);
-            let ctx = DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            let ctx = DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &crate::test_support::test_fs() };
             let v0 = e.active().document.version;
             let moved = MouseEvent { kind: MouseEventKind::Moved, column: 6, row: 9, modifiers: KeyModifiers::NONE };
             (id.row().mouse)(&mut e, moved, area, &ctx);
@@ -434,6 +443,7 @@ mod tests {
     #[test]
     #[allow(clippy::type_complexity)] // test-local table of (name, opener closure) pairs; not a public API surface
     fn close_all_clears_every_overlay() {
+        let (tx, _rx) = std::sync::mpsc::channel();
         let diag_fixture = || wordcartel_core::diagnostics::Diagnostic {
             range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
             source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
@@ -445,7 +455,7 @@ mod tests {
             ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
-            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(std::path::PathBuf::from(".")))),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
             ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),

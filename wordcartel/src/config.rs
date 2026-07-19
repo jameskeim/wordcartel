@@ -55,6 +55,7 @@ pub struct Config {
     pub menu: MenuConfig,
     pub clipboard: ClipboardConfig,
     pub plugins: PluginsConfig,
+    pub files: FilesConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -120,11 +121,37 @@ pub enum CaretShape { #[default] Default, Block, Beam, Underline }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardProvider { Auto, Native, Osc52, Off }
 
+/// Which file types the picker lists. Two-state rather than a bool so it carries NAMED
+/// states for the `MenuMark::Value` representative and the two set-per-state commands
+/// (command-surface contract, law 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FileTypeFilter {
+    /// What `file::open` can actually open, plus output siblings in destination mode.
+    #[default]
+    Documents,
+    All,
+}
+
 /// Menu bar configuration section.
 #[derive(Debug, Clone)]
 pub struct MenuConfig { pub bar: MenuBarMode }
 impl Default for MenuConfig {
     fn default() -> Self { MenuConfig { bar: MenuBarMode::Auto } }
+}
+
+/// File-browser filter configuration section (`[files]`). Persisted (command-surface
+/// contract decision 8 — "show all files" must stick): `snapshot_of` seeds the two
+/// `Editor` fields from here at startup; `set_show_clutter`/`set_file_type_filter` are
+/// the sole runtime mutators.
+#[derive(Debug, Clone)]
+pub struct FilesConfig {
+    pub show_clutter: bool,
+    pub type_filter: FileTypeFilter,
+}
+impl Default for FilesConfig {
+    fn default() -> Self {
+        FilesConfig { show_clutter: false, type_filter: FileTypeFilter::Documents }
+    }
 }
 
 /// Clipboard configuration section (`[clipboard]`).
@@ -273,6 +300,7 @@ struct RawConfig {
     menu: RawMenu,
     clipboard: RawClipboard,
     plugins: RawPlugins,
+    files: RawFiles,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -367,6 +395,12 @@ struct RawClipboard {
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawFiles {
+    show_clutter: Option<bool>,
+    type_filter: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawPlugins {
     enabled: Option<bool>,
     disable: Option<Vec<String>>,
@@ -401,13 +435,24 @@ pub fn config_layer_paths(
     xdg_config_dir: Option<&Path>,
     anchor_dir: &Path,
 ) -> Vec<PathBuf> {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    config_layer_paths_with_fs(&crate::fsx::RealFs, cli, xdg_config_dir, anchor_dir)
+}
+
+/// Seam-taking core of [`config_layer_paths`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn config_layer_paths_with_fs(
+    fs: &dyn crate::fsx::Fs,
+    cli: &Cli,
+    xdg_config_dir: Option<&Path>,
+    anchor_dir: &Path,
+) -> Vec<PathBuf> {
     if cli.no_config {
         return Vec::new();
     }
     let mut v = Vec::new();
     if let Some(x) = xdg_config_dir {
         let p = x.join("wordcartel").join("config.toml");
-        if p.is_file() {
+        if crate::fsx::is_file_via(fs, &p) {
             v.push(p);
         }
     }
@@ -415,14 +460,14 @@ pub fn config_layer_paths(
     let mut dir = Some(anchor_dir);
     while let Some(d) = dir {
         let p = d.join(".wordcartel.toml");
-        if p.is_file() {
+        if crate::fsx::is_file_via(fs, &p) {
             v.push(p);
             break;
         }
         dir = d.parent();
     }
     if let Some(c) = &cli.config_path {
-        if c.is_file() {
+        if crate::fsx::is_file_via(fs, c) {
             v.push(c.clone());
         }
         // (a missing --config path is surfaced as a warning by the caller in Task 5)
@@ -436,13 +481,31 @@ pub fn config_layer_paths(
 /// build_keymap applies them in precedence order (Codex plan-review fix).
 #[allow(clippy::too_many_lines)] // config parse — one arm per config key
 pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    load_with_fs(&crate::fsx::RealFs, paths)
+}
+
+#[allow(clippy::too_many_lines)] // config parse — one arm per config key
+pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut warns = Vec::new();
     for p in paths {
-        let text = match std::fs::read_to_string(p) {
-            Ok(t) => t,
+        let bytes = match fs.read_capped(p, crate::limits::MAX_CONFIG_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                warns.push(format!("config: {} is too large (> {} bytes) — ignored",
+                    p.display(), crate::limits::MAX_CONFIG_BYTES));
+                continue;
+            }
             Err(e) => {
                 warns.push(format!("config: cannot read {}: {e}", p.display()));
+                continue;
+            }
+        };
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => {
+                warns.push(format!("config: {} is not valid UTF-8 — ignored", p.display()));
                 continue;
             }
         };
@@ -551,6 +614,15 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 "osc52"  => cfg.clipboard.provider = ClipboardProvider::Osc52,
                 "off"    => cfg.clipboard.provider = ClipboardProvider::Off,
                 other => warns.push(format!("clipboard.provider \"{other}\" invalid; using auto")),
+            }
+        }
+        // files: per-field override; enum-valued string with a warning on unknowns.
+        if let Some(v) = raw.files.show_clutter { cfg.files.show_clutter = v; }
+        if let Some(t) = raw.files.type_filter {
+            match t.as_str() {
+                "documents" => cfg.files.type_filter = FileTypeFilter::Documents,
+                "all"       => cfg.files.type_filter = FileTypeFilter::All,
+                other => warns.push(format!("files.type_filter \"{other}\" invalid; using documents")),
             }
         }
         // plugins: per-field override (omitted field inherits the lower layer); `disable`
@@ -668,6 +740,11 @@ pub fn clipboard_provider_str(p: ClipboardProvider) -> &'static str {
         ClipboardProvider::Osc52 => "osc52",
         ClipboardProvider::Off => "off",
     }
+}
+
+/// "documents"/"all" — round-trips `FileTypeFilter` for the overrides mirror.
+pub fn file_type_filter_str(f: FileTypeFilter) -> &'static str {
+    match f { FileTypeFilter::Documents => "documents", FileTypeFilter::All => "all" }
 }
 
 #[cfg(test)]
@@ -1200,6 +1277,9 @@ mod tests {
             canvas: CanvasMode::Transparent,
             clipboard_provider: crate::config::ClipboardProvider::Auto,
             view_messages_min_kind: crate::status::StatusKind::Info,
+            // C5 Task 24: files_show_clutter/files_type_filter round-trip too.
+            files_show_clutter: true,
+            files_type_filter: crate::config::FileTypeFilter::All,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -1221,6 +1301,43 @@ mod tests {
             "[theme] chrome must round-trip to 'zen'");
         assert_eq!(cfg.theme.canvas.as_deref(), Some("transparent"),
             "[theme] canvas must round-trip");
+        assert!(cfg.files.show_clutter, "files.show_clutter must round-trip to true");
+        assert_eq!(cfg.files.type_filter, crate::config::FileTypeFilter::All,
+            "files.type_filter must round-trip to All");
+    }
+
+    // -----------------------------------------------------------------------
+    // [files] filter defaults + invalid value (C5 Task 24 fix I2)
+    //
+    // The round-trip test above only ever exercises DIVERGENT values (true/All), so it
+    // never touches the default-on-absent path at all — flipping `FilesConfig::default()`
+    // to `{true, All}` breaks nothing workspace-wide without these. Mirrors the
+    // `clipboard_provider_default_is_auto` / `clipboard_provider_unknown_warns_and_defaults_auto`
+    // pair `[files]` was copied from but left unguarded.
+    // -----------------------------------------------------------------------
+
+    fn load_files(name: &str, body: &str) -> (Config, Vec<String>) {
+        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        let out = load(std::slice::from_ref(&p));
+        let _ = std::fs::remove_file(&p);
+        out
+    }
+
+    #[test]
+    fn files_filters_default_on_absent() {
+        let (cfg, _) = load(&[]); // no config file → defaults
+        assert!(!cfg.files.show_clutter,
+            "files.show_clutter must default to false (hidden files off)");
+        assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents,
+            "files.type_filter must default to Documents");
+    }
+
+    #[test]
+    fn files_type_filter_unknown_warns_and_defaults_documents() {
+        let (cfg, warns) = load_files("unknown", "[files]\ntype_filter = \"spreadsheets\"\n");
+        assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents);
+        assert!(warns.iter().any(|w| w.contains("files.type_filter")));
     }
 
     // -----------------------------------------------------------------------
@@ -1303,5 +1420,30 @@ mod tests {
         let v = ViewConfig::default();
         assert_eq!(v.caret_shape, CaretShape::Default);
         assert!(v.caret_blink, "blink default on (inert under Default until a shape is chosen)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: config-class reads acquire a cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_over_cap_degrades_like_an_unreadable_file() {
+        // Config-class reads acquire a cap. An over-cap config must warn and fall back to
+        // defaults — the SAME degradation an unreadable file already gets — never panic and
+        // never silently apply a truncated parse.
+        let d = std::env::temp_dir().join(format!("wc-cfg-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("dir");
+        let p = d.join("config.toml");
+        std::fs::write(&p, vec![b'#'; (crate::limits::MAX_CONFIG_BYTES + 1) as usize])
+            .expect("seed oversized");
+        let (cfg, warns) = load_with_fs(&crate::fsx::RealFs, std::slice::from_ref(&p));
+        assert_eq!(cfg.state.max_entries, Config::default().state.max_entries,
+            "over-cap config falls back to defaults");
+        // Names the OVER-CAP branch specifically. `|| w.contains("cannot read")` would let a
+        // broken read path read as a cap success — the cap could be absent and an unrelated
+        // IO failure would satisfy the assertion.
+        assert!(warns.iter().any(|w| w.contains("too large")),
+            "the warning must name the CAP, not merely any read failure: {warns:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

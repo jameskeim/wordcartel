@@ -24,6 +24,7 @@ pub fn write_dump(path: Option<&Path>, rope: &ropey::Rope, dir: &Path, seq: u64)
         None => "scratch".to_string(),
     };
     let out = dir.join(format!("recovered-{}-{}-{}.md", name, std::process::id(), seq));
+    // fs-chokepoint-allow: (w) ownership exception (§5.2) — the panic-dump path holds no injected handle
     crate::swap::write_atomic(&out, &rope.to_string())?;
     Ok(out)
 }

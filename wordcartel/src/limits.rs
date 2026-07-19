@@ -13,6 +13,18 @@ pub const MAX_SEARCH_MATCHES: usize = 100_000;
 /// Skip/trim persisting a serialized session larger than this; bound the load read at it too.
 pub const MAX_SESSION_BYTES: usize = 8 * 1024 * 1024;
 
+/// Retention cap for ONE interactive directory listing (the picker). Enumeration is never
+/// capped — the disclosed total must be real. Non-interactive scans (plugin discovery, the
+/// swap state-dir scans) pass `cap: None`.
+pub const MAX_DIR_ENTRIES: usize = 5_000;
+
+/// Cap for CONFIG-class reads — `config.toml`, `.wordcartel.toml`,
+/// `settings-overrides.toml`, and a base16 theme file. Generous for TOML (these are
+/// hand-written files), and deliberately separate from `MAX_OPEN_BYTES`, which governs
+/// documents. Over-cap degrades exactly as an unreadable config already does: warn and
+/// fall back to defaults.
+pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 /// Max decoded paste size (canonical home; re-exported from clipboard.rs).
 pub const PASTE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Max OSC-52 encoded clipboard payload (canonical home; re-exported from clipboard.rs).

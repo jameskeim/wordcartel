@@ -49,6 +49,35 @@ pub enum RenderMode {
     Review,
 }
 
+/// A lineage HINT, not a uniqueness invariant (mirroring "path is not a uniqueness
+/// invariant"). 64 bits is sufficient because nothing keys on it: a collision means two
+/// documents share a hint no code consults, and it is not a security token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocumentId(pub u64);
+
+impl DocumentId {
+    /// Mint using std only. `RandomState::new()` is OS-seeded per instance; the
+    /// process-local counter guarantees two ids minted in the same nanosecond still differ.
+    ///
+    /// NO new dependency: decision 2 excludes `rand`/`getrandom`/`uuid`, and an earlier draft
+    /// of the spec said "128-bit random", which would have smuggled one in.
+    pub fn mint() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u128(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+        DocumentId(h.finish())
+    }
+
+    /// 16 hex digits. Stored as an OPAQUE STRING in both formats, never parsed back into a
+    /// fixed-width integer, so a future wider id needs no format migration.
+    pub fn to_hex(self) -> String { format!("{:016x}", self.0) }
+}
+
 #[derive(Debug, Clone)]
 pub struct Document {
     pub buffer: TextBuffer,
@@ -67,6 +96,11 @@ pub struct Document {
     /// Last-known on-disk fingerprint (captured at load, refreshed by the save
     /// merge). Used by dispatch_save to detect external modifications (§4.3).
     pub stored_fp: Option<crate::save::FileFingerprint>,
+    /// A lineage hint minted once at construction and never re-minted (not on
+    /// edit, not on save-to-a-new-path). Nothing reads it today — it rides the
+    /// session-state entry and the swap header for a future effort (snapshots)
+    /// to answer "which document is this?" across renames.
+    pub id: DocumentId,
 }
 
 impl Document {
@@ -222,6 +256,7 @@ impl Buffer {
             stored_fp: path.as_deref().and_then(crate::save::fingerprint),
             path,
             saved_version: Some(0),
+            id: DocumentId::mint(),
         };
         let view = View {
             scroll: 0,
@@ -266,8 +301,14 @@ impl Buffer {
 
     /// Open `path` into a named Buffer, mirroring run()'s open branch:
     /// Ok → named clean; NotFound → named empty "new file" (`"\n"`); other errors propagate.
-    pub fn from_file(id: BufferId, path: &std::path::Path, area: (u16, u16)) -> Result<Buffer, crate::file::OpenError> {
-        match crate::file::open(path) {
+    ///
+    /// Takes the `fs` seam (C5 §2.3 / §4.1) rather than reaching `file::open`'s `RealFs`
+    /// wrapper: this is the document-read path behind every open (picker Enter, recents,
+    /// launch open, replace-in-place), so it must be fault-injectable end to end.
+    pub fn from_file(id: BufferId, fs: &dyn crate::fsx::Fs, path: &std::path::Path, area: (u16, u16))
+        -> Result<Buffer, crate::file::OpenError>
+    {
+        match crate::file::open_with_fs(fs, path) {
             Ok(text) => Ok(Buffer::from_text(id, &text, Some(path.to_path_buf()), area)),
             Err(crate::file::OpenError::NotFound(_)) => Ok(Buffer::from_text(id, "\n", Some(path.to_path_buf()), area)),
             Err(e) => Err(e),
@@ -428,6 +469,16 @@ pub struct MouseState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkPending { Set, Jump }
 
+/// One pending session-entry rename, recorded by a Save-As merge and applied where the
+/// session store is actually reachable (`app::run`).
+#[derive(Clone, Debug)]
+pub struct SessionMigration {
+    /// The buffer's PRE-REKEY path, read IN THE MERGE — not the dispatch-time `prior_key`.
+    /// Merge-time capture is what makes overlapping Save-As from one source chain correctly.
+    pub from: std::path::PathBuf,
+    pub to: std::path::PathBuf,
+}
+
 // MenuView is now Clone (#[derive(Clone, Debug)]); Editor intentionally remains !Clone.
 #[derive(Debug)]
 pub struct Editor {
@@ -457,6 +508,12 @@ pub struct Editor {
     /// Default-empty; capped at [`crate::limits::PLUGIN_MAX_PENDING_DISPATCH`] at the
     /// `wc.command` call site.
     pub pending_plugin_dispatch: std::collections::VecDeque<crate::plugin::PluginDispatch>,
+    /// Save-As session-entry migrations awaiting application.
+    ///
+    /// A QUEUE, not an `Option` slot: `fold_and_continue` drains the executor in a loop, so
+    /// several save merges can land before `app::run` next reaches a persist point, and a
+    /// slot would silently drop all but the last.
+    pub pending_session_migrations: std::collections::VecDeque<SessionMigration>,
     /// Armed plugin timers (P3 §3). Lives on Editor (not the host) so `timers::next_wake(&Editor,_)`
     /// sees the next-due. Auto-disarmed by `clear_plugin_wake_state`. Bounded by
     /// PLUGIN_MAX_TIMERS_PER_PLUGIN/plugin.
@@ -483,6 +540,12 @@ pub struct Editor {
     pub pending_save_as: Option<PostSaveAction>,
     /// The target awaiting an OverwriteSaveAs confirmation (existing-file Save-As). (Task 3)
     pub pending_save_overwrite: Option<PathBuf>,
+    /// The CHOSEN (logical, pre-resolution) path paired with `pending_save_overwrite`'s
+    /// RESOLVED one — reconstructing a `SaveTarget` for the confirmed overwrite needs both
+    /// (Task 21). PAIRED LIFETIME: set and cleared in lockstep with `pending_save_overwrite`
+    /// everywhere overwrite state is abandoned, or a stale `chosen` could pair with a
+    /// different `resolved` on a later round trip — a silent wrong-target write.
+    pub pending_save_as_chosen: Option<PathBuf>,
     /// The target awaiting an OverwriteWriteBlock confirmation (^KW existing file). (9A Task 4)
     pub pending_write_block: Option<PathBuf>,
     /// H5 clean-recovery: the EXACT set of provably-valueless recovery files snapshotted when
@@ -566,6 +629,12 @@ pub struct Editor {
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
     /// File browser overlay state. XOR with all other overlays.
     pub file_browser: Option<crate::file_browser::FileBrowser>,
+    /// File-browser clutter filter (dotfiles + VCS dirs hidden by default). Task 23 adds
+    /// the setter/command/persistence; this task just seeds the field and consumes it.
+    pub files_show_clutter: bool,
+    /// File-browser type filter (Documents by default). Task 23 adds the setter/command/
+    /// persistence; this task just seeds the field and consumes it.
+    pub files_type_filter: crate::config::FileTypeFilter,
     /// Caret-shape picker overlay state (C1 T6 field/stub; T7 fills in the picker's
     /// logic). XOR with all other overlays.
     pub cursor_picker: Option<crate::cursor_picker::CursorPicker>,
@@ -643,6 +712,7 @@ impl Editor {
             pending_plugin_calls: std::collections::VecDeque::new(),
             pending_plugin_events: std::collections::VecDeque::new(),
             pending_plugin_dispatch: std::collections::VecDeque::new(),
+            pending_session_migrations: std::collections::VecDeque::new(),
             pending_plugin_timers: Vec::new(),
             next_timer_handle: 0,
             on_change_due: None,
@@ -650,6 +720,7 @@ impl Editor {
             plugin_inventory: Vec::new(),
             parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
+            pending_save_as_chosen: None,
             pending_write_block: None, pending_clean: Vec::new(),
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
@@ -686,6 +757,8 @@ impl Editor {
             outline: None,
             theme_picker: None,
             file_browser: None,
+            files_show_clutter: false,
+            files_type_filter: crate::config::FileTypeFilter::default(),
             cursor_picker: None,
             splash: None,
             theme: wordcartel_core::theme::default(),
@@ -909,14 +982,110 @@ impl Editor {
         self.palette = Some(p);
     }
 
-    /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
-    pub fn open_file_browser(&mut self, dir: std::path::PathBuf) {
+    /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant. The
+    /// listing is fetched off-thread (Task 13) — `fb.dir` is set immediately so the
+    /// painter has a title, and `start_listing` records the SAME `dir` as the pending
+    /// target, so the eventual commit is a no-op move for this initial open. ONE spawn
+    /// path serves both "open" and "descend", not two.
+    pub fn open_file_browser(&mut self,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+        dir: std::path::PathBuf)
+    {
         crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: dir.clone(), query: String::new(), mode: crate::file_browser::BrowseMode::Select,
+            listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+        };
+        crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
+        self.file_browser = Some(fb);
+    }
+
+    /// Open the destination picker for `purpose`, seeded at `dir` with `field` pre-filled.
+    ///
+    /// Returns whether it opened. Callers use the RETURN VALUE to decide follow-up control
+    /// flow — never by inspecting which overlay is up. `dispatch_save_then` used to sniff
+    /// `minibuffer.kind == SaveAs` to know a Save-As had started, which silently broke the
+    /// moment Save-As stopped using a minibuffer.
+    pub fn open_destination_picker(&mut self,
+        fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+        purpose: crate::file_browser::DestinationPurpose,
+        dir: std::path::PathBuf, field: String) -> bool
+    {
+        crate::overlays::close_all(self);
+        self.pending_keys.clear(); self.pending_mark = None;
+        let field_cursor = field.len();
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: dir.clone(), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Destination { purpose, field, field_cursor },
+            listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+        };
+        // ASYNC, exactly like `open_file_browser`. A synchronous `refetch` here would block
+        // the input loop on the directory read and undo Task 13 for every destination
+        // picker — Save-As, Write-Block, and Export. There is no synchronous listing path.
+        crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
+        self.file_browser = Some(fb);
+        true
+    }
+
+    /// Open the recents picker with availability NOT yet probed — every row starts `File`
+    /// (selectable) and is re-marked when `Msg::RecentsProbed` lands. Splitting this from
+    /// `open_recents` is what lets the probe run off-thread: the writer sees their list
+    /// immediately instead of waiting on one `stat` per row.
+    pub fn open_recents_pending(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.open_recents(paths.into_iter()
+            .map(|path| crate::recents::RecentRow { path, available: true })
+            .collect());
+    }
+
+    /// Present recents through the existing picker. Rows populate BOTH `fb.listing` (the
+    /// IMMUTABLE cache — set here, once, never mutated afterward) and `fb.entries` (the
+    /// derived, filtered view) — mirroring `Select`/`Destination`, whose `rederive` always
+    /// re-derives `entries` fresh from `listing` on every keystroke. Filtering `entries` in
+    /// place instead (the Task 23 defect) makes the narrowed list its own source on the next
+    /// keystroke — a one-way ratchet that never widens back out as the writer backspaces.
+    ///
+    /// UNAVAILABLE rows carry `kind == EntryKind::Unknown`, which the picker ALREADY renders
+    /// marked and refuses on Enter (Task 14) — so "greyed and not selectable" needs no new
+    /// input handling, no new refusal branch, and no new painter path.
+    pub fn open_recents(&mut self, rows: Vec<crate::recents::RecentRow>) {
+        crate::overlays::close_all(self);
+        self.pending_keys.clear(); self.pending_mark = None;
+        let listing: Vec<crate::fsx::DirEntryInfo> = rows.iter().map(|r| {
+            crate::fsx::DirEntryInfo {
+                // Full path as the label — recents span directories, so a bare file name
+                // would be ambiguous.
+                name: r.path.to_string_lossy().into_owned(),
+                raw_name: r.path.clone().into_os_string(),
+                kind: if r.available {
+                    crate::fsx::EntryKind::File
+                } else {
+                    crate::fsx::EntryKind::Unknown
+                },
+                is_symlink: false,
+                broken: false,
+            }
+        }).collect();
+        let total = listing.len();
+        let entries: Vec<crate::file_browser::FileEntry> = listing.iter().map(|e| {
+            crate::file_browser::FileEntry {
+                name: e.name.clone(), kind: e.kind, is_symlink: e.is_symlink, broken: e.broken,
+            }
+        }).collect();
         self.file_browser = Some(crate::file_browser::FileBrowser {
-            dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
+            dir: std::env::current_dir().unwrap_or_default(),
+            query: String::new(),
+            mode: crate::file_browser::BrowseMode::Recents,
+            listing, total_seen: total, unreadable: 0,
+            entries, disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
         });
-        if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
     }
 
     /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.
@@ -1150,6 +1319,18 @@ impl Editor {
     /// Consulted by `set_status`/`set_status_full`/`finish_topic` via `resolve_slot`.
     pub fn set_messages_min_kind(&mut self, k: crate::status::StatusKind) { self.messages_min_kind = k; }
 
+    /// The SOLE mutator for the file-browser clutter filter (contract law 6). Every write
+    /// path — `show_clutter_on`/`show_clutter_off`/`toggle_clutter`, and startup config —
+    /// routes through this.
+    pub fn set_show_clutter(&mut self, on: bool) { self.files_show_clutter = on; }
+
+    /// The SOLE mutator for the file-browser type filter (contract law 6). Every write
+    /// path — `file_types_documents`/`file_types_all`/`toggle_file_types`, and startup
+    /// config — routes through this.
+    pub fn set_file_type_filter(&mut self, f: crate::config::FileTypeFilter) {
+        self.files_type_filter = f;
+    }
+
     /// Set the status-line transient mode (Off coerces to Auto — status has no true Off,
     /// no-silent-UI) and clear its stale dwell state.
     pub fn set_status_line_mode(&mut self, mode: crate::config::TransientMode) {
@@ -1238,6 +1419,22 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_ids_are_distinct_and_stable() {
+        let a = DocumentId::mint();
+        let b = DocumentId::mint();
+        assert_ne!(a, b, "two ids minted back-to-back differ (the counter component)");
+        assert_eq!(a.to_hex().len(), 16, "16 hex digits");
+        // Stability across a MUTATION, not across two reads of the same expression — the
+        // latter is true unconditionally for a Copy field and asserts nothing.
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let id = e.active().document.id;
+        e.active_mut().document.version += 1;
+        e.active_mut().document.saved_version = Some(e.active().document.version);
+        assert_eq!(e.active().document.id, id,
+            "the id is minted once and survives edits/saves — it is not re-minted per version");
+    }
 
     #[test]
     fn set_status_shows_text_and_reveals_bar() {
@@ -1511,7 +1708,7 @@ mod tests {
         std::fs::write(&p, "hello\nworld\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (40, 10)); // host editor for ids
         let id = e.alloc_id();
-        let b = Buffer::from_file(id, &p, (40, 10)).expect("ok");
+        let b = Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)).expect("ok");
         assert_eq!(b.id, id);
         assert_eq!(b.document.buffer.to_string(), "hello\nworld\n");
         assert_eq!(b.document.path.as_deref(), Some(p.as_path()));
@@ -1525,7 +1722,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let mut e = Editor::new_from_text("\n", None, (40, 10));
         let id = e.alloc_id();
-        let b = Buffer::from_file(id, &p, (40, 10)).expect("NotFound → named empty buffer, not Err");
+        let b = Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)).expect("NotFound → named empty buffer, not Err");
         assert_eq!(b.document.path.as_deref(), Some(p.as_path()));
         assert_eq!(b.document.buffer.to_string(), "\n");
     }
@@ -1536,7 +1733,7 @@ mod tests {
         std::fs::write(&p, [0u8, 159, 146, 150]).unwrap(); // invalid UTF-8 / NUL
         let mut e = Editor::new_from_text("\n", None, (40, 10));
         let id = e.alloc_id();
-        assert!(matches!(Buffer::from_file(id, &p, (40, 10)), Err(crate::file::OpenError::Binary(_))));
+        assert!(matches!(Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)), Err(crate::file::OpenError::Binary(_))));
         let _ = std::fs::remove_file(&p);
     }
 

@@ -342,6 +342,13 @@ Carried forward from the 4a deferral list (ledger row 4a):
 
 ### 5.3 Modal-prompt infrastructure (shared)
 
+> **AMENDED by C5 (2026-07-19).** The "single-line" half of this section now reads: the
+> **question and its choices** are a single line, painted on the status row. A prompt may
+> additionally carry a typed `detail: Vec<String>` — structured disclosure painted as a
+> bordered box directly ABOVE the status row (`chrome_geom::prompt_detail_rect` +
+> `render_overlays::paint_prompt_detail`). See C5 §11.3 for the reasoning and the standing
+> constraints; the three 4b prompts below are unaffected and carry an empty `detail`.
+
 A small reusable modal mechanism (e.g. `wordcartel/src/prompt.rs`) renders a
 single-line/centered prompt with labeled choices and routes the keypress to a
 result. Three users in 4b:

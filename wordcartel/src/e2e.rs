@@ -63,7 +63,14 @@ struct Harness {
     ex: BenchExecutor,
     term: Terminal<TestBackend>,
     tx: Sender<Msg>,
-    _rx: Receiver<Msg>,
+    /// The message channel's receiving end. Named (not `_rx`) because the C5 journey READS it:
+    /// the file-browser listing and the export both cross a thread boundary and deliver their
+    /// result here, so a journey that never pumps this asserts against a picker that is still
+    /// empty. See `pump_listing` / `await_msg`.
+    rx: Receiver<Msg>,
+    /// The ONE `Fs` handle the harness threads through `reduce` and hands to the journeys, so a
+    /// test that opens a picker and the loop that services it are talking to the same seam.
+    fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     now: u64,
 }
 
@@ -79,9 +86,10 @@ impl Harness {
         let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let ex = BenchExecutor::Inline(InlineExecutor::default());
         let term = Terminal::new(TestBackend::new(size.0, size.1)).expect("test terminal");
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let editor = Rc::new(RefCell::new(editor));
-        let mut h = Harness { editor, plugin_host: None, reg, keymap, ex, term, tx, _rx, now: 0 };
+        let fs = crate::test_support::test_fs();
+        let mut h = Harness { editor, plugin_host: None, reg, keymap, ex, term, tx, rx, fs, now: 0 };
         crate::derive::rebuild(&mut h.editor.borrow_mut());
         h.render();
         h
@@ -95,9 +103,10 @@ impl Harness {
         let reg = Registry::builtins();
         let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let term = Terminal::new(TestBackend::new(size.0, size.1)).expect("test terminal");
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let editor = Rc::new(RefCell::new(editor));
-        let mut h = Harness { editor, plugin_host: None, reg, keymap, ex, term, tx, _rx, now: 0 };
+        let fs = crate::test_support::test_fs();
+        let mut h = Harness { editor, plugin_host: None, reg, keymap, ex, term, tx, rx, fs, now: 0 };
         crate::derive::rebuild(&mut h.editor.borrow_mut());
         h.render();
         h
@@ -123,11 +132,12 @@ impl Harness {
         editor.diag_cfg.enabled = false;
         let ex = BenchExecutor::Inline(InlineExecutor::default());
         let term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let editor = Rc::new(RefCell::new(editor));
         host.attach_bridge(editor.clone(), tx.clone(), Rc::new(TestClock::new(0)) as Rc<dyn wordcartel_core::history::Clock>)
             .expect("bridge attaches on a live VM");
-        let mut h = Harness { editor, plugin_host: Some(host), reg, keymap, ex, term, tx, _rx, now: 0 };
+        let fs = crate::test_support::test_fs();
+        let mut h = Harness { editor, plugin_host: Some(host), reg, keymap, ex, term, tx, rx, fs, now: 0 };
         crate::derive::rebuild(&mut h.editor.borrow_mut());
         h.render();
         h
@@ -139,14 +149,14 @@ impl Harness {
     /// state-orthogonal for the seed journeys). A clipboard/mouse journey must add them.
     fn step(&mut self, msg: Msg) -> bool {
         let clock = TestClock(self.now);
-        let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
+        let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx, &self.fs) };
         // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): mirrors run()'s
         // choreography — runs AFTER reduce's borrow scope has dropped, holding NO outer borrow,
         // so a dispatched plugin command's Lua callback can re-borrow the editor via the
         // bridge's wc.* closures. `None` for the non-plugin journeys — a real skip, not a
         // null-host no-op call.
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx, &self.fs);
         }
         // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — mirrors run()'s
         // post-pump call; idempotent + self-guarding, so a no-op for the non-plugin journeys and
@@ -174,10 +184,10 @@ impl Harness {
         // Clear any residue so this step's spans are attributable to this step.
         let _ = crate::derive::bench_spans::drain();
         let t0 = std::time::Instant::now();
-        let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
+        let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx, &self.fs) };
         let t_reduce = t0.elapsed();
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx, &self.fs);
         }
         { crate::app::hydrate_overlays(&mut self.editor.borrow_mut(), &self.reg, &self.keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
@@ -207,6 +217,63 @@ impl Harness {
     fn resize(&mut self, w: u16, h: u16) {
         self.term.backend_mut().resize(w, h);         // sync the TestBackend cell grid
         self.step(Msg::Input(Event::Resize(w, h)));   // update the editor's buffer areas
+    }
+
+    // — async plumbing the C5 file-picker journey needs (Task 26) —
+
+    /// Deliver one pending `Msg::ListingDone` into the editor. The file-browser listing runs on
+    /// its own thread (§6.3), so a journey that opens a picker and asserts on `fb.entries`
+    /// without this is asserting against a picker that is still empty — a state real usage
+    /// never sees. Delegates to the shared `test_support` pump so the e2e layer and the unit
+    /// tests cannot drift on what "the listing arrived" means.
+    fn pump_listing(&mut self) -> bool {
+        crate::test_support::pump_listing(&mut self.editor.borrow_mut(), &self.rx)
+    }
+
+    /// Deliver one pending `Msg::RecentsProbed` into the editor — the recents picker's
+    /// availability probe, which `recents::open_recent` also runs off-thread.
+    fn pump_recents(&mut self) -> bool {
+        match self.rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Msg::RecentsProbed { epoch, rows }) => {
+                crate::recents::apply_recents_probed(&mut self.editor.borrow_mut(), epoch, rows);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply every ready job outcome, exactly as `run()`'s fold does. With the inline executor
+    /// a save has already run by the time Enter returns; its outcome still has to be merged
+    /// before `document.path` / `dirty()` reflect it.
+    fn drain_jobs(&mut self) {
+        for o in self.ex.drain() {
+            crate::jobs_apply::apply_outcome(o, &mut self.editor.borrow_mut());
+        }
+    }
+
+    /// Waits up to 5s for each of at most `n` messages, returning true as soon as one
+    /// satisfies `pred`. A plain `try_iter()` drain would race any thread-spawning
+    /// dispatch (`do_export`) and make the assertion scheduling-dependent.
+    fn await_msg(&self, n: usize, pred: impl Fn(&Msg) -> bool) -> bool {
+        std::iter::from_fn(|| self.rx.recv_timeout(std::time::Duration::from_secs(5)).ok())
+            .take(n)
+            .any(|m| pred(&m))
+    }
+
+    /// Dispatch a registered command BY NAME through the real registry, exactly as the palette
+    /// and the menu do. Journeys use this rather than calling the handler directly: a hand-call
+    /// passes even when the command was never registered, or its arm never wired — the
+    /// vacuous-guard pattern this effort had to correct repeatedly.
+    fn dispatch_command(&mut self, name: &str) {
+        let id = self.reg.commands().map(|(id, _)| id).find(|id| id.0 == name)
+            .unwrap_or_else(|| panic!("no command registered under {name:?}"));
+        let clock = TestClock(self.now);
+        let mut e = self.editor.borrow_mut();
+        let mut ctx = crate::registry::Ctx {
+            editor: &mut e, clock: &clock, executor: &self.ex,
+            msg_tx: self.tx.clone(), fs: std::sync::Arc::clone(&self.fs),
+        };
+        let _ = self.reg.dispatch(id, &mut ctx);
     }
 
     fn advance_ms(&mut self, ms: u64) { self.now = self.now.saturating_add(ms); }
@@ -714,7 +781,7 @@ fn on_save_hook_fires_on_real_save() {
     let clock = TestClock(h.now);
     {
         let mut e = h.editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx);
     }
     // InlineExecutor already ran the job inline; drain + apply the merge (fires the event).
@@ -724,7 +791,7 @@ fn on_save_hook_fires_on_real_save() {
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
     // The pump drains the event the merge just enqueued — no outer borrow held.
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
 
     let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
         .expect("the plugin's Lua-global counter must exist");
@@ -758,9 +825,9 @@ fn on_buffer_close_and_open_fire() {
     // 1) Reuse-shape open: fires on_open once.
     {
         let mut e = h.editor.borrow_mut();
-        crate::workspace::open_as_new_buffer(&mut e, &path_a);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &path_a);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     assert_eq!(opens, 1, "the reuse-shape open must fire on_open exactly once, not twice");
     let last_open: String =
@@ -772,9 +839,9 @@ fn on_buffer_close_and_open_fire() {
     // pushes a fresh buffer instead of reusing — the OTHER open_as_new_buffer arm.
     {
         let mut e = h.editor.borrow_mut();
-        crate::workspace::open_as_new_buffer(&mut e, &path_b);
+        crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &path_b);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     assert_eq!(opens, 2, "the new-buffer-shape open must also fire on_open, once");
     let last_open: String =
@@ -788,7 +855,7 @@ fn on_buffer_close_and_open_fire() {
         let mut e = h.editor.borrow_mut();
         crate::workspace::close_buffer_now(&mut e, b_id);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let closes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
     assert_eq!(closes, 1, "the clean close must fire on_buffer_close exactly once");
     let last_close: String =
@@ -804,7 +871,7 @@ fn on_buffer_close_and_open_fire() {
         assert!(matches!(r, crate::commands::CommandResult::Quit));
         assert!(e.quit, "Quit must set the quit flag on a clean workspace");
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
     let opens_after_quit: i64 =
         h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     let closes_after_quit: i64 =
@@ -944,12 +1011,12 @@ fn pomodoro_lua_e2e_success_demo() {
     // already-supplied-arg path, so no minibuffer opens (Task 5 case 2).
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         let r = reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
         assert_eq!(r, CommandResult::Handled);
         assert!(e.minibuffer.is_none(), "an already-supplied arg must never open the prompt");
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx); // runs the Lua callback: arms wc.timer, sets status
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs()); // runs the Lua callback: arms wc.timer, sets status
 
     let deadline = 25 * 60 * 1000u64;
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "start arms exactly one timer");
@@ -961,9 +1028,9 @@ fn pomodoro_lua_e2e_success_demo() {
     // no input in between (mirrors the run loop waking on next_wake alone).
     let fire_at = deadline + 1;
     clock.set(fire_at);
-    let keep = reduce(Msg::Tick, &mut editor.borrow_mut(), &reg, &keymap, &ex, &clock, &tx);
+    let keep = reduce(Msg::Tick, &mut editor.borrow_mut(), &reg, &keymap, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert!(keep, "Msg::Tick must not itself request quit");
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
 
     assert_eq!(editor.borrow().status_text(), "Pomodoro: 25 min session complete",
         "the observer-tier callback ran DURING inactivity");
@@ -976,19 +1043,19 @@ fn pomodoro_lua_e2e_success_demo() {
     // self-fire on the cancel dispatch's pump (unlike a stale/frozen bridge clock would).
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before cancel");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), Some(fire_at + deadline));
 
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         reg.dispatch_with_arg(cancel_id, &mut ctx, None);
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert!(editor.borrow().pending_plugin_timers.is_empty(), "wc.timer_cancel disarms the session");
     assert_eq!(editor.borrow().status_text(), "Pomodoro: cancelled");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None);
@@ -997,10 +1064,10 @@ fn pomodoro_lua_e2e_success_demo() {
     // its own teardown (P3 §3g auto-disarm).
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before reload");
 
     editor.borrow_mut().plugins_reload_requested = true;
@@ -1084,7 +1151,7 @@ fn wordcount_lua_e2e_success_demo() {
     let ex = InlineExecutor::default();
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx);
     }
     {
@@ -1092,7 +1159,7 @@ fn wordcount_lua_e2e_success_demo() {
         let mut e = editor.borrow_mut();
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().status_text(), "Saved — 3 words (goal: 100)",
         "the demo's on_save hook must report the live word count against its configured goal");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma\n",
@@ -1109,7 +1176,7 @@ fn wordcount_lua_e2e_success_demo() {
 
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
         crate::save::dispatch_save(&mut ctx);
     }
     {
@@ -1117,7 +1184,7 @@ fn wordcount_lua_e2e_success_demo() {
         let mut e = editor.borrow_mut();
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx);
+    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
     assert_eq!(editor.borrow().status_text(), "Saved (v2) — 3 words (goal: 100)",
         "the EDITED plugin's wording must be live after plugins_reload, on the very next save");
 }
@@ -1211,10 +1278,10 @@ fn journey_row0_click_unrevealed_edits_text() {
 /// A6 journey: opening the palette and pressing End reaches the LAST registered
 /// command without filtering, and Enter dispatches it.
 ///
-/// The last command is `save_settings` (D1+A5 T3 registration order) — benign and
-/// observable: dispatch sets `settings_save_requested = true`. The reach-without-typing
-/// property is the contract; selected must be within the visible window
-/// (selected - scroll_top < 15) before Enter.
+/// The last command is `plugin_list` (P2 Task 8b registration order) — benign and
+/// observable: dispatch writes a plugin-inventory summary to the status line. The
+/// reach-without-typing property is the contract; selected must be within the visible
+/// window (selected - scroll_top < 15) before Enter.
 #[test]
 fn journey_palette_end_reaches_last_command() {
     // A tall document keeps the palette's row math honest under scrolling.
@@ -1632,6 +1699,8 @@ fn journey_chrome_zen_toggle() {
         canvas:             wordcartel_core::theme::CanvasMode::Opaque,
         clipboard_provider: crate::config::ClipboardProvider::Auto,
         view_messages_min_kind: crate::status::StatusKind::Info,
+        files_show_clutter: false,
+        files_type_filter: crate::config::FileTypeFilter::Documents,
     };
     // Mirror the run-loop pattern: clear the flag, then write the file.
     h.editor.borrow_mut().settings_save_requested = false;
@@ -1685,7 +1754,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("prose_lens_passive"), &mut ctx);
     }
     assert_eq!(h.editor.borrow().active().view.prose_lens, Some(crate::lenses::ProseLensCategory::Passive),
@@ -1717,7 +1786,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("prose_lens_next_match"), &mut ctx);
     }
     {
@@ -1753,7 +1822,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("prose_lens_off"), &mut ctx);
     }
     h.tick();
@@ -1894,7 +1963,7 @@ fn e2e_lens_switch_flips_the_painted_underline_set() {
         use crate::registry::{Ctx, CommandId};
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
         h.reg.dispatch(CommandId("analysis_next"), &mut ctx);
     }
     assert_eq!(h.editor.borrow().active_analysis_source, DiagSource::Plugin("mock"),
@@ -2957,4 +3026,144 @@ mod e2e_bench {
         }
         loglog_slope(&pts)
     }
+}
+
+// ---------------------------------------------------------------------------
+// C5 whole-effort journey (Task 26)
+// ---------------------------------------------------------------------------
+
+/// The C5 file-interface journey, end to end through the real `reduce → advance → render`
+/// loop: open the picker, name a new document through the destination picker, export from it,
+/// Save-As to a second name, and reopen the result from recents.
+///
+/// Every stage drives the REAL entry point — `open_file_browser` / `open_destination_picker`
+/// for the overlays, the registry for `open_recent`, and `h.key(Enter)` through the ordinary
+/// intercept for every commit. Calling the commit helpers directly would pass with a broken
+/// keymap, a broken Enter arm, or a command that was never registered; this effort shipped
+/// exactly that class of defect more than once.
+///
+/// The listing is pumped before every assertion on `fb.entries`, because it arrives from
+/// another thread (§6.3) — an unpumped picker is empty, a state real usage never reaches.
+#[test]
+fn journey_open_save_export_saveas_reopen() {
+    let d = std::env::temp_dir().join(format!("wc-c5-journey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).expect("dir");
+    std::fs::write(d.join("existing.md"), b"already here\n").expect("seed");
+
+    let mut h = Harness::new("first draft\n", None, (100, 30));
+
+    // 1. OPEN the picker and confirm it lists the seeded directory.
+    h.editor.borrow_mut().open_file_browser(&h.fs, &h.tx, d.clone());
+    h.pump_listing();
+    assert!(h.editor.borrow().file_browser.as_ref().expect("picker")
+        .entries.iter().any(|e| e.name == "existing.md"),
+        "the picker lists what is really there");
+    h.key(KeyCode::Esc);
+
+    // 2. FIRST SAVE through the destination picker. Type a name with NO extension and
+    //    let policy append `.md`; the footer must show the post-policy target first.
+    h.editor.borrow_mut().open_destination_picker(&h.fs, &h.tx,
+        crate::file_browser::DestinationPurpose::SaveAs, d.clone(), String::new());
+    h.pump_listing();
+    for c in "chapter one".chars() { h.key(KeyCode::Char(c)); }
+    {
+        let e = h.editor.borrow();
+        let fb = e.file_browser.as_ref().expect("the destination picker is still open");
+        let footer = crate::file_browser::footer_target(&*h.fs, fb)
+            .expect("destination mode shows a target");
+        assert!(footer.contains(&d.join("chapter one.md").display().to_string()),
+            "the writer sees the resolved, post-policy target BEFORE committing: {footer}");
+    }
+    h.key(KeyCode::Enter);
+    h.drain_jobs();
+    assert_eq!(std::fs::read_to_string(d.join("chapter one.md")).expect("written"),
+        "first draft\n");
+    assert_eq!(h.editor.borrow().active().document.path.as_deref(),
+        Some(d.join("chapter one.md").as_path()), "buffer rekeyed to the CHOSEN path");
+
+    // 3. EXPORT with a destination — bare Enter reproduces the derived path.
+    h.editor.borrow_mut().open_destination_picker(&h.fs, &h.tx,
+        crate::file_browser::DestinationPurpose::Export { ext: "html".into() },
+        d.clone(), "chapter one.html".into());
+    h.pump_listing();
+    h.key(KeyCode::Enter);
+    // BOUNDED wait, not an immediate drain: `do_export` spawns a thread, so reading the
+    // channel the instant after Enter races it and this assertion would pass or fail on
+    // scheduling. Mirrors T21's `export_commits_end_to_end_from_enter_through`. Asserts the
+    // DISPATCH, not pandoc's output — pandoc may be absent on the gate machine.
+    assert!(h.await_msg(4, |m| matches!(m,
+        Msg::ExportDone { target, .. } if target == &d.join("chapter one.html"))),
+        "Enter-through dispatches the export for the seeded target");
+
+    // 4. SAVE-AS to a new name — the status must NAME the full path.
+    h.editor.borrow_mut().open_destination_picker(&h.fs, &h.tx,
+        crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "chapter one v2.md".into());
+    h.pump_listing();
+    h.key(KeyCode::Enter);
+    h.drain_jobs();
+    let status = h.editor.borrow().status_text().to_string();
+    assert!(status.contains(&d.join("chapter one v2.md").display().to_string()),
+        "a successful Save-As names where the bytes went: {status}");
+
+    // 5. REOPEN via recents — the rescue path.
+    //
+    // Driven through the real Enter arm, and through the same `open_recent` core the registry
+    // command calls: `rows_from` alone would pass with a broken opener or a broken Enter arm.
+    //
+    // The session store is read from an ISOLATED dir via `open_recent_in` — the seam that
+    // mirrors `state::load_in`/`save_in`. The earlier form loaded and restored the DEVELOPER'S
+    // real `$XDG_STATE_HOME` store; that restore was correct on both the pass and panic paths
+    // but not EXCLUSIVE, since `persist_session_for_test` writes the same file from a sibling
+    // thread of the same process and an interleave would discard its write. This journey now
+    // touches nothing ambient.
+    let target = d.join("chapter one v2.md");
+    let canon = std::fs::canonicalize(&target).expect("the file just written is canonicalizable");
+    let store = d.join("state");
+    std::fs::create_dir_all(&store).expect("isolated session-store dir");
+    {
+        let mut seeded = crate::state::SessionState::default();
+        let (mtime, size) = crate::state::file_identity(&canon).expect("identity of a real file");
+        seeded.entries.insert(canon.to_string_lossy().into_owned(), crate::state::StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(), mtime, size,
+            seq: seeded.next_seq(),
+            folds: Vec::new(), block: None, id: None,
+        });
+        seeded.save_in(&store).expect("seed the isolated session store");
+    }
+    // Registry wiring is still proven through the REAL dispatch — `dispatch_command` panics on
+    // an unregistered id, and a command whose arm was never wired leaves neither of the two
+    // outcomes `open_recent` can produce. That dispatch reads the ambient store and writes
+    // nothing, so it carries none of the interleave hazard the seeded write did; the seam call
+    // below then supplies the deterministic rows.
+    h.dispatch_command("open_recent");
+    {
+        let e = h.editor.borrow();
+        assert!(e.file_browser.is_some() || e.status_text() == "No recent files",
+            "the registered command really runs the recents opener: {:?}", e.status_text());
+    }
+    crate::overlays::close_all(&mut h.editor.borrow_mut());
+    let before = h.editor.borrow().active().document.path.clone();
+    h.editor.borrow_mut().active_mut().document.path = None;   // a different buffer
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::recents::open_recent_in(&mut e, &h.fs, &h.tx, &store);
+    }
+    h.pump_recents();
+    assert!(h.editor.borrow().file_browser.is_some(), "the command opened the recents picker");
+    {
+        let idx = {
+            let e = h.editor.borrow();
+            let fb = e.file_browser.as_ref().expect("recents picker");
+            fb.entries.iter().position(|r| r.name.ends_with("chapter one v2.md"))
+                .expect("the just-saved document is listed, ranked by seq")
+        };
+        h.editor.borrow_mut().file_browser.as_mut().expect("recents picker").selected = idx;
+    }
+    h.key(KeyCode::Enter);
+    let reopened = h.editor.borrow().active().document.path.clone();
+    assert_eq!(reopened, before,
+        "Enter on a recents row REOPENS that document — the buffer actually changed");
+
+    let _ = std::fs::remove_dir_all(&d);
 }

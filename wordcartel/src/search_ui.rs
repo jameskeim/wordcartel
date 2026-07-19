@@ -181,6 +181,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         let word = editor.active().document.buffer.slice(a..b).to_string();
         editor.dictionary.insert(word.clone());
         match editor.diag_cfg.dictionary.clone() {
+            // fs-chokepoint-allow: (w) config-class read — the personal dictionary, not document content
             Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
                 Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
                 Err(e) => editor.set_status_full(crate::status::StatusKind::Error, format!("add to dictionary failed: {e}"),
@@ -240,7 +241,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
                     _ => {}
                 }
-                return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+                return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
             }
             match k.code {
                 KeyCode::Esc => { search_cancel(editor); return crate::app::Handled::Done(!editor.quit); }
@@ -250,7 +251,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 KeyCode::Enter if alt => {
                     if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
                     search_sync(editor); // park on first match
-                    return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
+                    return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs));
                 }
                 KeyCode::Enter if shift => { search_step(editor, false); }
                 KeyCode::F(3) if shift   => { search_step(editor, false); }
@@ -274,7 +275,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             // Recompute against the live buffer and pin the current match.
             search_sync(editor);
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx)); // return ONLY for key events (including non-Press)
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs)); // return ONLY for key events (including non-Press)
     }
     // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
     // fall through to the normal handlers below.

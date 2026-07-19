@@ -2,8 +2,6 @@
 // Ported atomic primitive from ~/projects/par-command/repar/src/atomic.rs (MIT, user's own).
 // Added: symlink refusal, skip-unchanged, mode preservation (#[cfg(unix)]).
 
-use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -57,13 +55,13 @@ fn is_binary(bytes: &[u8]) -> bool {
 /// Map an IO error from File::open or read_to_end to the appropriate OpenError.
 /// Preserves BOTH is_dir() disambiguation sites — the NotFound arm (some FS
 /// surfaces a dir-read as NotFound) and the catch-all (some OSes return Other).
-fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
+fn map_open_io_err(fs: &dyn crate::fsx::Fs, e: std::io::Error, label: &str, path: &Path) -> OpenError {
     match e.kind() {
         std::io::ErrorKind::NotFound => {
             // Double-check: could be PermissionDenied that looks like NotFound
-            // on some FS. is_dir() does a separate stat — if that fails we keep
+            // on some FS. The stat is a separate probe — if that fails we keep
             // NotFound. If the path IS a dir, that takes precedence.
-            if path.is_dir() {
+            if matches!(fs.stat(path), Ok(st) if st.is_dir) {
                 OpenError::IsDir(label.to_owned())
             } else {
                 OpenError::NotFound(label.to_owned())
@@ -73,7 +71,7 @@ fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
         _ => {
             // For anything else, still check IsDir (some OSes return Other
             // when read() is called on a directory).
-            if path.is_dir() {
+            if matches!(fs.stat(path), Ok(st) if st.is_dir) {
                 OpenError::IsDir(label.to_owned())
             } else {
                 OpenError::Io(format!("{label}: {e}"))
@@ -83,43 +81,47 @@ fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
 }
 
 pub fn open(path: &Path) -> Result<String, OpenError> {
-    let label = path.display().to_string();
-    let limit = crate::limits::MAX_OPEN_BYTES;
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    open_with_fs(&crate::fsx::RealFs, path)
+}
 
-    // (a) Fast refusal when metadata is trustworthy.
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.is_file() && meta.len() > limit {
+/// Seam-taking core of [`open`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn open_with_fs(fs: &dyn crate::fsx::Fs, path: &Path) -> Result<String, OpenError> {
+    open_bounded_with_fs(fs, path, crate::limits::MAX_OPEN_BYTES)
+}
+
+/// `open_with_fs` with an explicit cap — the seam-taking core proper.
+pub(crate) fn open_bounded_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
+    -> Result<String, OpenError>
+{
+    let label = path.display().to_string();
+
+    // (a) Fast refusal when metadata is trustworthy. `stat` follows symlinks, matching the
+    // `fs::metadata` this replaces; a `broken` link falls through to the read, which fails —
+    // exactly what the old `if let Ok(meta)` did.
+    if let Ok(st) = fs.stat(path) {
+        if st.is_file && st.len > limit {
             return Err(OpenError::TooLarge(label, limit));
         }
     }
 
     // (b) Bounded read — caps the allocation even if metadata lied (/proc, sparse).
-    let bytes = match fs::File::open(path) {
-        Ok(f) => {
-            let mut buf = Vec::new();
-            if let Err(e) = Read::read_to_end(&mut f.take(limit + 1), &mut buf) {
-                return Err(map_open_io_err(e, &label, path));
-            }
-            if buf.len() as u64 > limit {
-                return Err(OpenError::TooLarge(label, limit));
-            }
-            buf
-        }
-        Err(e) => return Err(map_open_io_err(e, &label, path)),
+    let bytes = match fs.read_capped(path, limit) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Err(OpenError::TooLarge(label, limit)),
+        Err(e) => return Err(map_open_io_err(fs, e, &label, path)),
     };
 
-    // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but
-    // guard it anyway (opening a dir with read() sometimes succeeds on some FS).
-    if path.is_dir() {
+    // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but guard it
+    // anyway (opening a dir with read() sometimes succeeds on some FS).
+    if matches!(fs.stat(path), Ok(st) if st.is_dir) {
         return Err(OpenError::IsDir(label));
     }
 
-    // Binary test: NUL byte OR invalid UTF-8 (exactly repar's is_binary).
     if is_binary(&bytes) {
         return Err(OpenError::Binary(label));
     }
 
-    // SAFETY: is_binary already verified valid UTF-8; from_utf8 will not fail.
     Ok(String::from_utf8(bytes).expect("already verified by is_binary"))
 }
 
@@ -131,22 +133,42 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
 /// file exceeds `limit` OR any open/read error occurs — every caller treats `None` as
 /// its existing safe degradation. Mirrors `open`'s `.take(limit + 1)` + `len > limit`.
 pub fn bounded_read_opt(path: &Path, limit: u64) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    let f = fs::File::open(path).ok()?;
-    Read::read_to_end(&mut f.take(limit + 1), &mut buf).ok()?;
-    if buf.len() as u64 > limit { return None; }
-    Some(buf)
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    bounded_read_opt_with_fs(&crate::fsx::RealFs, path, limit)
+}
+
+/// Seam-taking core. Preserves the historical contract EXACTLY: `None` for both over-cap
+/// and IO failure, because every caller treats `None` as its own safe degradation. The
+/// seam distinguishes the two; this wrapper deliberately discards the distinction.
+pub(crate) fn bounded_read_opt_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
+    -> Option<Vec<u8>>
+{
+    match fs.read_capped(path, limit) {
+        Ok(Some(b)) => Some(b),
+        Ok(None) | Err(_) => None,
+    }
 }
 
 pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
-    // (1) Symlink refusal — symlink_metadata does NOT follow the link.
-    match path.symlink_metadata() {
-        Ok(meta) if meta.file_type().is_symlink() => return Err(SaveError::Symlink),
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    save_atomic_with_fs(&crate::fsx::RealFs, path, content)
+}
+
+/// Seam-taking core of [`save_atomic`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn save_atomic_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content: &str)
+    -> Result<SaveOutcome, SaveError>
+{
+    // (1) Symlink refusal. UNCHANGED semantics: `stat` reports `is_symlink` from
+    // `symlink_metadata`, which does not follow — exactly what this check needs.
+    // This stays an unconditional last-resort guard; C5 resolves destinations BEFORE
+    // they reach here (spec §7.6.1), so it simply never fires on the save path.
+    match fs.stat(path) {
+        Ok(st) if st.is_symlink => return Err(SaveError::Symlink),
         _ => {}
     }
 
     // (2) Skip-unchanged — bounded read; over-cap or unreadable → skip the optimization.
-    if let Some(existing) = bounded_read_opt(path, crate::limits::MAX_OPEN_BYTES) {
+    if let Some(existing) = bounded_read_opt_with_fs(fs, path, crate::limits::MAX_OPEN_BYTES) {
         if existing == content.as_bytes() {
             return Ok(SaveOutcome::Unchanged);
         }
@@ -154,15 +176,10 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
 
     // (3) Commit through the shared fault-tested core. Mode is preserved from the
     // existing target (else 0600); dir-fsync after rename for durability.
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content.as_bytes(),
-        crate::fsx::WriteOpts {
-            mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
-            dir_fsync: true,
-        },
-    )
+    crate::fsx::atomic_replace(fs, path, content.as_bytes(), crate::fsx::WriteOpts {
+        mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
+        dir_fsync: true,
+    })
     .map_err(|e| SaveError::Io(e.to_string()))?;
 
     Ok(SaveOutcome::Saved)
@@ -174,15 +191,30 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
 // ---------------------------------------------------------------------------
 
 pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content,
-        crate::fsx::WriteOpts {
-            mode: crate::fsx::ModePolicy::Fixed(0o600),
-            dir_fsync: true,
-        },
-    )
+    // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
+    save_atomic_bytes_with_fs(&crate::fsx::RealFs, path, content)
+}
+
+/// Byte-exact atomic write. NO UTF-8 check and NO skip-unchanged (unlike `save_atomic`),
+/// but it DOES share the symlink refusal: `atomic_replace` renames over the target, which
+/// through a link would replace the link with a regular file.
+///
+/// The guard is new in C5. Before, export targets were derived and never user-chosen, so
+/// the exposure did not exist; C5 lets a writer pick an export destination (spec §9), and
+/// a target can become a symlink between resolution and write. Session-state writes
+/// (`state::SessionState::save_in`) acquire the same guard — a deliberate change, not a
+/// side effect.
+pub(crate) fn save_atomic_bytes_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content: &[u8])
+    -> Result<(), SaveError>
+{
+    match fs.stat(path) {
+        Ok(st) if st.is_symlink => return Err(SaveError::Symlink),
+        _ => {}
+    }
+    crate::fsx::atomic_replace(fs, path, content, crate::fsx::WriteOpts {
+        mode: crate::fsx::ModePolicy::Fixed(0o600),
+        dir_fsync: true,
+    })
     .map_err(|e| SaveError::Io(e.to_string()))
 }
 
@@ -193,6 +225,12 @@ pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: production code reaches the filesystem through the `fsx::Fs` seam
+    // exclusively (fs_chokepoint.rs GATE), so this import lives here rather than at
+    // module top level, where a standalone `#[cfg(test)] use std::fs;` would sit
+    // outside the guard's `mod tests` strip boundary and false-positive as a
+    // production import.
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -211,6 +249,31 @@ mod tests {
     // -------------------------------------------------------------------------
     // TDD RED tests (from brief) — these are written BEFORE implementation.
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn open_routes_through_the_seam_and_faults_are_injectable() {
+        // First time file::open is fault-testable at all — it hardcoded RealFs internally.
+        let p = scratch_path("open-fault");
+        fs::write(&p, b"hello\n").expect("seed");
+        let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::ReadCapped);
+        let err = open_with_fs(&ff, &p).expect_err("injected read must surface as OpenError");
+        assert!(matches!(err, OpenError::Io(_)), "injected IO error maps to OpenError::Io, got {err:?}");
+        // And the real seam still opens normally.
+        assert_eq!(open_with_fs(&crate::fsx::RealFs, &p).expect("real open"), "hello\n");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn open_over_cap_is_still_too_large_not_io() {
+        // Behaviour preservation: over-cap must stay OpenError::TooLarge, NOT become an
+        // IO error just because read_capped now separates the two outcomes.
+        let p = scratch_path("open-over");
+        fs::write(&p, vec![b'x'; 64]).expect("seed");
+        let err = open_bounded_with_fs(&crate::fsx::RealFs, &p, 8)
+            .expect_err("over-cap must be refused");
+        assert!(matches!(err, OpenError::TooLarge(_, 8)), "got {err:?}");
+        let _ = fs::remove_file(&p);
+    }
 
     /// save_atomic writes content; a subsequent open reads it back → Saved.
     #[test]
@@ -325,7 +388,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
           crate::save::dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty(), "dirty must be cleared after a successful background save");
@@ -438,6 +501,23 @@ mod tests {
         let err = open(&p).expect_err("must refuse oversized file");
         assert!(matches!(err, OpenError::TooLarge(..)), "expected TooLarge, got {err:?}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_atomic_bytes_refuses_a_symlink() {
+        // save_atomic_bytes had NO symlink guard. It is the export write path, and C5 makes
+        // export targets user-selectable for the first time — so a chosen target can now be
+        // a symlink, and the target can be swapped for one between resolution and write.
+        let real = scratch_path("bytes-link-real");
+        let link = scratch_path("bytes-link");
+        fs::write(&real, b"original\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = save_atomic_bytes_with_fs(&crate::fsx::RealFs, &link, b"new\n")
+            .expect_err("must refuse");
+        assert!(matches!(err, SaveError::Symlink), "got {err:?}");
+        assert_eq!(fs::read(&real).expect("read"), b"original\n", "target untouched");
+        let _ = fs::remove_file(&link); let _ = fs::remove_file(&real);
     }
 
     /// No temp litter left after a successful save.

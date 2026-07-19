@@ -834,3 +834,91 @@ abortable selection):**
 **Reuse:** builds directly on S8 — the `PosStore` + `PosSweep` substrate, the range-select nav pattern
 (`prose_lens_next_match`), and the `wordcartel-nlp` classifier surface. Not yet designed; graduates to
 the gated pipeline (brainstorm → spec → gates → plan → build) when picked up.
+
+### H26 — fs-chokepoint guard: use-tree parsing for full soundness
+<!-- item: H26 -->
+
+C5 ships `wordcartel/tests/fs_chokepoint.rs`, a merge gate that fails the build when production code
+reaches the filesystem outside the seam. It is a **textual scanner over three detection layers** —
+import-gating (`use std::fs…`), fully-qualified `std::fs::` paths, and the closed std-defined set of
+filesystem-touching inherent `Path` methods in both dot-call and UFCS spellings. C5's spec states its
+coverage as an explicit Caught / Not-caught pair rather than claiming soundness.
+
+**The gap.** Three import spellings evade layer 1 and are documented as accepted limits:
+
+- nested grouped imports — `use std::{fs::File as StdFile};`
+- renamed-in-group imports — `use std::{fs::{self as filesystem, OpenOptions as OO}};`
+- leading-root paths — `use ::std::fs;`
+
+Each enables a bare short-form call (`filesystem::write(…)`) that no specified layer sees. Closing
+them properly requires **parsing `use` trees** rather than matching text — a dev-dependency (`syn`
+or equivalent) plus real parsing logic in a test.
+
+**Why it was deferred, not overlooked.** Weighed during C5's spec gate (2026-07-18) and declined as
+disproportionate: the gate exists to catch the realistic regression — someone mid-effort reaches for
+`fs::read_to_string` and writes an ordinary import — and the gap spellings are ones nobody produces
+by accident. Adding a parser dependency also cuts against C5's zero-new-dependencies decision. The
+scanner's own self-check plants one evasion per detection route, so the layers that exist are proven
+to work; what is unproven is only the undisclosed-spelling case.
+
+**Note the boundary that is NOT part of this item.** fd-originated `fs::File` (`From<OwnedFd>`,
+`FromRawFd`) is outside the chokepoint rule by design, not by scanner weakness — the rule governs
+reaching the filesystem *by path*, and a descriptor names no path. If a future effort starts doing
+fd-based filesystem work, the **rule** needs widening, not the scanner.
+
+**When it becomes worth doing:** if a real bypass ever lands via one of the three spellings, or if
+the seam's guarantees start carrying weight they do not today (a plugin FS API, sandboxing, an
+audit requirement). Absent that, the honest-limits gate is the better trade.
+
+*(Captured 2026-07-18 during C5's spec gate.)*
+
+### H27 — dispatch signatures: pass DispatchCtx instead of 8 loose args
+<!-- item: H27 -->
+
+Seven dispatch functions now carry `#[allow(clippy::too_many_arguments)]`, added by C5 Task 5 when
+one new parameter (the `Arc<dyn Fs + Send + Sync>` seam handle) pushed each from 7 args to 8:
+`input::handle_key`, `app::reduce`, `app::reduce_dispatch`, `app::dispatch_overlay_command`,
+`menu::dispatch_row_action`, `mouse::handle`, `plugin::pump::drain_one_dispatch`.
+
+**Why this is a real item rather than bookkeeping.** Two of those functions take the eight loose
+arguments and then **reconstruct the bundle from them** a few lines into the body — `reduce_dispatch`
+receives `(msg, editor, reg, keymap, ex, clock, msg_tx, fs)` and immediately does
+`let ctx = DispatchCtx { reg, keymap, ex, clock, msg_tx, fs };`. The bundle is not missing; it is
+being disassembled at the call site and reassembled in the callee.
+
+**The fix is unusually clean, because `DispatchCtx` was built for exactly this.** It already carries
+`reg`, `keymap`, `ex`, `clock`, `msg_tx`, `fs` — precisely the loose parameters — and it
+**deliberately excludes `&mut Editor`** so the editor can be passed separately without an aliasing
+tangle in the H21 table loop. That is the whole reason its shape is what it is. So the signature
+collapses to three arguments and the allow disappears:
+
+```rust
+reduce_dispatch(msg, &mut Editor, &DispatchCtx)
+```
+
+This is using a bundle the codebase already has, for the case it was designed for — not a refactor
+looking for a justification.
+
+**Why it was deferred out of C5 rather than folded in.** Re-signaturing these is cross-cutting, and
+21 of C5's 26 task briefs were written against the loose form. Changing it mid-effort would
+invalidate briefs that fresh implementers — who see only their own task — have no way to
+cross-check against.
+
+**Why it should not simply be dropped.** The project's own history is the argument. The H1
+god-object split (`app.rs`/`render.rs`, 2026-07-09) happened because *dispatch attractors* accumulate:
+a central `match` that every feature must edit grows monotonically with feature count.
+`clippy::too_many_lines` and `too_many_arguments` are the anti-regrowth GATEs that exist to catch
+that class early. Seven suppressions is the lint doing its job and being told to be quiet — and each
+one is individually defensible, which is precisely how the previous accumulation happened.
+
+**Scope (expected Small):** collapse the seven signatures onto the existing context bundle; delete all
+seven allows; confirm `module_budgets` and `too_many_lines` stay green. No new types, no design forks
+— the bundle exists and every call site already holds its pieces.
+
+**Anchors:** `overlays::DispatchCtx` (`overlays.rs`), `registry::Ctx` (`registry.rs`),
+`app::reduce_dispatch` / `app::dispatch_overlay_command` (`app.rs`), the seven allow sites (grep
+`too_many_arguments`). Precedent for the bundle's editor-exclusion rationale: the H21 overlay
+dispatch-table effort.
+
+*(Captured 2026-07-18 from C5 Task 5's review. See also [[H1]] — the god-object split this lint
+exists to prevent recurring.)*

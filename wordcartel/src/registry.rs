@@ -29,6 +29,10 @@ pub struct Ctx<'a> {
     pub executor: &'a dyn Executor,
     /// Owned `Sender` (not a borrow) because `dispatch_filter` moves a clone into a `'static` spawned thread.
     pub msg_tx: std::sync::mpsc::Sender<Msg>,
+    /// The filesystem seam. OWNED (`Arc`), not borrowed, because `jobs::Job::run` is
+    /// `Box<dyn FnOnce() -> JobResult + Send>` — a job closure must be able to clone this in.
+    /// Synchronous call sites still take plain `&dyn Fs`; see §5.2 of the C5 spec.
+    pub fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 }
 
 pub type Handler = fn(&mut Ctx) -> CommandResult;
@@ -236,8 +240,9 @@ impl Registry {
         r.register("delete_forward", "Delete Forward",   None, |c| run(c, Command::DeleteForward));
 
         // A14 — ten Emacs-parity atomic text-edit commands (commands/textops.rs).
-        // Registered BEFORE save_settings (Codex F4): journey_palette_end_reaches_last_command
-        // + the registration-order invariant both rely on save_settings staying last.
+        // Registered well before `plugin_list` (Codex F4): journey_palette_end_reaches_last_command
+        // + the registration-order invariant both rely on `plugin_list` staying LAST, not on
+        // `save_settings` — see the note at `plugin_list`'s own registration site below.
         r.register("transpose_chars", "Transpose Characters", None, |c| crate::commands::textops::transpose_chars(c.editor, c.clock));
         r.register("transpose_words", "Transpose Words",      None, |c| crate::commands::textops::transpose_words(c.editor, c.clock));
         r.register("transpose_lines", "Transpose Lines",      None, |c| crate::commands::textops::transpose_lines(c.editor, c.clock));
@@ -286,12 +291,12 @@ impl Registry {
                 .and_then(|p| p.parent())
                 .map(|d| d.to_path_buf())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            c.editor.open_file_browser(dir);
+            c.editor.open_file_browser(&c.fs, &c.msg_tx, dir);
             CommandResult::Handled
         });
         r.register("save", "Save", Some(MenuCategory::File), crate::save::dispatch_save);
         r.register("save_as", "Save As…", Some(MenuCategory::File), |c| {
-            crate::prompts::open_save_as(c.editor);
+            crate::prompts::open_save_as(c.editor, &c.fs, &c.msg_tx);
             CommandResult::Handled
         });
         r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
@@ -303,7 +308,7 @@ impl Registry {
         // snapshotted set (safe by construction — see prompts::open_clean_recovery). Trailing …
         // marks the prompt-opening command (cf. save_as); palette + File menu by registration.
         r.register("clean_recovery", "Clean Recovery Files\u{2026}", Some(MenuCategory::File), |c| {
-            crate::prompts::open_clean_recovery(c.editor);
+            crate::prompts::open_clean_recovery(c.editor, &*c.fs, c.clock);
             CommandResult::Handled
         });
 
@@ -334,19 +339,19 @@ impl Registry {
 
         // Export menu.
         r.register("export_html", "Export HTML", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "html", &c.msg_tx);
+            crate::export::run_export(c.editor, &c.fs, "html", &c.msg_tx);
             CommandResult::Handled
         });
         r.register("export_docx", "Export DOCX", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "docx", &c.msg_tx);
+            crate::export::run_export(c.editor, &c.fs, "docx", &c.msg_tx);
             CommandResult::Handled
         });
         r.register("export_pdf", "Export PDF", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "pdf", &c.msg_tx);
+            crate::export::run_export(c.editor, &c.fs, "pdf", &c.msg_tx);
             CommandResult::Handled
         });
         r.register("export_tex", "Export LaTeX", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "tex", &c.msg_tx);
+            crate::export::run_export(c.editor, &c.fs, "tex", &c.msg_tx);
             CommandResult::Handled
         });
 
@@ -425,7 +430,7 @@ impl Registry {
         r.register_mut("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
         r.register_mut("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
         // Marked block write-to-file (Task 4 / Effort 9A).
-        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
+        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor, &c.fs, &c.msg_tx); CommandResult::Handled });
 
         // Effort 6: send-to-scratch verbs.
         r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
@@ -798,9 +803,42 @@ impl Registry {
                 c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
                 CommandResult::Handled
             });
-        // toggle_canvas and toggle_chrome MUST be registered BEFORE save_settings
-        // (journey_palette_end relies on save_settings being the last command dispatched
-        // from End+Enter — spec D3 / A.7).
+        r.register("open_recent", "Open Recent\u{2026}", Some(MenuCategory::File), |c| {
+            // Async form (Task 23): the availability probe runs off-thread, so this needs the
+            // owned Arc and the sender, not a borrowed `&dyn Fs`.
+            crate::recents::open_recent(c.editor, &c.fs, &c.msg_tx);
+            CommandResult::Handled
+        });
+        // C5 filter toggles — set-per-state primitives (palette-only) + one stateful
+        // representative each, mirroring scrollbar_off/auto/on + cycle_scrollbar (law 8).
+        r.register("show_clutter_on",  "Show Hidden Files",  None, |c| {
+            c.editor.set_show_clutter(true);  CommandResult::Handled });
+        r.register("show_clutter_off", "Hide Hidden Files",  None, |c| {
+            c.editor.set_show_clutter(false); CommandResult::Handled });
+        r.register_stateful("toggle_clutter", "Hidden Files", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.files_show_clutter),
+            |c| { let next = !c.editor.files_show_clutter;
+                  c.editor.set_show_clutter(next); CommandResult::Handled });
+        r.register("file_types_documents", "File Types: Documents", None, |c| {
+            c.editor.set_file_type_filter(crate::config::FileTypeFilter::Documents);
+            CommandResult::Handled });
+        r.register("file_types_all", "File Types: All Files", None, |c| {
+            c.editor.set_file_type_filter(crate::config::FileTypeFilter::All);
+            CommandResult::Handled });
+        r.register_stateful("toggle_file_types", "File Types", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.files_type_filter {
+                crate::config::FileTypeFilter::Documents => "Documents",
+                crate::config::FileTypeFilter::All       => "All files",
+            }),
+            |c| { let next = match c.editor.files_type_filter {
+                      crate::config::FileTypeFilter::Documents => crate::config::FileTypeFilter::All,
+                      crate::config::FileTypeFilter::All => crate::config::FileTypeFilter::Documents,
+                  };
+                  c.editor.set_file_type_filter(next); CommandResult::Handled });
+        // `plugin_list` stays the LAST registered command (journey_palette_end_reaches_last_command
+        // is a merge gate on it — pressing End+Enter in the palette must land on `plugin_list`).
+        // `save_settings` itself carries no such constraint; `plugins_reload`/`plugin_list` already
+        // register after it.
         r.register_stateful("toggle_canvas", "Canvas: Opaque/Transparent", Some(MenuCategory::Settings),
             |e| MenuMark::Value(match e.canvas {
                 wordcartel_core::theme::CanvasMode::Opaque       => "Opaque",
@@ -1091,6 +1129,24 @@ mod tests {
     struct Z;
     impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
 
+    /// The compile-shape guard for this task: `Ctx.fs` must be an OWNED handle so a job
+    /// closure (`'static + Send`, per `jobs::Job::run`) can clone it in and use it after
+    /// crossing a real thread boundary — a borrowed `&dyn Fs` cannot do this.
+    #[test]
+    fn ctx_fs_field_exists_and_is_clonable_into_a_closure() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ctx = Ctx {
+            editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx,
+            fs: std::sync::Arc::new(crate::fsx::RealFs),
+        };
+        let handle = std::sync::Arc::clone(&ctx.fs);
+        let t = std::thread::spawn(move || handle.stat(std::path::Path::new("/")).is_ok());
+        assert!(t.join().expect("joins"));
+    }
+
     #[test]
     fn menu_from_str_parses_all_eight_and_rejects_unknown() {
         for (s, m) in [
@@ -1167,13 +1223,12 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
-        // No path → save handler opens the Save-As minibuffer (Effort 7, Task 3).
+        // No path → save handler opens the Save-As destination picker (Task 21).
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
-            Some(crate::minibuffer::MinibufferKind::SaveAs)),
-            "unnamed save opens the Save-As minibuffer");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
+            "unnamed save opens the Save-As destination picker");
     }
 
     #[test]
@@ -1186,7 +1241,7 @@ mod tests {
         // Dispatch `id` against editor `e` with the caret preset to `caret`; return the new head
         // (and leave `e`'s selection for the caller to inspect).
         let dispatch = |e: &mut Editor, id: &'static str| {
-            let mut ctx = Ctx { editor: e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = Ctx { editor: e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             reg.dispatch(CommandId(id), &mut ctx)
         };
         let head = |e: &Editor| e.active().document.selection.primary().head;
@@ -1259,7 +1314,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
 
         assert_eq!(r, CommandResult::Handled);
@@ -1283,7 +1338,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
 
         assert_eq!(r, CommandResult::Handled);
@@ -1311,7 +1366,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch_with_arg(id, &mut ctx, Some("25".into()));
 
         assert_eq!(r, CommandResult::Handled);
@@ -1333,7 +1388,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
 
         assert_eq!(r, CommandResult::Handled);
@@ -1351,7 +1406,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch_with_arg(CommandId("save"), &mut ctx, Some("x".into()));
         assert_eq!(r, CommandResult::Handled);
     }
@@ -1376,7 +1431,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
     }
@@ -1397,7 +1452,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(id, &mut ctx);
         assert_eq!(r, CommandResult::Handled);
         assert_eq!(e.pending_plugin_calls.len(), 1, "re-registered id dispatches as a plugin call");
@@ -1424,7 +1479,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("nope"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Noop);
         assert!(e.status_text().contains("unknown command"), "must surface, never silent (§12.5)");
@@ -1538,7 +1593,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("plugins_reload"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert!(e.plugins_reload_requested, "plugins_reload sets the request flag the seam consumes");
@@ -1555,7 +1610,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
@@ -1585,7 +1640,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
@@ -1984,7 +2039,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         reg.dispatch(CommandId(id), &mut ctx);
     }
 
@@ -2231,7 +2286,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         assert!(ctx.editor.view_opts.splash, "default on");
         let r = reg.dispatch(CommandId("splash_off"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
@@ -2282,7 +2337,7 @@ mod tests {
         // Dispatch flips it on and rebuilds.
         let ex = InlineExecutor::default();
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = Ctx { editor: &mut ed, clock: &Z, executor: &ex, msg_tx: tx };
+        let mut ctx = Ctx { editor: &mut ed, clock: &Z, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
         assert_eq!(reg.dispatch(CommandId("toggle_ventilate"), &mut ctx), CommandResult::Handled);
         assert!(ed.active().view.ventilate, "dispatch turned the lens on");
         assert!(matches!(f(&ed), MenuMark::OnOff(true)));
@@ -2311,5 +2366,53 @@ mod tests {
         assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Warning);
         dispatch_id(&mut e, "messages_min_info");
         assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Info);
+    }
+
+    // -----------------------------------------------------------------------
+    // C5 Task 24: seven file-interface commands, registration order + shape rule 8
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn c5_commands_register_before_plugin_list() {
+        // `e2e::journey_palette_end_reaches_last_command` presses End+Enter in the palette
+        // and asserts the status starts with "plugins:", which hardcodes plugin_list as the
+        // LAST registered command. It is a merge gate: registering any C5 command after it
+        // breaks the build.
+        let reg = Registry::builtins();
+        // `Registry::commands()` yields `(CommandId, &CommandMeta)` — destructure the pair.
+        let ids: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
+        let last = ids.last().copied().expect("non-empty registry");
+        assert_eq!(last, "plugin_list", "plugin_list must stay last");
+        for id in ["open_recent", "show_clutter_on", "show_clutter_off", "toggle_clutter",
+                   "file_types_documents", "file_types_all", "toggle_file_types"] {
+            let at = ids.iter().position(|x| *x == id)
+                .unwrap_or_else(|| panic!("{id} must be registered"));
+            assert!(at < ids.len() - 1, "{id} must register BEFORE plugin_list");
+        }
+    }
+
+    #[test]
+    fn filter_toggles_follow_law_8_set_per_state_plus_one_representative() {
+        let reg = Registry::builtins();
+        // Set-per-state primitives are palette-only.
+        for id in ["show_clutter_on", "show_clutter_off", "file_types_documents", "file_types_all"] {
+            assert_eq!(reg.meta(CommandId(id)).expect("registered").menu, None,
+                "{id} is a palette-only set primitive");
+        }
+        // One stateful representative each, carrying a MenuCategory.
+        assert_eq!(reg.meta(CommandId("toggle_clutter")).expect("registered").menu,
+            Some(MenuCategory::View));
+        assert_eq!(reg.meta(CommandId("toggle_file_types")).expect("registered").menu,
+            Some(MenuCategory::View));
+        // And they report live state.
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let f = reg.meta(CommandId("toggle_clutter")).unwrap().state.expect("stateful");
+        assert!(matches!(f(&ed), MenuMark::OnOff(false)), "clutter hidden by default");
+        ed.set_show_clutter(true);
+        assert!(matches!(f(&ed), MenuMark::OnOff(true)));
+        let g = reg.meta(CommandId("toggle_file_types")).unwrap().state.expect("stateful");
+        assert_eq!(g(&ed), MenuMark::Value("Documents"));
+        ed.set_file_type_filter(crate::config::FileTypeFilter::All);
+        assert_eq!(g(&ed), MenuMark::Value("All files"));
     }
 }

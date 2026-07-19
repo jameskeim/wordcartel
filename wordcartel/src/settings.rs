@@ -64,6 +64,12 @@ pub struct SettingsSnapshot {
     /// Message verbosity floor (Q6, A17 T10; `view.messages_min_kind`). Mutated by
     /// `messages_min_info`/`messages_min_warning`/`toggle_messages_verbosity`.
     pub view_messages_min_kind: crate::status::StatusKind,
+    /// File-browser clutter filter (`[files] show_clutter`; command-surface decision 8 —
+    /// C5). Mutated by `set_show_clutter` (`show_clutter_on`/`show_clutter_off`/`toggle_clutter`).
+    pub files_show_clutter: bool,
+    /// File-browser type filter (`[files] type_filter`; command-surface decision 8 — C5).
+    /// Mutated by `set_file_type_filter` (`file_types_documents`/`file_types_all`/`toggle_file_types`).
+    pub files_type_filter: crate::config::FileTypeFilter,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +101,7 @@ pub struct OverridesFile {
     #[serde(skip_serializing_if = "Option::is_none")] pub menu:   Option<OMenu>,
     #[serde(skip_serializing_if = "Option::is_none")] pub mouse:  Option<OMouse>,
     #[serde(skip_serializing_if = "Option::is_none")] pub clipboard: Option<OClipboard>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub files:  Option<OFiles>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -150,6 +157,13 @@ pub struct OClipboard {
     #[serde(skip_serializing_if = "Option::is_none")] pub provider: Option<String>,
 }
 
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OFiles {
+    #[serde(skip_serializing_if = "Option::is_none")] pub show_clutter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub type_filter: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot builders
 // ---------------------------------------------------------------------------
@@ -192,6 +206,8 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         canvas: crate::theme_resolve::parse_canvas(&cfg.theme.canvas).0,
         clipboard_provider: cfg.clipboard.provider,
         view_messages_min_kind: cfg.view.messages_min_kind,
+        files_show_clutter: cfg.files.show_clutter,
+        files_type_filter: cfg.files.type_filter,
     }
 }
 
@@ -217,6 +233,8 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         canvas: editor.canvas,
         clipboard_provider: editor.clipboard_provider,
         view_messages_min_kind: editor.messages_min_kind(),
+        files_show_clutter: editor.files_show_clutter,
+        files_type_filter: editor.files_type_filter,
     }
 }
 
@@ -255,6 +273,7 @@ pub fn parse_mask(bytes: &str) -> OverridesFile {
         menu:   Option<OMenu>,
         mouse:  Option<OMouse>,
         clipboard: Option<OClipboard>,
+        files:  Option<OFiles>,
     }
     #[derive(Default, Deserialize)]
     #[serde(default)]
@@ -286,7 +305,7 @@ pub fn parse_mask(bytes: &str) -> OverridesFile {
         }
     });
     OverridesFile { keymap: mask.keymap, theme, view: mask.view, menu: mask.menu, mouse: mask.mouse,
-        clipboard: mask.clipboard }
+        clipboard: mask.clipboard, files: mask.files }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +508,23 @@ pub fn compute_overrides(
     let has_provider = provider.is_some();
     let clipboard = some_if(OClipboard { provider }, has_provider);
 
-    OverridesFile { keymap, theme, view, menu, mouse, clipboard }
+    // --- files — per-key mask predicate ---
+    let show_clutter = diff_key(
+        &runtime.files_show_clutter, &baseline.files_show_clutter,
+        existing.files.as_ref().and_then(|f| f.show_clutter.as_ref()),
+        mask.files.as_ref().and_then(|f| f.show_clutter).is_some(),
+    );
+    let rt_tf   = crate::config::file_type_filter_str(runtime.files_type_filter).to_string();
+    let base_tf = crate::config::file_type_filter_str(baseline.files_type_filter).to_string();
+    let type_filter = diff_key(
+        &rt_tf, &base_tf,
+        existing.files.as_ref().and_then(|f| f.type_filter.as_ref()),
+        mask.files.as_ref().and_then(|f| f.type_filter.as_ref()).is_some(),
+    );
+    let has_files = show_clutter.is_some() || type_filter.is_some();
+    let files = some_if(OFiles { show_clutter, type_filter }, has_files);
+
+    OverridesFile { keymap, theme, view, menu, mouse, clipboard, files }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,12 +545,15 @@ pub(crate) fn save_overrides(
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // fs-chokepoint-allow: (b) directory provisioning — probing the config dir, not user data
     let existed = parent.exists();
+    // fs-chokepoint-allow: (b) directory provisioning for the config dir
     std::fs::create_dir_all(&parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if !existed {
+            // fs-chokepoint-allow: (b) directory provisioning — chmod the newly-created dir
             std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
@@ -613,7 +651,9 @@ mod tests {
             chrome_disposition: ChromeDisposition::Full,
             canvas: CanvasMode::Opaque,
             clipboard_provider: crate::config::ClipboardProvider::Auto,
-            view_messages_min_kind: crate::status::StatusKind::Info }
+            view_messages_min_kind: crate::status::StatusKind::Info,
+            files_show_clutter: false,
+            files_type_filter: crate::config::FileTypeFilter::Documents }
     }
 
     fn snap_with<F: FnOnce(&mut SettingsSnapshot)>(f: F) -> SettingsSnapshot {
@@ -801,9 +841,16 @@ mod tests {
                 Err(std::io::Error::other("boom")) // io_other_error is deny — the repo idiom (fsx.rs:394+)
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn read_capped(&self, p: &std::path::Path, l: u64)
+                -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
         }
         let d = tempdir();
         let err = save_overrides(&FailFs, &d.join("o.toml"), &OverridesFile::default()).unwrap_err();
@@ -872,9 +919,16 @@ mod tests {
                 Err(std::io::Error::other("boom"))
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn read_capped(&self, p: &std::path::Path, l: u64)
+                -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
         }
         let d = tempdir();
         let path = d.join("o.toml");
@@ -901,9 +955,16 @@ mod tests {
                 Err(std::io::Error::other("boom"))
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn read_capped(&self, p: &std::path::Path, l: u64)
+                -> std::io::Result<Option<Vec<u8>>> { crate::fsx::RealFs.read_capped(p, l) }
+            fn stat(&self, p: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
+                crate::fsx::RealFs.stat(p)
+            }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
         }
         let d = tempdir();
         let path = d.join("o.toml");
@@ -1071,6 +1132,32 @@ mod tests {
         assert!(of2.view.is_none() || of2.view.as_ref().unwrap().caret_shape.is_none());
     }
 
+    // C5 Task 24: the two persisted filter toggles round-trip through the diff law + parse
+    // (decision 8 — "show all files" must stick).
+    #[test]
+    fn files_filters_round_trip_via_diff_law() {
+        use crate::config::FileTypeFilter;
+        let base = snap_with(|s| {
+            s.files_show_clutter = false;
+            s.files_type_filter = FileTypeFilter::Documents;
+        });
+        let mut rt = base.clone();
+        rt.files_show_clutter = true;
+        rt.files_type_filter = FileTypeFilter::All;
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        let f = of.files.as_ref().expect("files section present on divergence");
+        assert_eq!(f.show_clutter, Some(true));
+        assert_eq!(f.type_filter.as_deref(), Some("all"));
+        // ...and the written keys deserialize back through parse_overrides.
+        let text = toml::to_string(&of).expect("serialize overrides");
+        let re = parse_overrides(&text);
+        assert_eq!(re.files.as_ref().and_then(|f| f.show_clutter), Some(true));
+        assert_eq!(re.files.as_ref().and_then(|f| f.type_filter.clone()).as_deref(), Some("all"));
+        // No divergence → no [files] section written (rule 4).
+        let of2 = compute_overrides(&base, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert!(of2.files.is_none(), "unchanged filters write no [files] section");
+    }
+
     #[test]
     fn clipboard_provider_round_trips_through_overrides() {
         // A runtime value differing from baseline appears in the computed overrides.
@@ -1106,6 +1193,7 @@ mod tests {
                 menu_bar: _, mouse_capture: _,
                 chrome_disposition: _, canvas: _, clipboard_provider: _,
                 view_messages_min_kind: _,
+                files_show_clutter: _, files_type_filter: _,
             } = s;
         }
         let _ = field_guard; // reference it so the guard compiles (no dead_code allow needed)
@@ -1134,6 +1222,10 @@ mod tests {
         assert!(has("clipboard_provider_cycle") && has("clipboard_provider_auto"), "clipboard_provider");
         assert!(has("toggle_messages_verbosity") && has("messages_min_info") && has("messages_min_warning"),
             "view_messages_min_kind");
+        assert!(has("toggle_clutter") && has("show_clutter_on") && has("show_clutter_off"),
+            "files_show_clutter");
+        assert!(has("toggle_file_types") && has("file_types_documents") && has("file_types_all"),
+            "files_type_filter");
     }
 
     #[test]

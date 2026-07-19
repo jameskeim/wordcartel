@@ -93,11 +93,12 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 /// Apply a finished job's result, then advance a multi-buffer quit drain if one
 /// is waiting on this completion. The single funnel for all JobDone handling so
 /// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
-pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     apply_result(r, editor);
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
-        drive_quit_drain(editor, ex, clock, msg_tx);
+        drive_quit_drain(editor, ex, clock, msg_tx, fs);
     }
 }
 
@@ -167,11 +168,12 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
 /// Apply a finished job outcome, then advance a multi-buffer quit drain if one
 /// is waiting on this completion. The single funnel for all JobDone handling so
 /// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
-pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     apply_outcome(outcome, editor);
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
-        drive_quit_drain(editor, ex, clock, msg_tx);
+        drive_quit_drain(editor, ex, clock, msg_tx, fs);
     }
 }
 
@@ -179,7 +181,8 @@ pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, 
 /// and either dispatch its save (SaveAll) or raise the per-buffer review prompt
 /// (ReviewEach). When the queue is empty, quit. Re-driven by save completion
 /// (apply_result sets `quit_drain_advance`) and by review-prompt resolution.
-pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     loop {
         if editor.quit_drain.is_none() { return; }
         // Pop already-clean / vanished buffers off the front. Each iteration uses a
@@ -202,7 +205,7 @@ pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Cloc
         let mode = editor.quit_drain.as_ref().unwrap().mode;
         match mode {
             crate::editor::QuitMode::SaveAll => {
-                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
                 crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
                 return; // wait for the save (named) or Save-As (unnamed) to complete
             }
@@ -301,6 +304,7 @@ pub(crate) fn apply_export_done(
     target: std::path::PathBuf,
     result: Result<crate::export::ExportResult, crate::filter::FilterError>,
     overwrite_confirmed: bool,
+    fs: &dyn crate::fsx::Fs,
 ) {
     // TOCTOU guard (Codex pre-merge gate): run_export only prompts for overwrite
     // if the target existed at check time.  When it did not (overwrite_confirmed
@@ -310,9 +314,9 @@ pub(crate) fn apply_export_done(
     // The residual check-to-write window is microseconds vs. the whole pandoc
     // run; an unsafe-free atomic no-replace rename is unavailable under
     // #![forbid(unsafe_code)].
-    if !overwrite_confirmed && target.exists() {
+    if !overwrite_confirmed && crate::fsx::exists_via(fs, &target) {
         if let Ok(crate::export::ExportResult::TempReady(tmp)) = &result {
-            let _ = std::fs::remove_file(tmp);
+            let _ = fs.remove_file(tmp);
         }
         editor.set_status_full(crate::status::StatusKind::Warning, format!(
             "export target {} appeared — re-run export to overwrite",
@@ -322,7 +326,7 @@ pub(crate) fn apply_export_done(
     }
     match result {
         Ok(crate::export::ExportResult::Bytes(bytes)) => {
-            match file::save_atomic_bytes(&target, &bytes) {
+            match file::save_atomic_bytes_with_fs(fs, &target, &bytes) {
                 Ok(()) => {
                     let status = format!("exported {}", target.display());
                     editor.set_status(crate::status::StatusKind::Info, status);
@@ -334,13 +338,13 @@ pub(crate) fn apply_export_done(
             }
         }
         Ok(crate::export::ExportResult::TempReady(tmp)) => {
-            match std::fs::rename(&tmp, &target) {
+            match fs.rename(&tmp, &target) {
                 Ok(()) => {
                     let status = format!("exported {}", target.display());
                     editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = fs.remove_file(&tmp);
                     editor.set_status_full(crate::status::StatusKind::Error, format!("export rename failed: {e}"),
                         crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
@@ -435,7 +439,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
@@ -458,7 +462,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
@@ -599,7 +603,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::CloseSave { id: x_id }, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::CloseSave { id: x_id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_after_save.is_some(), "pending armed");
         let pre_count = e.buffers.len();
         for o in ex.drain() { apply_outcome(o, &mut e); }
@@ -654,15 +658,16 @@ mod tests {
         #[cfg(not(unix))] { return; }
         #[cfg(unix)]
         {
-            // Symlink-target trick: the save fails → buffer stays, pending cleared,
-            // error status contains "symlink".
+            // ENOTDIR trick: target sits "inside" a regular file → the save fails → buffer
+            // stays, pending cleared, error status surfaced. NOT a symlink target — Task
+            // 15/16 (§7.6.1/§4.10) made a symlinked document path resolve and succeed, so a
+            // symlink no longer produces a save failure here.
             use crate::jobs::{Executor, InlineExecutor};
             use crate::prompt::PromptAction;
-            let real = quit_tmp("real");
-            std::fs::write(&real, "real\n").unwrap();
-            let link = quit_tmp("link");
-            std::os::unix::fs::symlink(&real, &link).unwrap();
-            let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+            let parent = quit_tmp("parent");
+            std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+            let target = parent.join("doc.md"); // ENOTDIR on temp create
+            let mut e = Editor::new_from_text("x\n", Some(target.clone()), (80, 24));
             e.active_mut().document.saved_version = None;
             e.active_mut().document.version = 1; // dirty
             let id = e.active().id;
@@ -670,13 +675,14 @@ mod tests {
             let ex = InlineExecutor::default();
             let clk = TestClock(0);
             let (tx, _rx) = std::sync::mpsc::channel();
-            crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+            crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
             for o in ex.drain() { apply_outcome(o, &mut e); }
             assert!(e.by_id(id).is_some(), "buffer NOT closed — save failed");
             assert!(e.pending_after_save.is_none(), "pending cleared on save failure");
-            assert!(e.status_text().to_lowercase().contains("symlink"), "error status: {:?}", e.status_text());
-            let _ = std::fs::remove_file(&link);
-            let _ = std::fs::remove_file(&real);
+            assert!(
+                e.status_text().to_lowercase().contains("not a directory") || e.status_text().contains("ENOTDIR"),
+                "error status: {:?}", e.status_text());
+            let _ = std::fs::remove_file(&parent);
         }
     }
 
@@ -835,7 +841,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.prompt.is_some(), "external-mod conflict raises the modal");
         assert!(e.pending_after_save.is_none(), "pending_after_save NOT armed on conflict");
         let _ = std::fs::remove_file(&p);
@@ -955,10 +961,27 @@ mod tests {
         std::fs::write(&parent, "i am a file\n").unwrap();
         let target = parent.join("out.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, &crate::fsx::RealFs);
         assert!(e.status_text().contains("export write failed"));
         assert_sticky_error_survives_info(&mut e);
         let _ = std::fs::remove_file(&parent);
+    }
+
+    /// C5 Task 8: export Bytes write is fault-injectable through the seam.
+    /// The HTML export write now routes through save_atomic_bytes_with_fs(fs, …)
+    /// instead of reaching around to the hardwired RealFs wrapper. This test
+    /// proves the seam is alive by injecting a fault at the create step.
+    #[test]
+    fn apply_export_done_bytes_write_is_fault_injectable() {
+        use crate::editor::Editor;
+        let target = std::env::temp_dir().join(format!("wc-c4-exportbytes-fault-{}.html", std::process::id()));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        // Inject a create failure via FaultFs: the write will fail before touching disk.
+        let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Create);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, &ff);
+        // The failure must surface as a Sticky Error in the status.
+        assert!(e.status_text().contains("export write failed"), "got: {}", e.status_text());
+        assert_sticky_error_survives_info(&mut e);
     }
 
     #[test]
@@ -969,7 +992,7 @@ mod tests {
         let missing_tmp = std::env::temp_dir().join(format!("wc-c4-exportrename-missing-{}.tmp", std::process::id()));
         let target = std::env::temp_dir().join(format!("wc-c4-exportrename-target-{}.html", std::process::id()));
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true, &crate::fsx::RealFs);
         assert!(e.status_text().contains("export rename failed"));
         assert_sticky_error_survives_info(&mut e);
     }
@@ -979,7 +1002,7 @@ mod tests {
         use crate::editor::Editor;
         let target = std::env::temp_dir().join(format!("wc-c4-exportpandoc-{}.html", std::process::id()));
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true);
+        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true, &crate::fsx::RealFs);
         assert_sticky_error_survives_info(&mut e);
     }
 
@@ -992,7 +1015,7 @@ mod tests {
         let target = std::env::temp_dir().join(format!("wc-c4-exporttoctou-{}.html", std::process::id()));
         std::fs::write(&target, "existing\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false);
+        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false, &crate::fsx::RealFs);
         assert!(e.status_text().contains("appeared — re-run export to overwrite"));
         assert_sticky_warning_survives_info(&mut e);
         let _ = std::fs::remove_file(&target);
