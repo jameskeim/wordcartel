@@ -320,4 +320,62 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn destination_mode_reveals_output_siblings_the_select_mode_hides() {
+        // The other half of the Task 18 fix. `typing_in_destination_mode_narrows_the_listing…`
+        // above covers the FILTER TEXT half of `rederive`'s internal derivation but seeds only
+        // `.md` files, which satisfy `is_document` regardless of `destination`'s value — it
+        // never exercises the flag. `documents_filter_is_mode_aware` exercises the flag, but
+        // by calling `filter_and_rank` directly with a hand-built `FilterOpts`, bypassing
+        // `fb.mode` -> `rederive` -> `apply_listing_done` entirely. A reviewer hardcoded
+        // `destination: false` inside `rederive` and all 33 `file_browser*` tests still passed.
+        //
+        // This drives the REAL wiring in both modes: destination mode via `start_listing` +
+        // `apply_listing_done` (constructed by hand — `Editor::open_destination_picker` is a
+        // later task, same rationale as the sibling test above), select mode via the real
+        // `Editor::open_file_browser` entry point.
+        //
+        // FAIL-VERIFY: hardcode `destination: false` inside `rederive`, watch this fail, revert.
+        let d = std::env::temp_dir().join(format!("wc-destsibling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        std::fs::write(d.join("chapter.md"), b"x").expect("seed md");
+        std::fs::write(d.join("chapter.docx"), b"x").expect("seed docx");
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+
+        // Destination mode.
+        let mut e_dst = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Destination {
+                purpose: crate::file_browser::DestinationPurpose::SaveAs,
+                field: String::new(), field_cursor: 0,
+            },
+            listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        crate::file_browser::start_listing(&mut fb, d.clone(), &fs, &tx);
+        e_dst.file_browser = Some(fb);
+        crate::test_support::pump_listing(&mut e_dst, &rx);
+        let dst_names: Vec<String> = e_dst.file_browser.as_ref().expect("open")
+            .entries.iter().map(|r| r.name.clone()).collect();
+        assert!(dst_names.iter().any(|n| n == "chapter.docx"),
+            "destination mode must reveal output-format siblings: {dst_names:?}");
+
+        // Select mode, via the real `Editor::open_file_browser` -> `apply_listing_done` ->
+        // `rederive` path.
+        let mut e_sel = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let _rx2 = crate::test_support::open_and_pump(&mut e_sel, d.clone());
+        let sel_names: Vec<String> = e_sel.file_browser.as_ref().expect("open")
+            .entries.iter().map(|r| r.name.clone()).collect();
+        assert!(!sel_names.iter().any(|n| n == "chapter.docx"),
+            "select mode must hide output-format siblings: {sel_names:?}");
+        assert!(sel_names.iter().any(|n| n == "chapter.md"),
+            "sanity: the .md file is still shown in select mode: {sel_names:?}");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

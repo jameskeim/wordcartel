@@ -326,7 +326,7 @@ mod tests {
         // `chrome_geom::file_browser_row_origin`; using it here would be a forward reference,
         // and row 0 sits at `list_top` by construction so this needs no helper.
         let ov = crate::chrome_geom::palette_overlay_rect(area,
-            e.file_browser.as_ref().unwrap().entries.len());
+            e.file_browser.as_ref().expect("picker open").entries.len());
         let (col, row) = (ov.x + 1, ov.y + 2);   // +1 border column, +2 border + query row
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
