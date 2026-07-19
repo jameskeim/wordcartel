@@ -724,6 +724,29 @@ mod tests {
         (0..w).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    /// The rectangle the painter ACTUALLY drew, recovered from the cell grid by finding the
+    /// box-drawing corners. Nothing else paints on these fresh single-widget backends, so the
+    /// four corner glyphs occur exactly once each. Panics with the screen dump if a corner is
+    /// missing — a silent `None` here would turn a real geometry regression into a skipped
+    /// assertion, which is the failure mode this helper exists to close.
+    fn drawn_box_rect(term: &Terminal<TestBackend>) -> Rect {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area().width, buf.area().height);
+        let find = |glyph: &str| -> (u16, u16) {
+            for y in 0..h {
+                for x in 0..w {
+                    if buf[(x, y)].symbol() == glyph { return (x, y); }
+                }
+            }
+            panic!("the painter drew no {glyph} corner; screen:\n{}",
+                (0..h).map(|y| row_text(term, y)).collect::<Vec<_>>().join("\n"));
+        };
+        let (x0, y0) = find("\u{250c}");                 // ┌
+        let (x1, _)  = find("\u{2510}");                 // ┐
+        let (_, y1)  = find("\u{2514}");                 // └
+        Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+
     fn empty_destination_fb(dir: std::path::PathBuf, field: &str) -> FileBrowser {
         FileBrowser {
             dir, query: String::new(),
@@ -800,5 +823,58 @@ mod tests {
             "the footer text must land in its OWN dedicated row: {:?}", row_text(&term, footer_row));
         assert!(!row_text(&term, title_row).contains("new-chapter"),
             "and must NOT be squeezed into the border title instead: {:?}", row_text(&term, title_row));
+    }
+
+    // ---- the DRAWN box is the one chrome_geom describes ---------------------------
+
+    #[test]
+    fn the_painted_box_occupies_exactly_file_browser_overlay_rect() {
+        // `file_browser_overlay_rect` is the single source the footer reservation, the mouse
+        // hit-test (`file_browser_row_at`) and its inverse (`file_browser_row_origin`) all read
+        // the box geometry from. That contract is worth only as much as the painter's actual
+        // obedience to it: every other test here scrapes CONTENT at a row derived from the same
+        // function, so a painter that computed its own — even a differently-WRONG own — box
+        // could still line those assertions up. This one scrapes the drawn border itself.
+        //
+        // Both fixtures are checked because they discriminate different mistakes. The empty
+        // destination listing is where `file_browser_overlay_rect` and the plain
+        // `palette_overlay_rect(area, entries.len())` it wraps genuinely DISAGREE (the footer
+        // reservation grows the box), so it catches a painter that dropped the reservation. The
+        // populated select listing pins x/width/height for the ordinary case, where the two
+        // agree on height and only a hand-rolled inset would show up.
+        //
+        // FAIL-VERIFY: replace the painter's `file_browser_overlay_rect(area, fb)` with
+        // `palette_overlay_rect(area, fb.entries.len())` — the empty case fails on height.
+        // Then instead inset it by one column (`ov_rect.x + 1`) — both cases fail on x.
+        // Confirmed for both, then restored.
+        let dir = std::env::temp_dir().join(format!("wc-render-rect-{}", std::process::id()));
+        let area = Rect::new(0, 0, 80, 24);
+
+        let mut empty = Editor::new_from_text("x\n", None, (80, 24));
+        empty.file_browser = Some(empty_destination_fb(dir.clone(), "new-chapter"));
+
+        let mut populated = Editor::new_from_text("x\n", None, (80, 24));
+        let mut fb = empty_destination_fb(dir.clone(), "");
+        fb.mode = BrowseMode::Select;
+        fb.entries = (0..7).map(|i| crate::file_browser::FileEntry {
+            name: format!("chapter-{i}.md"), kind: crate::fsx::EntryKind::File,
+            is_symlink: false, broken: false,
+        }).collect();
+        populated.file_browser = Some(fb);
+
+        for (label, e) in [("empty destination", &mut empty), ("populated select", &mut populated)] {
+            crate::derive::rebuild(e);
+            let expected = {
+                let fb = e.file_browser.as_ref().expect("open");
+                crate::chrome_geom::file_browser_overlay_rect(area, fb)
+            };
+            let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| paint_file_browser(f, e, &cs)).expect("draw");
+
+            assert_eq!(drawn_box_rect(&term), expected,
+                "{label}: the border the painter actually drew must BE \
+                 file_browser_overlay_rect — the rect the hit-test and footer both trust");
+        }
     }
 }
