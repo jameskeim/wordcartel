@@ -178,42 +178,55 @@ fn file_browser_has_footer_row(fb: &crate::file_browser::FileBrowser) -> bool {
         if !field.trim().is_empty())
 }
 
-/// Row budget for the file browser's ENTRY LIST — single-sourced between the painter
-/// (`render_overlays::paint_file_browser`) and the hit-test (`file_browser_row_at`) below, so
-/// a footer row that shrinks the list can never diverge between the two (the A21 mouse/render
-/// divergence this effort is explicitly guarding against).
-///
-/// Destination mode's resolved-target footer, when shown, claims ONE row from the list's
-/// budget: the interior shrinks by exactly one so the footer gets a dedicated, full-width row
-/// rather than being squeezed into the border title alongside `windowed_indicator`.
-pub(crate) fn file_browser_list_h(area: Rect, fb: &crate::file_browser::FileBrowser) -> u16 {
-    let raw = crate::list_window::list_h_for(fb.entries.len(), area.height);
-    let reserved = usize::from(file_browser_has_footer_row(fb));
-    raw.saturating_sub(reserved) as u16
+/// How many dedicated interior rows the picker's footer area wants — today exactly the
+/// resolved-target line, when destination mode is showing one.
+pub(crate) fn file_browser_footer_rows(fb: &crate::file_browser::FileBrowser) -> usize {
+    usize::from(file_browser_has_footer_row(fb))
 }
 
-/// The file browser's overlay box — like `palette_overlay_rect`, but ALSO reserves height for
-/// the resolved-target footer row when one is showing.
+/// The picker's row ledger: `(interior content rows, entry-list rows)`. THE single source
+/// `file_browser_overlay_rect`, `file_browser_list_h`, the painter and the mouse hit-test all
+/// read their geometry from, so a footer row can never shift one of them without the others
+/// (the A21 mouse/render divergence this effort exists to prevent).
 ///
-/// `palette_overlay_rect(area, fb.entries.len())` sizes the box to content alone. For a small
-/// or empty listing (a freshly created, still-empty project folder; a listing that has not
-/// arrived yet) that leaves NO slack for the footer's own row, so the painter fell back to the
-/// cramped border-title footer regardless of how much room the TERMINAL actually had — the
-/// fallback was gated on what the directory happened to contain, not on the space available.
-/// Reserving a row here whenever the footer wants one — capped by the SAME `list_h_for` the
-/// painter already uses, so a genuinely tiny terminal still degrades correctly — fixes that at
-/// the one place both the painter and the hit-test below read the box height from.
+/// The footer lines are ADDITIVE where the terminal has room: the box grows by `reserved`
+/// rows rather than confiscating them from the list. Confiscating was the old behaviour and
+/// it cost a writer real information — a filtered destination listing with two entries showed
+/// only one of them plus a `1/2` indicator, on a 100x30 terminal with rows to spare. Growth is
+/// capped by the SAME `list_h_for` ceiling the painter honours (content cap 15, frame cap
+/// `height - 4`), so a genuinely tiny terminal still degrades to the cramped border-title
+/// fallback instead of painting out of bounds; and a listing already at that ceiling still
+/// lends the footer one of its own rows, because there is nowhere left to grow.
+fn file_browser_rows(area: Rect, fb: &crate::file_browser::FileBrowser) -> (usize, usize) {
+    let reserved = file_browser_footer_rows(fb);
+    let raw = crate::list_window::list_h_for(fb.entries.len(), area.height);
+    let box_rows = crate::list_window::list_h_for(fb.entries.len() + reserved, area.height).max(raw);
+    (box_rows, box_rows.saturating_sub(reserved))
+}
+
+/// How many of the reserved footer rows the box ACTUALLY got — `reserved` on any terminal
+/// with room, and 0 on one too small to grow, where the painter falls back to the cramped
+/// border-title footer. The painter reads this rather than re-deriving a height guard of its
+/// own, so what it paints and what the box was sized for stay the same number.
+pub(crate) fn file_browser_footer_rows_shown(area: Rect, fb: &crate::file_browser::FileBrowser) -> usize {
+    let (box_rows, list_h) = file_browser_rows(area, fb);
+    box_rows - list_h
+}
+
+/// Row budget for the file browser's ENTRY LIST — the second half of
+/// [`file_browser_rows`]'s ledger.
+pub(crate) fn file_browser_list_h(area: Rect, fb: &crate::file_browser::FileBrowser) -> u16 {
+    file_browser_rows(area, fb).1 as u16
+}
+
+/// The file browser's overlay box — like `palette_overlay_rect`, but sized from
+/// [`file_browser_rows`] so the footer's rows are part of the box rather than borrowed from
+/// the list.
 ///
 /// Single-sourced with the hit-test (`file_browser_row_at`/`file_browser_row_origin`) so the
 /// two can never disagree on where the box's bottom edge is (the A21 hazard).
 pub(crate) fn file_browser_overlay_rect(area: Rect, fb: &crate::file_browser::FileBrowser) -> Rect {
-    let raw = crate::list_window::list_h_for(fb.entries.len(), area.height);
-    // `file_browser_list_h` already reserves one of these rows for the footer when it can;
-    // growing the box is only needed when the content itself would otherwise leave zero rows
-    // for it (`raw == 0`) — content that already fills or exceeds the budget just lends the
-    // footer one of its own rows, unchanged from before this fix.
-    let box_row_budget = if file_browser_has_footer_row(fb) { raw.max(1) } else { raw };
-    palette_overlay_rect(area, box_row_budget)
+    palette_overlay_rect(area, file_browser_rows(area, fb).0)
 }
 
 /// Return the absolute list-row index that `(col, row)` hits in the file browser,
@@ -575,10 +588,16 @@ mod tests {
 
     #[test]
     fn hit_testing_and_the_painter_agree_on_the_last_row_in_destination_mode() {
-        // The footer consumes a row from the block's bottom edge, so the list interior
-        // shrinks. If `file_browser_row_at` kept the old height, a click on the last visible
-        // row would select the row BELOW the one drawn there — off-by-one on a surface where
-        // the next keystroke can commit a write.
+        // The footer takes the row immediately below the last entry, so the list interior
+        // stops one row short of the block's bottom edge. If `file_browser_row_at` kept the
+        // old height, a click on the last visible row would select the row BELOW the one drawn
+        // there — off-by-one on a surface where the next keystroke can commit a write.
+        //
+        // 20 entries, not a dozen: since the footer's row is ADDITIVE (the box grows for it
+        // where the terminal allows — see `file_browser_rows`), the list only genuinely
+        // windows once the content itself reaches the `list_h_for` ceiling. A fixture below
+        // that ceiling would leave `list_h == entries.len()` and the "last visible row" this
+        // test is about would not exist — the precondition below is what catches that.
         //
         // FAIL-VERIFY: leave `file_browser_row_at` computing its own height instead of
         // calling `file_browser_list_h`, watch this fail.
@@ -589,7 +608,7 @@ mod tests {
                 purpose: crate::file_browser::DestinationPurpose::SaveAs,
                 field: "x".into(), field_cursor: 1 },
             listing: Vec::new(), total_seen: 0, unreadable: 0,
-            entries: (0..12).map(|i| crate::file_browser::FileEntry {
+            entries: (0..20).map(|i| crate::file_browser::FileEntry {
                 name: format!("f{i:02}.md"), kind: crate::fsx::EntryKind::File,
                 is_symlink: false, broken: false }).collect(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,

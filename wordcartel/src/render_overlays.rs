@@ -511,15 +511,15 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         // exists). `None` in select mode or with an empty field. Rendered against the real
         // filesystem — this is a read-only display probe, not a fault-injectable write path.
         let footer = crate::file_browser::footer_target(&crate::fsx::RealFs, fb);
-        // A dedicated content row exists for the footer only when the BOX (sized above,
-        // reservation included) actually has room for one — `ov_h >= 4` is exactly the guard
-        // the rendering below already uses to enter the interior-content branch. Gating on the
-        // TERMINAL'S available height (via `file_browser_overlay_rect`) rather than on how many
-        // entries the directory happens to contain is the point: an empty directory on an
-        // ordinary terminal must still get the dedicated row, not the cramped border-title
-        // fallback. Only a genuinely tiny terminal (one `file_browser_overlay_rect` cannot grow
-        // past, however small the content) falls back to the title.
-        let dedicated_footer_row = footer.is_some() && ov_h >= 4;
+        // How many dedicated footer rows the BOX was actually sized for — read from the same
+        // ledger that sized it, never re-derived from a height guard here, or the painter and
+        // the geometry could disagree about the row the mouse hit-test skips. Gating on the
+        // TERMINAL'S available height rather than on how many entries the directory happens to
+        // contain is the point: an empty directory on an ordinary terminal still gets its own
+        // row, not the cramped border-title fallback. Only a genuinely tiny terminal falls
+        // back to the title.
+        let footer_rows = crate::chrome_geom::file_browser_footer_rows_shown(area, fb);
+        let dedicated_footer_row = footer.is_some() && footer_rows >= 1;
         let footer_takes_title = footer.is_some() && !dedicated_footer_row;
 
         frame.render_widget(Clear, ov_rect);
@@ -910,16 +910,16 @@ mod tests {
 
         let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
         let area = Rect::new(0, 0, 80, 24);
-        let query_row = {
-            let fb = e.file_browser.as_ref().expect("picker open");
-            crate::chrome_geom::file_browser_overlay_rect(area, fb).y + 1
-        };
+        // The box's origin is re-read after every render, never cached: a non-empty field
+        // brings the resolved-target footer with it, and the box grows for that row.
+        let query_row = |e: &Editor| crate::chrome_geom::file_browser_overlay_rect(
+            area, e.file_browser.as_ref().expect("picker open")).y + 1;
 
         // (a) An empty field paints a VISIBLY empty row — §7.2 Row 2's safety rationale.
         crate::derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
-        let empty_row = row_text(&term, query_row);
+        let empty_row = row_text(&term, query_row(&e));
         assert_eq!(empty_row.trim_matches(|c| c == ' ' || c == '\u{2502}'), ">",
             "an empty field must paint as a bare prompt, nothing more: {empty_row:?}");
 
@@ -930,7 +930,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
-        let row = row_text(&term, query_row);
+        let row = row_text(&term, query_row(&e));
         assert!(row.contains("chapter"),
             "the typed filename must reach the SCREEN, not just `fb.mode`'s field: {row:?}");
 
@@ -950,6 +950,49 @@ mod tests {
             "the caret must sit at `field_cursor`, not pinned to the empty query");
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- the footer GROWS the box; it does not confiscate a list row ---------------
+
+    /// C5 review finding M5, found live at 100x30: a filtered destination listing with two
+    /// entries painted only ONE of them plus a `1/2` windowed indicator. The footer's row was
+    /// taken out of the list's budget rather than added to the box, so a picker whose whole
+    /// job is to show a writer what they might clobber hid half of it — on a terminal with
+    /// twenty spare rows. Superset of T20's deferred "a 1-row listing loses its only visible
+    /// row" Minor, which is the degenerate case of the same arithmetic.
+    ///
+    /// FAIL-VERIFY (mutation): restore `file_browser_rows`'s pre-fix budget
+    /// (`box_rows = raw.max(reserved)`, i.e. grow only when the content leaves nothing) —
+    /// `chapter-two.md` vanishes from the screen and the `1/2` indicator appears. Confirmed,
+    /// then reverted.
+    #[test]
+    fn a_two_entry_destination_listing_shows_both_entries_alongside_the_footer() {
+        let dir = std::env::temp_dir().join(format!("wc-render-m5-{}", std::process::id()));
+        let mut e = Editor::new_from_text("x\n", None, (100, 30));
+        let mut fb = empty_destination_fb(dir, "chapter");
+        fb.entries = ["chapter-one.md", "chapter-two.md"].iter().map(|n| {
+            crate::file_browser::FileEntry {
+                name: (*n).into(), kind: crate::fsx::EntryKind::File,
+                is_symlink: false, broken: false,
+            }
+        }).collect();
+        e.file_browser = Some(fb);
+        crate::derive::rebuild(&mut e);
+
+        let area = Rect::new(0, 0, 100, 30);
+        assert_eq!(crate::chrome_geom::file_browser_list_h(area, e.file_browser.as_ref().expect("open")), 2,
+            "the list keeps a row per entry — the footer's row comes from the box, not the list");
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let screen = (0..30).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+
+        assert!(screen.contains("chapter-one.md"), "the first entry is drawn:\n{screen}");
+        assert!(screen.contains("chapter-two.md"),
+            "and so is the second — the footer must not cost the writer an entry:\n{screen}");
+        assert!(!screen.contains("1/2"),
+            "and nothing is windowed away, so no n/total indicator is drawn:\n{screen}");
     }
 
     // ---- the height, not the listing size, gates the cramped fallback -------------
