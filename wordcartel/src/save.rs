@@ -68,17 +68,44 @@ fn fingerprint_with_limit(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SaveMode { Normal, SaveAs }
 
+/// The two paths a save needs, kept apart because a symlinked destination makes them differ.
+///
+/// A struct rather than two positional `PathBuf`s ON PURPOSE: same-typed positional
+/// parameters are silently swappable, and getting this wrong reintroduces either the
+/// unsaveable-symlink defect or the canonical-`Document.path` regressions. For an ordinary
+/// destination the two fields are equal, which is the common case and costs nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct SaveTarget {
+    /// What the writer selected — logical, possibly a symlink.
+    pub chosen: std::path::PathBuf,
+    /// Where bytes actually go — resolution applied. Never a symlink.
+    pub resolved: std::path::PathBuf,
+}
+
+impl SaveTarget {
+    /// For a destination that needed no resolution (the common case: the two are equal).
+    #[allow(dead_code)] // C5 Task 21 wires Write-Block through this same-target path; forward reference
+    pub(crate) fn same(p: std::path::PathBuf) -> Self {
+        SaveTarget { chosen: p.clone(), resolved: p }
+    }
+}
+
 /// Internal: dispatch the save job (no external-mod check). `do_save` delegates
 /// here with `SaveMode::Normal`; Save-As enters with `SaveMode::SaveAs` and the
 /// re-key `target`. Called by `dispatch_save`/`overwrite_save` (Normal) and
 /// `perform_save_as` (SaveAs).
-pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMode) {
+pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
     let prior_key = ctx.editor.active().document.path.clone(); // for SaveAs swap re-key
-    let write_path = target.clone();
+    let write_path = target.resolved.clone();   // bytes go HERE
+    let chosen_path = target.chosen.clone();    // the buffer is rekeyed to THIS
+    // OWNED handle cloned into the job closure. `jobs::Job::run` is
+    // `Box<dyn FnOnce() -> JobResult + Send>`, so a borrowed `&dyn Fs` cannot cross —
+    // which is exactly why Task 5 put an `Arc` on `Ctx`.
+    let fs = std::sync::Arc::clone(&ctx.fs);
     // Self-replacing Progress keyed on THIS (buffer, version): the completion below reconstructs the
     // identical key from the captured `buffer_id`/`v` and collapses exactly this start (§4.2). A
     // concurrent same-buffer save at a different version keeps its own lineage; a Filter/Transform
@@ -93,8 +120,17 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
         run: Box::new(move || {
             // Worker: materialize the snapshot off the keystroke path, then write.
             let content = snap.to_string();
-            let outcome = file::save_atomic(&write_path, &content);
-            let new_fp = fingerprint(&write_path);
+            // Both the write and the fingerprint use the RESOLVED path: the fingerprint must
+            // describe the file actually written. (`fingerprint` follows symlinks, so this
+            // agrees with `dispatch_save`'s check on Document.path whenever the link resolves.)
+            //
+            // BOTH go through the SEAM (`*_with_fs`), not the `RealFs` wrappers. This is the
+            // single most valuable thing the seam extension buys: the worker-side save path
+            // becomes fault-testable for the FIRST time. Calling `file::save_atomic` here —
+            // which hardcodes `RealFs` internally — would silently discard that, and an
+            // `Arc<FaultFs>` injected at `Ctx` would have no effect.
+            let outcome = file::save_atomic_with_fs(&*fs, &write_path, &content);
+            let new_fp = fingerprint_with_fs(&*fs, &write_path);
             JobResult {
                 buffer_id,
                 class: ResultClass::Durability,
@@ -105,13 +141,17 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                     // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
                     // Assemble the (global) status in a local so the `b` mutable borrow ends
                     // before we touch editor.status.
-                    // P2 on_save fire site: computed from the closure's OWNED `target` (the
-                    // written path), NOT from `b` — a closed buffer must still fire (the write
-                    // DID succeed). Fires on Saved AND Unchanged (both are the user-visible
-                    // "a save completed" outcome); Err fires nothing.
+                    // P2 on_save fire site: computed from the closure's OWNED `chosen_path`,
+                    // NOT from `b` — a closed buffer must still fire (the write DID succeed).
+                    // Fires on Saved AND Unchanged (both are the user-visible "a save completed"
+                    // outcome); Err fires nothing.
+                    //
+                    // CHOSEN, not resolved: consistency with `plugin::api`'s `wc.path()`, which
+                    // returns `Document.path`. A Save event reporting a path `wc.path()` never
+                    // returns would make the two disagree.
                     let fire_save: Option<PathBuf> =
                         matches!(outcome, Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged))
-                            .then(|| target.clone());
+                            .then(|| chosen_path.clone());
                     // A17 T4 (F4 Error table): captured BEFORE the match below moves `outcome`'s
                     // Err payload — a genuine SaveError (IO/symlink) must land Sticky/Error so it
                     // survives the next keystroke, unlike the ordinary Info completion messages.
@@ -120,7 +160,10 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
                             Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
-                                if matches!(mode, SaveMode::SaveAs) { b.document.path = Some(target.clone()); }
+                                // Middle B: the buffer is rekeyed to the CHOSEN path so
+                                // display, prefills, the open-dir seed, export derivation,
+                                // wc.path(), and the LSP uri all stay logical.
+                                if matches!(mode, SaveMode::SaveAs) { b.document.path = Some(chosen_path.clone()); }
                                 b.document.saved_version = Some(v);
                                 b.document.stored_fp = new_fp;
                                 // The swap latch (`swapped_version`) asserts "this version's content
@@ -184,7 +227,18 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
 /// check). Called by `dispatch_save` (after the check) and `overwrite_save`.
 fn do_save(ctx: &mut Ctx) {
     let path = ctx.editor.active().document.path.clone().expect("do_save called without a path");
-    do_save_to(ctx, path, SaveMode::Normal);
+    // A plain Save resolves its own destination too — the document's path can itself be a
+    // symlink (that is §4.10: openable but unsaveable).
+    let resolved = match crate::fsx::resolve_write_destination(&*ctx.fs, &path) {
+        Ok(r) => r,
+        Err(crate::fsx::DestError::BrokenSymlink) => {
+            ctx.editor.set_status_full(crate::status::StatusKind::Warning,
+                format!("{}: destination symlink cannot be resolved", path.display()),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return;
+        }
+    };
+    do_save_to(ctx, SaveTarget { chosen: path, resolved }, SaveMode::Normal);
 }
 
 /// Registry `"save"` handler: external-mod check then dispatch a background save.
@@ -434,14 +488,20 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    // Superseded by Task 15/16 (§7.6.1/§4.10): `do_save` now resolves a symlinked document
+    // path through `resolve_write_destination` BEFORE dispatch, exactly like a Save-As
+    // destination, so a plain Save whose own `Document.path` is a symlink no longer fails —
+    // it succeeds, writing to the resolved target while the link itself survives. This
+    // replaces the old "save through a symlink is refused" premise, which was the defect
+    // this task fixes; the still-failing "last resort" guard inside `save_atomic` itself
+    // remains covered directly by `file::tests::save_through_symlink_refused`.
+    #[cfg(unix)]
     #[test]
-    fn background_save_failure_keeps_dirty_and_status() {
-        // Save through a symlink is refused by save_atomic → merge must keep dirty.
+    fn background_save_through_symlinked_document_path_resolves_and_succeeds() {
         let real = scratch();
         let link = scratch();
         std::fs::write(&real, "real\n").unwrap();
-        #[cfg(unix)] std::os::unix::fs::symlink(&real, &link).unwrap();
-        #[cfg(not(unix))] { let _ = &link; return; }
+        std::os::unix::fs::symlink(&real, &link).unwrap();
         let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
         e.active_mut().document.saved_version = None;
         e.active_mut().document.version = 1;
@@ -449,23 +509,27 @@ mod tests {
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
-        assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
-        assert!(e.active().document.saved_version.is_none());
-        assert!(e.status_text().to_lowercase().contains("symlink"));
+        assert!(!e.active().document.dirty(), "a resolved symlink destination saves cleanly");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "x\n", "bytes land on the RESOLVED target");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "the link itself survives");
+        assert_eq!(e.active().document.path.as_deref(), Some(link.as_path()),
+            "Document.path stays the CHOSEN (logical) path, not the resolved one");
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
     }
 
-    /// A17 T4: a genuine background-save failure (SaveError, via the same symlink refusal as
-    /// above) must land as a Sticky Error — it must survive a later Info ack rather than
-    /// silently clearing on the next keystroke (Q1).
+    /// A17 T4: a genuine background-save failure (SaveError, via the same ENOTDIR trigger as
+    /// `background_save_failure_parent_is_file_keeps_dirty`) must land as a Sticky Error — it
+    /// must survive a later Info ack rather than silently clearing on the next keystroke (Q1).
+    /// (Was triggered via a symlink refusal; Task 15/16 made symlinked destinations resolve
+    /// and succeed instead, so the failure trigger moved to a real I/O error.)
+    #[cfg(unix)]
     #[test]
     fn background_save_failure_is_a_sticky_error_that_survives_a_later_info() {
-        let real = scratch();
-        let link = scratch();
-        std::fs::write(&real, "real\n").unwrap();
-        #[cfg(unix)] std::os::unix::fs::symlink(&real, &link).unwrap();
-        #[cfg(not(unix))] { let _ = &link; return; }
-        let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+        let parent = scratch();
+        std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+        let target = parent.join("doc.md"); // ENOTDIR on temp create
+
+        let mut e = Editor::new_from_text("x\n", Some(target.clone()), (80, 24));
         e.active_mut().document.saved_version = None;
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
@@ -477,7 +541,7 @@ mod tests {
         e.set_status(crate::status::StatusKind::Info, "later ack");
         // Q1: an Info does NOT displace a held Error.
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
-        let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_file(&parent);
     }
 
     /// A successful background save is still an ordinary Info/Transient status (the failure
@@ -1006,5 +1070,89 @@ mod tests {
         assert!(!e.quit, "must NOT quit on a panicked save");
         assert!(e.status_text().to_lowercase().contains("save"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_onto_a_symlink_splits_chosen_and_resolved_correctly() {
+        // THE highest-value test of this task: one SaveTarget field going to the wrong
+        // consumer reintroduces either §4.10's defect (unsaveable symlinks) or §7.6.2's
+        // seven regressions (canonical Document.path). All five consumers asserted at once.
+        let real = scratch();
+        let link = scratch();
+        std::fs::write(&real, b"original\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let mut e = Editor::new_from_text("new body\n", None, (80, 24));
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let resolved = std::fs::canonicalize(&link).expect("canonicalize");
+        {
+            let mut ctx = Ctx {
+                editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(),
+                fs: std::sync::Arc::new(crate::fsx::RealFs),
+            };
+            do_save_to(&mut ctx,
+                SaveTarget { chosen: link.clone(), resolved: resolved.clone() },
+                SaveMode::SaveAs);
+        }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        // 1. The write landed on the RESOLVED target…
+        assert_eq!(std::fs::read_to_string(&real).expect("read target"), "new body\n");
+        // 2. …and the link survived as a link.
+        assert!(link.symlink_metadata().expect("lstat").file_type().is_symlink(),
+            "the symlink must survive — atomic_replace renamed over the TARGET");
+        // 3. Document.path holds the CHOSEN path (Middle B).
+        assert_eq!(e.active().document.path.as_deref(), Some(link.as_path()),
+            "the buffer keeps the path the writer chose, not the canonical target");
+        // 4. stored_fp describes the written file, so a follow-up save sees no conflict.
+        assert_eq!(e.active().document.stored_fp, crate::save::fingerprint(&resolved),
+            "stored_fp must match the file actually written");
+        assert!(!e.active().document.dirty(), "and the buffer is clean");
+
+        let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn an_injected_fault_reaches_the_save_worker() {
+        // The seam extension's headline payoff, asserted. The worker-side write is
+        // fault-testable for the FIRST time — it previously hardcoded RealFs inside the job
+        // closure. This FAILS if an implementer calls `file::save_atomic` (the RealFs
+        // wrapper) instead of `save_atomic_with_fs` with the Arc cloned from Ctx.fs.
+        //
+        // FAIL-VERIFY: call `file::save_atomic` here, watch this fail (the file is written
+        // for real and the buffer goes clean), then revert.
+        let p = scratch();
+        std::fs::write(&p, b"old\n").expect("seed");
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None;
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        {
+            let mut ctx = Ctx {
+                editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(),
+                fs: std::sync::Arc::new(
+                    crate::test_support::FaultFs::new(crate::test_support::FaultAt::Rename)),
+            };
+            do_save_to(&mut ctx, SaveTarget::same(p.clone()), SaveMode::Normal);
+        }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert!(e.active().document.dirty(),
+            "an injected write failure must leave the buffer dirty — if this passes as clean, \
+             the worker bypassed the seam and wrote for real");
+        assert_eq!(std::fs::read_to_string(&p).expect("read"), "old\n",
+            "and the file on disk is untouched");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_target_same_sets_both_fields() {
+        let p = std::path::PathBuf::from("/tmp/x.md");
+        let t = SaveTarget::same(p.clone());
+        assert_eq!(t.chosen, p);
+        assert_eq!(t.resolved, p, "the common case: no resolution needed, both equal");
     }
 }

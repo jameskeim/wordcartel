@@ -136,7 +136,9 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
         editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
         return;
     }
-    perform_save_as(editor, target, executor, clock, msg_tx, fs);
+    // Transitional: `save_as_submit` has no resolution step yet (Task 21 retires it), so
+    // both fields are the same value — the simplest correct form for its two-task lifetime.
+    perform_save_as(editor, target.clone(), target, executor, clock, msg_tx, fs);
 }
 
 /// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
@@ -169,14 +171,29 @@ fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::P
     }
 }
 
-fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
-                   executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+// `pub(crate)`, NOT private: `file_browser_commit::commit_destination` calls this across
+// module boundaries. It was `fn` in the tree and must be widened here or the commit arm
+// does not compile.
+pub(crate) fn perform_save_as(editor: &mut crate::editor::Editor, chosen: std::path::PathBuf,
+                   resolved: std::path::PathBuf,
+                   executor: &dyn crate::jobs::Executor,
+                   clock: &dyn wordcartel_core::history::Clock,
                    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+                   // The CALLER's handle. Constructing `Arc::new(RealFs)` here would make
+                   // Save-As — the most durability-critical user path in this effort —
+                   // unreachable by an injected `FaultFs`, silently undoing the seam at the
+                   // one place it matters most. Every caller already holds `ctx.fs`.
                    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     let v = editor.active().document.version;
     let buffer_id = editor.active().id;
-    { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
-      crate::save::do_save_to(&mut ctx, target, crate::save::SaveMode::SaveAs); }
+    {
+        let mut ctx = crate::registry::Ctx {
+            editor, clock, executor, msg_tx: msg_tx.clone(),
+            fs: std::sync::Arc::clone(fs),
+        };
+        crate::save::do_save_to(&mut ctx,
+            crate::save::SaveTarget { chosen, resolved }, crate::save::SaveMode::SaveAs);
+    }
     if let Some(action) = editor.pending_save_as.take() {
         editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
     }
@@ -293,7 +310,18 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteSaveAs => {
             if let Some(t) = editor.pending_save_overwrite.take() {
-                perform_save_as(editor, t, ex, clock, msg_tx, fs);
+                // Resolve the stored target the same way `do_save` resolves a plain Save's
+                // destination (§7.6.1) — the confirmed overwrite target can itself be a
+                // symlink whose write must land on the resolved file while the buffer keeps
+                // the chosen (logical) path.
+                match crate::fsx::resolve_write_destination(&**fs, &t) {
+                    Ok(resolved) => perform_save_as(editor, t, resolved, ex, clock, msg_tx, fs),
+                    Err(crate::fsx::DestError::BrokenSymlink) => {
+                        editor.set_status_full(crate::status::StatusKind::Warning,
+                            format!("{}: destination symlink cannot be resolved", t.display()),
+                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+                    }
+                }
             }
         }
         PromptAction::OverwriteWriteBlock => {

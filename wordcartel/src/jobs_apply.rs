@@ -658,15 +658,16 @@ mod tests {
         #[cfg(not(unix))] { return; }
         #[cfg(unix)]
         {
-            // Symlink-target trick: the save fails → buffer stays, pending cleared,
-            // error status contains "symlink".
+            // ENOTDIR trick: target sits "inside" a regular file → the save fails → buffer
+            // stays, pending cleared, error status surfaced. NOT a symlink target — Task
+            // 15/16 (§7.6.1/§4.10) made a symlinked document path resolve and succeed, so a
+            // symlink no longer produces a save failure here.
             use crate::jobs::{Executor, InlineExecutor};
             use crate::prompt::PromptAction;
-            let real = quit_tmp("real");
-            std::fs::write(&real, "real\n").unwrap();
-            let link = quit_tmp("link");
-            std::os::unix::fs::symlink(&real, &link).unwrap();
-            let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+            let parent = quit_tmp("parent");
+            std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+            let target = parent.join("doc.md"); // ENOTDIR on temp create
+            let mut e = Editor::new_from_text("x\n", Some(target.clone()), (80, 24));
             e.active_mut().document.saved_version = None;
             e.active_mut().document.version = 1; // dirty
             let id = e.active().id;
@@ -678,9 +679,10 @@ mod tests {
             for o in ex.drain() { apply_outcome(o, &mut e); }
             assert!(e.by_id(id).is_some(), "buffer NOT closed — save failed");
             assert!(e.pending_after_save.is_none(), "pending cleared on save failure");
-            assert!(e.status_text().to_lowercase().contains("symlink"), "error status: {:?}", e.status_text());
-            let _ = std::fs::remove_file(&link);
-            let _ = std::fs::remove_file(&real);
+            assert!(
+                e.status_text().to_lowercase().contains("not a directory") || e.status_text().contains("ENOTDIR"),
+                "error status: {:?}", e.status_text());
+            let _ = std::fs::remove_file(&parent);
         }
     }
 

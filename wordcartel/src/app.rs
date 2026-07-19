@@ -2060,17 +2060,19 @@ mod tests {
 
     #[test]
     fn quit_drain_aborts_on_save_failure() {
-        // Save-All over a buffer whose save fails (symlink target is refused) →
-        // quit_drain cleared, quit stays false, error status surfaced.
+        // Save-All over a buffer whose save fails → quit_drain cleared, quit stays false,
+        // error status surfaced. Trigger: an ENOTDIR write (target sits "inside" a regular
+        // file), NOT a symlink target — Task 15/16 (§7.6.1/§4.10) made a symlinked document
+        // path resolve and succeed, so a symlink no longer produces a save failure here.
         #[cfg(not(unix))] { return; }
         #[cfg(unix)]
         {
             use crate::editor::Editor;
             use crate::jobs::{Executor, InlineExecutor};
             use crate::prompt::PromptAction;
-            let real = quit_tmp("real"); std::fs::write(&real, "real\n").unwrap();
-            let link = quit_tmp("link"); std::os::unix::fs::symlink(&real, &link).unwrap();
-            let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+            let parent = quit_tmp("parent"); std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+            let target = parent.join("doc.md"); // ENOTDIR on temp create
+            let mut e = Editor::new_from_text("x\n", Some(target.clone()), (80, 24));
             e.active_mut().document.saved_version = None; e.active_mut().document.version = 1; // dirty
             e.install_scratch();
             let ex = InlineExecutor::default();
@@ -2080,8 +2082,10 @@ mod tests {
             for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs()); }
             assert!(e.quit_drain.is_none(), "failed save aborts the drain");
             assert!(!e.quit, "a failed save must not quit (no data loss)");
-            assert!(e.status_text().to_lowercase().contains("symlink"), "error status surfaced");
-            let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+            assert!(
+                e.status_text().to_lowercase().contains("not a directory") || e.status_text().contains("ENOTDIR"),
+                "error status surfaced; got: {:?}", e.status_text());
+            let _ = std::fs::remove_file(&parent);
         }
     }
 
