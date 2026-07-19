@@ -290,7 +290,6 @@ pub(crate) fn is_file_via(fs: &dyn Fs, path: &Path) -> bool {
 }
 
 /// A WRITE destination the caller asked to save through cannot be honoured.
-#[allow(dead_code)] // C5 Task 21 wires this into Save-As/Write-Block; forward reference
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DestError {
     /// The destination is a symlink whose target cannot be resolved. Refused BEFORE any
@@ -316,7 +315,6 @@ pub(crate) enum DestError {
 ///   `atomic_replace` then renames over the TARGET)
 /// * broken symlink        -> `Err(DestError::BrokenSymlink)`
 /// * does not exist yet    -> unchanged (the ordinary new-file case)
-#[allow(dead_code)] // C5 Task 21 wires this into Save-As/Write-Block; forward reference
 pub(crate) fn resolve_write_destination(fs: &dyn Fs, path: &Path)
     -> Result<PathBuf, DestError>
 {

@@ -142,6 +142,49 @@ pub(crate) fn classify_enter(e: &FileEntry, dir: &std::path::Path) -> EnterOutco
     }
 }
 
+/// The destination-mode footer: `→ /abs/path/after-policy.md`, plus an inline note when the
+/// target already exists.
+///
+/// Shows the POST-POLICY name so the `.md` that policy appends is visible before commit, and
+/// the RESOLVED path when a symlink changed it — resolution should be visible up front, not
+/// discovered in a confirm dialog.
+pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option<String> {
+    let BrowseMode::Destination { field, purpose, .. } = &fb.mode else { return None };
+    if field.trim().is_empty() { return None; }
+    let typed = crate::file_browser_commit::resolve_field(&fb.dir, field);
+    // An export destination's extension is fixed by the format — policy does not apply.
+    let after_policy = if matches!(purpose, DestinationPurpose::Export { .. }) {
+        typed
+    } else {
+        match crate::file_browser_commit::apply_extension_policy(&typed) {
+            crate::file_browser_commit::ExtVerdict::Defaulted(p) => p,
+            crate::file_browser_commit::ExtVerdict::Honoured(p) => p,
+            crate::file_browser_commit::ExtVerdict::Redirect { path, ext } => {
+                return Some(format!("\u{2192} {} \u{2014} {ext} is an export format",
+                    path.display()));
+            }
+            // `ExtVerdict` grew this fourth arm in Task 19's review, after this footer's
+            // brief was written — flagged per the dispatch note rather than silently
+            // invented. A trailing separator names a directory the writer is asking to
+            // create/enter, not a file: same "no alternate flow, just fix the field"
+            // framing as `apply_extension_policy`'s own doc comment on `Refused`.
+            crate::file_browser_commit::ExtVerdict::Refused(path) => {
+                return Some(format!("\u{2192} {} \u{2014} names a directory, not a file",
+                    path.display()));
+            }
+        }
+    };
+    let shown = match crate::fsx::resolve_write_destination(fs, &after_policy) {
+        Ok(r) => r,
+        Err(crate::fsx::DestError::BrokenSymlink) => {
+            return Some(format!("\u{2192} {} \u{2014} symlink cannot be resolved",
+                after_policy.display()));
+        }
+    };
+    let note = if crate::fsx::exists_via(fs, &shown) { " (exists \u{2014} will confirm)" } else { "" };
+    Some(format!("\u{2192} {}{note}", shown.display()))
+}
+
 /// Execute the selected file-browser entry — the shared Enter path for the keyboard
 /// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. "..")
 /// by spawning an off-thread listing (Task 13) — `fb.dir`/`query`/`selected`/`scroll_top`
@@ -715,6 +758,70 @@ mod tests {
         assert!(fb.pending_dir.is_none(), "the pending target is cleared");
         assert!(e.status_text().contains("cannot read directory"), "and they are told");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn footer_shows_the_post_policy_absolute_target() {
+        // The .md that policy appends must be visible BEFORE commit, not discovered after.
+        let d = std::env::temp_dir().join(format!("wc-footer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let mut fb = FileBrowser {
+            dir: d.clone(), query: String::new(),
+            mode: BrowseMode::Destination {
+                purpose: DestinationPurpose::SaveAs,
+                field: "chapter one".into(), field_cursor: 11,
+            },
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
+        assert!(line.contains(&d.join("chapter one.md").display().to_string()),
+            "the footer shows the ABSOLUTE, post-policy target: {line}");
+        assert!(!line.contains("will confirm"), "nothing exists there yet");
+
+        // When the target exists, overwrite is telegraphed one step BEFORE the confirm.
+        std::fs::write(d.join("taken.md"), b"x").expect("seed");
+        if let BrowseMode::Destination { field, field_cursor, .. } = &mut fb.mode {
+            *field = "taken.md".into(); *field_cursor = field.len();
+        }
+        let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
+        assert!(line.contains("exists"), "an existing target is disclosed inline: {line}");
+
+        // RESOLUTION must be visible before commit, not discovered in a confirm dialog. If
+        // `footer_target` skipped `resolve_write_destination`, it would echo the symlink path
+        // and both assertions above would still pass.
+        //
+        // FAIL-VERIFY: drop the `resolve_write_destination` call from `footer_target`, watch
+        // this fail — the footer shows `link.md` instead of the target.
+        #[cfg(unix)]
+        {
+            std::fs::write(d.join("real-target.md"), b"x").expect("seed");
+            std::os::unix::fs::symlink(d.join("real-target.md"), d.join("link.md"))
+                .expect("symlink");
+            if let BrowseMode::Destination { field, field_cursor, .. } = &mut fb.mode {
+                *field = "link.md".into(); *field_cursor = field.len();
+            }
+            let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
+            assert!(line.contains("real-target.md"),
+                "the footer names the RESOLVED write target, not the link the writer typed: {line}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn footer_is_absent_in_select_mode() {
+        let mut fb = FileBrowser {
+            dir: std::env::temp_dir(), query: "q".into(), mode: BrowseMode::Select,
+            listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(), "select mode names no target");
+        fb.mode = BrowseMode::Destination {
+            purpose: DestinationPurpose::SaveAs, field: String::new(), field_cursor: 0 };
+        assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(), "an empty field names none either");
     }
 
     #[test]

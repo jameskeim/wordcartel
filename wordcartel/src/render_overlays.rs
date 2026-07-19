@@ -15,7 +15,7 @@ use crate::{
     render::ChromeStyles,
     chrome_geom::{
         menu_bar_layout, menu_bar_layout_cats, menu_dropdown_rect,
-        palette_overlay_rect, windowed_indicator,
+        palette_overlay_rect, windowed_indicator, file_browser_list_h,
     },
 };
 
@@ -399,15 +399,41 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        let list_h = crate::list_window::list_h_for(fb.entries.len(), h);
+        // The RAW row budget (before the footer's reservation) — used only to decide
+        // whether a dedicated footer row exists at all (see `dedicated_footer_row` below).
+        let raw_list_h = crate::list_window::list_h_for(fb.entries.len(), h);
+        // The list's ACTUAL row budget — single-sourced with `chrome_geom::file_browser_row_at`
+        // so hit-testing can never disagree with what gets painted here (the A21 hazard).
+        let list_h = file_browser_list_h(area, fb) as usize;
+
+        // The resolved-target footer: the post-policy, post-resolution absolute write target,
+        // shown live so a writer never saves not knowing where it went (§ the reason this task
+        // exists). `None` in select mode or with an empty field. Rendered against the real
+        // filesystem — this is a read-only display probe, not a fault-injectable write path.
+        let footer = crate::file_browser::footer_target(&crate::fsx::RealFs, fb);
+        // A dedicated content row exists for the footer only when the box has room for one
+        // (raw_list_h > 0 — i.e. `list_h_for` already reserved at least one interior row before
+        // the footer's own reservation ran). In a terminal too cramped for that, the footer
+        // takes over the block's bottom-edge TITLE instead of losing to `windowed_indicator` —
+        // the safety disclosure wins the one available edge over navigational polish.
+        let dedicated_footer_row = footer.is_some() && raw_list_h > 0;
+        let footer_takes_title = footer.is_some() && !dedicated_footer_row;
 
         frame.render_widget(Clear, ov_rect);
         frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
         let title = format!(" Open: {} ", fb.dir.display());
         let mut block = Block::default().borders(Borders::ALL).title(title)
             .border_style(cs.overlay_border);
-        // Indicator composes with the existing dynamic title (file browser already uses top title).
-        if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
+        if footer_takes_title {
+            // No spare interior row: the footer — the safety disclosure that prevents
+            // save-to-nowhere — wins the block's bottom edge over the n/total indicator,
+            // which is mere navigational polish.
+            if let Some(ref line) = footer {
+                let truncated: String = line.chars().take(ov_w.saturating_sub(2) as usize).collect();
+                block = block.title_bottom(Line::from(truncated));
+            }
+        } else if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
+            // Indicator composes with the existing dynamic title (file browser already uses top title).
             block = block.title_bottom(ind);
         }
         frame.render_widget(block, ov_rect);
@@ -452,6 +478,23 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
                     list_area,
                     &mut list_state,
                 );
+            }
+
+            // The footer's dedicated row: the last interior row, immediately above the bottom
+            // border — full box width, so a long absolute path is not truncated to whatever a
+            // border title's corners leave (unlike `footer_takes_title`'s cramped fallback
+            // above). TEXT carries the meaning here (the arrow, the "exists" note), never
+            // colour alone — the terminal-plain / no-color constraint.
+            if dedicated_footer_row {
+                if let Some(ref line) = footer {
+                    let footer_row = ov_y + 2 + list_h as u16;
+                    let footer_area = Rect::new(ov_x + 1, footer_row, ov_w.saturating_sub(2), 1);
+                    let truncated: String = line.chars().take(footer_area.width as usize).collect();
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(truncated, cs.ov_query))),
+                        footer_area,
+                    );
+                }
             }
         }
     }

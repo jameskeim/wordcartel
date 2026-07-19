@@ -25,7 +25,6 @@ pub(crate) enum CommitOutcome {
 /// 1. `~/`-prefixed -> home-relative.
 /// 2. absolute      -> as typed.
 /// 3. otherwise     -> joined onto `dir`, NOT onto cwd.
-#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
 pub(crate) fn resolve_field(dir: &Path, field: &str) -> PathBuf {
     let t = field.trim();
     if let Some(rest) = t.strip_prefix("~/") {
@@ -97,7 +96,6 @@ pub(crate) fn classify_destination_enter(
 const OUTPUT_EXTS: &[&str] = &["docx", "pdf", "html", "tex"];
 
 /// The verdict `apply_extension_policy` reaches for a SAVE destination's extension.
-#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ExtVerdict {
     /// Append `.md` — the name had no extension.
@@ -120,7 +118,6 @@ pub(crate) enum ExtVerdict {
 ///
 /// Never applied in select mode, and never to an export destination (whose extension is
 /// fixed by the format).
-#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
 pub(crate) fn apply_extension_policy(path: &Path) -> ExtVerdict {
     // A TRAILING SEPARATOR (`sub/`) names a directory the writer is asking to create or
     // enter, not a file — but `Path::file_name()` (and therefore `extension()`) silently

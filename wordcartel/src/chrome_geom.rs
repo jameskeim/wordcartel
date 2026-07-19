@@ -140,16 +140,50 @@ pub(crate) fn cursor_picker_row_at(area: Rect, cp: &crate::cursor_picker::Cursor
     } else { None }
 }
 
+/// Whether a resolved-target footer row exists for `fb` — mirrors the guard
+/// `file_browser::footer_target` opens with (destination mode + non-empty field), duplicated
+/// here because geometry has no `Fs` handle: a filesystem probe can change the footer's TEXT,
+/// never WHETHER the row exists, so this half of the guard needs none.
+fn file_browser_has_footer_row(fb: &crate::file_browser::FileBrowser) -> bool {
+    matches!(&fb.mode, crate::file_browser::BrowseMode::Destination { field, .. }
+        if !field.trim().is_empty())
+}
+
+/// Row budget for the file browser's ENTRY LIST — single-sourced between the painter
+/// (`render_overlays::paint_file_browser`) and the hit-test (`file_browser_row_at`) below, so
+/// a footer row that shrinks the list can never diverge between the two (the A21 mouse/render
+/// divergence this effort is explicitly guarding against).
+///
+/// Destination mode's resolved-target footer, when shown, claims ONE row from the list's
+/// budget: the interior shrinks by exactly one so the footer gets a dedicated, full-width row
+/// rather than being squeezed into the border title alongside `windowed_indicator`.
+pub(crate) fn file_browser_list_h(area: Rect, fb: &crate::file_browser::FileBrowser) -> u16 {
+    let raw = crate::list_window::list_h_for(fb.entries.len(), area.height);
+    let reserved = usize::from(file_browser_has_footer_row(fb));
+    raw.saturating_sub(reserved) as u16
+}
+
 /// Return the absolute list-row index that `(col, row)` hits in the file browser,
 /// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
 pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrowser, col: u16, row: u16) -> Option<usize> {
     let r = palette_overlay_rect(area, fb.entries.len());
     let list_top = r.y.saturating_add(2);
-    let list_h = crate::list_window::list_h_for(fb.entries.len(), area.height) as u16;
+    let list_h = file_browser_list_h(area, fb);
     if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
         && row >= list_top && row < list_top.saturating_add(list_h) {
         Some((row - list_top) as usize + fb.scroll_top)
     } else { None }
+}
+
+/// The inverse of `file_browser_row_at`: the screen cell the painter draws WINDOW-RELATIVE
+/// row `row_index` at (i.e. the `row_index`-th visible row, not an absolute entry index), so
+/// tests (and any future caller) can address the cell the painter drew a given row at without
+/// duplicating the geometry.
+#[allow(dead_code)] // test-only today — no production caller needs the inverse of the hit-test
+pub(crate) fn file_browser_row_origin(area: Rect, fb: &crate::file_browser::FileBrowser, row_index: usize) -> (u16, u16) {
+    let r = palette_overlay_rect(area, fb.entries.len());
+    let list_top = r.y.saturating_add(2);
+    (r.x.saturating_add(1), list_top + row_index as u16)
 }
 
 /// Return the absolute list-row index that `(col, row)` hits in the outline overlay,
@@ -435,5 +469,40 @@ mod tests {
             Some(scroll_top),
             "first item row must return scroll_top",
         );
+    }
+
+    #[test]
+    fn hit_testing_and_the_painter_agree_on_the_last_row_in_destination_mode() {
+        // The footer consumes a row from the block's bottom edge, so the list interior
+        // shrinks. If `file_browser_row_at` kept the old height, a click on the last visible
+        // row would select the row BELOW the one drawn there — off-by-one on a surface where
+        // the next keystroke can commit a write.
+        //
+        // FAIL-VERIFY: leave `file_browser_row_at` computing its own height instead of
+        // calling `file_browser_list_h`, watch this fail.
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let mut fb = crate::file_browser::FileBrowser {
+            dir: std::env::temp_dir(), query: String::new(),
+            mode: crate::file_browser::BrowseMode::Destination {
+                purpose: crate::file_browser::DestinationPurpose::SaveAs,
+                field: "x".into(), field_cursor: 1 },
+            listing: Vec::new(), total_seen: 0, unreadable: 0,
+            entries: (0..12).map(|i| crate::file_browser::FileEntry {
+                name: format!("f{i:02}.md"), kind: crate::fsx::EntryKind::File,
+                is_symlink: false, broken: false }).collect(),
+            disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None,
+        };
+        let list_h = file_browser_list_h(area, &fb) as usize;
+        assert!(list_h > 0 && list_h < fb.entries.len(),
+            "precondition: the list is windowed, so a last visible row exists");
+        let last = list_h - 1;
+        let (col, row) = file_browser_row_origin(area, &fb, last);
+        assert_eq!(file_browser_row_at(area, &fb, col, row), Some(last),
+            "a click on the cell the painter drew row {last} at must select row {last}");
+        // And one row further down is OUTSIDE the list — that cell belongs to the footer.
+        assert_eq!(file_browser_row_at(area, &fb, col, row + 1), None,
+            "the row below the last entry is the footer, not a selectable entry");
+        fb.selected = last;
     }
 }
