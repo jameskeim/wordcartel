@@ -6,7 +6,6 @@ use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 use std::collections::HashSet;
 use std::io;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// FNV-1a 64-bit — stable across Rust versions (unlike DefaultHasher), no dep.
@@ -179,25 +178,16 @@ pub(crate) fn pid_is_live(_pid: u32) -> bool {
 }
 
 /// Read a swap file, refusing (None) if it exceeds the cap — never slurp unbounded.
-fn read_swap_capped(path: &std::path::Path) -> Option<String> {
-    let f = std::fs::File::open(path).ok()?;
-    let cap = crate::limits::MAX_OPEN_BYTES;
-    let mut s = String::new();
-    std::io::Read::take(f, cap + 1).read_to_string(&mut s).ok()?;
-    if s.len() as u64 > cap { return None; }
-    Some(s)
+fn read_swap_capped(fs: &dyn crate::fsx::Fs, path: &std::path::Path) -> Option<String> {
+    let bytes = fs.read_capped(path, crate::limits::MAX_OPEN_BYTES).ok()??;
+    String::from_utf8(bytes).ok()
 }
 
 /// Read a file as raw bytes, refusing (None) if it exceeds the cap or is unreadable — the
 /// byte-exact counterpart to `read_swap_capped` (a user's saved file need not be UTF-8, and
 /// the `.tmp`/`assess` comparisons are byte-for-byte). Never slurps unbounded.
-fn read_file_capped_bytes(path: &Path) -> Option<Vec<u8>> {
-    let f = std::fs::File::open(path).ok()?;
-    let cap = crate::limits::MAX_OPEN_BYTES;
-    let mut buf = Vec::new();
-    std::io::Read::take(f, cap + 1).read_to_end(&mut buf).ok()?;
-    if buf.len() as u64 > cap { return None; }
-    Some(buf)
+fn read_file_capped_bytes(fs: &dyn crate::fsx::Fs, path: &Path) -> Option<Vec<u8>> {
+    fs.read_capped(path, crate::limits::MAX_OPEN_BYTES).ok()?
 }
 
 /// The swap paths this session must NEVER offer for cleaning: every open buffer's swap (named
@@ -230,7 +220,9 @@ pub(crate) fn open_swap_paths(editor: &Editor) -> HashSet<PathBuf> {
 ///   the temp) exists and is byte-identical (the temp merely duplicates an already-committed
 ///   file). A live/own writing pid, a missing target, or ANY divergence → EXCLUDED (a
 ///   crash-window temp can hold the newest, only snapshot).
-pub(crate) fn cleanable_recovery_files(dir: &Path, protected: &HashSet<PathBuf>) -> Vec<PathBuf> {
+pub(crate) fn cleanable_recovery_files(fs: &dyn crate::fsx::Fs, dir: &Path,
+    protected: &HashSet<PathBuf>) -> Vec<PathBuf>
+{
     let me = std::process::id();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
@@ -238,7 +230,7 @@ pub(crate) fn cleanable_recovery_files(dir: &Path, protected: &HashSet<PathBuf>)
         let path = entry.path();
         let fname = entry.file_name();
         let fname = fname.to_string_lossy();
-        if recovery_file_is_cleanable(dir, &path, &fname, protected, me) { out.push(path); }
+        if recovery_file_is_cleanable(fs, dir, &path, &fname, protected, me) { out.push(path); }
     }
     out
 }
@@ -248,15 +240,16 @@ pub(crate) fn cleanable_recovery_files(dir: &Path, protected: &HashSet<PathBuf>)
 /// candidate lives in (needed to resolve a `.tmp` target); `me` is our pid. Fails closed: any
 /// path whose recovery value cannot be positively disproved returns `false`.
 fn recovery_file_is_cleanable(
-    dir: &Path, path: &Path, fname: &str, protected: &HashSet<PathBuf>, me: u32,
+    fs: &dyn crate::fsx::Fs, dir: &Path, path: &Path, fname: &str,
+    protected: &HashSet<PathBuf>, me: u32,
 ) -> bool {
     if protected.contains(path) { return false; } // open buffer / session swap → never offer
     if fname.starts_with("recovered-") && fname.ends_with(".md") {
         true                                       // the app's own already-extracted dump
     } else if fname.ends_with(".swp") {
-        swap_is_cleanable(path)
+        swap_is_cleanable(fs, path)
     } else if fname.ends_with(".tmp") {
-        tmp_is_cleanable(dir, path, fname, me)
+        tmp_is_cleanable(fs, dir, path, fname, me)
     } else {
         false
     }
@@ -268,15 +261,17 @@ fn recovery_file_is_cleanable(
 /// only ever narrows it — so the forward-TOCTOU law (never sweep a file that appeared after the
 /// prompt) is untouched. `protected` is gathered exactly as enumeration did (`open_swap_paths`).
 /// Fails closed: a path with no parent dir or file name is treated as no-longer-cleanable.
-pub(crate) fn recovery_path_still_cleanable(path: &Path, protected: &HashSet<PathBuf>) -> bool {
+pub(crate) fn recovery_path_still_cleanable(fs: &dyn crate::fsx::Fs, path: &Path,
+    protected: &HashSet<PathBuf>) -> bool
+{
     let (Some(dir), Some(fname)) = (path.parent(), path.file_name()) else { return false };
-    recovery_file_is_cleanable(dir, path, &fname.to_string_lossy(), protected, std::process::id())
+    recovery_file_is_cleanable(fs, dir, path, &fname.to_string_lossy(), protected, std::process::id())
 }
 
 /// True iff a `*.swp` candidate is provably valueless (see `cleanable_recovery_files`).
 /// Every early return is a "keep" (fail closed).
-fn swap_is_cleanable(candidate: &Path) -> bool {
-    let Some(raw) = read_swap_capped(candidate) else { return false };  // unreadable / oversized
+fn swap_is_cleanable(fs: &dyn crate::fsx::Fs, candidate: &Path) -> bool {
+    let Some(raw) = read_swap_capped(fs, candidate) else { return false };  // unreadable / oversized
     let Some((header, _body)) = parse(&raw) else { return false };      // unparseable provenance
     if pid_is_live(header.pid) { return false }                         // a live writer owns it
     let Some(rp) = header.realpath.as_deref() else { return false };    // no doc path recorded
@@ -288,13 +283,13 @@ fn swap_is_cleanable(candidate: &Path) -> bool {
         Ok(canonical) if canonical == *candidate => {}
         _ => return false,
     }
-    let current = read_file_capped_bytes(real);
-    matches!(assess(Some(real), current.as_deref()), RecoveryDecision::DiscardSilently)
+    let current = read_file_capped_bytes(fs, real);
+    matches!(assess(fs, Some(real), current.as_deref()), RecoveryDecision::DiscardSilently)
 }
 
 /// True iff a `.tmp` atomic-write temp is provably valueless (see `cleanable_recovery_files`).
 /// Name shape (fsx::create_temp): `.{target}.wcartel-{pid}-{counter}.tmp`.
-fn tmp_is_cleanable(dir: &Path, candidate: &Path, fname: &str, me: u32) -> bool {
+fn tmp_is_cleanable(fs: &dyn crate::fsx::Fs, dir: &Path, candidate: &Path, fname: &str, me: u32) -> bool {
     let Some(stripped) = fname.strip_prefix('.') else { return false };
     let Some((target_name, tail)) = stripped.rsplit_once(".wcartel-") else { return false };
     let Some(ids) = tail.strip_suffix(".tmp") else { return false };
@@ -304,7 +299,7 @@ fn tmp_is_cleanable(dir: &Path, candidate: &Path, fname: &str, me: u32) -> bool 
     let target = dir.join(target_name);
     // Delete ONLY a temp that byte-duplicates its already-committed target; a missing target
     // (crash before any rename) or any divergence means the temp may be the only/newest copy.
-    match (read_file_capped_bytes(&target), read_file_capped_bytes(candidate)) {
+    match (read_file_capped_bytes(fs, &target), read_file_capped_bytes(fs, candidate)) {
         (Some(t), Some(c)) => t == c,
         _ => false,
     }
@@ -315,12 +310,14 @@ fn tmp_is_cleanable(dir: &Path, candidate: &Path, fname: &str, me: u32) -> bool 
 /// own. Skip our own pid and live pids; return the newest valid non-empty
 /// orphan as (file path, header, body).
 pub fn find_orphan_scratch_swap() -> Option<(std::path::PathBuf, SwapHeader, String)> {
-    find_orphan_scratch_swap_in(&state_dir().ok()?)
+    find_orphan_scratch_swap_in(&crate::fsx::RealFs, &state_dir().ok()?)
 }
 
 /// Dir-injectable core of `find_orphan_scratch_swap` so tests can isolate from the
 /// shared real state dir (which accumulates orphan litter across runs).
-fn find_orphan_scratch_swap_in(dir: &std::path::Path) -> Option<(std::path::PathBuf, SwapHeader, String)> {
+fn find_orphan_scratch_swap_in(fs: &dyn crate::fsx::Fs, dir: &std::path::Path)
+    -> Option<(std::path::PathBuf, SwapHeader, String)>
+{
     let me = std::process::id();
     let mut best: Option<(std::path::PathBuf, SwapHeader, String)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -331,7 +328,7 @@ fn find_orphan_scratch_swap_in(dir: &std::path::Path) -> Option<(std::path::Path
             .and_then(|s| s.parse::<u32>().ok());
         let Some(pid) = pid else { continue };
         if pid == me || pid_is_live(pid) { continue; }
-        let Some(raw) = read_swap_capped(&entry.path()) else { continue };
+        let Some(raw) = read_swap_capped(fs, &entry.path()) else { continue };
         let Some((header, body)) = parse(&raw) else { continue };
         if body.is_empty() { continue; }
         let newer = match &best { Some((_, h, _)) => header.ts_ms > h.ts_ms, None => true };
@@ -343,13 +340,18 @@ fn find_orphan_scratch_swap_in(dir: &std::path::Path) -> Option<(std::path::Path
 /// Atomic 0600 write into our own state dir (no symlink/skip-unchanged logic, no
 /// dir-fsync). Routes through the shared fault-tested core, inheriting its
 /// TempGuard cleanup (this path previously left a temp behind on write failure).
+/// Thin `RealFs` wrapper for callers with no `fs` in scope (notably
+/// `recovery::write_dump`, which runs from the panic hook).
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content.as_bytes(),
-        crate::fsx::WriteOpts { mode: crate::fsx::ModePolicy::Fixed(0o600), dir_fsync: false },
-    )
+    write_atomic_with_fs(&crate::fsx::RealFs, path, content)
+}
+
+pub(crate) fn write_atomic_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, content: &str)
+    -> io::Result<()>
+{
+    crate::fsx::atomic_replace(fs, path, content.as_bytes(), crate::fsx::WriteOpts {
+        mode: crate::fsx::ModePolicy::Fixed(0o600), dir_fsync: false,
+    })
 }
 
 pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {
@@ -383,9 +385,11 @@ pub enum RecoveryDecision {
 
 /// Recovery predicate (spec §5.1): content-hash first, stat as tiebreaker.
 /// `current_file_bytes` is `Some` when the doc path exists on disk, else `None`.
-pub fn assess(doc_path: Option<&Path>, current_file_bytes: Option<&[u8]>) -> RecoveryDecision {
+pub fn assess(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>, current_file_bytes: Option<&[u8]>)
+    -> RecoveryDecision
+{
     let sp = match swap_path(doc_path) { Ok(p) => p, Err(_) => return RecoveryDecision::OpenNormally };
-    let Some(raw) = read_swap_capped(&sp) else { return RecoveryDecision::OpenNormally };
+    let Some(raw) = read_swap_capped(fs, &sp) else { return RecoveryDecision::OpenNormally };
     let (header, body) = match parse(&raw) {
         Some(x) => x,
         None => return RecoveryDecision::Prompt(
@@ -413,6 +417,7 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
     let header = build_header(ctx.editor, "", ts); // body filled on worker
     let version = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
+    let fs = std::sync::Arc::clone(&ctx.fs);   // owned — the closure is 'static + Send
     ctx.executor.dispatch(Job {
         buffer_id,
         class: ResultClass::Durability,
@@ -422,7 +427,7 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
             let body = snap.to_string();
             let mut h = header;
             h.content_hash = fnv1a64(body.as_bytes());
-            let ok = write_atomic(&path, &serialize(&h, &body)).is_ok();
+            let ok = write_atomic_with_fs(&*fs, &path, &serialize(&h, &body)).is_ok();
             JobResult {
                 buffer_id,
                 class: ResultClass::Durability,
@@ -631,7 +636,7 @@ mod tests {
         // A doc path whose swap file does not exist.
         let p = std::env::temp_dir().join(format!("wc-norec-{}.md", std::process::id()));
         let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
-        assert!(matches!(assess(Some(&p), Some(b"abc\n")), RecoveryDecision::OpenNormally));
+        assert!(matches!(assess(&crate::fsx::RealFs, Some(&p), Some(b"abc\n")), RecoveryDecision::OpenNormally));
     }
 
     #[test]
@@ -642,7 +647,7 @@ mod tests {
             content_hash: fnv1a64(body.as_bytes()), version: 1, ts_ms: 1, pid: 1 };
         write_atomic(&swap_path(Some(&p)).unwrap(), &serialize(&h, body)).unwrap();
         // F on disk == swap body → swap adds nothing.
-        assert!(matches!(assess(Some(&p), Some(body.as_bytes())), RecoveryDecision::DiscardSilently));
+        assert!(matches!(assess(&crate::fsx::RealFs, Some(&p), Some(body.as_bytes())), RecoveryDecision::DiscardSilently));
         let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
     }
 
@@ -654,7 +659,7 @@ mod tests {
             content_hash: fnv1a64(body.as_bytes()), version: 9, ts_ms: 1, pid: 1 };
         write_atomic(&swap_path(Some(&p)).unwrap(), &serialize(&h, body)).unwrap();
         // F differs from swap → prompt, carrying the swap body for Recover.
-        match assess(Some(&p), Some(b"file version\n")) {
+        match assess(&crate::fsx::RealFs, Some(&p), Some(b"file version\n")) {
             RecoveryDecision::Prompt(hdr, b) => { assert_eq!(hdr.version, 9); assert_eq!(b, body); }
             other => panic!("expected Prompt, got {other:?}"),
         }
@@ -698,7 +703,7 @@ mod tests {
         };
         write_atomic(&my_path, &serialize(&my_h, "self text\n")).unwrap();
 
-        let result = find_orphan_scratch_swap_in(&dir);
+        let result = find_orphan_scratch_swap_in(&crate::fsx::RealFs, &dir);
         assert!(result.is_some(), "finder must return the orphan");
         let (found_path, found_header, found_body) = result.unwrap();
         assert_eq!(found_path, orphan_path, "finder must return the dead-pid orphan");
@@ -718,7 +723,7 @@ mod tests {
         let p = scratch(); // a doc path
         let sp = swap_path(Some(&p)).unwrap();
         std::fs::write(&sp, "x".repeat(crate::limits::MAX_OPEN_BYTES as usize + 1)).unwrap();
-        assert!(matches!(assess(Some(&p), None), RecoveryDecision::OpenNormally));
+        assert!(matches!(assess(&crate::fsx::RealFs, Some(&p), None), RecoveryDecision::OpenNormally));
         let _ = std::fs::remove_file(&sp);
     }
 
@@ -749,6 +754,46 @@ mod tests {
         assert_eq!(body, "swap me\n");
         assert_eq!(h.version, 3);
         let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&doc_path);
+    }
+
+    /// The swap worker must write through `ctx.fs`, not a hardcoded `RealFs` — an injected
+    /// fault at `Ctx` construction must be able to fail the write and, in turn, suppress the
+    /// latch. Before this task the worker called `write_atomic` (always `RealFs` internally),
+    /// so an injected `FaultFs` was unreachable from here.
+    ///
+    /// FAIL-VERIFY: change the worker's `write_atomic_with_fs(&*fs, ...)` back to plain
+    /// `write_atomic(...)`, watch this fail (the real write succeeds and the latch sets
+    /// regardless of the injected fault), then revert.
+    #[test]
+    fn dispatch_swap_write_uses_the_injected_fs_and_a_failed_write_does_not_latch() {
+        use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
+        use crate::test_support::{FaultAt, FaultFs};
+        use wordcartel_core::history::Clock;
+        struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 456 } }
+
+        let doc_path = std::env::temp_dir().join(format!(
+            "wc-dispatch-swap-fault-{}-{}.md",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut e = Editor::new_from_text("swap me\n", Some(doc_path.clone()), (80, 24));
+        e.active_mut().document.version = 3;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let faulty: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(FaultFs::new(FaultAt::Create));
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx, fs: faulty };
+          dispatch_swap_write(&mut ctx); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert!(e.active().swapped_version.is_none(),
+            "an injected write failure must NOT latch swapped_version");
+        assert!(e.active().last_swap_at.is_none(),
+            "an injected write failure must NOT record last_swap_at");
+        let _ = std::fs::remove_file(swap_path(Some(&doc_path)).unwrap());
         let _ = std::fs::remove_file(&doc_path);
     }
 
@@ -847,17 +892,17 @@ mod tests {
 
         // (a) DiscardSilently + dead pid → cleanable.
         let (p, sp) = make_doc_with_swap("saved\n", "saved\n", DEAD_PID);
-        assert!(swap_is_cleanable(&sp), "swap body == saved file → zero recovery value → cleanable");
+        assert!(swap_is_cleanable(&crate::fsx::RealFs, &sp), "swap body == saved file → zero recovery value → cleanable");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
 
         // (b) Prompt (diverged) → NEVER cleanable (recoverable unsaved content).
         let (p, sp) = make_doc_with_swap("on disk\n", "UNSAVED WORK\n", DEAD_PID);
-        assert!(!swap_is_cleanable(&sp), "a diverged, recoverable swap must never be cleanable — no data loss");
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &sp), "a diverged, recoverable swap must never be cleanable — no data loss");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
 
         // (c) live pid → excluded even though the body matches (a live writer owns it).
         let (p, sp) = make_doc_with_swap("saved\n", "saved\n", std::process::id());
-        assert!(!swap_is_cleanable(&sp), "a live-pid swap is never swept");
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &sp), "a live-pid swap is never swept");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
     }
 
@@ -871,7 +916,7 @@ mod tests {
         let raw = std::fs::read_to_string(&sp).unwrap();
         let relocated = unique_dir("reloc").join("relocated.swp");
         std::fs::write(&relocated, &raw).unwrap();
-        assert!(!swap_is_cleanable(&relocated),
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &relocated),
             "a swap not at its canonical swap_path(realpath) is excluded (stale/relocated twin)");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&relocated);
@@ -881,7 +926,7 @@ mod tests {
             content_hash: fnv1a64(b"x\n"), version: 1, ts_ms: 1, pid: DEAD_PID };
         let none_swap = unique_dir("none").join("nopath.swp");
         write_atomic(&none_swap, &serialize(&h, "x\n")).unwrap();
-        assert!(!swap_is_cleanable(&none_swap), "a swap with no recorded realpath is excluded");
+        assert!(!swap_is_cleanable(&crate::fsx::RealFs, &none_swap), "a swap with no recorded realpath is excluded");
         let _ = std::fs::remove_file(&none_swap);
     }
 
@@ -892,7 +937,7 @@ mod tests {
         let dir = state_dir().unwrap();
         let (p_ok, sp_ok)   = make_doc_with_swap("same\n", "same\n", DEAD_PID);        // DiscardSilently
         let (p_bad, sp_bad) = make_doc_with_swap("file\n", "swap unsaved\n", DEAD_PID); // Prompt
-        let out = cleanable_recovery_files(&dir, &HashSet::new());
+        let out = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &HashSet::new());
         assert!(out.contains(&sp_ok), "valueless swap is enumerated as cleanable");
         assert!(!out.contains(&sp_bad), "recoverable (Prompt) swap is NEVER enumerated — no data loss");
         for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
@@ -912,7 +957,7 @@ mod tests {
 
         let mut protected = HashSet::new();
         protected.insert(protected_dump.clone());
-        let out = cleanable_recovery_files(&dir, &protected);
+        let out = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &protected);
         assert!(out.contains(&dump), "a recovered-*.md dump is cleanable");
         assert!(!out.contains(&other), "an unrelated file is never touched");
         assert!(!out.contains(&protected_dump), "a protected path is never offered");
@@ -941,7 +986,7 @@ mod tests {
         let tmp_self = dir.join(format!(".doc.md-abcd.swp.wcartel-{}-3.tmp", std::process::id()));
         std::fs::write(&tmp_self, "committed\n").unwrap();
 
-        let out = cleanable_recovery_files(&dir, &HashSet::new());
+        let out = cleanable_recovery_files(&crate::fsx::RealFs, &dir, &HashSet::new());
         assert!(out.contains(&tmp_same), "byte-identical temp duplicate is valueless → cleanable");
         assert!(!out.contains(&tmp_diff), "a temp diverging from its target may hold newer work → excluded");
         assert!(!out.contains(&tmp_orphan), "a temp whose target is missing may be the only copy → excluded");
@@ -961,7 +1006,7 @@ mod tests {
     #[test]
     fn enumerator_empty_dir_yields_nothing() {
         let dir = unique_dir("empty");
-        assert!(cleanable_recovery_files(&dir, &HashSet::new()).is_empty());
+        assert!(cleanable_recovery_files(&crate::fsx::RealFs, &dir, &HashSet::new()).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

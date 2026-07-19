@@ -2,8 +2,8 @@
 // Ported atomic primitive from ~/projects/par-command/repar/src/atomic.rs (MIT, user's own).
 // Added: symlink refusal, skip-unchanged, mode preservation (#[cfg(unix)]).
 
+#[cfg(test)]
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -83,43 +83,46 @@ fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
 }
 
 pub fn open(path: &Path) -> Result<String, OpenError> {
-    let label = path.display().to_string();
-    let limit = crate::limits::MAX_OPEN_BYTES;
+    open_with_fs(&crate::fsx::RealFs, path)
+}
 
-    // (a) Fast refusal when metadata is trustworthy.
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.is_file() && meta.len() > limit {
+/// Seam-taking core of [`open`]. Kept `pub(crate)` so tests can inject a `FaultFs`.
+pub(crate) fn open_with_fs(fs: &dyn crate::fsx::Fs, path: &Path) -> Result<String, OpenError> {
+    open_bounded_with_fs(fs, path, crate::limits::MAX_OPEN_BYTES)
+}
+
+/// `open_with_fs` with an explicit cap — the seam-taking core proper.
+pub(crate) fn open_bounded_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
+    -> Result<String, OpenError>
+{
+    let label = path.display().to_string();
+
+    // (a) Fast refusal when metadata is trustworthy. `stat` follows symlinks, matching the
+    // `fs::metadata` this replaces; a `broken` link falls through to the read, which fails —
+    // exactly what the old `if let Ok(meta)` did.
+    if let Ok(st) = fs.stat(path) {
+        if st.is_file && st.len > limit {
             return Err(OpenError::TooLarge(label, limit));
         }
     }
 
     // (b) Bounded read — caps the allocation even if metadata lied (/proc, sparse).
-    let bytes = match fs::File::open(path) {
-        Ok(f) => {
-            let mut buf = Vec::new();
-            if let Err(e) = Read::read_to_end(&mut f.take(limit + 1), &mut buf) {
-                return Err(map_open_io_err(e, &label, path));
-            }
-            if buf.len() as u64 > limit {
-                return Err(OpenError::TooLarge(label, limit));
-            }
-            buf
-        }
+    let bytes = match fs.read_capped(path, limit) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Err(OpenError::TooLarge(label, limit)),
         Err(e) => return Err(map_open_io_err(e, &label, path)),
     };
 
-    // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but
-    // guard it anyway (opening a dir with read() sometimes succeeds on some FS).
+    // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but guard it
+    // anyway (opening a dir with read() sometimes succeeds on some FS).
     if path.is_dir() {
         return Err(OpenError::IsDir(label));
     }
 
-    // Binary test: NUL byte OR invalid UTF-8 (exactly repar's is_binary).
     if is_binary(&bytes) {
         return Err(OpenError::Binary(label));
     }
 
-    // SAFETY: is_binary already verified valid UTF-8; from_utf8 will not fail.
     Ok(String::from_utf8(bytes).expect("already verified by is_binary"))
 }
 
@@ -131,11 +134,19 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
 /// file exceeds `limit` OR any open/read error occurs — every caller treats `None` as
 /// its existing safe degradation. Mirrors `open`'s `.take(limit + 1)` + `len > limit`.
 pub fn bounded_read_opt(path: &Path, limit: u64) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    let f = fs::File::open(path).ok()?;
-    Read::read_to_end(&mut f.take(limit + 1), &mut buf).ok()?;
-    if buf.len() as u64 > limit { return None; }
-    Some(buf)
+    bounded_read_opt_with_fs(&crate::fsx::RealFs, path, limit)
+}
+
+/// Seam-taking core. Preserves the historical contract EXACTLY: `None` for both over-cap
+/// and IO failure, because every caller treats `None` as its own safe degradation. The
+/// seam distinguishes the two; this wrapper deliberately discards the distinction.
+pub(crate) fn bounded_read_opt_with_fs(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
+    -> Option<Vec<u8>>
+{
+    match fs.read_capped(path, limit) {
+        Ok(Some(b)) => Some(b),
+        Ok(None) | Err(_) => None,
+    }
 }
 
 pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
@@ -211,6 +222,31 @@ mod tests {
     // -------------------------------------------------------------------------
     // TDD RED tests (from brief) — these are written BEFORE implementation.
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn open_routes_through_the_seam_and_faults_are_injectable() {
+        // First time file::open is fault-testable at all — it hardcoded RealFs internally.
+        let p = scratch_path("open-fault");
+        fs::write(&p, b"hello\n").expect("seed");
+        let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::ReadCapped);
+        let err = open_with_fs(&ff, &p).expect_err("injected read must surface as OpenError");
+        assert!(matches!(err, OpenError::Io(_)), "injected IO error maps to OpenError::Io, got {err:?}");
+        // And the real seam still opens normally.
+        assert_eq!(open_with_fs(&crate::fsx::RealFs, &p).expect("real open"), "hello\n");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn open_over_cap_is_still_too_large_not_io() {
+        // Behaviour preservation: over-cap must stay OpenError::TooLarge, NOT become an
+        // IO error just because read_capped now separates the two outcomes.
+        let p = scratch_path("open-over");
+        fs::write(&p, vec![b'x'; 64]).expect("seed");
+        let err = open_bounded_with_fs(&crate::fsx::RealFs, &p, 8)
+            .expect_err("over-cap must be refused");
+        assert!(matches!(err, OpenError::TooLarge(_, 8)), "got {err:?}");
+        let _ = fs::remove_file(&p);
+    }
 
     /// save_atomic writes content; a subsequent open reads it back → Saved.
     #[test]

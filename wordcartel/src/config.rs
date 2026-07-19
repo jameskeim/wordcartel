@@ -436,13 +436,30 @@ pub fn config_layer_paths(
 /// build_keymap applies them in precedence order (Codex plan-review fix).
 #[allow(clippy::too_many_lines)] // config parse — one arm per config key
 pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
+    load_with_fs(&crate::fsx::RealFs, paths)
+}
+
+#[allow(clippy::too_many_lines)] // config parse — one arm per config key
+pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut warns = Vec::new();
     for p in paths {
-        let text = match std::fs::read_to_string(p) {
-            Ok(t) => t,
+        let bytes = match fs.read_capped(p, crate::limits::MAX_CONFIG_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                warns.push(format!("config: {} is too large (> {} bytes) — ignored",
+                    p.display(), crate::limits::MAX_CONFIG_BYTES));
+                continue;
+            }
             Err(e) => {
                 warns.push(format!("config: cannot read {}: {e}", p.display()));
+                continue;
+            }
+        };
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => {
+                warns.push(format!("config: {} is not valid UTF-8 — ignored", p.display()));
                 continue;
             }
         };
@@ -1303,5 +1320,30 @@ mod tests {
         let v = ViewConfig::default();
         assert_eq!(v.caret_shape, CaretShape::Default);
         assert!(v.caret_blink, "blink default on (inert under Default until a shape is chosen)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: config-class reads acquire a cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_over_cap_degrades_like_an_unreadable_file() {
+        // Config-class reads acquire a cap. An over-cap config must warn and fall back to
+        // defaults — the SAME degradation an unreadable file already gets — never panic and
+        // never silently apply a truncated parse.
+        let d = std::env::temp_dir().join(format!("wc-cfg-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("dir");
+        let p = d.join("config.toml");
+        std::fs::write(&p, vec![b'#'; (crate::limits::MAX_CONFIG_BYTES + 1) as usize])
+            .expect("seed oversized");
+        let (cfg, warns) = load_with_fs(&crate::fsx::RealFs, std::slice::from_ref(&p));
+        assert_eq!(cfg.state.max_entries, Config::default().state.max_entries,
+            "over-cap config falls back to defaults");
+        // Names the OVER-CAP branch specifically. `|| w.contains("cannot read")` would let a
+        // broken read path read as a cap success — the cap could be absent and an unrelated
+        // IO failure would satisfy the assertion.
+        assert!(warns.iter().any(|w| w.contains("too large")),
+            "the warning must name the CAP, not merely any read failure: {warns:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

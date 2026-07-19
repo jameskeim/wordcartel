@@ -159,6 +159,12 @@ pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
 /// Resolve order (D1+D5): base pick/construct → [Ansi16 sentinel-fill | derive_chrome(disp)] →
 /// user styles → cue glyph. User chrome overrides land LAST, over the depth policy.
 pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot, disp: ChromeDisposition) -> ResolvedTheme {
+    resolve_theme_with_fs(&crate::fsx::RealFs, tc, env, disp)
+}
+
+pub(crate) fn resolve_theme_with_fs(fs: &dyn crate::fsx::Fs, tc: &ThemeConfig,
+    env: &EnvSnapshot, disp: ChromeDisposition) -> ResolvedTheme
+{
     let mut warnings = Vec::new();
 
     let detected = detect_depth(env.no_color, env.colorterm.as_deref(), env.term.as_deref());
@@ -174,14 +180,20 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot, disp: ChromeDispositio
     let mut t = if depth == Depth::None {
         theme::no_color()
     } else if let Some(path) = &tc.file {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match crate::base16::parse_base16(&text) {
+        match fs.read_capped(path, crate::limits::MAX_CONFIG_BYTES)
+            .map(|o| o.and_then(|b| String::from_utf8(b).ok()))
+        {
+            Ok(Some(text)) => match crate::base16::parse_base16(&text) {
                 Ok((pal, scheme)) => {
                     let name = scheme.unwrap_or_else(|| format!("base16:{}", path.display()));
                     theme::from_base16(&name, pal)
                 }
                 Err(e) => { warnings.push(format!("theme file {}: {e} — using default", path.display())); theme::default() }
             },
+            Ok(None) => {
+                warnings.push(format!("theme file {}: too large or not UTF-8 — using default", path.display()));
+                theme::default()
+            }
             Err(e) => { warnings.push(format!("theme file {}: {e} — using default", path.display())); theme::default() }
         }
     } else if let Some(name) = &tc.name {

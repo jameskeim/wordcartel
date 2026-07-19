@@ -5,7 +5,6 @@
 // the file on disk at resume time; a mismatch → discard (never restore stale state).
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
@@ -104,13 +103,16 @@ impl SessionState {
 /// Load from a specific directory (testable variant). Corrupt/missing/over-cap → empty.
 /// The read is bounded at MAX_SESSION_BYTES+1 so a huge file is never fully slurped.
 pub fn load_in(dir: &Path) -> SessionState {
+    load_in_with_fs(&crate::fsx::RealFs, dir)
+}
+
+pub(crate) fn load_in_with_fs(fs: &dyn crate::fsx::Fs, dir: &Path) -> SessionState {
     let path = dir.join("session.toml");
-    let Ok(f) = std::fs::File::open(&path) else { return SessionState::default() };
-    let mut text = String::new();
     let cap = crate::limits::MAX_SESSION_BYTES as u64;
-    if f.take(cap + 1).read_to_string(&mut text).is_err() || text.len() as u64 > cap {
-        return SessionState::default(); // unreadable or over-cap → empty (graceful)
-    }
+    let Ok(Some(bytes)) = fs.read_capped(&path, cap) else {
+        return SessionState::default(); // missing, unreadable, or over-cap → empty (graceful)
+    };
+    let Ok(text) = String::from_utf8(bytes) else { return SessionState::default() };
     toml::from_str(&text).unwrap_or_default()
 }
 

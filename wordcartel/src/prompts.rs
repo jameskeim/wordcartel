@@ -82,9 +82,9 @@ pub fn open_save_as(editor: &mut crate::editor::Editor) {
 /// snapshot them into `pending_clean`, and raise a count-confirm prompt. TOCTOU-safe — the
 /// confirm deletes the snapshot, not a re-scan. An empty enumeration (or no state dir) sets a
 /// status and raises NO prompt, so the user is never asked to confirm deleting nothing.
-pub fn open_clean_recovery(editor: &mut crate::editor::Editor) {
+pub fn open_clean_recovery(editor: &mut crate::editor::Editor, fs: &dyn crate::fsx::Fs) {
     let files = match crate::swap::state_dir() {
-        Ok(dir) => crate::swap::cleanable_recovery_files(&dir, &crate::swap::open_swap_paths(editor)),
+        Ok(dir) => crate::swap::cleanable_recovery_files(fs, &dir, &crate::swap::open_swap_paths(editor)),
         Err(_) => Vec::new(),
     };
     raise_clean_recovery(editor, files);
@@ -318,7 +318,7 @@ pub fn resolve_prompt(
             let protected = crate::swap::open_swap_paths(editor);
             let mut n = 0usize;
             for p in std::mem::take(&mut editor.pending_clean) {
-                if !crate::swap::recovery_path_still_cleanable(&p, &protected) { continue; }
+                if !crate::swap::recovery_path_still_cleanable(&**fs, &p, &protected) { continue; }
                 if std::fs::remove_file(&p).is_ok() { n += 1; }
             }
             editor.set_status(crate::status::StatusKind::Info, format!("Cleaned {n} file(s)"));

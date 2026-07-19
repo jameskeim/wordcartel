@@ -602,17 +602,17 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
     let mut overrides_snapshot = overrides_path.as_ref()
         .filter(|p| p.is_file())
-        .map(|p| std::fs::read_to_string(p)
-            .map(|s| settings::parse_overrides(&s))
-            .unwrap_or_default())
+        .and_then(|p| fs.read_capped(p, crate::limits::MAX_CONFIG_BYTES).ok().flatten())
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| settings::parse_overrides(&s))
         .unwrap_or_default();
     // Mask snapshot: parse the --config layer via parse_mask so theme provenance is
     // collapsed at load time (file vs name are indistinguishable for the guard).
     let mask_snapshot = cli.config_path.as_ref()
         .filter(|c| c.is_file())
-        .map(|c| std::fs::read_to_string(c)
-            .map(|s| settings::parse_mask(&s))
-            .unwrap_or_default())
+        .and_then(|c| fs.read_capped(c, crate::limits::MAX_CONFIG_BYTES).ok().flatten())
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| settings::parse_mask(&s))
         .unwrap_or_default();
     // Seed theme_identity from the MERGED config's provenance — an overrides/hand `name`
     // wins over `file` per theme_identity_of's rule; use editor.theme.name since resolved.theme
@@ -638,7 +638,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         // would previously DiscardSilently; it now Prompts. Safe direction.)
         let file_bytes = editor.active().document.path.as_deref()
             .and_then(|p| crate::file::bounded_read_opt(p, crate::limits::MAX_OPEN_BYTES));
-        match crate::swap::assess(editor.active().document.path.as_deref(), file_bytes.as_deref()) {
+        match crate::swap::assess(&*fs, editor.active().document.path.as_deref(), file_bytes.as_deref()) {
             crate::swap::RecoveryDecision::OpenNormally => {}
             crate::swap::RecoveryDecision::DiscardSilently => {
                 crate::swap::delete(editor.active().document.path.as_deref());
