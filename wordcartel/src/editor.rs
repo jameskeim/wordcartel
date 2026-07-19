@@ -1278,6 +1278,18 @@ impl Editor {
     /// Consulted by `set_status`/`set_status_full`/`finish_topic` via `resolve_slot`.
     pub fn set_messages_min_kind(&mut self, k: crate::status::StatusKind) { self.messages_min_kind = k; }
 
+    /// The SOLE mutator for the file-browser clutter filter (contract law 6). Every write
+    /// path — `show_clutter_on`/`show_clutter_off`/`toggle_clutter`, and startup config —
+    /// routes through this.
+    pub fn set_show_clutter(&mut self, on: bool) { self.files_show_clutter = on; }
+
+    /// The SOLE mutator for the file-browser type filter (contract law 6). Every write
+    /// path — `file_types_documents`/`file_types_all`/`toggle_file_types`, and startup
+    /// config — routes through this.
+    pub fn set_file_type_filter(&mut self, f: crate::config::FileTypeFilter) {
+        self.files_type_filter = f;
+    }
+
     /// Set the status-line transient mode (Off coerces to Auto — status has no true Off,
     /// no-silent-UI) and clear its stale dwell state.
     pub fn set_status_line_mode(&mut self, mode: crate::config::TransientMode) {

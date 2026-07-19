@@ -55,6 +55,7 @@ pub struct Config {
     pub menu: MenuConfig,
     pub clipboard: ClipboardConfig,
     pub plugins: PluginsConfig,
+    pub files: FilesConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -136,6 +137,21 @@ pub enum FileTypeFilter {
 pub struct MenuConfig { pub bar: MenuBarMode }
 impl Default for MenuConfig {
     fn default() -> Self { MenuConfig { bar: MenuBarMode::Auto } }
+}
+
+/// File-browser filter configuration section (`[files]`). Persisted (command-surface
+/// contract decision 8 — "show all files" must stick): `snapshot_of` seeds the two
+/// `Editor` fields from here at startup; `set_show_clutter`/`set_file_type_filter` are
+/// the sole runtime mutators.
+#[derive(Debug, Clone)]
+pub struct FilesConfig {
+    pub show_clutter: bool,
+    pub type_filter: FileTypeFilter,
+}
+impl Default for FilesConfig {
+    fn default() -> Self {
+        FilesConfig { show_clutter: false, type_filter: FileTypeFilter::Documents }
+    }
 }
 
 /// Clipboard configuration section (`[clipboard]`).
@@ -284,6 +300,7 @@ struct RawConfig {
     menu: RawMenu,
     clipboard: RawClipboard,
     plugins: RawPlugins,
+    files: RawFiles,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -375,6 +392,12 @@ struct RawMenu {
 #[serde(default)]
 struct RawClipboard {
     provider: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawFiles {
+    show_clutter: Option<bool>,
+    type_filter: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -591,6 +614,15 @@ pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Confi
                 other => warns.push(format!("clipboard.provider \"{other}\" invalid; using auto")),
             }
         }
+        // files: per-field override; enum-valued string with a warning on unknowns.
+        if let Some(v) = raw.files.show_clutter { cfg.files.show_clutter = v; }
+        if let Some(t) = raw.files.type_filter {
+            match t.as_str() {
+                "documents" => cfg.files.type_filter = FileTypeFilter::Documents,
+                "all"       => cfg.files.type_filter = FileTypeFilter::All,
+                other => warns.push(format!("files.type_filter \"{other}\" invalid; using documents")),
+            }
+        }
         // plugins: per-field override (omitted field inherits the lower layer); `disable`
         // replaces wholesale when a layer sets it (not accumulated — a higher layer's list
         // is the complete intended set, mirroring diagnostics.linters).
@@ -706,6 +738,11 @@ pub fn clipboard_provider_str(p: ClipboardProvider) -> &'static str {
         ClipboardProvider::Osc52 => "osc52",
         ClipboardProvider::Off => "off",
     }
+}
+
+/// "documents"/"all" — round-trips `FileTypeFilter` for the overrides mirror.
+pub fn file_type_filter_str(f: FileTypeFilter) -> &'static str {
+    match f { FileTypeFilter::Documents => "documents", FileTypeFilter::All => "all" }
 }
 
 #[cfg(test)]
@@ -1238,6 +1275,9 @@ mod tests {
             canvas: CanvasMode::Transparent,
             clipboard_provider: crate::config::ClipboardProvider::Auto,
             view_messages_min_kind: crate::status::StatusKind::Info,
+            // C5 Task 24: files_show_clutter/files_type_filter round-trip too.
+            files_show_clutter: true,
+            files_type_filter: crate::config::FileTypeFilter::All,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -1259,6 +1299,9 @@ mod tests {
             "[theme] chrome must round-trip to 'zen'");
         assert_eq!(cfg.theme.canvas.as_deref(), Some("transparent"),
             "[theme] canvas must round-trip");
+        assert!(cfg.files.show_clutter, "files.show_clutter must round-trip to true");
+        assert_eq!(cfg.files.type_filter, crate::config::FileTypeFilter::All,
+            "files.type_filter must round-trip to All");
     }
 
     // -----------------------------------------------------------------------

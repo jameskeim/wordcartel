@@ -595,6 +595,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.set_caret_blink(cfg.view.caret_blink);
     editor.set_messages_min_kind(cfg.view.messages_min_kind);
     editor.set_clipboard_provider(cfg.clipboard.provider);
+    editor.set_show_clutter(cfg.files.show_clutter);
+    editor.set_file_type_filter(cfg.files.type_filter);
     editor.clear_clipboard_provider_dirty(); // worker gets the initial plan below; no redundant rebuild
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();

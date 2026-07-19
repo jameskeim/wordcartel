@@ -802,9 +802,42 @@ impl Registry {
                 c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
                 CommandResult::Handled
             });
-        // toggle_canvas and toggle_chrome MUST be registered BEFORE save_settings
-        // (journey_palette_end relies on save_settings being the last command dispatched
-        // from End+Enter — spec D3 / A.7).
+        r.register("open_recent", "Open Recent\u{2026}", Some(MenuCategory::File), |c| {
+            // Async form (Task 23): the availability probe runs off-thread, so this needs the
+            // owned Arc and the sender, not a borrowed `&dyn Fs`.
+            crate::recents::open_recent(c.editor, &c.fs, &c.msg_tx);
+            CommandResult::Handled
+        });
+        // C5 filter toggles — set-per-state primitives (palette-only) + one stateful
+        // representative each, mirroring scrollbar_off/auto/on + cycle_scrollbar (law 8).
+        r.register("show_clutter_on",  "Show Hidden Files",  None, |c| {
+            c.editor.set_show_clutter(true);  CommandResult::Handled });
+        r.register("show_clutter_off", "Hide Hidden Files",  None, |c| {
+            c.editor.set_show_clutter(false); CommandResult::Handled });
+        r.register_stateful("toggle_clutter", "Hidden Files", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.files_show_clutter),
+            |c| { let next = !c.editor.files_show_clutter;
+                  c.editor.set_show_clutter(next); CommandResult::Handled });
+        r.register("file_types_documents", "File Types: Documents", None, |c| {
+            c.editor.set_file_type_filter(crate::config::FileTypeFilter::Documents);
+            CommandResult::Handled });
+        r.register("file_types_all", "File Types: All Files", None, |c| {
+            c.editor.set_file_type_filter(crate::config::FileTypeFilter::All);
+            CommandResult::Handled });
+        r.register_stateful("toggle_file_types", "File Types", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.files_type_filter {
+                crate::config::FileTypeFilter::Documents => "Documents",
+                crate::config::FileTypeFilter::All       => "All files",
+            }),
+            |c| { let next = match c.editor.files_type_filter {
+                      crate::config::FileTypeFilter::Documents => crate::config::FileTypeFilter::All,
+                      crate::config::FileTypeFilter::All => crate::config::FileTypeFilter::Documents,
+                  };
+                  c.editor.set_file_type_filter(next); CommandResult::Handled });
+        // `plugin_list` stays the LAST registered command (journey_palette_end_reaches_last_command
+        // is a merge gate on it — pressing End+Enter in the palette must land on `plugin_list`).
+        // `save_settings` itself carries no such constraint; `plugins_reload`/`plugin_list` already
+        // register after it.
         r.register_stateful("toggle_canvas", "Canvas: Opaque/Transparent", Some(MenuCategory::Settings),
             |e| MenuMark::Value(match e.canvas {
                 wordcartel_core::theme::CanvasMode::Opaque       => "Opaque",
@@ -2332,5 +2365,53 @@ mod tests {
         assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Warning);
         dispatch_id(&mut e, "messages_min_info");
         assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Info);
+    }
+
+    // -----------------------------------------------------------------------
+    // C5 Task 24: seven file-interface commands, registration order + shape rule 8
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn c5_commands_register_before_plugin_list() {
+        // `e2e::journey_palette_end_reaches_last_command` presses End+Enter in the palette
+        // and asserts the status starts with "plugins:", which hardcodes plugin_list as the
+        // LAST registered command. It is a merge gate: registering any C5 command after it
+        // breaks the build.
+        let reg = Registry::builtins();
+        // `Registry::commands()` yields `(CommandId, &CommandMeta)` — destructure the pair.
+        let ids: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
+        let last = ids.last().copied().expect("non-empty registry");
+        assert_eq!(last, "plugin_list", "plugin_list must stay last");
+        for id in ["open_recent", "show_clutter_on", "show_clutter_off", "toggle_clutter",
+                   "file_types_documents", "file_types_all", "toggle_file_types"] {
+            let at = ids.iter().position(|x| *x == id)
+                .unwrap_or_else(|| panic!("{id} must be registered"));
+            assert!(at < ids.len() - 1, "{id} must register BEFORE plugin_list");
+        }
+    }
+
+    #[test]
+    fn filter_toggles_follow_law_8_set_per_state_plus_one_representative() {
+        let reg = Registry::builtins();
+        // Set-per-state primitives are palette-only.
+        for id in ["show_clutter_on", "show_clutter_off", "file_types_documents", "file_types_all"] {
+            assert_eq!(reg.meta(CommandId(id)).expect("registered").menu, None,
+                "{id} is a palette-only set primitive");
+        }
+        // One stateful representative each, carrying a MenuCategory.
+        assert_eq!(reg.meta(CommandId("toggle_clutter")).expect("registered").menu,
+            Some(MenuCategory::View));
+        assert_eq!(reg.meta(CommandId("toggle_file_types")).expect("registered").menu,
+            Some(MenuCategory::View));
+        // And they report live state.
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let f = reg.meta(CommandId("toggle_clutter")).unwrap().state.expect("stateful");
+        assert!(matches!(f(&ed), MenuMark::OnOff(false)), "clutter hidden by default");
+        ed.set_show_clutter(true);
+        assert!(matches!(f(&ed), MenuMark::OnOff(true)));
+        let g = reg.meta(CommandId("toggle_file_types")).unwrap().state.expect("stateful");
+        assert_eq!(g(&ed), MenuMark::Value("Documents"));
+        ed.set_file_type_filter(crate::config::FileTypeFilter::All);
+        assert_eq!(g(&ed), MenuMark::Value("All files"));
     }
 }
