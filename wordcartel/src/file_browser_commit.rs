@@ -1198,6 +1198,68 @@ mod tests {
     }
 
     #[test]
+    fn export_enter_through_reproduces_run_export_with_probe_derivation() {
+        // The gap this closes: `export.rs`'s own tests call `run_export_with_probe` but
+        // never press Enter, and the sibling test above presses Enter but seeds the picker
+        // by hand-calling `open_destination_picker` with LITERALS ("notes.html", `d`) that
+        // merely happen to match what `run_export` derives — it never calls `run_export` at
+        // all. A reviewer proved the gap live: mutating `run_export_with_probe` to seed
+        // `derived.file_stem()` instead of `derived.file_name()` (dropping the extension)
+        // failed `export::`'s tests but left the sibling test above fully green. This test
+        // drives the WHOLE chain — real derivation, real async listing pump, real Enter
+        // intercept — through the actual production entry point, with the expected value
+        // COMPUTED from `derived_export_path` rather than typed twice, so it cannot pass by
+        // coincidence of two literals agreeing.
+        let d = std::env::temp_dir().join(format!("wc-exp-seam-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let src = d.join("notes.md");
+        std::fs::write(&src, b"# hi\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src.clone()), (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+
+        // Seed through the REAL production entry point — `run_export`'s own derivation is
+        // what gets exercised here, not a hand-typed stand-in for it.
+        crate::export::run_export_with_probe(&mut e, &fs, "html", &tx, || true);
+        assert!(e.file_browser.is_some(), "run_export_with_probe must open the destination picker");
+
+        // Pump the async listing to completion — a bare Enter without pumping would exercise
+        // a highlight/state real usage never reaches (the same class of bug the parent-row
+        // highlight fix upstream of this file addressed for save-as).
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        press_enter(&mut e, &fs, &ex, &clk, &tx);
+
+        // Computed, never typed: the whole point of this test is that it cannot pass by two
+        // literals coincidentally agreeing.
+        let expected = crate::export::derived_export_path(&src, "html");
+
+        assert!(e.file_browser.is_none(), "the picker closed on commit");
+        // Assert on the DISPATCHED target rather than the file on disk. Draining `ExportDone`
+        // through `apply_export_done` and checking the written bytes would make this test's
+        // pass/fail depend on pandoc actually being installed on whatever machine runs the
+        // gate (see `export_destination_picker_opens_without_pandoc_installed` and the sibling
+        // `export_commits_end_to_end_from_enter_through` above, which apply the same
+        // discipline for the same reason) — an environment assumption, not a code assertion.
+        // The dispatched target is exactly what `run_export`'s derivation is responsible for,
+        // and it is observable regardless of pandoc's presence.
+        let dispatched_target = std::iter::from_fn(|| rx.recv_timeout(
+                std::time::Duration::from_secs(5)).ok())
+            .take(4)
+            .find_map(|m| match m {
+                crate::app::Msg::ExportDone { target, .. } => Some(target),
+                _ => None,
+            });
+        assert_eq!(dispatched_target, Some(expected),
+            "Enter on the picker seeded by run_export_with_probe must dispatch ExportDone \
+             for exactly derived_export_path's target (status was {:?})", e.status_text());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn an_empty_field_with_no_highlight_commits_nothing() {
         let d = tmp("nothing");
         assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "", None, false),
