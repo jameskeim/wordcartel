@@ -289,6 +289,51 @@ pub(crate) fn is_file_via(fs: &dyn Fs, path: &Path) -> bool {
     matches!(fs.stat(path), Ok(st) if st.is_file)
 }
 
+/// A WRITE destination the caller asked to save through cannot be honoured.
+#[allow(dead_code)] // C5 Task 21 wires this into Save-As/Write-Block; forward reference
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DestError {
+    /// The destination is a symlink whose target cannot be resolved. Refused BEFORE any
+    /// write is dispatched — it must never reach `atomic_replace`, and must never surface
+    /// as `SaveError::Symlink`, which names a mechanism rather than the problem.
+    BrokenSymlink,
+}
+
+/// Resolve a WRITE destination through symlinks (spec §7.6.1).
+///
+/// `file::save_atomic` refuses to write through a symlink — correctly, because
+/// `atomic_replace` renames a temp over the target and would replace the LINK with a
+/// regular file, destroying it. That refusal stays an unconditional last-resort guard;
+/// resolution happens here, BEFORE a path ever reaches it, which is why
+/// `file::tests::save_through_symlink_refused` continues to pass unmodified.
+///
+/// Applied at all four write-destination boundaries — Save, Save-As, Write-Block, and the
+/// Export destination — so a writer who navigates through symlinks cannot pick a
+/// destination that fails at the end of a save they thought would work.
+///
+/// * not a symlink         -> unchanged
+/// * symlink that resolves -> the resolved target (the link is preserved, because
+///   `atomic_replace` then renames over the TARGET)
+/// * broken symlink        -> `Err(DestError::BrokenSymlink)`
+/// * does not exist yet    -> unchanged (the ordinary new-file case)
+#[allow(dead_code)] // C5 Task 21 wires this into Save-As/Write-Block; forward reference
+pub(crate) fn resolve_write_destination(fs: &dyn Fs, path: &Path)
+    -> Result<PathBuf, DestError>
+{
+    match fs.stat(path) {
+        // Broken link: refuse now, with a reason a writer can act on.
+        Ok(st) if st.broken => Err(DestError::BrokenSymlink),
+        // Resolvable link: write to the target, so the link survives the rename.
+        Ok(st) if st.is_symlink => match std::fs::canonicalize(path) {
+            Ok(target) => Ok(target),
+            // `stat` said it resolves but canonicalize disagrees — a race. Fail closed.
+            Err(_) => Err(DestError::BrokenSymlink),
+        },
+        // Ordinary existing file, or nothing there yet (Err from `stat`): unchanged.
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
 // Platform-specific O_EXCL open with `mode` on Unix; plain create_new elsewhere.
 #[cfg(unix)]
 fn open_excl(path: &Path, mode: u32) -> std::io::Result<fs::File> {
@@ -947,6 +992,51 @@ mod tests {
                 "it is a NAMED entry in `entries`, never counted in `unreadable` — that field \
                  means 'could not even be named'");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---------------------------------------------------------------------------
+    // resolve_write_destination tests (Task 15)
+    // ---------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_destination_follows_a_link_and_preserves_it() {
+        let d = unique_dir("resolve-link");
+        let real = d.join("real.md");
+        let link = d.join("link.md");
+        std::fs::write(&real, b"original\n").expect("seed");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let got = resolve_write_destination(&RealFs, &link).expect("resolves");
+        assert_eq!(std::fs::canonicalize(&got).expect("canon"),
+                   std::fs::canonicalize(&real).expect("canon"),
+                   "a symlinked destination resolves to its target — that is what makes \
+                    writing through it work at all");
+        assert!(link.symlink_metadata().expect("lstat").file_type().is_symlink(),
+            "and the link itself is untouched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resolve_write_destination_passes_a_new_path_through_unchanged() {
+        // The ORDINARY Save-As case. `canonicalize` cannot serve as the mechanism here,
+        // because it fails identically for "does not exist yet" and "broken symlink" —
+        // which is exactly why FileStat carries `broken`.
+        let d = unique_dir("resolve-new");
+        let fresh = d.join("brand-new.md");
+        assert_eq!(resolve_write_destination(&RealFs, &fresh).expect("passes through"), fresh);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_destination_refuses_a_broken_symlink() {
+        let d = unique_dir("resolve-broken");
+        let link = d.join("dangling.md");
+        std::os::unix::fs::symlink(d.join("gone.md"), &link).expect("symlink");
+        assert_eq!(resolve_write_destination(&RealFs, &link),
+                   Err(DestError::BrokenSymlink),
+                   "refused BEFORE dispatch — it must never reach atomic_replace");
         let _ = std::fs::remove_dir_all(&d);
     }
 
