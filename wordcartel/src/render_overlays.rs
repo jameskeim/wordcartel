@@ -568,7 +568,14 @@ pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &Ch
             // No spare interior row: the footer — the safety disclosure that prevents
             // save-to-nowhere — wins the block's bottom edge over the n/total indicator,
             // which is mere navigational polish.
-            let truncated = elide_path_left(&footer_lines[0], ov_w.saturating_sub(2) as usize);
+            // Same which-end rule as the dedicated rows below (§11.3.1 rule 5), applied to the
+            // one line the title can carry: line 0 is the resolved target only when there IS a
+            // target line, and a path loses its LEFT end. With no target (select/recents mode)
+            // line 0 is a disclosure — a heading, whose meaning is its leading counts — so it
+            // loses its RIGHT end instead.
+            let w = ov_w.saturating_sub(2) as usize;
+            let truncated = if footer.is_some() { elide_path_left(&footer_lines[0], w) }
+                            else { footer_lines[0].chars().take(w).collect() };
             block = block.title_bottom(Line::from(truncated));
         } else if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
             // Indicator composes with the existing dynamic title (file browser already uses top title).
@@ -1084,6 +1091,50 @@ mod tests {
             "and so must the type count — shown + withheld accounts for what is there:\n{screen}");
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// C5 re-gate finding M-R2: on a terminal too small to grow the box the footer's first
+    /// line moves into the border title, and that fallback elided it from the LEFT
+    /// unconditionally. In select mode there is no resolved-target line, so line 0 is a
+    /// DISCLOSURE — a heading whose counts sit at its start — and the writer saw
+    /// `…den (type)` with the numbers cut off. Same heading-vs-item rule as the dedicated
+    /// rows (§11.3.1 rule 5), which is where the direction is decided correctly.
+    ///
+    /// FAIL-VERIFY (mutation): restore the unconditional
+    /// `elide_path_left(&footer_lines[0], w)` in the `footer_takes_title` arm — the leading
+    /// counts vanish behind an ellipsis and this fails. Confirmed, then reverted.
+    #[test]
+    fn the_cramped_title_fallback_truncates_a_disclosure_heading_from_the_right() {
+        let dir = std::env::temp_dir().join(format!("wc-render-mr2-{}", std::process::id()));
+        let mut e = Editor::new_from_text("x\n", None, (34, 4));
+        let mut fb = empty_destination_fb(dir, "");
+        fb.mode = BrowseMode::Select;           // no resolved-target line: line 0 is the disclosure
+        // A real listing, so the fallback below is provably driven by the terminal's height
+        // (`list_h_for` floors at `height - 4`) and not by an empty directory.
+        fb.entries = (0..6).map(|i| crate::file_browser::FileEntry {
+            name: format!("ch{i}.md"), kind: crate::fsx::EntryKind::File,
+            is_symlink: false, broken: false,
+        }).collect();
+        fb.disclosure = crate::file_browser_listing::Disclosure {
+            hidden_clutter: 1234, hidden_type: 5678, ..Default::default()
+        };
+        e.file_browser = Some(fb);
+        crate::derive::rebuild(&mut e);
+
+        let area = Rect::new(0, 0, 34, 4);
+        assert_eq!(crate::chrome_geom::file_browser_footer_rows_shown(
+            area, e.file_browser.as_ref().expect("open")), 0,
+            "precondition: this terminal is too small for a dedicated footer row");
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(34, 4)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let screen = (0..4).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+
+        assert!(screen.contains("1234 hidden (clutter)"),
+            "a heading keeps its OPENING — the counts are the whole point:\n{screen}");
+        assert!(!screen.contains('\u{2026}'),
+            "and it is cut on the right, not marked with a left-elision ellipsis:\n{screen}");
     }
 
     // ---- the footer GROWS the box; it does not confiscate a list row ---------------
