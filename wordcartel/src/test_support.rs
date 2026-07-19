@@ -61,6 +61,7 @@ pub(crate) enum FaultAt {
     SyncDir,
     ReadCapped,
     Stat,
+    ListDir,
     // Not yet constructed by any test as of C5 Task 1 — a later task's remove_file
     // fault-injection test (a non-fsx module) is the first consumer. Silence the
     // dead-code lint for this deliberate forward reference rather than dropping the
@@ -155,5 +156,13 @@ impl Fs for FaultFs {
             return Err(Error::other("injected: remove_file"));
         }
         self.inner.remove_file(path)
+    }
+    fn list_dir(&self, path: &Path, cap: Option<usize>)
+        -> std::io::Result<crate::fsx::DirListing>
+    {
+        if matches!(self.fail, FaultAt::ListDir) {
+            return Err(Error::other("injected: list_dir"));
+        }
+        self.inner.list_dir(path, cap)
     }
 }

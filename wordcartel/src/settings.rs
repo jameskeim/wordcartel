@@ -809,6 +809,8 @@ mod tests {
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
         }
         let d = tempdir();
         let err = save_overrides(&FailFs, &d.join("o.toml"), &OverridesFile::default()).unwrap_err();
@@ -885,6 +887,8 @@ mod tests {
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
         }
         let d = tempdir();
         let path = d.join("o.toml");
@@ -919,6 +923,8 @@ mod tests {
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
             fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+            fn list_dir(&self, p: &std::path::Path, cap: Option<usize>)
+                -> std::io::Result<crate::fsx::DirListing> { crate::fsx::RealFs.list_dir(p, cap) }
         }
         let d = tempdir();
         let path = d.join("o.toml");

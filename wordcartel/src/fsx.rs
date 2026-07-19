@@ -40,6 +40,60 @@ pub(crate) struct FileStat {
     pub broken: bool,
 }
 
+/// What a directory entry resolved to. An ENUM, not a pair of bools, so `Unknown` cannot be
+/// silently absorbed into a false branch — the house rule on exhaustive matches applied to the
+/// failure mode this design kept hitting. Critically, `Other` (a legitimately-classified fifo)
+/// and `Unknown` (we could not classify it) are DIFFERENT facts that two bools cannot separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    /// RESOLVED regular file (follows symlinks).
+    File,
+    /// RESOLVED directory (follows symlinks).
+    Dir,
+    /// RESOLVED to something that is neither — fifo, socket, block/char device.
+    Other,
+    /// NOT classified: either the `file_type()` probe itself failed, or this is a symlink
+    /// whose target could not be resolved (`broken`). We have a name but no type.
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // C5 tasks 5-24 use this via implementors; forward reference
+pub(crate) struct DirEntryInfo {
+    /// LOSSY-rendered (`to_string_lossy`). A name that is not valid UTF-8 arrives here with
+    /// replacement characters, which is fine for display and for the `.lua` suffix test, but
+    /// means a caller CANNOT recover the original bytes from this field.
+    pub name: String,
+    /// The raw, unconverted name. Carried because `plugin::load::discover` must distinguish
+    /// "a plugin whose name is not valid UTF-8" (reported by name, lossily) from an ordinary
+    /// file — a distinction `name` alone destroys, since the lossy conversion always succeeds.
+    /// Every other consumer uses `name`.
+    pub raw_name: std::ffi::OsString,
+    pub kind: EntryKind,
+    /// True when the entry itself is a symlink, whatever it points at.
+    pub is_symlink: bool,
+    /// Symlink whose target could not be RESOLVED. Same meaning as `FileStat::broken`.
+    /// INVARIANT: `broken` implies `is_symlink` and `kind == Unknown`.
+    pub broken: bool,
+}
+
+/// The result of one directory listing.
+///
+/// `total_seen` counts EVERY entry the iterator yielded, Ok or Err.
+/// `unreadable` counts entries that could not even be NAMED (the iterator itself yielded Err).
+/// It is NOT "entries we could not classify" — a named entry whose TYPE probe failed is a
+/// perfectly good row with `kind == Unknown` and lives in `entries`, because a name is more
+/// useful than a tally and `plugin::load::discover` needs it to test "plausibly a plugin".
+///
+/// INVARIANT: `total_seen == entries.len() + unreadable + capped_out`.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // C5 tasks 5-24 use this via implementors; forward reference
+pub(crate) struct DirListing {
+    pub entries: Vec<DirEntryInfo>,
+    pub total_seen: usize,
+    pub unreadable: usize,
+}
+
 /// The filesystem ops the atomic-write commit needs. Object-safe (no generics,
 /// no associated types) so `&dyn Fs` works.
 pub(crate) trait Fs {
@@ -61,6 +115,12 @@ pub(crate) trait Fs {
     /// Durably flush a directory entry. A dir that cannot be opened is NOT an error.
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+    /// Enumerate `path`. Enumeration is ALWAYS complete; only RETENTION is capped, and only
+    /// when `cap` is `Some`. `cap: None` is the non-interactive form (plugin discovery, the
+    /// swap scans) — those are uncapped today and capping them would be a refactor-introduced
+    /// regression, not a new protection.
+    #[allow(dead_code)] // C5 tasks 5-24 use this via implementors; forward reference
+    fn list_dir(&self, path: &Path, cap: Option<usize>) -> std::io::Result<DirListing>;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +216,58 @@ impl Fs for RealFs {
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
         fs::remove_file(path)
     }
+    fn list_dir(&self, path: &Path, cap: Option<usize>) -> std::io::Result<DirListing> {
+        let rd = fs::read_dir(path)?;
+        let mut entries = Vec::new();
+        let mut total_seen = 0usize;
+        let mut unreadable = 0usize;
+        for item in rd {
+            total_seen += 1;
+            let Ok(entry) = item else { unreadable += 1; continue };
+            // Past the cap we still COUNT (the total must be real) but do no further work:
+            // no allocation retained and, critically, no `metadata` call — symlink
+            // resolution below runs on retained entries only.
+            if cap.is_some_and(|c| entries.len() >= c) { continue; }
+            let raw_name = entry.file_name();
+            let name = raw_name.to_string_lossy().into_owned();
+            // NOTE: no `?` on file_type() — one unclassifiable entry must NOT abort the whole
+            // directory. A named-but-unclassified entry is emitted with kind == Unknown.
+            let mut stats = 0usize; // observed by the syscall-economy test via classify_entry
+            let (kind, is_symlink, broken) = match entry.file_type() {
+                Err(_) => (EntryKind::Unknown, false, false),
+                Ok(ft) => classify_entry(&entry, ft, &mut stats),
+            };
+            entries.push(DirEntryInfo { name, raw_name, kind, is_symlink, broken });
+        }
+        Ok(DirListing { entries, total_seen, unreadable })
+    }
+}
+
+/// Classify ONE directory entry, recording how many `metadata` calls it cost.
+///
+/// Extracted as a named function — rather than inlined in `list_dir` — specifically so the
+/// syscall-economy test can drive it and OBSERVE the stat count. A counter wrapped around
+/// `list_dir` cannot see inside `RealFs::list_dir`, so it could not detect a regression to
+/// stat-everything; this can.
+///
+/// `stats` is incremented once per `metadata` call, which happens ONLY for symlinks.
+fn classify_entry(entry: &fs::DirEntry, ft: fs::FileType, stats: &mut usize)
+    -> (EntryKind, bool, bool)
+{
+    if !ft.is_symlink() {
+        return (kind_of(ft.is_file(), ft.is_dir()), false, false);
+    }
+    *stats += 1;
+    match fs::metadata(entry.path()) {
+        Ok(m) => (kind_of(m.is_file(), m.is_dir()), true, false),
+        Err(_) => (EntryKind::Unknown, true, true),
+    }
+}
+
+/// Map a resolved (is_file, is_dir) pair onto an `EntryKind`. Neither true means `Other`
+/// — a fifo, socket, or device — which is a CLASSIFIED answer, not an unknown one.
+fn kind_of(is_file: bool, is_dir: bool) -> EntryKind {
+    if is_file { EntryKind::File } else if is_dir { EntryKind::Dir } else { EntryKind::Other }
 }
 
 // Platform-specific O_EXCL open with `mode` on Unix; plain create_new elsewhere.
@@ -617,6 +729,196 @@ mod tests {
         let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::ReadCapped);
         let err = fs.read_capped(&p, 1024).expect_err("injected read must fail");
         assert!(err.to_string().contains("injected: read_capped"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---------------------------------------------------------------------------
+    // list_dir tests
+    // ---------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn list_dir_classifies_kinds_and_resolves_symlinks() {
+        let d = unique_dir("list-kinds");
+        std::fs::write(d.join("a.txt"), b"x").expect("seed file");
+        std::fs::create_dir_all(d.join("sub")).expect("seed dir");
+        std::os::unix::fs::symlink(d.join("a.txt"), d.join("lf")).expect("link->file");
+        std::os::unix::fs::symlink(d.join("sub"), d.join("ld")).expect("link->dir");
+        std::os::unix::fs::symlink(d.join("gone"), d.join("lb")).expect("link->nothing");
+
+        let l = RealFs.list_dir(&d, None).expect("list");
+        let by = |n: &str| l.entries.iter().find(|e| e.name == n).expect("entry").clone();
+
+        assert_eq!(by("a.txt").kind, EntryKind::File);
+        assert_eq!(by("sub").kind, EntryKind::Dir);
+        // Resolved through the link — the §4.9 regression.
+        assert_eq!(by("lf").kind, EntryKind::File);
+        assert!(by("lf").is_symlink);
+        assert_eq!(by("ld").kind, EntryKind::Dir);
+        assert!(by("ld").is_symlink);
+        // Broken: Unknown, not Other. These are different facts.
+        assert_eq!(by("lb").kind, EntryKind::Unknown);
+        assert!(by("lb").broken && by("lb").is_symlink);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_dir_cap_none_retains_everything_and_counts_truthfully() {
+        let d = unique_dir("list-uncapped");
+        for i in 0..12 { std::fs::write(d.join(format!("f{i}.txt")), b"x").expect("seed"); }
+        let l = RealFs.list_dir(&d, None).expect("list");
+        assert_eq!(l.entries.len(), 12);
+        assert_eq!(l.total_seen, 12);
+        assert_eq!(l.unreadable, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_dir_caps_retention_but_not_enumeration() {
+        // The count must be REAL: capping enumeration would make "showing N of TOTAL"
+        // unknowable, and §7.4's disclosure law requires shown + withheld to account for
+        // what is really there.
+        let d = unique_dir("list-capped");
+        for i in 0..12 { std::fs::write(d.join(format!("f{i:02}.txt")), b"x").expect("seed"); }
+        let l = RealFs.list_dir(&d, Some(5)).expect("list");
+        assert_eq!(l.entries.len(), 5, "retention capped");
+        assert_eq!(l.total_seen, 12, "enumeration NOT capped — the total is real");
+        assert_eq!(l.total_seen, l.entries.len() + l.unreadable + 7, "accounting balances");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_dir_fault_is_injectable() {
+        let d = unique_dir("list-fault");
+        let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::ListDir);
+        let err = fs.list_dir(&d, None).expect_err("injected list must fail");
+        assert!(err.to_string().contains("injected: list_dir"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_stats_only_symlinks_not_every_entry() {
+        // SYSCALL ECONOMY (spec §14). The naive fix — `metadata()` on every entry — costs one
+        // stat per entry, 5,000 in a capped listing. `d_type` already yields the symlink bit
+        // for free, so resolution runs ONLY on symlinks.
+        //
+        // FAIL-VERIFY: change `classify_entry` to call `metadata` unconditionally, watch
+        // this fail with a non-zero count, then revert.
+        //
+        // This drives the resolution helper DIRECTLY rather than through a wrapper around
+        // `list_dir`. An earlier draft counted via a `CountingFs` whose `list_dir` delegated
+        // to `RealFs::list_dir` — so a regression to stat-everything would happen INSIDE the
+        // delegate, never passing through the counter, and the test would pass while the
+        // defect shipped. A guard that cannot observe the code under test is not a guard.
+        let d = unique_dir("resolve-economy");
+        std::fs::write(d.join("plain.md"), b"x").expect("seed");
+        std::fs::create_dir_all(d.join("sub")).expect("seed");
+
+        let mut stats = 0usize;
+        for entry in std::fs::read_dir(&d).expect("read").flatten() {
+            let ft = entry.file_type().expect("file_type");
+            let (_kind, _link, _broken) = classify_entry(&entry, ft, &mut stats);
+        }
+        assert_eq!(stats, 0,
+            "a directory of NON-symlink entries performs ZERO metadata calls — d_type answers \
+             it all. If this is non-zero, resolution is stat-ing entries it does not need to.");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join("plain.md"), d.join("link.md")).expect("symlink");
+            let mut stats2 = 0usize;
+            for entry in std::fs::read_dir(&d).expect("read").flatten() {
+                let ft = entry.file_type().expect("file_type");
+                let (_k, _l, _b) = classify_entry(&entry, ft, &mut stats2);
+            }
+            assert_eq!(stats2, 1, "exactly ONE metadata call — for the one symlink");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // WHAT THIS GUARD COVERS, AND WHAT IT DOES NOT.
+    //
+    // Covers: a stat-everything regression introduced INSIDE `classify_entry` — the helper
+    // that owns per-entry resolution, and where such a change would naturally land.
+    //
+    // Does NOT cover: a stat call added in `list_dir` AROUND the helper (e.g. an extra
+    // `fs.metadata(...)` in the loop body). Observing that would need `list_dir` itself to
+    // report a count, which means either a counting parameter threaded through production
+    // code purely for a test, or a second implementation to drift from the first. Neither is
+    // worth it for a cost regression that is visible in a profile and harmless to
+    // correctness.
+    //
+    // Stated plainly because an honest partial guard is fine; one that READS as complete is
+    // not — that is how the previous version of this test shipped as vacuous.
+
+    #[test]
+    fn list_dir_emits_a_named_entry_whose_type_cannot_be_determined() {
+        // CASE 2 of the three entry categories: named, unclassifiable. It belongs in
+        // `entries` with `kind == Unknown`, NOT in `unreadable` (which means "could not even
+        // be NAMED"), and it must NOT abort the listing — an earlier draft used
+        // `entry.file_type()?`, which would take the whole directory down over one entry.
+        //
+        // Exercises the REAL path. Constructing a `DirEntryInfo { kind: Unknown }` by hand
+        // would assert nothing about `list_dir` — it would test the struct literal.
+        //
+        // A broken symlink is the portable way to reach the Unknown arm: `file_type()`
+        // succeeds (it is a symlink), the follow-up `metadata()` fails, and the entry must
+        // come back NAMED with `kind == Unknown` rather than being dropped or aborting the
+        // listing.
+        //
+        // FAIL-VERIFY: change the resolution arm to `continue` on metadata failure (dropping
+        // the entry), watch this fail; then to `?` (aborting), watch the second assert fail.
+        let d = unique_dir("list-unknown");
+        std::fs::write(d.join("ok.md"), b"x").expect("seed");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.join("nothing"), d.join("mystery")).expect("symlink");
+
+        let l = RealFs.list_dir(&d, None).expect("one odd entry must NOT abort the listing");
+        assert!(l.entries.iter().any(|e| e.name == "ok.md"),
+            "the well-formed sibling still comes back");
+        #[cfg(unix)]
+        {
+            let m = l.entries.iter().find(|e| e.name == "mystery")
+                .expect("the unclassifiable entry is EMITTED, with its name — not dropped");
+            assert_eq!(m.kind, EntryKind::Unknown);
+            assert_eq!(l.unreadable, 0,
+                "it is a NAMED entry in `entries`, never counted in `unreadable` — that field \
+                 means 'could not even be named'");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::print_stderr)] // env-conditional skip notice — mirrors main.rs's harness allow
+    fn a_permission_denied_symlink_chain_reports_broken_not_a_listing_failure() {
+        // `broken` means UNRESOLVABLE — dangling, permission-denied, or looping — not "the
+        // target is gone". A permission failure on the chain must classify as broken rather
+        // than failing the listing or masquerading as `Other`.
+        use std::os::unix::fs::PermissionsExt;
+        let d = unique_dir("list-perm");
+        let hidden = d.join("hidden");
+        std::fs::create_dir_all(&hidden).expect("dir");
+        std::fs::write(hidden.join("t.md"), b"x").expect("seed");
+        std::os::unix::fs::symlink(hidden.join("t.md"), d.join("link.md")).expect("symlink");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Root ignores mode bits, so the chain resolves and `broken` is legitimately false.
+        // Skip rather than assert the opposite.
+        if std::fs::metadata(hidden.join("t.md")).is_ok() {
+            std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).ok();
+            let _ = std::fs::remove_dir_all(&d);
+            eprintln!("skip: privileged process — chmod 000 does not restrict this test");
+            return;
+        }
+
+        let l = RealFs.list_dir(&d, None).expect("the listing itself still succeeds");
+        let link = l.entries.iter().find(|e| e.name == "link.md").expect("link listed");
+        assert!(link.is_symlink);
+        assert!(link.broken, "an unresolvable chain is broken, whatever the reason");
+        assert_eq!(link.kind, EntryKind::Unknown, "and therefore unclassified, not Other");
+
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).expect("restore");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
