@@ -890,6 +890,9 @@ mod tests {
         // DECISION 12. Today a symlink to a .lua file and a symlink to a plugin directory
         // are BOTH silently ignored — neither is_file() nor is_dir() under the non-following
         // entry.file_type(). Both must now load.
+        //
+        // FAIL-VERIFY: add `if e.is_symlink { continue; }` to the discover_with_fs loop,
+        // watch both assertions in this test fail (neither symlinked shape loads), then revert.
         let d = unique_plugin_dir("d12-follow");
         let store = d.join("store");
         std::fs::create_dir_all(store.join("dirplug")).expect("seed");
@@ -932,6 +935,10 @@ mod tests {
         // Following symlinks closes the biggest class but not all of them, so the rule is:
         // report anything PLAUSIBLY a plugin that cannot be loaded — and nothing else, or
         // the report floods with README.md and becomes useless.
+        //
+        // FAIL-VERIFY: add `if e.is_symlink { continue; }` to the discover_with_fs loop,
+        // watch the "dangling.lua" assertion fail (the broken symlink is skipped before it
+        // ever reaches the is_plausible_plugin/broken-report path), then revert.
         let d = unique_plugin_dir("d12-rider3");
         let p = d.join("plugins");
         std::fs::create_dir_all(&p).expect("seed");
@@ -948,6 +955,46 @@ mod tests {
             "an ordinary non-plugin file stays silent — the qualifier is what bounds the report");
         assert!(!named.contains(&"just_a_dir"),
             "an ordinary subdirectory without init.lua stays silent");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_reports_non_utf8_filename_as_skipped_not_mangled_into_sources() {
+        // The UTF-8 decision in discover_with_fs's File arm MUST be made on `raw_name`
+        // (an OsString), not on `name` (already lossy-converted to String). If it read
+        // `name`, `Path::new(&e.name).to_str()` would always succeed — the invalid-UTF-8
+        // branch would be unreachable, and a plugin whose filename is not valid UTF-8 would
+        // silently load under a mangled stem instead of being reported as skipped.
+        //
+        // FAIL-VERIFY: change `Path::new(&e.raw_name)` to `Path::new(&e.name)` in the File
+        // arm above, watch this test fail — the entry stays out of `sources` but the skip
+        // report no longer names the UTF-8 problem (the lossy-name-derived stem now passes
+        // `to_str()` trivially, so the read is attempted against a path that doesn't exist on
+        // disk and fails as merely "unreadable" instead), then revert.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let d = unique_plugin_dir("d-nonutf8-name");
+        let plugins = d.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("seed");
+        let bad_name = OsStr::from_bytes(b"bad\xffname.lua");
+        std::fs::write(plugins.join(bad_name), "-- bad name\n").expect("seed");
+        // A normal sibling proves the rest of the directory still loads fine alongside it.
+        std::fs::write(plugins.join("ok.lua"), "-- ok\n").expect("seed");
+
+        let got = discover_with_fs(&crate::fsx::RealFs, &plugins, &[]);
+
+        let stems: Vec<&str> = got.sources.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(stems, vec!["ok"], "the non-UTF-8-named file must not appear in sources");
+
+        assert_eq!(got.skipped.len(), 1, "exactly one skip report for the bad-name entry");
+        let report = &got.skipped[0];
+        let err = report.result.as_ref().expect_err("non-UTF-8 filename is a failure");
+        assert!(
+            err.to_lowercase().contains("utf-8") || err.to_lowercase().contains("utf8"),
+            "error should name the UTF-8 problem: {err}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
