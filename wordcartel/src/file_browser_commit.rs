@@ -15,7 +15,20 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CommitOutcome {
     Descend(PathBuf),
-    Commit(PathBuf),
+    Commit {
+        /// The absolute path Enter targets, before extension policy.
+        path: PathBuf,
+        /// TRUE only for Row 2 — the empty-field commit onto a HIGHLIGHTED EXISTING FILE.
+        ///
+        /// Extension policy (§8) is "a pure classification function over the **field text**",
+        /// and a Row-2 commit has no field text: the highlighted file's own name IS the
+        /// target, chosen off the screen by the writer. Piping it through policy anyway
+        /// retargeted an existing extensionless `README` to `README.md` — a DIFFERENT file,
+        /// created silently, with no overwrite confirm (the new path did not exist) and no
+        /// footer disclosure (the field was empty), which is exactly the harm Row 2's own
+        /// contract says the overwrite-confirm is there to prevent.
+        from_highlight: bool,
+    },
     Nothing,
 }
 
@@ -93,7 +106,7 @@ pub(crate) fn classify_destination_enter(
     if trimmed.is_empty() {
         return match highlighted {
             Some(e) if matches!(e.kind, EntryKind::File) => {
-                CommitOutcome::Commit(dir.join(&e.name))
+                CommitOutcome::Commit { path: dir.join(&e.name), from_highlight: true }
             }
             // Other/Unknown are refused in select mode and are not commit targets here
             // either — we do not know they are writable regular files.
@@ -111,7 +124,7 @@ pub(crate) fn classify_destination_enter(
     }
 
     // Row 4 — the ordinary case.
-    CommitOutcome::Commit(resolved)
+    CommitOutcome::Commit { path: resolved, from_highlight: false }
 }
 
 /// Extensions that mean "this is an export, not a save".
@@ -237,11 +250,15 @@ pub(crate) fn commit_destination(
                 editor.quit_drain_advance = false;
             }
         }
-        CommitOutcome::Commit(raw) => {
+        CommitOutcome::Commit { path: raw, from_highlight } => {
             // Extension policy applies to SAVE destinations only — an export's extension is
-            // fixed by the chosen format.
+            // fixed by the chosen format — and only to FIELD TEXT (§8). Row 2 has neither:
+            // its target is a file the writer highlighted on screen, so its name is already
+            // the answer and policy can only move the write somewhere else (see
+            // `CommitOutcome::Commit::from_highlight`).
             let chosen = match &purpose {
                 crate::file_browser::DestinationPurpose::Export { .. } => raw,
+                _ if from_highlight => raw,
                 _ => match apply_extension_policy(&raw) {
                     ExtVerdict::Defaulted(p) | ExtVerdict::Honoured(p) => p,
                     ExtVerdict::Redirect { path, ext } => {
@@ -388,7 +405,7 @@ mod tests {
         let e = fe("existing.md", EntryKind::File);
         assert_eq!(
             classify_destination_enter(&crate::fsx::RealFs, &d, "", Some(&e), false),
-            CommitOutcome::Commit(d.join("existing.md")));
+            CommitOutcome::Commit { path: d.join("existing.md"), from_highlight: true });
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -419,7 +436,7 @@ mod tests {
             CommitOutcome::Descend(d.join("chapter-one")));
         assert_eq!(
             classify_destination_enter(&crate::fsx::RealFs, &d, "chapter-oneX", None, false),
-            CommitOutcome::Commit(d.join("chapter-oneX")),
+            CommitOutcome::Commit { path: d.join("chapter-oneX"), from_highlight: false },
             "one more character and it is an ordinary new-file commit");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -429,7 +446,7 @@ mod tests {
         let d = tmp("row4");
         assert_eq!(
             classify_destination_enter(&crate::fsx::RealFs, &d, "chapter one", None, false),
-            CommitOutcome::Commit(d.join("chapter one")),
+            CommitOutcome::Commit { path: d.join("chapter one"), from_highlight: false },
             "the ordinary case: a new file in the directory the writer is looking at");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -613,6 +630,66 @@ mod tests {
             code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         let _ = crate::file_browser_intercept::intercept(crate::app::Msg::Input(enter), e, &ctx);
+    }
+
+    /// C5 review finding I1 — probe-proven against the branch, then fixed here. Row 2 (empty
+    /// field, Enter on a highlighted existing file) piped its target through extension policy,
+    /// whose `Defaulted` arm retargets an EXTENSIONLESS name: choosing an existing `README`
+    /// wrote a brand-new `README.md` instead. `README` was untouched, no overwrite prompt was
+    /// raised (the new path did not exist), and no footer disclosure appeared (the field was
+    /// empty) — the writer's only clue was a status line naming a file they never chose.
+    ///
+    /// That contradicts Row 2's own contract ("commit to THAT file … goes through the
+    /// overwrite-confirm prompt, which is what makes this safe") and §8's scoping of the
+    /// policy to "a pure classification function over the FIELD TEXT" — a Row-2 commit has no
+    /// field text. An emergent composition of three individually-correct tasks (T18's table,
+    /// T19's policy, T21's wiring), which is why no single task owned it.
+    ///
+    /// Driven through the REAL intercept — arrow keys to navigate, Enter to commit — because
+    /// the defect lives in the composition, not in any one function's return value.
+    ///
+    /// FAIL-VERIFY: drop the `_ if from_highlight => raw` arm from `commit_destination`, watch
+    /// this fail with `README.md` created and no prompt. Confirmed, then reverted.
+    #[test]
+    fn row2_onto_an_extensionless_file_targets_that_exact_file() {
+        let d = tmp("row2-extensionless");
+        std::fs::write(d.join("README"), b"precious readme\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("buffer body\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), String::new());
+        crate::test_support::pump_listing(&mut e, &rx);
+
+        // Navigate DELIBERATELY onto `README` — Row 2 requires `highlight_is_navigated()`.
+        for _ in 0..8 {
+            let on_readme = e.file_browser.as_ref()
+                .and_then(|fb| fb.entries.get(fb.selected))
+                .is_some_and(|r| r.name == "README");
+            if on_readme { break; }
+            crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Down);
+        }
+        {
+            let fb = e.file_browser.as_ref().expect("picker open");
+            assert_eq!(fb.entries.get(fb.selected).map(|r| r.name.as_str()), Some("README"),
+                "precondition: the highlight is on the existing extensionless file");
+            assert!(fb.highlight_is_navigated(), "precondition: the writer moved it there");
+            assert_eq!(fb.mode.filter_text(&fb.query), "",
+                "precondition: the field is empty — this is Row 2, not Row 4");
+        }
+
+        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+
+        assert!(!d.join("README.md").exists(),
+            "extension policy must NOT retarget a highlighted existing file to a different one");
+        assert_eq!(std::fs::read_to_string(d.join("README")).expect("still there"),
+            "precious readme\n", "and nothing is written until the writer confirms");
+        assert_eq!(e.pending_save_overwrite.as_deref(),
+            Some(std::fs::canonicalize(d.join("README")).expect("canon").as_path()),
+            "the overwrite-confirm — Row 2's whole safety argument — must actually be raised");
+        assert!(e.prompt.is_some(), "and the writer must be looking at it");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
