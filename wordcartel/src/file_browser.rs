@@ -41,6 +41,10 @@ pub enum BrowseMode {
         /// Byte offset into `field`.
         field_cursor: usize,
     },
+    /// Rows are SYNTHESIZED from the session store (see `recents.rs`), not read from a
+    /// directory. No listing thread is spawned, `..` is not shown, and descend is
+    /// meaningless — every row is a document. Filtering ranks the rows themselves.
+    Recents,
 }
 
 impl BrowseMode {
@@ -48,8 +52,10 @@ impl BrowseMode {
     /// The text the listing filter should use: the query in select mode, the field in
     /// destination mode. One accessor so the two modes cannot drift apart.
     pub fn filter_text<'a>(&'a self, query: &'a str) -> &'a str {
-        match self { BrowseMode::Select => query,
-                     BrowseMode::Destination { field, .. } => field }
+        match self {
+            BrowseMode::Select | BrowseMode::Recents => query,
+            BrowseMode::Destination { field, .. } => field,
+        }
     }
 }
 
@@ -313,7 +319,10 @@ pub(crate) fn click_commit_or_copy(editor: &mut crate::editor::Editor) {
     let Some(fb) = editor.file_browser.as_mut() else { return };
     let Some(entry) = fb.entries.get(fb.selected).cloned() else { return };
     match &mut fb.mode {
-        BrowseMode::Select => { /* caller invokes file_browser_enter — unchanged */ }
+        // Recents mirrors Select: no field to populate, the caller's `file_browser_enter`
+        // does the opening (mouse wiring for Recents is a later task; this arm exists only
+        // so the match stays exhaustive rather than absorbing a future mode silently).
+        BrowseMode::Select | BrowseMode::Recents => { /* caller invokes file_browser_enter — unchanged */ }
         BrowseMode::Destination { field, field_cursor, .. } => {
             if matches!(entry.kind, crate::fsx::EntryKind::File) {
                 crate::file_browser_commit::copy_name_into_field(field, field_cursor, &entry.name);

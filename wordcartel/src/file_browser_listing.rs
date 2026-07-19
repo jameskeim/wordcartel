@@ -135,6 +135,21 @@ pub(crate) fn filter_and_rank(
 /// every path that rebuilds entries (initial listing, descend, field edit, filter-toggle
 /// change) would otherwise have to remember, and `apply_listing_done` did not.
 pub(crate) fn rederive(fb: &mut FileBrowser, show_clutter: bool, types: FileTypeFilter) {
+    // Recents rows are SYNTHESIZED (see `recents.rs`), not read from `fb.listing` — there is
+    // no directory, no "..", and no type/clutter policy to apply. Typing must still NARROW
+    // the list (that property is the entire reason `BrowseMode::Recents` is an explicit
+    // variant rather than the rejected early-return-in-rederive guard — an early return
+    // preserves the rows but cannot filter them), so this fuzzy-ranks the rows themselves.
+    if matches!(fb.mode, crate::file_browser::BrowseMode::Recents) {
+        if !fb.query.is_empty() {
+            fb.entries = crate::palette::fuzzy_filter(&fb.entries, &fb.query, |e| e.name.as_str());
+        }
+        if fb.selected >= fb.entries.len() {
+            fb.selected = fb.entries.len().saturating_sub(1);
+        }
+        fb.scroll_top = fb.scroll_top.min(fb.entries.len().saturating_sub(1));
+        return;
+    }
     let opts = FilterOpts {
         show_clutter,
         types,

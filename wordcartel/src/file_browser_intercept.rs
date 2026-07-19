@@ -31,7 +31,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         let ah = editor.active().view.area.1;
         if let Some(fb) = editor.file_browser.as_mut() {
             match &mut fb.mode {
-                BrowseMode::Select => fb.query.push_str(text),
+                BrowseMode::Select | BrowseMode::Recents => fb.query.push_str(text),
                 BrowseMode::Destination { field, field_cursor, .. } => {
                     for c in text.chars() { crate::minibuffer::text_insert(field, field_cursor, c); }
                 }
@@ -100,7 +100,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
                         match &mut fb.mode {
-                            BrowseMode::Select => { fb.query.pop(); }
+                            BrowseMode::Select | BrowseMode::Recents => { fb.query.pop(); }
                             BrowseMode::Destination { field, field_cursor, .. } => {
                                 crate::minibuffer::text_backspace(field, field_cursor);
                             }
@@ -133,7 +133,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
                         match &mut fb.mode {
-                            BrowseMode::Select => fb.query.push(c),
+                            BrowseMode::Select | BrowseMode::Recents => fb.query.push(c),
                             BrowseMode::Destination { field, field_cursor, .. } => {
                                 crate::minibuffer::text_insert(field, field_cursor, c);
                             }

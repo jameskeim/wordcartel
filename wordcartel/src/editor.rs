@@ -993,6 +993,50 @@ impl Editor {
         true
     }
 
+    /// Open the recents picker with availability NOT yet probed — every row starts `File`
+    /// (selectable) and is re-marked when `Msg::RecentsProbed` lands. Splitting this from
+    /// `open_recents` is what lets the probe run off-thread: the writer sees their list
+    /// immediately instead of waiting on one `stat` per row.
+    pub fn open_recents_pending(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.open_recents(paths.into_iter()
+            .map(|path| crate::recents::RecentRow { path, available: true })
+            .collect());
+    }
+
+    /// Present recents through the existing picker. Rows become `FileEntry` values, so nav,
+    /// fuzzy ranking, windowing, mouse hover, and the painter all work unchanged.
+    ///
+    /// UNAVAILABLE rows carry `kind == EntryKind::Unknown`, which the picker ALREADY renders
+    /// marked and refuses on Enter (Task 14) — so "greyed and not selectable" needs no new
+    /// input handling, no new refusal branch, and no new painter path.
+    pub fn open_recents(&mut self, rows: Vec<crate::recents::RecentRow>) {
+        crate::overlays::close_all(self);
+        self.pending_keys.clear(); self.pending_mark = None;
+        let entries: Vec<crate::file_browser::FileEntry> = rows.iter().map(|r| {
+            crate::file_browser::FileEntry {
+                // Full path as the label — recents span directories, so a bare file name
+                // would be ambiguous.
+                name: r.path.to_string_lossy().into_owned(),
+                kind: if r.available {
+                    crate::fsx::EntryKind::File
+                } else {
+                    crate::fsx::EntryKind::Unknown
+                },
+                is_symlink: false,
+                broken: false,
+            }
+        }).collect();
+        let total = entries.len();
+        self.file_browser = Some(crate::file_browser::FileBrowser {
+            dir: std::env::current_dir().unwrap_or_default(),
+            query: String::new(),
+            mode: crate::file_browser::BrowseMode::Recents,
+            listing: Vec::new(), total_seen: total, unreadable: 0,
+            entries, disclosure: Default::default(), selected: 0, scroll_top: 0,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+        });
+    }
+
     /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.
     ///
     /// Snapshots the current `(caret_shape, caret_blink)` as the originals so Esc/click-away

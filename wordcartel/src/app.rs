@@ -80,6 +80,13 @@ pub enum Msg {
         dir: std::path::PathBuf,
         result: std::io::Result<crate::fsx::DirListing>,
     },
+    /// A recents availability probe completed on its own thread (`recents::open_recent`).
+    /// Same epoch discipline as `ListingDone` — a probe for a recents list the writer has
+    /// already closed and reopened must never re-mark the CURRENT rows.
+    RecentsProbed {
+        epoch: u64,
+        rows: Vec<crate::recents::RecentRow>,
+    },
     Tick,
     /// The input reader thread ended (Err from read(), or a panic). Surfaced by
     /// the input watchdog; the run loop turns it into a clean InputLost shutdown.
@@ -137,6 +144,8 @@ impl std::fmt::Debug for Msg {
             Msg::ClipboardAvailability(ok) => f.debug_tuple("ClipboardAvailability").field(ok).finish(),
             Msg::ListingDone { epoch, dir, .. } =>
                 write!(f, "ListingDone(epoch={epoch}, dir={})", dir.display()),
+            Msg::RecentsProbed { epoch, rows } =>
+                write!(f, "RecentsProbed({epoch}, {} rows)", rows.len()),
             Msg::Tick => f.write_str("Tick"),
             Msg::InputThreadDied => f.write_str("InputThreadDied"),
         }
@@ -349,6 +358,9 @@ fn reduce_dispatch(
         Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx, fs),
         Msg::ListingDone { epoch, dir, result } => {
             crate::file_browser::apply_listing_done(editor, epoch, dir, result);
+        }
+        Msg::RecentsProbed { epoch, rows } => {
+            crate::recents::apply_recents_probed(editor, epoch, rows);
         }
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
