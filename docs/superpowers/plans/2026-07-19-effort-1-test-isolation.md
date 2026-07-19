@@ -102,6 +102,37 @@ already isolated in its own commit and the broad one is the obvious suspect.
 Tasks 5 and 6 are independent of everything and could land anywhere; they are last among the
 isolation tasks because they are trivial.
 
+## Shared recipe: selecting the lib test harness (`$BIN`)
+
+Tasks 1.6, 4.4, 7.2 and 7.3 run the compiled lib test binary directly, many times. **Select it
+deterministically from cargo's own output — never with a glob.** `target/debug/deps/wordcartel-*`
+matches non-executable `.d` dependency files and several stale harness hashes; `ls -t` returns a
+`.d` file first on this workspace today, so a glob either dies with permission-denied or silently
+runs a *different* binary while the loop reports counts as evidence. That is a soak proving
+nothing while looking like it proved something — this effort's signature defect in shell form.
+
+```sh
+pick_bin() {
+  cargo test -p wordcartel --lib --no-run --message-format=json 2>/dev/null \
+    | jq -r 'select(.reason=="compiler-artifact"
+                    and .target.name=="wordcartel"
+                    and (.target.kind|index("lib"))
+                    and .profile.test==true) | .executable' \
+    | tail -1
+}
+BIN=$(pick_bin)
+# Assert BEFORE running anything against it.
+[ -n "$BIN" ] || { echo "FATAL: no lib test harness found"; exit 1; }
+[ -x "$BIN" ] || { echo "FATAL: selected path is not executable: $BIN"; exit 1; }
+case "$BIN" in */target/*/deps/wordcartel-*) ;; *) echo "FATAL: unexpected path: $BIN"; exit 1;; esac
+echo "harness: $BIN"
+"$BIN" --list 2>/dev/null | tail -1        # sanity: prints "NNNN tests, 0 benchmarks"
+```
+
+`jq` is present on this machine (verified). Every task using `$BIN` MUST run these assertions and
+paste both the `harness:` line and the `--list` tail into its report, so the reader can see which
+binary produced the counts. Always quote `"$BIN"`.
+
 ## Task count: 7
 
 ---
@@ -531,12 +562,14 @@ fails, the cap reasoning has been broken; stop and report.
 
 **1.6 — Targeted repeat at default threading.** The old flake was load-sensitive, so a single pass
 proves little:
+```sh
+# Select and ASSERT the harness — see "Shared recipe" above; do not use a glob.
+BIN=$(pick_bin)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FATAL: bad harness"; exit 1; }
+echo "harness: $BIN"
+for i in $(seq 1 30); do "$BIN" filter:: 2>&1 | grep -E "^test result"; done | sort | uniq -c
 ```
-cargo build -p wordcartel --tests
-BIN=$(ls -t target/debug/deps/wordcartel-* | grep -v '\.d$' | head -1)
-for i in $(seq 1 30); do $BIN filter:: 2>&1 | grep -E "^test result" ; done | sort | uniq -c
-```
-Expect 30 identical `ok` lines, zero failures. Paste the `uniq -c` output in your report.
+Expect 30 identical `ok` lines, zero failures. Paste the `harness:` line and the `uniq -c` output.
 
 **1.7 — Full gates, then commit.**
 ```
@@ -589,33 +622,50 @@ exact defect was caught mid-review; do not re-introduce it by reasoning about sh
 **The probe is the acceptance criterion.** Run this on the implementing machine and paste the
 output into your report:
 
+**Cleanup rule (do not weaken):** this probe kills **only process groups it created**, via
+`setsid` + `kill -- -PGID`. **Never use a pattern-matched kill** (`pkill -x sleep`, `killall`) —
+this runs on the developer's real machine, where a name match would terminate their unrelated
+processes. A PID-list approach is also insufficient and was rejected after testing: T7bad's
+backgrounded `sleep` has fd 0 on `/dev/null`, so it appears in no holder list and survives; the
+process group catches it.
+
 ```sh
-cd "$(mktemp -d)"
+PROBE_DIR=$(mktemp -d); cd "$PROBE_DIR"
 probe() {                            # $1 = label, $2 = sh -c script
-  F="$PWD/F$1"; mkfifo "$F"
-  sleep 15 > "$F" & HOLDER=$!
+  F="$PROBE_DIR/F$1"; mkfifo "$F"
+  setsid sleep 15 > "$F" & HOLDER=$!
   sleep 0.2
-  sh -c "$2" < "$F" >/dev/null 2>&1 & SHPID=$!
+  # setsid: the scenario leads its OWN process group, so every descendant it spawns shares the
+  # PGID and can be killed as a group — exactly what we created, nothing else.
+  setsid sh -c "$2" < "$F" >/dev/null 2>&1 & SHPID=$!
   sleep 0.6
   echo "--- $1"
-  if kill -0 $SHPID 2>/dev/null; then echo "    direct child pid=$SHPID STILL ALIVE"
-  else wait $SHPID 2>/dev/null; echo "    direct child pid=$SHPID EXITED rc=$?"; fi
+  if kill -0 "$SHPID" 2>/dev/null; then echo "    direct child pid=$SHPID STILL ALIVE"
+  else wait "$SHPID" 2>/dev/null; echo "    direct child pid=$SHPID EXITED rc=$?"; fi
   found=0
   for p in /proc/[0-9]*; do
-    pid=${p#/proc/}; [ "$pid" = "$HOLDER" ] && continue
-    if [ "$(readlink $p/fd/0 2>/dev/null)" = "$F" ]; then
+    pid=${p#/proc/}
+    if [ "$(readlink "$p/fd/0" 2>/dev/null)" = "$F" ]; then
       found=1
-      echo "    HOLDS STDIN: pid=$pid cmd=$(tr '\0' ' ' < $p/cmdline 2>/dev/null)"
-      echo "        fd1=$(readlink $p/fd/1 2>/dev/null)  fd2=$(readlink $p/fd/2 2>/dev/null)"
+      echo "    HOLDS STDIN: pid=$pid cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)"
+      echo "        fd1=$(readlink "$p/fd/1" 2>/dev/null)  fd2=$(readlink "$p/fd/2" 2>/dev/null)"
     fi
   done
-  [ $found = 0 ] && echo "    NOBODY holds the stdin object"
-  pkill -x sleep 2>/dev/null; sleep 0.3; true
+  [ "$found" = 0 ] && echo "    NOBODY holds the stdin object"
+  kill -- -"$SHPID" 2>/dev/null || true
+  kill -- -"$HOLDER" 2>/dev/null || true
+  wait 2>/dev/null || true
 }
 probe T5    'exec >/dev/null 2>/dev/null; sleep 600'
 probe T7bad 'exec >/dev/null 2>/dev/null; sleep 600 & exit 0'
 probe T7    'exec 3<&0; exec >/dev/null 2>/dev/null; sleep 30 <&3 & exit 0'
-pkill -x sleep 2>/dev/null; true
+cd /; rm -rf "$PROBE_DIR"
+```
+
+Then confirm the probe left nothing of its own behind (informational — a non-zero count means
+other `sleep` processes exist on the machine, which is exactly why a name-matched kill is banned):
+```sh
+pgrep -x -u "$(id -u)" sleep | wc -l
 ```
 
 Required outcomes — **if any differs, stop and report rather than adjusting the assertions**:
@@ -784,18 +834,35 @@ next to `state_dir_is_0700`:
     #[test]
     fn state_dir_in_test_builds_is_redirected_off_the_real_xdg_dir() {
         let d = state_dir().expect("state dir resolves in test builds");
+        // The LOAD-BEARING assertion: the per-process component the redirect (and ONLY the
+        // redirect) produces. `starts_with(temp_dir())` alone is not enough — with
+        // XDG_STATE_HOME set under /tmp (e.g. /tmp/state) the UNPATCHED production path already
+        // satisfies it, so this guard would pass with no redirect at all while tests kept using
+        // ambient XDG state.
+        let expected = format!("wcartel-test-state-{}", std::process::id());
+        assert!(d.components().any(|c| c.as_os_str() == expected.as_str()),
+            "must resolve through the per-process redirect component {expected:?}; got {d:?}");
         assert!(d.starts_with(std::env::temp_dir()),
-            "test builds must resolve under the temp dir, never the real XDG state dir; got {d:?}");
+            "…and it must live under the temp dir, never the real XDG state dir; got {d:?}");
         assert!(d.ends_with("wordcartel"),
             "the wordcartel component is still appended, so path shapes match production: {d:?}");
     }
 ```
 
-**3.2 — Run it and watch it fail.**
-```
+**3.2 — Run it and watch it fail — and prove the failure is real.**
+```sh
 cargo test -p wordcartel --lib swap::tests::state_dir_in_test_builds 2>&1 | tail -20
 ```
-Expect FAIL: the returned path is under `$HOME/.local/state` or `$XDG_STATE_HOME`.
+Expect FAIL on the `wcartel-test-state-<pid>` assertion. Then confirm the guard is not merely
+passing/failing on ambient environment, by checking it still fails with `XDG_STATE_HOME` pointed
+under the temp dir — the exact configuration that would defeat a `starts_with(temp_dir())`-only
+guard:
+```sh
+XDG_STATE_HOME="$(mktemp -d)" cargo test -p wordcartel --lib \
+  swap::tests::state_dir_in_test_builds 2>&1 | tail -20
+```
+This must **also** FAIL before the fix. If it passes, the guard is testing the environment rather
+than the redirect — stop and report.
 
 **3.3 — Implement the redirect.** Replace only the `let base = …` binding in `state_dir`, and
 extend the doc comment. The rest of the body — `create_dir_all`, the `cfg(unix)` chmod, and both
@@ -849,11 +916,13 @@ redirected dir ourselves); the enumerator/kept/modal tests still pass because th
 containment, not exact counts. **If a test fails because it expected ambient litter, stop and
 report — do not weaken its assertion.**
 
-**3.5 — Prove the real directory is untouched by a full run.**
-```
-ls -la --time-style=full-iso ~/.local/state/wordcartel 2>/dev/null | head -5   # before
+**3.5 — Prove the real directory is untouched by a full run.** (Read-only inspection; this step
+must never create, modify, or delete anything under `~`.)
+```sh
+REAL="${XDG_STATE_HOME:-$HOME/.local/state}/wordcartel"
+ls -la --time-style=full-iso "$REAL" 2>/dev/null | head -5   # before
 cargo test --workspace >/dev/null 2>&1
-ls -la --time-style=full-iso ~/.local/state/wordcartel 2>/dev/null | head -5   # after
+ls -la --time-style=full-iso "$REAL" 2>/dev/null | head -5   # after
 ```
 Directory mtime and contents must be unchanged across the run. Paste both listings. (If the
 directory does not exist, that is a pass — say so.)
@@ -1001,18 +1070,23 @@ that is not in the body and would not work. Replace the whole test:
 
 **4.4 — Soak the specific flake at DEFAULT threading.** A single green run proves nothing: the
 baseline failure rate is ~3/60 whole-binary runs.
-```
-cargo build -p wordcartel --tests
-BIN=$(ls -t target/debug/deps/wordcartel-* | grep -v '\.d$' | head -1)
+```sh
+BIN=$(pick_bin)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FATAL: bad harness"; exit 1; }
+echo "harness: $BIN"
+LOGS=$(mktemp -d)                       # own scratch dir, removed below — no fixed /tmp paths
 fails=0
 for i in $(seq 1 60); do
-  $BIN >/tmp/wc-lastgood-$i.log 2>&1 || fails=$((fails+1))
+  "$BIN" >"$LOGS/run-$i.log" 2>&1 || fails=$((fails+1))
 done
-echo "failed runs: $fails"
-grep -l "undo_and_redo_refresh_the_recovery_snapshot" /tmp/wc-lastgood-*.log | wc -l
+echo "failed runs: $fails / 60"
+grep -l "undo_and_redo_refresh_the_recovery_snapshot" "$LOGS"/run-*.log | wc -l
+rm -rf "$LOGS"
 ```
-Both numbers must be **0**. Note `$BIN` with no arguments runs the whole lib binary at default
-threads — that is the point; do not add `--test-threads`.
+Both numbers must be **0**. Note `"$BIN"` with no test-name argument runs the whole lib binary at
+default threads — that is the point; **do not add `--test-threads`.** A single green run is NOT
+evidence here: this test passes ~57 times in 60 even unfixed, which is exactly why the soak, not
+the test, is the verification.
 
 **4.5 — Gates and commit.** Full gates as Task 1.7. Commit:
 `test(recovery): serialize LAST_GOOD for the one test that asserts it`.
@@ -1164,27 +1238,35 @@ All green/clean/warning-free. Paste the `test result:` lines and the clippy summ
 
 **7.2 — Repro-basis soak, 60× at DEFAULT threading.** This is the exact condition that produced
 the baseline failures (3/60 for the editor test, 4/60 for the filter test):
-```
-cargo build -p wordcartel --tests
-BIN=$(ls -t target/debug/deps/wordcartel-* | grep -v '\.d$' | head -1)
+```sh
+BIN=$(pick_bin)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FATAL: bad harness"; exit 1; }
+echo "harness: $BIN"; "$BIN" --list 2>/dev/null | tail -1
+SOAK=$(mktemp -d)                       # own scratch dir, removed at the end of this step
 fails=0
 for i in $(seq 1 60); do
-  $BIN >/tmp/wc-soak-$i.log 2>&1 || fails=$((fails+1))
+  "$BIN" >"$SOAK/soak-$i.log" 2>&1 || fails=$((fails+1))
 done
 echo "failed runs: $fails / 60"
-grep -h "^test .* FAILED\|panicked at" /tmp/wc-soak-*.log | sort | uniq -c
+grep -h "^test .* FAILED\|panicked at" "$SOAK"/soak-*.log | sort | uniq -c
+rm -rf "$SOAK"
 ```
 Required: `failed runs: 0 / 60`, and the grep empty. **No `--test-threads` flag anywhere.**
 
 **7.3 — Contention soak, 6 rounds × 6 concurrent processes.** This is the condition under which
 the filter test failed 14/36 (~39%):
-```
+```sh
+BIN=$(pick_bin)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FATAL: bad harness"; exit 1; }
+echo "harness: $BIN"
+CONT=$(mktemp -d)                       # own scratch dir, removed at the end of this step
 for r in $(seq 1 6); do
-  for p in $(seq 1 6); do $BIN >/tmp/wc-cont-$r-$p.log 2>&1 & done
-  wait
+  for p in $(seq 1 6); do "$BIN" >"$CONT/cont-$r-$p.log" 2>&1 & done
+  wait                                  # waits only on THIS shell's background jobs
 done
-grep -h "^test .* FAILED\|panicked at" /tmp/wc-cont-*.log | sort | uniq -c
-grep -l "FAILED" /tmp/wc-cont-*.log | wc -l
+grep -h "^test .* FAILED\|panicked at" "$CONT"/cont-*.log | sort | uniq -c
+grep -l "FAILED" "$CONT"/cont-*.log | wc -l
+rm -rf "$CONT"
 ```
 Required: zero failures across all 36 runs. Specifically confirm none of these appear:
 `filter::tests::run_filter_non_zero_exit_carries_stderr`,
@@ -1231,9 +1313,35 @@ Check these specifically; each is a defect this effort's review rounds actually 
    `run_filter_large_stderr_does_not_deadlock` / `run_filter_rejects_oversized` pass unmodified.
 6. **No `--test-threads` flag** was added to any test invocation to make something pass.
 7. **No existing assertion was weakened** to accommodate the `state_dir` redirect.
+8. **Shell hygiene in any command a task adds or improvises:** no pattern-matched kill
+   (`pkill`/`killall`) — kill only process groups the command created; no binary or path selected
+   by a glob — select deterministically and assert before use; no fixed `/tmp` paths — `mktemp -d`
+   and remove it; every destructive command targets a variable the command itself created.
 
 ## History
 
+- 2026-07-19 (rev 2) — **Codex plan gate round 1 folded; all four accepted.** IMPORTANT 1: the
+  fd-0 probe used `pkill -x sleep`, which would terminate the developer's unrelated processes on
+  their real machine. Rewritten to `setsid` + `kill -- -PGID`, killing only groups the probe
+  created. A PID-list fix was tried first and **rejected after testing**: T7bad's backgrounded
+  `sleep` has fd 0 on `/dev/null`, so it appears in no holder list and survived — the process
+  group catches it. Re-ran all three probes with the new cleanup: identical verdicts, zero
+  leftover processes. IMPORTANT 2: `BIN=$(ls -t target/debug/deps/wordcartel-* | …)` was
+  non-deterministic — verified on this workspace that `ls -t` returns a non-executable `.d` file
+  first, and that stale harness hashes exist, so the soak would have died or silently measured the
+  wrong binary. Replaced with a `pick_bin()` recipe reading cargo's `--message-format=json`
+  artifact stream, plus mandatory pre-run assertions (non-empty, executable, expected path) and a
+  `--list` sanity line pasted into every report; verified it selects the current harness (1768
+  tests). IMPORTANT 3: Task 3's guard asserted only `starts_with(temp_dir())`, which today's
+  UNPATCHED `state_dir()` already satisfies when `XDG_STATE_HOME` is under `/tmp` — the same
+  "name stronger than the test" shape as the spec's round-3 T7. It now asserts the
+  `wcartel-test-state-<pid>` component, and step 3.2 additionally requires the guard to fail under
+  `XDG_STATE_HOME=$(mktemp -d)` before the fix. MINOR: all soak logs moved from fixed `/tmp/wc-*`
+  paths to per-step `mktemp -d` dirs that are removed. Also swept the whole plan for the class:
+  no pattern-matched kills, no glob-selected binaries or paths, no fixed temp paths, every
+  `rm -rf` targeting a variable the command created, every `$BIN` quoted, and Task 3.5's real-dir
+  inspection made read-only and `XDG_STATE_HOME`-aware. Reviewer note 8 added so improvised
+  commands during execution are held to the same rules.
 - 2026-07-19 (rev 1) — Initial plan, written against spec rev 8 (committed `1837c75`). Seven
   tasks. Sequencing: EPIPE (1–2) before isolation (3–6) before validation (7), with the
   redirect-before-`LAST_GOOD` ordering justified by blast radius in the Sequencing section.
