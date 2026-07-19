@@ -428,6 +428,16 @@ pub struct MouseState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkPending { Set, Jump }
 
+/// One pending session-entry rename, recorded by a Save-As merge and applied where the
+/// session store is actually reachable (`app::run`).
+#[derive(Clone, Debug)]
+pub struct SessionMigration {
+    /// The buffer's PRE-REKEY path, read IN THE MERGE — not the dispatch-time `prior_key`.
+    /// Merge-time capture is what makes overlapping Save-As from one source chain correctly.
+    pub from: std::path::PathBuf,
+    pub to: std::path::PathBuf,
+}
+
 // MenuView is now Clone (#[derive(Clone, Debug)]); Editor intentionally remains !Clone.
 #[derive(Debug)]
 pub struct Editor {
@@ -457,6 +467,12 @@ pub struct Editor {
     /// Default-empty; capped at [`crate::limits::PLUGIN_MAX_PENDING_DISPATCH`] at the
     /// `wc.command` call site.
     pub pending_plugin_dispatch: std::collections::VecDeque<crate::plugin::PluginDispatch>,
+    /// Save-As session-entry migrations awaiting application.
+    ///
+    /// A QUEUE, not an `Option` slot: `fold_and_continue` drains the executor in a loop, so
+    /// several save merges can land before `app::run` next reaches a persist point, and a
+    /// slot would silently drop all but the last.
+    pub pending_session_migrations: std::collections::VecDeque<SessionMigration>,
     /// Armed plugin timers (P3 §3). Lives on Editor (not the host) so `timers::next_wake(&Editor,_)`
     /// sees the next-due. Auto-disarmed by `clear_plugin_wake_state`. Bounded by
     /// PLUGIN_MAX_TIMERS_PER_PLUGIN/plugin.
@@ -649,6 +665,7 @@ impl Editor {
             pending_plugin_calls: std::collections::VecDeque::new(),
             pending_plugin_events: std::collections::VecDeque::new(),
             pending_plugin_dispatch: std::collections::VecDeque::new(),
+            pending_session_migrations: std::collections::VecDeque::new(),
             pending_plugin_timers: Vec::new(),
             next_timer_handle: 0,
             on_change_due: None,

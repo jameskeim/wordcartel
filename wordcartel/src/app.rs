@@ -920,10 +920,23 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             let mut e = editor.borrow_mut();
             guard.terminal().draw(|f| render::render(f, &mut e))?;
         }
-        // Persist session state when a save just completed (saved_version advanced).
+        // Persist when a save just completed (saved_version advanced) OR when a Save-As
+        // queued a session migration.
+        //
+        // The migration half must NOT be gated on `sv` alone: `do_save_to`'s merge targets
+        // `by_id_mut(buffer_id)` so a save lands on the right buffer even after the user
+        // switches away, but `sv` reads `active().document.saved_version`. Save-As a
+        // document, switch buffers before the write completes, and the active buffer's
+        // saved_version never moves — the branch would not fire and the migration would
+        // strand. Reading the queue off the Editor is buffer-blind by construction.
         let sv = { editor.borrow().active().document.saved_version };
-        if sv != last_persisted_saved {
+        let has_migrations = !editor.borrow().pending_session_migrations.is_empty();
+        if has_migrations || sv != last_persisted_saved {
             session_seq += 1;
+            {
+                let mut e = editor.borrow_mut();
+                crate::session_restore::drain_session_migrations(&mut session, &mut e, &cfg);
+            }
             { crate::session_restore::persist_session(&mut session, &editor.borrow(), &cfg, session_seq); }
             last_persisted_saved = sv;
         }
@@ -945,8 +958,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
     }
 
-    // On clean quit: persist once more (cursor may have moved since the last save).
+    // On clean quit: drain any migration queued by a save that completed on the final
+    // iteration, then persist once more (cursor may have moved since the last save).
     session_seq += 1;
+    {
+        let mut e = editor.borrow_mut();
+        crate::session_restore::drain_session_migrations(&mut session, &mut e, &cfg);
+    }
     crate::session_restore::persist_session(&mut session, &editor.borrow(), &cfg, session_seq);
 
     // Restore the terminal BEFORE the executor drops: ThreadExecutor::drop joins

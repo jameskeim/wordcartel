@@ -157,13 +157,25 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                     // survives the next keystroke, unlike the ordinary Info completion messages.
                     let is_save_error = outcome.is_err();
                     let mut status = String::new();
+                    // Hoisted out of the `by_id_mut` block (local-then-assign, mirrors
+                    // `status`/`fire_save`): the session-migration queue push below needs
+                    // `editor` mutably, which conflicts with a live `&mut Buffer` borrow.
+                    let mut migrate_from: Option<PathBuf> = None;
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
                             Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
+                                // MERGE-TIME capture. The dispatch-time `prior_key` is stale
+                                // for a second Save-As dispatched before this merge landed;
+                                // reading the buffer here gives the truth at THIS moment, so
+                                // a->b then a->c records (a,b) then (b,c) and chains.
+                                let pre_rekey = b.document.path.clone();
                                 // Middle B: the buffer is rekeyed to the CHOSEN path so
                                 // display, prefills, the open-dir seed, export derivation,
                                 // wc.path(), and the LSP uri all stay logical.
-                                if matches!(mode, SaveMode::SaveAs) { b.document.path = Some(chosen_path.clone()); }
+                                if matches!(mode, SaveMode::SaveAs) {
+                                    b.document.path = Some(chosen_path.clone());
+                                    migrate_from = pre_rekey;
+                                }
                                 b.document.saved_version = Some(v);
                                 b.document.stored_fp = new_fp;
                                 // The swap latch (`swapped_version`) asserts "this version's content
@@ -199,6 +211,17 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                                 // Do NOT re-introduce SaveError::Symlink match — e.to_string()
                                 // for Symlink still contains "symlink", satisfying the test.
                                 status = e.to_string();
+                            }
+                        }
+                    }
+                    // Queue the session-entry migration. Nothing is queued when there is no
+                    // old entry (first Save-As of an unnamed buffer) or when the path did not
+                    // change (Save-As onto the same path).
+                    if matches!(mode, SaveMode::SaveAs) {
+                        if let Some(from) = migrate_from {
+                            if from != chosen_path {
+                                editor.pending_session_migrations.push_back(
+                                    crate::editor::SessionMigration { from, to: chosen_path.clone() });
                             }
                         }
                     }

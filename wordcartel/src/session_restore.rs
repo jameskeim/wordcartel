@@ -189,10 +189,148 @@ pub fn persist_session_for_test(s: &mut crate::state::SessionState, e: &crate::e
     persist_session(s, e, cfg, seq);
 }
 
+/// Apply every queued Save-As session-entry migration, FIFO.
+///
+/// FIFO is required, not incidental: with merge-time capture each entry's `from` is the
+/// previous entry's `to`, so any other order strands the chain.
+///
+/// Best-effort — this is hygiene, not a durability guarantee. A migration whose `from` key
+/// is already absent is a silent no-op, never an error and never a reason to fail a persist.
+pub(crate) fn drain_session_migrations(
+    session: &mut crate::state::SessionState,
+    editor: &mut crate::editor::Editor,
+    cfg: &crate::config::Config,
+) {
+    while let Some(m) = editor.pending_session_migrations.pop_front() {
+        // Both endpoints are LOGICAL paths (Middle B); canonicalizing here is what makes a
+        // symlinked destination converge on the same key as its target.
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
+        let from_key = std::fs::canonicalize(&m.from)
+            .unwrap_or_else(|_| m.from.clone()).to_string_lossy().into_owned();
+        // fs-chokepoint-allow: (c) pure path resolution — a name computation, not content access
+        let to_key = std::fs::canonicalize(&m.to)
+            .unwrap_or_else(|_| m.to.clone()).to_string_lossy().into_owned();
+        if from_key == to_key { continue; }
+        let Some(mut entry) = session.entries.remove(&from_key) else { continue };
+        entry.seq = session.next_seq();
+        session.record(to_key, entry, cfg.state.max_entries);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestClock;
+    use crate::jobs::{Executor, InlineExecutor};
+    use crate::registry::Ctx;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    struct Z; impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+    fn tx() -> std::sync::mpsc::Sender<crate::app::Msg> {
+        std::sync::mpsc::channel().0
+    }
+    fn scratch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wcartel-sessmig-{}-{}.md",
+            std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    #[test]
+    fn two_migrations_in_one_drain_batch_both_apply() {
+        // FAIL-VERIFY: swap the queue for an `Option` slot, watch this fail, then revert.
+        //
+        // FAILS AGAINST AN `Option` SLOT. `app::fold_and_continue` drains the executor in a
+        // LOOP (`for o in ex.drain() { apply_job_outcome(…) }`), so several ready save jobs
+        // merge before app::run next reaches a persist point. A single slot would keep only
+        // the last, silently losing the first writer's marks with no error.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let cfg = crate::config::Config::default();
+        let mut s = crate::state::SessionState::default();
+        let entry = |c: usize| crate::state::StateEntry {
+            cursor: c, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq: 1,
+            folds: vec![], block: None };
+        s.entries.insert("/a.md".into(), entry(11));
+        s.entries.insert("/x.md".into(), entry(22));
+
+        e.pending_session_migrations.push_back(crate::editor::SessionMigration {
+            from: "/a.md".into(), to: "/b.md".into() });
+        e.pending_session_migrations.push_back(crate::editor::SessionMigration {
+            from: "/x.md".into(), to: "/y.md".into() });
+
+        drain_session_migrations(&mut s, &mut e, &cfg);
+
+        assert!(s.entries.contains_key("/b.md"), "first migration applied");
+        assert!(s.entries.contains_key("/y.md"), "second migration applied — NOT clobbered");
+        assert_eq!(s.entries["/b.md"].cursor, 11, "and it carried the cursor across");
+        assert_eq!(s.entries["/y.md"].cursor, 22);
+        assert!(!s.entries.contains_key("/a.md") && !s.entries.contains_key("/x.md"),
+            "the old keys are gone — the point is to remove the stale duplicate");
+        assert!(e.pending_session_migrations.is_empty(), "the queue drains fully");
+    }
+
+    #[test]
+    fn overlapping_same_source_save_as_chains_correctly() {
+        // DRIVES THE REAL DISPATCH. An earlier version hand-enqueued (a->b, b->c) — the
+        // already-correct sequence — so it passed even if `do_save_to` never captured
+        // anything. It guarded nothing, which is exactly what it was split out to prevent.
+        //
+        // FAIL-VERIFY: move the capture back to dispatch time (bind `prior_key` before the
+        // job and use it for the migration), watch this fail with an entry stranded at /b.md.
+        let p_a = scratch();
+        let p_b = scratch();
+        let p_c = scratch();
+        std::fs::write(&p_a, b"body\n").expect("seed");
+        let mut e = Editor::new_from_text("body\n", Some(p_a.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+
+        // TWO Save-As dispatched from the SAME source before either merge lands. This is the
+        // ordering dispatch-time capture gets wrong: it would record (a->b, a->c).
+        {
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex,
+                msg_tx: tx(), fs: std::sync::Arc::clone(&fs) };
+            crate::save::do_save_to(&mut ctx,
+                crate::save::SaveTarget::same(p_b.clone()), crate::save::SaveMode::SaveAs);
+            crate::save::do_save_to(&mut ctx,
+                crate::save::SaveTarget::same(p_c.clone()), crate::save::SaveMode::SaveAs);
+        }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        // The queue the MERGES produced — not one we wrote by hand.
+        let mut s = crate::state::SessionState::default();
+        let key = |p: &std::path::Path| std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned();
+        s.entries.insert(key(&p_a), crate::state::StateEntry {
+            cursor: 7, scroll: 0, marks: Default::default(), mtime: 1, size: 1, seq: 1,
+            folds: vec![], block: None });
+        let cfg = crate::config::Config::default();
+        drain_session_migrations(&mut s, &mut e, &cfg);
+
+        assert!(s.entries.contains_key(&key(&p_c)),
+            "the chain must land at the FINAL path — dispatch-time capture strands it at /b");
+        assert_eq!(s.entries[&key(&p_c)].cursor, 7, "carrying the original cursor through both hops");
+        assert!(!s.entries.contains_key(&key(&p_a)), "no stale source entry");
+        assert!(!s.entries.contains_key(&key(&p_b)), "no stranded intermediate entry");
+        assert_eq!(s.entries.len(), 1, "exactly ONE entry survives");
+        for f in [&p_a, &p_b, &p_c] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn a_migration_whose_source_is_gone_is_a_silent_no_op() {
+        // Hygiene, not a durability guarantee: never an error, never a reason to fail a
+        // persist.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let cfg = crate::config::Config::default();
+        let mut s = crate::state::SessionState::default();
+        e.pending_session_migrations.push_back(crate::editor::SessionMigration {
+            from: "/never-existed.md".into(), to: "/z.md".into() });
+        drain_session_migrations(&mut s, &mut e, &cfg);
+        assert!(s.entries.is_empty(), "nothing invented");
+        assert!(e.pending_session_migrations.is_empty(), "still drained");
+    }
 
     #[test]
     fn open_into_current_replaces_with_fresh_id_and_clean() {
