@@ -1262,7 +1262,14 @@ cargo test -p wordcartel --lib search_ui::tests::diag_apply_selected_add_dict 2>
 cargo test -p wordcartel --lib diagnostics_run::tests::append_word_to_dict 2>&1 | tail -10
 ```
 
-**5.4 — Confirm no fixed path remains.**
+**5.4 — Confirm no fixed `/tmp/wordcartel_` *writer* remains.**
+
+Scope note, so this check is not read as broader than it is: it covers the two sites this task
+migrates. Other `/tmp/...` literals elsewhere in the tree (`file_browser.rs`'s `/tmp/wc-classify`,
+`app.rs`'s `/tmp/wc-kmtest.md`) are **path values passed to pure functions** — `classify_enter`
+classifies a `&Path` and `Editor::new_from_text` takes the path as a label; neither touches the
+filesystem. They create no file, so they are not in D4's damage class and are deliberately out of
+scope. Do not "fix" them.
 ```
 grep -rn '/tmp/wordcartel_' wordcartel/src/ || echo "clean"
 ```
