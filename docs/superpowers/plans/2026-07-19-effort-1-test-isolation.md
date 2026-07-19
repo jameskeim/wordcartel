@@ -145,7 +145,8 @@ binary produced the counts. Always quote `"$BIN"`.
 
 ### Interfaces
 
-**Consumes** (existing, unchanged — do not alter these signatures):
+**Consumes** (existing, unchanged — do not alter these signatures). Every type the test snippets
+touch is listed verbatim so nothing has to be inferred:
 ```rust
 pub fn run_subprocess(
     argv: &[String],
@@ -155,7 +156,54 @@ pub fn run_subprocess(
     max_output: usize,
     cancel: &CancelFlag,
 ) -> Result<Vec<u8>, FilterError>
+
+/// Thin wrapper: bytes -> String, `Err(NotUtf8)` for non-UTF-8 output.
+pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunResult
+
+pub struct FilterSpec {
+    pub argv: Vec<String>,
+    pub shell: bool,
+    pub disposition: Disposition,
+    pub input: Input,
+    pub timeout: std::time::Duration,
+    pub max_output: usize,
+}
+
+#[derive(Clone, Debug)]
+pub enum Disposition { Filter, Insert }
+
+#[derive(Clone, Debug)]
+pub enum Input { SelectionElseBuffer, None, WholeBuffer }
+
+#[derive(Debug)]
+pub enum RunResult { Stdout(String), Err(FilterError) }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterError {
+    Spawn(String),
+    NonZero { code: String, stderr: String },
+    Timeout,
+    Cancelled,
+    TooLarge,
+    NotUtf8,
+    ExportWrite(String),
+    Panicked(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct CancelFlag(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl CancelFlag {
+    pub fn new() -> CancelFlag;
+    pub fn cancel(&self);
+    pub fn is_cancelled(&self) -> bool;
+}
+
+// wordcartel/src/limits.rs
+pub const MAX_FILTER_OUTPUT: usize = 64 * 1024 * 1024;
 ```
+All of the above are already in scope inside `filter.rs`'s `mod tests` via `use super::*;` except
+`MAX_FILTER_OUTPUT`, which is written as `crate::limits::MAX_FILTER_OUTPUT`.
+
 Callers that must keep compiling unchanged: `filter::run_filter` (same file) and two sites in
 `wordcartel/src/export.rs` (inside `run_export`'s `match &sink` arms).
 
@@ -600,7 +648,29 @@ body naming the EPIPE mechanism, and the two trailers verbatim.
 fn spec_for(argv: &[&str], timeout_secs: u64) -> FilterSpec   // in filter.rs mod tests
 fn big_stdin() -> String                                       // in filter.rs mod tests
 ```
-Plus existing `run_filter`, `RunResult`, `FilterError`, `CancelFlag` from the same module.
+Plus these, already in scope in `filter.rs`'s `mod tests` via `use super::*;`:
+```rust
+pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunResult
+
+#[derive(Debug)]
+pub enum RunResult { Stdout(String), Err(FilterError) }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterError {
+    Spawn(String), NonZero { code: String, stderr: String }, Timeout, Cancelled,
+    TooLarge, NotUtf8, ExportWrite(String), Panicked(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct CancelFlag(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl CancelFlag {
+    pub fn new() -> CancelFlag;
+    pub fn cancel(&self);          // T6 calls this from a second thread
+    pub fn is_cancelled(&self) -> bool;
+}
+```
+`CancelFlag` is `Clone` (it wraps an `Arc`), which is what lets T6 hand a clone to the worker
+thread and fire `cancel()` on the original.
 
 **Produces:** three `#[test]` fns, no production code.
 
@@ -945,13 +1015,36 @@ directory does not exist, that is a pass — say so.)
 
 ### Interfaces
 
-**Consumes** (existing, unchanged):
+**Consumes** (existing, unchanged). The rewritten test drives the real edit path, so every symbol
+it touches is listed verbatim — do not infer these:
 ```rust
+// wordcartel/src/recovery.rs
 pub static LAST_GOOD: std::sync::Mutex<Option<(Option<std::path::PathBuf>, ropey::Rope)>>;
 pub fn record_snapshot(path: Option<&std::path::Path>, rope: ropey::Rope);   // signature unchanged
+
+// wordcartel/src/editor.rs — Buffer (note `apply` is pub(crate), undo/redo are pub)
+pub(crate) fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit,
+                    kind: EditKind, clock: &dyn Clock);
+pub fn undo(&mut self) -> bool;
+pub fn redo(&mut self) -> bool;
+
+// wordcartel/src/editor.rs — Editor
+pub fn new_from_text(text: &str, path: Option<PathBuf>, area: (u16, u16)) -> Editor;
+#[inline] pub fn active_mut(&mut self) -> &mut Buffer;
+
+// wordcartel/src/commands.rs
+pub fn build_multi_replace(edits: &[(usize, usize, String)], doc_len: usize)
+    -> (wordcartel_core::change::ChangeSet, wordcartel_core::block_tree::Edit);
+
+// wordcartel-core/src/history.rs
+impl Transaction { pub fn new(changes: ChangeSet) -> Self; }
+pub enum EditKind { Type, Other }
+pub trait Clock { fn now_ms(&self) -> u64; }
 ```
-Called unconditionally from `Buffer::apply`, `Buffer::undo`, `Buffer::redo` in `editor.rs`, i.e.
-from nearly every editing test in the crate.
+`record_snapshot` is called unconditionally from `Buffer::apply`, `Buffer::undo` and
+`Buffer::redo`, i.e. from nearly every editing test in the crate — that is the blast radius this
+task's gate has to serialize against. `editor.rs`'s `mod tests` already imports `Transaction`,
+`EditKind` and `Selection`; add nothing new at module level.
 
 **Produces** (new, `#[cfg(test)]`-only, in `recovery.rs`):
 ```rust
@@ -1263,20 +1356,34 @@ Paste the output. Note whether it was present or absent — 7.4's pass condition
 **7.1 — Full workspace gates, with exit codes.** Bare `cargo` output can be misread: a workspace
 that fails to COMPILE emits no `test result:` lines at all, and `cargo build` succeeds *with*
 warnings. Capture status explicitly rather than eyeballing.
+
+**Exit-capture pattern — use this shape everywhere, do not "simplify" it.** Redirect the command's
+output to a file, capture `$?` on the *same line* with no pipe in between, then `tail` the file
+afterwards. Two reasons, both verified on this machine: `cmd | tail` makes `$?` report **`tail`**'s
+status, not the command's (so a failed build after emitted output reports `0`); and
+`${PIPESTATUS[0]}` is a **bash** array that expands to the empty string in this environment's shell
+(zsh 5.9, where it is `$pipestatus` and 1-indexed) — a blank field that reads as "fine". The
+pattern below depends on no array spelling and works in both shells.
 ```sh
 G=$(mktemp -d)                          # own scratch dir, removed at the end of this step
-cargo test --workspace 2>&1 | tee "$G/test.log" | tail -30
-echo "cargo test exit: ${PIPESTATUS[0]}"
+
+cargo test --workspace > "$G/test.log" 2>&1; test_rc=$?
+tail -30 "$G/test.log"
 grep -h "^test result:" "$G/test.log" | sed 's/; finished in.*//' | sort | uniq -c
 
-cargo clippy --workspace --all-targets 2>&1 | tee "$G/clippy.log" | tail -20
-echo "clippy exit: ${PIPESTATUS[0]}"
-echo "clippy warnings: $(grep -c '^warning' "$G/clippy.log")  errors: $(grep -c '^error' "$G/clippy.log")"
+cargo clippy --workspace --all-targets > "$G/clippy.log" 2>&1; clippy_rc=$?
+tail -20 "$G/clippy.log"
 
-cargo build -p wordcartel 2>&1 | tee "$G/build.log" | tail -10
-echo "build exit: ${PIPESTATUS[0]}  warnings: $(grep -c '^warning' "$G/build.log")"
-cargo test --workspace --no-run 2>&1 | tail -5
-echo "test --no-run exit: $?"
+cargo build -p wordcartel > "$G/build.log" 2>&1; build_rc=$?
+tail -10 "$G/build.log"
+
+cargo test --workspace --no-run > "$G/norun.log" 2>&1; norun_rc=$?
+tail -5 "$G/norun.log"
+
+echo "cargo test exit:    $test_rc"
+echo "clippy exit:        $clippy_rc   warnings: $(grep -c '^warning' "$G/clippy.log")  errors: $(grep -c '^error' "$G/clippy.log")"
+echo "build exit:         $build_rc   warnings: $(grep -c '^warning' "$G/build.log")"
+echo "test --no-run exit: $norun_rc"
 rm -rf "$G"
 ```
 Required: all four exit codes `0`; clippy warnings **and** errors both `0`; build warnings `0`;
@@ -1323,11 +1430,15 @@ echo "harness: $BIN  (declares ${EXPECTED:-?} tests)"
 CONT=$(mktemp -d)                       # own scratch dir, removed at the end of this step
 fails=0
 for r in $(seq 1 6); do
-  pids=""
-  for p in $(seq 1 6); do "$BIN" >"$CONT/cont-$r-$p.log" 2>&1 & pids="$pids $!"; done
-  # Wait on each PID individually: a bare `wait` discards exit codes, so a run killed by a signal
-  # (OOM, SIGKILL) that never wrote a FAILED line would be invisible to the greps below.
-  for pid in $pids; do wait "$pid" || fails=$((fails+1)); done
+  # Collect PIDs in the POSITIONAL PARAMETERS, not a space-joined string. An unquoted `$pids`
+  # does NOT word-split in this environment's shell (zsh), so `for pid in $pids` would iterate
+  # ONCE over the whole string and `wait` would error — turning a clean soak into a spurious
+  # failure. `"$@"` splits correctly in both zsh and bash.
+  set --
+  for p in $(seq 1 6); do "$BIN" >"$CONT/cont-$r-$p.log" 2>&1 & set -- "$@" $!; done
+  # Wait on each PID individually: a bare `wait` returns only the LAST job's status, so a run
+  # killed by a signal (OOM, SIGKILL) that never wrote a FAILED line would be invisible below.
+  for pid in "$@"; do wait "$pid" || fails=$((fails+1)); done
 done
 echo "failed runs: $fails / 36"
 echo "logs written: $(ls "$CONT"/cont-*.log 2>/dev/null | wc -l) / 36"
@@ -1364,13 +1475,16 @@ else
   echo "RESULT: absent"
 fi
 ```
-**Pass conditions — state which one applies, and note that they are different results:**
-- 7.0 said *absent* and this says `RESULT: absent` → pass (nothing created).
-- 7.0 said *present* and this says `RESULT: present` with `entries modified since 7.0: 0` → pass
-  (nothing written).
-- **`entries modified since 7.0` is non-zero → FAILURE.** Something in the suite reached the real
-  state dir. Report the paths `find` listed; do not rationalize it.
-- 7.0 said *absent* but this says `RESULT: present` → **FAILURE**, the suite created it.
+**Outcome matrix — all four combinations of the 7.0 baseline and this result are classified.
+State which one applies; only two are passes.**
+
+| 7.0 baseline | 7.4 result | verdict |
+|---|---|---|
+| absent | `RESULT: absent` | **pass** — nothing created |
+| present | `RESULT: present`, `entries modified since 7.0: 0` | **pass** — nothing written |
+| present | `RESULT: present`, count non-zero | **FAILURE** — the suite wrote to the real state dir. Report the paths `find` listed; do not rationalize them. |
+| absent | `RESULT: present` | **FAILURE** — the suite created it |
+| **present** | **`RESULT: absent`** | **FAILURE, and the loudest one** — a directory the effort claims never to touch was **deleted**, which `find -newer` cannot detect by construction (there is nothing left to stat). Suspect a test's cleanup running against the real dir. Report immediately; this is potential user-data loss, not a hygiene finding. |
 
 Note `find -newer` compares mtime, so a file rewritten with identical content still counts as
 modified — which is what we want, since the concern is writes, not content drift.
@@ -1380,8 +1494,12 @@ the real `wcartel` binary against the **real** state dir — deliberately, since
 real-state-dir behaviour is proven end-to-end — so running it first would legitimately touch
 `$REAL` and make 7.4's result unreadable.
 ```sh
-scripts/smoke/run.sh 2>&1 | tail -20
-echo "smoke exit: ${PIPESTATUS[0]}"
+S=$(mktemp -d)
+scripts/smoke/run.sh > "$S/smoke.log" 2>&1; smoke_rc=$?    # same capture pattern as 7.1
+tail -20 "$S/smoke.log"
+echo "smoke exit: $smoke_rc"
+grep -c '^smoke:' "$S/smoke.log"                            # must be ≥ 1
+rm -rf "$S"
 ```
 Quote the one-line summary **verbatim** (e.g. `smoke: 9/9 PASS`, `smoke: FAIL s3 — advisory`, or
 `smoke: SKIP — …`). **If no `smoke:` line appears at all, that is not a pass** — the script failed
@@ -1428,6 +1546,28 @@ Check these specifically; each is a defect this effort's review rounds actually 
 
 ## History
 
+- 2026-07-19 (rev 4) — **Plan gate round 2 folded; all four accepted, plus one the gate did not
+  flag.** IMPORTANT 1: `${PIPESTATUS[0]}` is bash-only and expands **empty** in this environment's
+  shell (verified: zsh 5.9, where it is `$pipestatus`, 1-indexed) — so 7.1's and 7.5's four exit
+  codes printed blank, and a blank field reads as "fine", voiding the step's own "all four exit
+  codes 0" requirement. Replaced everywhere with a shell-portable pattern verified on this
+  machine: redirect output to a file, capture `$?` on the same line with no pipe between, `tail`
+  the file afterwards. IMPORTANT 2: the same fix removes `cargo test --workspace --no-run | tail -5`
+  reporting **`tail`**'s status — applied uniformly to all five capture sites, not just the two
+  cited. IMPORTANT 3: Tasks 1 and 2 used `FilterSpec`/`Disposition`/`Input`/`RunResult`/
+  `FilterError`/`CancelFlag`/`run_filter`/`MAX_FILTER_OUTPUT` without declaring them; all are now
+  verbatim in the Interfaces blocks. Scanning the other tasks for the same omission found **Task 4
+  worse off** — its rewritten test drives `Buffer::apply`/`undo`/`redo`, `Editor::new_from_text`,
+  `active_mut`, `build_multi_replace`, `Transaction::new`, `EditKind` and `Clock`, none declared;
+  all added with real signatures (noting `apply` is `pub(crate)`). MINOR: 7.4's matrix now
+  classifies **7.0-present → 7.4-absent** as the loudest failure — `find -newer` cannot detect a
+  deletion by construction, and a real state dir disappearing is potential user-data loss, not
+  hygiene. **Found by re-scan, not flagged by the gate:** rev 3's own per-PID `wait` fix used
+  `pids="$pids $!"` then `for pid in $pids`, but an unquoted parameter does **not** word-split in
+  zsh (verified: 1 iteration instead of 3), so `wait` would have received one malformed argument
+  and turned a clean 36-run soak into a spurious failure. Rewritten to collect PIDs in the
+  positional parameters (`set -- "$@" $!` / `for pid in "$@"`), which splits correctly in both
+  shells. Also verified `$(seq …)` **does** split in zsh, so the existing loop counters are sound.
 - 2026-07-19 (rev 3) — **Missed instance of the rev-2 class, plus a full false-pass audit of Task
   7.** Step 7.4 still hardcoded `~/.local/state/wordcartel`: with `XDG_STATE_HOME` set it inspected
   a directory the code never uses and printed `(does not exist — pass)` — a **false pass on the
