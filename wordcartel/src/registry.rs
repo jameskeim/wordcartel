@@ -240,8 +240,9 @@ impl Registry {
         r.register("delete_forward", "Delete Forward",   None, |c| run(c, Command::DeleteForward));
 
         // A14 — ten Emacs-parity atomic text-edit commands (commands/textops.rs).
-        // Registered BEFORE save_settings (Codex F4): journey_palette_end_reaches_last_command
-        // + the registration-order invariant both rely on save_settings staying last.
+        // Registered well before `plugin_list` (Codex F4): journey_palette_end_reaches_last_command
+        // + the registration-order invariant both rely on `plugin_list` staying LAST, not on
+        // `save_settings` — see the note at `plugin_list`'s own registration site below.
         r.register("transpose_chars", "Transpose Characters", None, |c| crate::commands::textops::transpose_chars(c.editor, c.clock));
         r.register("transpose_words", "Transpose Words",      None, |c| crate::commands::textops::transpose_words(c.editor, c.clock));
         r.register("transpose_lines", "Transpose Lines",      None, |c| crate::commands::textops::transpose_lines(c.editor, c.clock));
