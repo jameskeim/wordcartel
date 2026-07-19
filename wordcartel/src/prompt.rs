@@ -196,8 +196,11 @@ impl Prompt {
     /// and had no way to learn which documents were holding it open, or how old they were.
     /// Only the first `KEPT_SHOWN` are named; a modal that grew without bound would push the
     /// choices themselves off a short terminal.
-    pub fn clean_recovery(n: usize, kept: &[crate::swap::KeptRecoverable]) -> Prompt {
-        let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
+    ///
+    /// `now_ms` is the caller's wall clock, threaded from the injected `Clock` like every other
+    /// timed shell path — this constructor stays pure data so a `TestClock` journey renders a
+    /// deterministic age.
+    pub fn clean_recovery(n: usize, kept: &[crate::swap::KeptRecoverable], now_ms: u64) -> Prompt {
         let mut message = format!("Delete {n} recovery file(s)? [Y]es · [C]ancel");
         if !kept.is_empty() {
             message.push_str(&format!("\n\nKeeping {} that may hold unsaved work:", kept.len()));
@@ -302,8 +305,12 @@ mod tests {
             .map(|i| crate::swap::KeptRecoverable {
                 realpath: format!("/docs/chapter-{i}.md"), ts_ms: 0,
             }).collect();
-        let p = Prompt::clean_recovery(4, &kept);
+        // The injected clock's reading is a parameter, so the age is deterministic and
+        // assertable — three days after every fixture's `ts_ms: 0`.
+        let p = Prompt::clean_recovery(4, &kept, 3 * 86_400_000);
         assert!(p.message.starts_with("Delete 4 recovery file(s)?"), "{:?}", p.message);
+        assert!(p.message.contains("(written 3 days ago)"),
+            "each named orphan carries its age, stamped against the injected clock: {:?}", p.message);
         assert!(p.message.contains(&format!("Keeping {} that may hold unsaved work", kept.len())),
             "the FULL kept count is stated even though only some are named: {:?}", p.message);
         for i in 0..KEPT_SHOWN {
@@ -318,7 +325,7 @@ mod tests {
         assert_eq!(p.action_for('y'), Some(PromptAction::CleanRecovery));
         assert_eq!(p.action_for('c'), Some(PromptAction::Cancel));
 
-        let none = Prompt::clean_recovery(4, &[]);
+        let none = Prompt::clean_recovery(4, &[], 3 * 86_400_000);
         assert!(!none.message.contains("Keeping"),
             "nothing spared → no disclosure block at all: {:?}", none.message);
     }

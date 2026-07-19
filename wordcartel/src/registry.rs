@@ -308,7 +308,7 @@ impl Registry {
         // snapshotted set (safe by construction — see prompts::open_clean_recovery). Trailing …
         // marks the prompt-opening command (cf. save_as); palette + File menu by registration.
         r.register("clean_recovery", "Clean Recovery Files\u{2026}", Some(MenuCategory::File), |c| {
-            crate::prompts::open_clean_recovery(c.editor, &*c.fs);
+            crate::prompts::open_clean_recovery(c.editor, &*c.fs, c.clock);
             CommandResult::Handled
         });
 
