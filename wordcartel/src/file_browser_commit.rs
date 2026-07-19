@@ -92,6 +92,61 @@ pub(crate) fn classify_destination_enter(
     CommitOutcome::Commit(resolved)
 }
 
+/// Extensions that mean "this is an export, not a save".
+#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
+const OUTPUT_EXTS: &[&str] = &["docx", "pdf", "html", "tex"];
+
+/// The verdict `apply_extension_policy` reaches for a SAVE destination's extension.
+#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExtVerdict {
+    /// Append `.md` — the name had no extension.
+    Defaulted(PathBuf),
+    /// A recognized OUTPUT extension. Refuse the save and offer Export, carrying the typed
+    /// path forward so the writer's intent is not thrown away.
+    Redirect { path: PathBuf, ext: String },
+    /// Any other extension — honoured silently.
+    Honoured(PathBuf),
+}
+
+/// F4's default-and-redirect policy for SAVE destinations.
+///
+/// Redirect is only defensible because export now HAS a destination (spec §9) — before C5,
+/// "use Export instead" was advice with nowhere to go.
+///
+/// Never applied in select mode, and never to an export destination (whose extension is
+/// fixed by the format).
+#[allow(dead_code)] // C5 Task 21 wires this into the destination-mode commit path; forward reference
+pub(crate) fn apply_extension_policy(path: &Path) -> ExtVerdict {
+    // `Path::extension()` returns `Some("")` for a TRAILING-DOT name like `notes.` — there
+    // IS an embedded dot, so it is not None, and the part after it is empty. Treating that
+    // as "has an extension" would take the Honoured arm and skip defaulting, leaving the
+    // writer with an extensionless `notes.` file. Filter the empty case into the None arm.
+    match path.extension().and_then(|e| e.to_str()).filter(|e| !e.is_empty()) {
+        Some(ext) => {
+            let lower = ext.to_ascii_lowercase();
+            if OUTPUT_EXTS.contains(&lower.as_str()) {
+                ExtVerdict::Redirect { path: path.to_path_buf(), ext: lower }
+            } else {
+                ExtVerdict::Honoured(path.to_path_buf())
+            }
+        }
+        None => {
+            let s = path.to_string_lossy();
+            // A dotfile has no extension AND must not be defaulted — its file_name starts
+            // with '.' and contains no further dot.
+            let is_dotfile = path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+            if is_dotfile {
+                return ExtVerdict::Honoured(path.to_path_buf());
+            }
+            let trimmed = s.trim_end_matches('.');
+            ExtVerdict::Defaulted(PathBuf::from(format!("{trimmed}.md")))
+        }
+    }
+}
+
 /// The `Tab` gesture: replace the field with a highlighted file's name. Returns nothing and
 /// touches no path — it CANNOT commit, which is the point. Overwrite becomes: highlight,
 /// Tab (name lands, footer shows the resolved target), Enter (overwrite-confirm).
@@ -362,5 +417,49 @@ mod tests {
         assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "   ", None),
             CommitOutcome::Nothing, "a whitespace-only field is empty");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- The extension policy (F4 default-and-redirect) ---------------------------
+
+    #[test]
+    fn extension_policy_table() {
+        use std::path::PathBuf;
+        let p = |s: &str| PathBuf::from(s);
+
+        // Missing extension -> append .md.
+        assert_eq!(apply_extension_policy(&p("/d/chapter one")),
+            ExtVerdict::Defaulted(p("/d/chapter one.md")));
+
+        // Recognized OUTPUT extensions -> redirect to Export, carrying the path.
+        for ext in ["docx", "pdf", "html", "tex"] {
+            assert_eq!(apply_extension_policy(&p(&format!("/d/book.{ext}"))),
+                ExtVerdict::Redirect { path: p(&format!("/d/book.{ext}")), ext: ext.into() },
+                "a save into an export format is refused and redirected, not written as markdown");
+        }
+        // Case-insensitive.
+        assert_eq!(apply_extension_policy(&p("/d/book.DOCX")),
+            ExtVerdict::Redirect { path: p("/d/book.DOCX"), ext: "docx".into() });
+
+        // Anything else -> honoured silently.
+        for name in ["notes.txt", "notes.rst", "notes.org", "notes.md"] {
+            assert_eq!(apply_extension_policy(&p(&format!("/d/{name}"))),
+                ExtVerdict::Honoured(p(&format!("/d/{name}"))));
+        }
+
+        // EDGE CASES, each a real way to get this wrong:
+        // A dotfile's leading dot is NOT an extension — never produce `.gitignore.md`.
+        assert_eq!(apply_extension_policy(&p("/d/.gitignore")),
+            ExtVerdict::Honoured(p("/d/.gitignore")));
+        assert_eq!(apply_extension_policy(&p("/d/.wordcartel.toml")),
+            ExtVerdict::Honoured(p("/d/.wordcartel.toml")));
+        // A trailing dot is no extension — and must not yield `notes..md`.
+        assert_eq!(apply_extension_policy(&p("/d/notes.")),
+            ExtVerdict::Defaulted(p("/d/notes.md")));
+        // Only the FINAL component is the extension.
+        assert_eq!(apply_extension_policy(&p("/d/chapter.one.md")),
+            ExtVerdict::Honoured(p("/d/chapter.one.md")));
+        assert_eq!(apply_extension_policy(&p("/d/chapter.one")),
+            ExtVerdict::Honoured(p("/d/chapter.one")),
+            "`one` is an unrecognized extension — honoured, not defaulted");
     }
 }
