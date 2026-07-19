@@ -1891,6 +1891,56 @@ enumerator's inclusion rules, the `pending_clean` snapshot-as-ceiling discipline
 This section is **severable**: under size pressure it can move to a follow-up without affecting
 anything else in C5.
 
+#### 11.3.1 Amendment — the disclosure is a box, not a longer line (ratified 2026-07-19)
+
+**This section amends §5.3 of the 04b crash-safety spec** ("Modal-prompt infrastructure"), whose
+"generic **single-line** modal" law C5 could not satisfy and deliver §11.3 at the same time. The
+amendment is recorded here and cross-referenced there.
+
+**What went wrong.** The first implementation composed the disclosure into `Prompt.message` with
+embedded newlines. `message` is painted into the **single status ROW** — `render.rs` does
+`status_text.chars().take(w)` into a height-1 rect — so the newlines collapsed and the row truncated
+at the terminal width. What actually reached the screen was:
+
+```
+Delete 4 recovery file(s)? [Y]es · [C]ancelKeeping 3 that may hold unsaved wor
+```
+
+**No realpath and no age ever rendered**, which is precisely and only what §11.3 asks for; `KEPT_SHOWN`,
+the elision line and `format_age` were dead in production. It passed review because both guards asserted
+on the `message` **string** and never rendered — they agreed with each other and neither agreed with
+production. Shortening the disclosure to fit one row was rejected: that satisfies the row constraint by
+deleting the requirement.
+
+**The amended law.** The **question and its choices remain a single line** on the status row — that half
+of §5.3 is unchanged, and it is what keeps the prompt's single `RenderSite::StatusRow` entry in the H21
+`OVERLAYS` table truthful. A prompt may **additionally** carry `detail: Vec<String>`: structured
+disclosure, one entry per rendered line, painted as a bordered box **directly above** the status row.
+
+Standing constraints, all of them load-bearing:
+
+1. **No second render site.** The box is body painted for the prompt by `render::paint_status`, not an
+   overlay of its own. `RenderSite` keeps its single-valued axis and H21's render-coverage test is
+   untouched.
+2. **Empty `detail` paints nothing at all.** Every other prompt in the app renders byte-identically to
+   its pre-amendment form. This is guarded by row-equality against a no-prompt render, not by inspection.
+3. **Structured lines live in `detail`, never `\n`-smuggled into `message`.** `message` is a one-row
+   string and will silently swallow them again.
+4. **The box is bounded by the live frame** (`chrome_geom::prompt_detail_rect`): sized and centred on the
+   `palette_overlay_rect` width ladder, bottom-anchored above the status row, height clamped to the rows
+   actually free. It returns `None` rather than a degenerate rect, so a tiny terminal cannot paint out of
+   bounds, and a clamped box announces how many lines it dropped. **The choices can never be pushed
+   off-screen**, which was the original single-line rule's real concern.
+5. **Long lines lose the right end if they are headings and the left end if they are items.** A heading's
+   meaning is at its start; a path item's filename and trailing age are at its end. Found live at 60
+   columns, where uniform left-elision rendered `…ng 18 that may hold unsaved work:`.
+6. **Disclosure guards must scrape a rendered `TestBackend`.** Asserting on the prompt struct is what let
+   the dead feature ship; a test that never renders cannot distinguish a delivered disclosure from a
+   composed one.
+
+The `command-surface-contract` was checked and places **no constraint on prompt rendering** (it governs
+commands, the palette, the menu, and keybinding hints), so it needs no amendment.
+
 ---
 
 ## 12. F5 — path-as-identity, resolved and recorded
