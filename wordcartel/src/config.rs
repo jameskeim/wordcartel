@@ -1305,6 +1305,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // [files] filter defaults + invalid value (C5 Task 24 fix I2)
+    //
+    // The round-trip test above only ever exercises DIVERGENT values (true/All), so it
+    // never touches the default-on-absent path at all — flipping `FilesConfig::default()`
+    // to `{true, All}` breaks nothing workspace-wide without these. Mirrors the
+    // `clipboard_provider_default_is_auto` / `clipboard_provider_unknown_warns_and_defaults_auto`
+    // pair `[files]` was copied from but left unguarded.
+    // -----------------------------------------------------------------------
+
+    fn load_files(name: &str, body: &str) -> (Config, Vec<String>) {
+        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        let out = load(std::slice::from_ref(&p));
+        let _ = std::fs::remove_file(&p);
+        out
+    }
+
+    #[test]
+    fn files_filters_default_on_absent() {
+        let (cfg, _) = load(&[]); // no config file → defaults
+        assert!(!cfg.files.show_clutter,
+            "files.show_clutter must default to false (hidden files off)");
+        assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents,
+            "files.type_filter must default to Documents");
+    }
+
+    #[test]
+    fn files_type_filter_unknown_warns_and_defaults_documents() {
+        let (cfg, warns) = load_files("unknown", "[files]\ntype_filter = \"spreadsheets\"\n");
+        assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents);
+        assert!(warns.iter().any(|w| w.contains("files.type_filter")));
+    }
+
+    // -----------------------------------------------------------------------
     // [clipboard] provider config (C3 Task 4)
     // -----------------------------------------------------------------------
 
