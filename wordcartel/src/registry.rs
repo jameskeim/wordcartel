@@ -338,19 +338,19 @@ impl Registry {
 
         // Export menu.
         r.register("export_html", "Export HTML", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "html", &c.msg_tx, &c.fs);
+            crate::export::run_export(c.editor, &c.fs, "html", &c.msg_tx);
             CommandResult::Handled
         });
         r.register("export_docx", "Export DOCX", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "docx", &c.msg_tx, &c.fs);
+            crate::export::run_export(c.editor, &c.fs, "docx", &c.msg_tx);
             CommandResult::Handled
         });
         r.register("export_pdf", "Export PDF", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "pdf", &c.msg_tx, &c.fs);
+            crate::export::run_export(c.editor, &c.fs, "pdf", &c.msg_tx);
             CommandResult::Handled
         });
         r.register("export_tex", "Export LaTeX", Some(MenuCategory::Export), |c| {
-            crate::export::run_export(c.editor, "tex", &c.msg_tx, &c.fs);
+            crate::export::run_export(c.editor, &c.fs, "tex", &c.msg_tx);
             CommandResult::Handled
         });
 

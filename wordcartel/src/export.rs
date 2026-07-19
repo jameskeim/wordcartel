@@ -248,15 +248,36 @@ fn run_pandoc(
 // run_export — public entry point called from registry commands
 // ---------------------------------------------------------------------------
 
-/// Top-level export entry: gate on pandoc probe, derive target path, handle
-/// overwrite confirmation, then dispatch.
+/// Top-level export entry: gate on pandoc, then open a destination picker PRE-SEEDED with
+/// the derived path.
+///
+/// The seeding is the whole point (decision 4): export is zero-decision today, and a bare
+/// Enter must reproduce that byte-for-byte. Destination CHOICE is new capability;
+/// destination OBLIGATION would be a regression.
 pub fn run_export(
     editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     ext: &str,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
-    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
-    // Must have a named file (not a scratch buffer).
+    run_export_with_probe(editor, fs, ext, msg_tx, probe_pandoc)
+}
+
+/// `run_export` with an INJECTABLE pandoc probe.
+///
+/// The probe seam exists because the merge gate runs on machines without pandoc: a test
+/// that depends on the host having it is an environment assumption that fails the gate
+/// rather than the code. Production passes `probe_pandoc` (still `OnceLock`-cached);
+/// tests pass a closure.
+pub(crate) fn run_export_with_probe(
+    editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    ext: &str,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    pandoc_available: impl Fn() -> bool,
+) {
+    // Both refusals stay AHEAD of the picker — no point choosing a destination for an
+    // export that cannot run.
     let source = match editor.active().document.path.clone() {
         Some(p) => p,
         None => {
@@ -265,29 +286,22 @@ pub fn run_export(
             return;
         }
     };
-
-    // Pandoc availability gate.
-    if !probe_pandoc() {
+    if !pandoc_available() {
         editor.set_status_full(crate::status::StatusKind::Error, "pandoc not found — install it to export",
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
 
-    let target = derived_export_path(&source, ext);
-
-    // If target exists, ask for overwrite confirmation.
-    if crate::fsx::exists_via(&**fs, &target) {
-        editor.pending_export = Some(PendingExport {
-            ext: ext.to_owned(),
-            target: target.clone(),
-        });
-        editor.open_prompt(crate::prompt::Prompt::export_overwrite(&target));
-        return;
-    }
-
-    // Target did not exist: dispatch without overwrite confirmation.  If it
-    // appears before the write completes, finalization refuses to clobber it.
-    do_export(editor, ext, &target, msg_tx, false, std::sync::Arc::clone(fs));
+    // `derived_export_path` still computes the default — it is now the SEED rather than the
+    // final answer, and it reads `Document.path`, which stays LOGICAL (§7.6.2), so the
+    // output lands beside the file the writer opened.
+    let derived = derived_export_path(&source, ext);
+    let dir = derived.parent().map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let field = derived.file_name().map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    editor.open_destination_picker(fs, msg_tx,
+        crate::file_browser::DestinationPurpose::Export { ext: ext.to_owned() }, dir, field);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,11 +323,82 @@ mod tests {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
-        run_export(&mut e, "html", &tx, &crate::test_support::test_fs());
+        run_export(&mut e, &crate::test_support::test_fs(), "html", &tx);
         assert!(e.status_text().to_lowercase().contains("save the file first"));
         // A17 T5 (F4 Warning table): a Sticky Warning.
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    #[test]
+    fn export_opens_a_destination_picker_pre_seeded_with_the_derived_path() {
+        // ENTER-THROUGH (decision 4). Export is zero-decision today; adding a mandatory
+        // dialog would be a regression dressed as a feature. Pre-seeding means a bare Enter
+        // reproduces today's behaviour byte-for-byte, with the target VISIBLE while doing so.
+        let d = std::env::temp_dir().join(format!("wc-exp-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let src = d.join("notes.md");
+        std::fs::write(&src, b"# hi\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src.clone()), (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        run_export_with_probe(&mut e, &fs, "html", &tx, || true);
+
+        let fb = e.file_browser.as_ref().expect("export opens the destination picker");
+        assert_eq!(fb.dir, d, "seeded at the SOURCE's directory");
+        match &fb.mode {
+            crate::file_browser::BrowseMode::Destination { purpose, field, .. } => {
+                // Compare BY REFERENCE — `DestinationPurpose::Export { ext: String }` is not
+                // `Copy`, so `*purpose` would move a `String` out of a borrow of `fb.mode`.
+                assert_eq!(purpose, &crate::file_browser::DestinationPurpose::Export {
+                    ext: "html".into() });
+                assert_eq!(field, "notes.html",
+                    "pre-filled with derived_export_path's file name, so bare Enter == today");
+            }
+            other => panic!("expected a destination picker, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn export_destination_picker_opens_without_pandoc_installed() {
+        // The merge gate runs on machines with no pandoc. `run_export` probes
+        // `pandoc --version` before anything else, so an environment assumption here would
+        // fail the gate rather than the code. The probe is injected, not detected.
+        let d = std::env::temp_dir().join(format!("wc-exp-nopandoc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let src = d.join("notes.md");
+        std::fs::write(&src, b"# hi\n").expect("seed");
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src), (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        // Pandoc PRESENT (injected) → the picker opens regardless of the host machine.
+        run_export_with_probe(&mut e, &fs, "html", &tx, || true);
+        assert!(e.file_browser.is_some(), "an injected-present probe opens the picker");
+        // Pandoc ABSENT (injected) → the refusal fires and no picker opens.
+        e.file_browser = None;
+        run_export_with_probe(&mut e, &fs, "html", &tx, || false);
+        assert!(e.file_browser.is_none(), "an injected-absent probe opens NO picker");
+        assert!(e.status_text().to_lowercase().contains("pandoc not found"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn export_still_refuses_before_opening_any_picker() {
+        // The probe and the unnamed-buffer refusal stay AHEAD of the picker: there is no
+        // point choosing a destination for an export that cannot run.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        run_export_with_probe(&mut e, &fs, "html", &tx, || true);
+        assert!(e.file_browser.is_none(), "an unnamed buffer opens NO picker");
+        assert!(e.status_text().to_lowercase().contains("save the file first"));
     }
 
     #[test]
