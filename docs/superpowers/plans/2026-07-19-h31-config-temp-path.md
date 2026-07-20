@@ -512,8 +512,9 @@ that would have gone green for an unrelated reason.
    git status --short      # must be clean
    ```
 
-10. Record both parts in `scratchpad/h31-gates/measurement-postfix.md` — counts, the `uniq -c`
-    output, the reproduced panic block, and the mechanism comparison. Commit:
+10. Record both parts in `scratchpad/h31-gates/measurement-postfix.md` — the harness's full
+    `SUMMARY:` line verbatim (it carries `runs=`, `failures=`, `threads=` and `expected_total=`),
+    its exit code, the reproduced panic block, and the mechanism comparison. Commit:
     `docs(h31): record post-fix measurement (0/60) and the attribution check`
 
 ---
