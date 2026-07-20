@@ -111,7 +111,9 @@ be rejected — the observation is unobtainable once the flake is gone.
 ### Files
 
 - `wordcartel/src/config.rs` — two assertion messages, inside `#[cfg(test)] mod tests`.
-- `scratchpad/h31-gates/observation-prefix.md` — new; the recorded evidence.
+- `scratchpad/h31-gates/run_n.sh` — new, **committed**; the run harness Tasks 3 and 4 also use.
+- `scratchpad/h31-gates/observation-prefix.md` — new, **committed**; the recorded evidence Task 3's
+  attribution check compares against.
 
 ### Interfaces
 
@@ -153,42 +155,102 @@ guard from `ea01138` (spec §5).
    `cargo build`/`cargo test --no-run` warning-free. Commit with the trailers:
    `test(h31): print warns on the two invalid-value assertions (D4, pre-fix diagnostic)`
 
-4. **Build the run harness.** Save as a file under a fresh `mktemp -d`; do not inline it repeatedly.
+4. **Build the run harness and COMMIT it.** Tasks 3 and 4 both need it, and each task's executor
+   sees only its own brief and a fresh shell — a harness under `mktemp -d` would not exist for them.
+   Write it to the in-repo path **`scratchpad/h31-gates/run_n.sh`** (that directory is tracked, not
+   gitignored — verified) and `chmod +x` it. One audited copy, three consumers.
+
    ```zsh
    #!/bin/zsh
-   # usage: run_n.sh <N> <outdir>
+   # H31 verification harness. Usage: run_n.sh <N> <outdir> <expected_total>
+   #
+   #   <expected_total> = the number of tests that must be ACCOUNTED FOR on every run,
+   #   i.e. passed + failed. Derived per task (see each task's brief) — never a magic
+   #   constant, because any task that adds a #[test] changes it.
+   #
+   # Exit 2 = integrity violation (the measurement is void, do not interpret it).
+   # Exit 0 = the runs happened and are trustworthy; test failures are REPORTED, not
+   #          treated as harness errors — Task 1 legitimately expects failures.
    set -u
-   N=$1; OUT=$2; mkdir -p "$OUT"
+   if [[ $# -ne 3 ]]; then print -r -- "usage: run_n.sh <N> <outdir> <expected_total>"; exit 2; fi
+   N=$1; OUT=$2; EXPECTED=$3; mkdir -p "$OUT"
+
+   if [[ -n "${RUST_TEST_SHUFFLE:-}" ]]; then
+     print -r -- "FATAL: RUST_TEST_SHUFFLE is set — ordering assumptions void"; exit 2
+   fi
+
+   # Binary from cargo's JSON artifact stream. NEVER an `ls -t` glob.
    BIN=$(cargo test -p wordcartel --lib --no-run --message-format=json 2>/dev/null \
      | jq -r 'select(.reason=="compiler-artifact")
               | select(.target.kind[]=="lib")
               | select(.executable != null) | .executable' | tail -1)
    if [[ -z "$BIN" || ! -x "$BIN" ]]; then print -r -- "FATAL: no lib test binary"; exit 2; fi
    print -r -- "binary: $BIN"
-   # Presence check — a 0-failure result is meaningless if the tests are not in the binary.
+
+   # Presence check. A 0-failure result is MEANINGLESS if the tests are not in the binary —
+   # a botched fold that dropped the flaky test would otherwise score a perfect run.
    "$BIN" --list > "$OUT/list.txt" 2>&1; rc=$?
    if [[ $rc -ne 0 ]]; then print -r -- "FATAL: --list failed rc=$rc"; exit 2; fi
    for t in files_type_filter_unknown_warns_and_defaults_documents \
             clipboard_provider_unknown_warns_and_defaults_auto; do
      if ! grep -q "$t" "$OUT/list.txt"; then print -r -- "FATAL: $t absent from binary"; exit 2; fi
    done
+
+   fails=0
    for i in $(seq 1 $N); do
      "$BIN" > "$OUT/run-$i.log" 2>&1; rc=$?
-     print -r -- "$i rc=$rc"
-   done
-   ```
-   `--shuffle` and `RUST_TEST_SHUFFLE` must be absent; do not add them.
+     LOG="$OUT/run-$i.log"
 
-5. **Attribute failures with this awk — never a bare test-name grep.** libtest prints the failing
-   names in an indented block after a second `failures:` header:
+     # PER-FILE integrity. An aggregate `grep | sort | uniq -c` over all logs would let a
+     # log with zero result lines cancel one with two; this cannot.
+     nres=$(grep -c '^test result:' "$LOG")
+     if [[ $nres -ne 1 ]]; then
+       print -r -- "FATAL: $LOG has $nres 'test result:' lines (want exactly 1)"; exit 2
+     fi
+     line=$(grep '^test result:' "$LOG")
+     passed=$(print -r -- "$line"   | awk '{for(i=1;i<=NF;i++) if($i=="passed;")   print $(i-1)}')
+     failed=$(print -r -- "$line"   | awk '{for(i=1;i<=NF;i++) if($i=="failed;")   print $(i-1)}')
+     filtered=$(print -r -- "$line" | awk '{for(i=1;i<=NF;i++) if($i=="filtered")  print $(i-1)}')
+     if [[ $filtered -ne 0 ]]; then
+       print -r -- "FATAL: $LOG filtered=$filtered — a filtered run is not a whole-suite run"; exit 2
+     fi
+     if [[ $((passed + failed)) -ne $EXPECTED ]]; then
+       print -r -- "FATAL: $LOG passed+failed=$((passed + failed)), expected $EXPECTED"; exit 2
+     fi
+
+     # Attribute failures by parsing the `failures:` BLOCK — never a bare test-name grep,
+     # because libtest prints the test name for PASSING runs too.
+     names=$(awk '/^failures:$/{blk=1; next} /^test result:/{blk=0} blk && /^    [a-zA-Z]/{print $1}' "$LOG")
+     if [[ -n "$names" ]]; then
+       fails=$((fails + 1)); print -r -- "run $i FAILED: $names"
+     fi
+   done
+   print -r -- "SUMMARY: runs=$N failures=$fails expected_total=$EXPECTED binary=$BIN"
+   ```
+   Never pass `--shuffle`, and never set `RUST_TEST_SHUFFLE` (the harness refuses if it is set).
+
+5. **Derive this task's `expected_total`** — do not copy a constant. At this point in the branch
+   Task 2 has not run, so the working tree still holds the `main` baseline — count it in place (do
+   **not** switch or detach branches to check; you would risk the branch state for nothing):
    ```zsh
-   for f in "$OUT"/run-*.log; do
-     names=$(awk '/^failures:$/{blk=1; next} /^test result:/{blk=0} blk && /^    [a-zA-Z]/{print $1}' "$f")
-     [[ -n "$names" ]] && print -r -- "$f: $names"
-   done
+   grep -rn '#\[test\]' wordcartel/src --include='*.rs' | wc -l    # → 1777
+   grep -rn '#\[ignore' wordcartel/src --include='*.rs'            # → exactly 1 (e2e.rs bench)
    ```
+   (Quote the `--include` pattern: unquoted `*.rs` is glob-expanded by zsh and the command fails
+   with `no matches found`.)
+   1777 `#[test]` attributes, 1 of them `#[ignore]`d (`r1_typing_latency_bench` in `e2e.rs`), so a
+   clean run reads `1776 passed; 0 failed; 1 ignored` and **`expected_total` for Task 1 is `1776`**
+   (passed + failed, ignored excluded). Task 1 adds no `#[test]`.
 
-6. **Run 30 iterations at default threading** and record the outcome.
+6. **Run 30 iterations at default threading:**
+   ```zsh
+   chmod +x scratchpad/h31-gates/run_n.sh
+   OUT=$(mktemp -d)
+   scratchpad/h31-gates/run_n.sh 30 "$OUT" 1776; rc=$?
+   print -r -- "harness rc=$rc outdir=$OUT"
+   ```
+   `rc=2` means the measurement is void — fix the cause and re-run; do not interpret the numbers.
+   Keep `$OUT` for step 8; the failing run's log is `"$OUT"/run-<i>.log`.
 
 7. **Pass condition — read it exactly (spec §7.1).** This step passes only if **all** hold:
    - **at least one** of the 30 runs failed;
@@ -204,9 +266,14 @@ guard from `ea01138` (spec §5).
    silently-vanished flake changes what the rest of this effort means.
 
 8. **Record the evidence** in `scratchpad/h31-gates/observation-prefix.md`: the binary path, the
-   failure count out of 30, and the **verbatim** panic block including the `warns` vector. Task 3
-   compares against this text. Commit:
-   `docs(h31): record the pre-fix mechanism observation (30 runs, D4)`
+   failure count out of 30, the harness `SUMMARY:` line, and the **verbatim** panic block including
+   the `warns` vector. Tasks 3 and 4 compare against this text, so it must be committed, not left in
+   `$OUT`. Commit **both** the record and the harness (Tasks 3 and 4 depend on the harness existing
+   in the repo):
+   ```zsh
+   git add scratchpad/h31-gates/run_n.sh scratchpad/h31-gates/observation-prefix.md
+   ```
+   `docs(h31): record the pre-fix mechanism observation (30 runs, D4) + run harness`
 
 ---
 
@@ -321,8 +388,18 @@ already in scope in this file (`tempdir()` returns one).
 
 7. **Gates:** `cargo test` green (full suite, default threading, no thread flags),
    `cargo clippy --workspace --all-targets` clean, `cargo build` and `cargo test --no-run`
-   warning-free. Note for the report: the fold removes helper functions only — **no `#[test]` item
-   is added or removed**, so the suite's test count must be unchanged. Commit:
+   warning-free. Capture each cargo exit code on the SAME LINE (`cargo build -p wordcartel > "$L" 2>&1; rc=$?`)
+   — in zsh without `pipefail` a pipeline's status is the last command's, so `cargo … | tail` reads
+   green on failure.
+
+   **Report the test-count delta explicitly, because Task 3 pins it.** This task adds exactly **one**
+   `#[test]` (`scratch_cfg_paths_are_unique_even_for_one_name`) and removes none — the fold deletes
+   helper *functions*, which are not tests. Confirm and state the number:
+   ```zsh
+   git diff main --unified=0 -- 'wordcartel/src/**' | grep -c '^+.*#\[test\]'   # → 1
+   git diff main --unified=0 -- 'wordcartel/src/**' | grep -c '^-.*#\[test\]'   # → 0
+   ```
+   Commit:
    `fix(h31): unique scratch path per call; fold three identical config test helpers`
 
 ---
@@ -336,34 +413,58 @@ nothing.**
 ### Files
 
 - `scratchpad/h31-gates/measurement-postfix.md` — new; both results.
+- `scratchpad/h31-gates/run_n.sh` — **consumed, not modified.** Committed by Task 1; invoked as
+  `run_n.sh <N> <outdir> <expected_total>`. If it is missing, Task 1 did not complete — stop and
+  report rather than reconstructing it, since a divergent second copy defeats the point of one
+  audited harness.
 - No source changes on the branch. (The attribution check edits a **scratch** branch that is
   discarded.)
 
 ### Steps — Part A: post-fix measurement (spec §7.2)
 
-1. Run 60 iterations with Task 1's harness and awk, at default threading, no shuffle.
+1. **Derive `expected_total` — it is NOT a constant.** The pin is strong because it is exact, and
+   wrong for the same reason the moment a task changes the test count, so compute it:
 
-2. **Required result: 0 of 60 failed.** Baseline was 10/60; at that 16.7% rate, 60 clean runs is
-   luck with probability ≈ 1.7×10⁻⁵.
+   > `expected_total` = **1776** (the `main` @ `60be3d1` baseline: 1777 `#[test]` attributes under
+   > `wordcartel/src`, minus the one `#[ignore]`d `r1_typing_latency_bench` in `e2e.rs`)
+   > **+ `#[test]`s this branch adds − `#[test]`s it removes.**
 
-3. **Run-integrity checks — ALL required.** Parsing the `failures:` block alone goes false-green if
-   a run aborts before printing it, output is dropped, or the wrong binary ran:
-   - the binary came from cargo's JSON artifact stream, not an `ls -t` glob (harness does this);
+   ```zsh
+   git diff main --unified=0 -- 'wordcartel/src/**' | grep -c '^+.*#\[test\]'   # added
+   git diff main --unified=0 -- 'wordcartel/src/**' | grep -c '^-.*#\[test\]'   # removed
+   ```
+   Task 2 adds exactly one (`scratch_cfg_paths_are_unique_even_for_one_name`) and removes none, so
+   at this point **`expected_total` = 1777**, and a clean run reads
+   `1777 passed; 0 failed; 1 ignored`. If the commands above disagree with that arithmetic, STOP:
+   either the fold removed a test it should not have, or a task added one this plan does not know
+   about. Re-derive, do not force the number.
+
+2. **Run 60 iterations** with the harness committed by Task 1:
+   ```zsh
+   OUT=$(mktemp -d)
+   scratchpad/h31-gates/run_n.sh 60 "$OUT" 1777; rc=$?
+   print -r -- "harness rc=$rc outdir=$OUT"
+   ```
+   **Required result: `rc=0` and `SUMMARY: runs=60 failures=0`.** Baseline was 10/60; at that 16.7%
+   rate, 60 clean runs is luck with probability ≈ 1.7×10⁻⁵. `rc=2` means an integrity check tripped
+   and the measurement is **void** — diagnose and re-run; never interpret the failure count from a
+   void run.
+
+3. **What the harness enforced, and why each matters** (verify these are in the copy you ran; if the
+   file was modified since Task 1, that is a finding to report, not to fix silently):
+   - binary from cargo's JSON artifact stream, never an `ls -t` glob;
    - **both** `files_type_filter_unknown_warns_and_defaults_documents` **and**
-     `clipboard_provider_unknown_warns_and_defaults_auto` are present in `--list` (harness checks
-     this, and it is load-bearing: **0/60 is also exactly what you get if the fold silently dropped
-     or renamed the flaky test out of the suite**);
-   - all 60 logs exist;
-   - each log has **exactly one** `test result:` line;
-   - **the passed-count is exactly `1776` on every run, with `0 failed`.** Any other total — higher
-     or lower — is a failed integrity check, not a pass. (1776 = 1777 `#[test]` attributes under
-     `wordcartel/src` minus the `#[ignore]`d `r1_typing_latency_bench` in `e2e.rs`. Task 2 removes
-     helper *functions* only, so the count must not move.) Check with:
-     ```zsh
-     grep -h '^test result:' "$OUT"/run-*.log | sort | uniq -c
-     ```
-     Required: exactly one distinct line, count 60, reading `test result: ok. 1776 passed; 0 failed; 1 ignored; …`.
-   - total runtime ~4–5 min for 60 runs; **an implausibly fast green did not run.**
+     `clipboard_provider_unknown_warns_and_defaults_auto` present via `--list` — load-bearing,
+     because **0/60 is also exactly what you get if the fold silently dropped or renamed the flaky
+     test out of the suite**;
+   - **per-file** `test result:` line count of exactly 1 (an aggregate `sort | uniq -c` across logs
+     would let a log with zero result lines cancel one with two — it reads like a per-file guarantee
+     and is not one);
+   - `filtered = 0` on every run;
+   - `passed + failed == expected_total` on every run — any other total, high or low, voids the run;
+   - failures attributed by parsing the `failures:` **block**, never a bare test-name grep.
+   - Additionally check yourself: all 60 logs exist (`ls "$OUT"/run-*.log | wc -l` → 60), and total
+     runtime was ~4–5 min. **An implausibly fast green did not run.**
 
 ### Steps — Part B: attribution check (spec §7.3)
 
@@ -386,7 +487,13 @@ that would have gone green for an unrelated reason.
    ```
    If the diff reaches any assertion, call site, or other function, redo it.
 
-7. Run 30 iterations with the same harness.
+7. Run 30 iterations with the same committed harness. The scratch branch changes no `#[test]`, so
+   `expected_total` is still 1777:
+   ```zsh
+   OUT=$(mktemp -d)
+   scratchpad/h31-gates/run_n.sh 30 "$OUT" 1777; rc=$?
+   print -r -- "harness rc=$rc outdir=$OUT"
+   ```
 
 8. **Pass condition:** the flake **returns**, AND the failure is
    `files_type_filter_unknown_warns_and_defaults_documents` failing at the **warning assertion**
@@ -449,7 +556,16 @@ result is a compiled binary whose named test fails at its named assertion.
    identified by Task 1's custom message `the invalid-value arm must warn by name (H31 diagnostic)`.
    A failure at the `assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents)` above it means
    the mutation was not confined to the warning arm — that is a **FAILED step**, not a pass; revert
-   and redo. Record the verbatim output. **Revert the mutation** and confirm the test passes again.
+   and redo. Record the verbatim output.
+
+   **Then revert, and prove the reversion is byte-for-byte:**
+   ```zsh
+   git diff --exit-code -- wordcartel/src/config.rs; rc=$?   # rc MUST be 0
+   ```
+   Re-running the target test is **not** sufficient proof: a leftover edit elsewhere in the warning
+   arm would not affect the *next* mutation's test (`files_filters_default_on_absent`) and could
+   persist silently into step 3, contaminating it. `git diff --exit-code` is both cheaper and
+   strictly stronger than a full-suite rerun. Do not apply mutation (b) until `rc=0`.
 
    Why this mutation and not `ea01138`'s: the invalid-value arm only *pushes the warning* — it does
    **not** assign `cfg.files.type_filter`. The `Documents` the first assertion sees comes from
@@ -470,7 +586,10 @@ result is a compiled binary whose named test fails at its named assertion.
    **Required outcome:** it fails **specifically at the `"files.type_filter must default to
    Documents"` assertion** (that test's own existing message). A failure at its `show_clutter`
    assertion means you flipped both fields — **FAILED step**; redo with only `type_filter` changed.
-   Record the verbatim output. **Revert** and confirm the test passes.
+   Record the verbatim output. **Then revert and prove it byte-for-byte, as in step 2:**
+   ```zsh
+   git diff --exit-code -- wordcartel/src/config.rs; rc=$?   # rc MUST be 0
+   ```
 
    Why one field and not `ea01138`'s `{ show_clutter: true, type_filter: All }`: that test asserts
    `show_clutter` **first**, so the struct-wide flip kills it at the first assertion and never
@@ -485,20 +604,27 @@ result is a compiled binary whose named test fails at its named assertion.
    cargo test             # full suite green
    ```
 
-6. **Final gates and the pre-merge report.** Note that a warning-free build proves nothing if
-   nothing was rebuilt — a cached `cargo build`/`clippy` emits no warnings by construction. Force a
-   real recompile of the touched crate first:
+6. **Final gates and the pre-merge report.** Two traps, both of which have bitten this project:
+   a warning-free build proves nothing if **nothing was rebuilt** (a cached `cargo build`/`clippy`
+   emits no warnings by construction), and in zsh **a pipeline's exit status is the LAST command's**
+   — `cargo build 2>&1 | tail -20` reports `tail`'s success even when the build failed. So: force a
+   recompile, capture each exit code on the SAME LINE, log to a file, and tail the *file*.
    ```zsh
+   L=$(mktemp -d)
    touch wordcartel/src/config.rs
-   cargo build -p wordcartel 2>&1 | tail -20
+   cargo build -p wordcartel > "$L/build.log" 2>&1; build_rc=$?
    touch wordcartel/src/config.rs
-   cargo clippy --workspace --all-targets 2>&1 | tail -20
-   cargo test --no-run 2>&1 | tail -20
+   cargo clippy --workspace --all-targets > "$L/clippy.log" 2>&1; clippy_rc=$?
+   cargo test --no-run > "$L/norun.log" 2>&1; norun_rc=$?
+   print -r -- "build=$build_rc clippy=$clippy_rc norun=$norun_rc"
+   tail -20 "$L/build.log"; tail -20 "$L/clippy.log"; tail -20 "$L/norun.log"
    ```
-   Treat an implausibly fast "clean" as not having run. Then run the PTY smoke suite and **quote its
-   one-line summary verbatim** in the report:
+   **All three `rc` values must be 0**, and the logs must contain no `warning:` lines for
+   `wordcartel`. Treat an implausibly fast "clean" as not having run. Then run the PTY smoke suite,
+   capturing its status the same way, and **quote its one-line summary verbatim** in the report:
    ```zsh
-   scripts/smoke/run.sh
+   scripts/smoke/run.sh > "$L/smoke.log" 2>&1; smoke_rc=$?
+   print -r -- "smoke_rc=$smoke_rc"; tail -5 "$L/smoke.log"
    ```
    It is mandatory-run, advisory-pass: a red result does not block the merge but must be surfaced
    explicitly (e.g. `smoke: FAIL s5 — advisory`). A `smoke: SKIP — …` line is quoted the same way
@@ -526,13 +652,53 @@ here so a reviewer can check the fix rather than rediscover the hole.
    and by stating explicitly that a build error is not a passing outcome for any mutation step.
 3. **Task 3's 0/60 was indistinguishable from "the test no longer exists."** The fold edits the very
    call sites of the flaky test, so a botched fold that dropped it would produce a *perfect* result.
-   Fixed by the `--list` presence check on both `unknown` tests before any run, and by pinning the
-   passed-count to exactly 1776 rather than accepting "the suite was green."
+   Fixed by the `--list` presence check on both `unknown` tests before any run, and by pinning
+   `passed + failed` to a derived expected total rather than accepting "the suite was green."
 
 Applying the same question to the rest: Task 1 step 7 cannot pass vacuously (it requires ≥1 failure
 with a named test, named assertion, and a matched `warns` string, and calls zero failures
 inconclusive). Task 3 Part B cannot pass on absence (same rule) and cannot misattribute a broad
 revert (the `git diff` confinement check). Task 4 step 6 cannot pass on a cached build (the `touch`).
+
+### Round 2 — defects found by the Codex plan gate, and what replaced them
+
+Two of these were introduced by round 1's own fixes. That is now the established pattern in this
+effort (spec round 2, plan round 2), and it is the reason this section exists.
+
+4. **The exact-count pin was self-contradictory and would have failed every run** (Critical). Task 2
+   adds one `#[test]`, but Task 3 pinned the post-fix count to the pre-fix 1776 while Task 2
+   separately claimed no test was added. The pin was strong *because* exact and wrong for the same
+   reason the moment a task changed the count. Fixed by making the total a **derived quantity with
+   its derivation shown** (baseline 1776 + added − removed, with the `git diff | grep -c '#\[test\]'`
+   commands), by passing it to the harness as an argument rather than hard-coding it, and by
+   checking `passed + failed == expected_total` — an invariant that holds in Task 1 where failures
+   are *expected*, not only on clean runs.
+5. **Task 3 named an artifact its executor would not possess** (Critical). The harness lived under
+   Task 1's `mktemp -d`, but each task's subagent sees only its own brief and a fresh shell. Fixed
+   by committing the harness once to `scratchpad/h31-gates/run_n.sh` (tracked, verified not
+   gitignored) and giving every consumer that exact path and its argument contract — one audited
+   copy rather than three inlined copies free to diverge.
+6. **"Exactly one `test result:` line per log" did not check that** (Important). The aggregate
+   `grep | sort | uniq -c` prints 60 even when one log has zero result lines and another has two —
+   they cancel. It *reads* like a per-file guarantee and is not one, the same species of defect this
+   effort keeps finding. Fixed by a per-file `grep -c` inside the harness that hard-fails the run.
+7. **Cargo steps piped to `tail -20` could read green on failure** (Important). In zsh without
+   `pipefail`, a pipeline's status is the last command's, so a failed build/clippy/`--no-run` was
+   invisible. Fixed by capturing each exit code on the same line into a log file and tailing the
+   *file*; the whole plan was swept for the pattern.
+8. **Reverting a mutation was not proven byte-for-byte** (Important, and a correction to this
+   author's own proposal). Re-running the target test after reverting mutation (a) proves nothing
+   about leftovers that only affect *other* tests — such a leftover would ride silently into
+   mutation (b). Fixed with `git diff --exit-code -- wordcartel/src/config.rs` after each revert:
+   cheaper than the full-suite rerun this author suggested, and strictly stronger.
+9. **The harness's `$OUT` was scoped to the harness process** (Minor) — the caller's awk loop
+   referenced a variable it did not own. Fixed by folding attribution into the harness and showing
+   the caller set `OUT=$(mktemp -d)` explicitly.
+
+One further hazard, caught while applying the rule to the steps touched this round: the count
+derivation originally suggested `git switch --detach 60be3d1` to confirm the baseline. Task 1 runs
+before any source change, so the working tree *is* the baseline — the switch bought nothing and put
+branch state at risk in a subagent's hands. Removed.
 
 ## Underdetermined in the spec, resolved here
 
