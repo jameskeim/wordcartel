@@ -814,6 +814,33 @@ audit requirement). Absent that, the honest-limits gate is the better trade.
 
 *(Captured 2026-07-18 during C5's spec gate.)*
 
+
+---
+
+**Grounded 2026-07-19 during effort ① (which then DEFERRED it — see below).** A read-only mapping
+agent measured the scanner rather than reasoning about it:
+
+- **The evasion surface is 5 of 6 uncaught**, not a narrow import-spelling gap. Caught: `use std::fs
+  as f`. **Not** caught: a same-module unqualified call to a wrapper (an explicit `w.module ==
+  module` skip, *disclosed in the scanner's own source*); a renamed/re-exported wrapper; function-
+  pointer or closure indirection; `RealFs` reached via a spelling lacking the literal `fsx::RealFs`;
+  and a `(w)` marker whose prose is never semantically checked.
+- **The scanner's 7 self-checks cover NONE of those six.**
+- **Marker census: `(w)`=37, `(c)`=6, `(b)`=6, `(g)`=1, `(e)`=1 — 51 total.** `(w)`
+  (wrapper-by-decision) is the dominant category by a wide margin, so "everything routes through the
+  seam" substantially over-describes the tree. Whether that is acceptable is its own question.
+- Layer 4 (added by C5) does catch the wrapper-bypass class that caused C5's Critical, and it
+  immediately found two more real sites. It is a genuine improvement; it is not a proof.
+
+**Why effort ① deferred it — a fact the original filing did not have.** `wordcartel`'s
+`[dev-dependencies]` are **`proptest` and `tempfile` only**. `syn`/`proc-macro2` appear in
+`Cargo.lock` solely as transitive deps of `bindgen`/`burn-derive`, unreachable from any workspace
+member. **Use-tree parsing therefore requires adding a new declared dependency**, against the
+standing dependency-weight concern (H2). That trade is the actual decision this item now carries —
+it is not merely "write a better scanner."
+
+Also relevant: **there is no CI.** The scanner runs only because a human or agent follows CLAUDE.md.
+
 ### H27 — dispatch signatures: pass DispatchCtx instead of 8 loose args
 <!-- item: H27 -->
 
@@ -865,6 +892,36 @@ dispatch-table effort.
 *(Captured 2026-07-18 from C5 Task 5's review. See also [[H1]] — the god-object split this lint
 exists to prevent recurring.)*
 
+
+---
+
+**Measured 2026-07-19 during effort ① (which then DEFERRED it).** The original filing called the fix
+"unusually clean." The blast radius says otherwise:
+
+| | production call sites | test call sites |
+|---|---|---|
+| `app::reduce` | 1 | **148** |
+| the other six combined | 9 | ~4 |
+
+**~150 test call sites, essentially all on `reduce`.** That is the "surprise on size" condition the
+post-C5 map named as the trigger to drop this back to opportunistic, and effort ① did exactly that.
+A shim could absorb them, but choosing one is a design decision this item has not made.
+
+**Two further facts the filing did not have:**
+
+- **There is a *second* bundle.** `handle_key`, `dispatch_overlay_command` and `drain_one_dispatch`
+  construct `registry::Ctx` — differently shaped, owning `&mut Editor` and holding *owned* rather
+  than borrowed `msg_tx`/`fs`, because `dispatch_filter` spawns a `'static` thread. Collapsing to
+  `DispatchCtx` does **not** remove that construction, so "the bundle is disassembled and
+  reassembled" is true of only part of the surface.
+- **Two of the seven are reached through the `OVERLAYS` function-pointer table** (via
+  `menu::intercept` / `palette::intercept`). Not a blocker, but signature changes ripple through a
+  table H21 deliberately froze.
+
+**Timing note.** The C5-era blocker was that 21 of 26 briefs were written against the loose form.
+That blocker only exists while an effort is in flight, so the cheap window is between efforts — and
+it closes the moment the next one starts writing briefs.
+
 ### H28 — Un-pumped picker tests assert unreachable states
 <!-- item: H28 -->
 
@@ -882,6 +939,29 @@ Either make them reachable (assert the warning in a state a writer can actually 
 them. A test that passes for the wrong reason is worse than no test: it reports coverage of a path
 nobody is checking.
 
+
+
+---
+
+**Re-grounded 2026-07-19 during effort ①, which DEFERRED it — and the finding changes what this item
+is.** Read this before acting on the description above.
+
+- **The convention was applied far more completely than the filing implies.** Of the 20 tests that
+  press Enter at a Destination picker, **18 already pump** and **all 20 drive the real intercept**.
+  Two others carry doc comments recording that they were *fixed* from unpumped to pumped. This is a
+  two-test remainder, not a systemic gap.
+- **Pumping was already tried on these two, and reverted** — their doc comments say so.
+- **The mechanism is verified, and it is why.** Before a listing lands, `entries` is empty, so
+  `highlighted` is `None` and the commit falls through to `Nothing` — the warning fires. Once
+  `apply_listing_done` runs, `rederive` puts `".."` at `entries[0]`, `selected` stays 0, and Row 1's
+  guard becomes true purely off `trimmed.is_empty()` → `Descend`. **The empty-path warning is
+  genuinely unreachable once a listing lands.**
+
+**So the real question is behavioural, not test hygiene: is that warning reachable in production at
+all?** If it is not, the tests are asserting a state no writer can reach and should be retired along
+with the dead branch — not "made to pump." **Making them pump would delete the assertion while
+appearing to fix it**, which is the exact defect class both efforts spent their review rounds
+catching (eight instances in effort ① alone).
 
 ### A22 — Write-Block Redirect exports the whole document, not the marked block
 <!-- item: A22 -->
