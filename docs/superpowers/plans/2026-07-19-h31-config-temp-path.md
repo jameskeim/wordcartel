@@ -437,24 +437,42 @@ nothing.**
    cross-check is the harness's own `passed + failed == expected_total` on a real run: if the
    derivation were wrong, every run would hard-fail with the actual total in the message.
 
-2. **Run 60 iterations** with the harness committed by Task 1:
+2. **Run 200 iterations** with the harness committed by Task 1:
    ```zsh
    OUT=$(mktemp -d)
-   scratchpad/h31-gates/run_n.sh 60 "$OUT" 1777; rc=$?
+   scratchpad/h31-gates/run_n.sh 200 "$OUT" 1777; rc=$?
    print -r -- "harness rc=$rc outdir=$OUT"
    ```
-   **Required result: `rc=0` and `SUMMARY: runs=60 failures=0`.** Baseline was 10/60; at that 16.7%
-   rate, 60 clean runs is luck with probability ≈ 1.7×10⁻⁵. `rc=2` means an integrity check tripped
-   and the measurement is **void** — diagnose and re-run; never interpret the failure count from a
-   void run.
+   **Required result: `rc=0` and `SUMMARY: runs=200 failures=0`.** Expect ~15-20 min.
+   `rc=2` means an integrity check tripped and the measurement is **void** — diagnose and re-run;
+   never interpret the failure count from a void run.
+
+   **Why 200 and not the 60 this plan originally specified — read this before shortening it.**
+   The 60-run figure was justified by "at the measured 16.7% rate, 60 clean runs is luck with
+   probability ≈ 1.7×10⁻⁵". That justification is no longer sound: **Task 1 measured the pre-fix
+   rate at 4/60 on a quiet machine**, against 10/60 during the grounding sweep when four agents
+   were loading the box. Pooling Task 1's observation runs gives ≈4-7%. At 6.7%, 60 clean runs is
+   luck with probability ≈ 1.6×10⁻² — a thousand times weaker than the number the criterion cites,
+   and weak enough that a clean 60 would prove very little.
+   The race window is **load-dependent**, not constant (effort ① saw 4/60 at default load vs 39%
+   under six-way contention). Since we cannot rely on reproducing the load, the answer is more
+   runs: at a 4.4% true rate, 200 clean runs is luck with probability ≈ 1.2×10⁻⁴.
+   **This is a strengthening of a ruled acceptance criterion, not a relaxation.** If you find
+   yourself tempted to drop back to 60 because 200 takes longer, that is the wrong trade — the
+   whole effort exists to be able to trust this number.
+
+   **The attribution check in step 6 is the stronger evidence and is not optional.** A clean run is
+   an absence; the attribution check produces a *positive* result (the flake returns when the
+   uniqueness is reverted), and a positive result cannot be manufactured by accidentally removing
+   the test. If the two disagree, believe the attribution check.
 
 3. **What the harness enforced, and why each matters** (verify these are in the copy you ran; if the
    file was modified since Task 1, that is a finding to report, not to fix silently):
    - binary from cargo's JSON artifact stream, never an `ls -t` glob;
    - **both** `files_type_filter_unknown_warns_and_defaults_documents` **and**
      `clipboard_provider_unknown_warns_and_defaults_auto` present via `--list` — load-bearing,
-     because **0/60 is also exactly what you get if the fold silently dropped or renamed the flaky
-     test out of the suite**;
+     because **a clean run is also exactly what you get if the fold silently dropped or renamed
+     the flaky test out of the suite**;
    - **per-file** `test result:` line count of exactly 1 (an aggregate `sort | uniq -c` across logs
      would let a log with zero result lines cancel one with two — it reads like a per-file guarantee
      and is not one);
@@ -515,7 +533,7 @@ that would have gone green for an unrelated reason.
 10. Record both parts in `scratchpad/h31-gates/measurement-postfix.md` — the harness's full
     `SUMMARY:` line verbatim (it carries `runs=`, `failures=`, `threads=` and `expected_total=`),
     its exit code, the reproduced panic block, and the mechanism comparison. Commit:
-    `docs(h31): record post-fix measurement (0/60) and the attribution check`
+    `docs(h31): record post-fix measurement (0/200) and the attribution check`
 
 ---
 
