@@ -1075,8 +1075,34 @@ a migration blocker. Note the in-repo comment at `:574` already records the edit
 <!-- item: H34 -->
 
 `cursor_style::tests::restore_caret_if_written_gated_by_latch` failed **1 of 30** whole-binary runs
-at 32-thread concurrency during H31's attribution check (2026-07-20), and **0 of 200** in H31's
-post-fix measurement. Observed incidentally; nobody was looking for it.
+at 32-thread concurrency during H31's attribution check (2026-07-20). Observed incidentally; nobody
+was looking for it.
+
+## MEASURED 2026-07-20 — 0/200 on clean `main`; downgraded to `watch`
+
+A dedicated 200-run spike against `main` @ `33391ad` (`scratchpad/h31-gates/run_n.sh 200 <out>
+1777`, `rc=0`) produced **zero failures**. Verified independently of the harness summary: 200 logs
+present, every one `1777 passed; 0 failed; 1 ignored`, no `failures:` block anywhere, runtimes
+clustered 4.05-4.28 s.
+
+**What that does and does not establish.** A 3.3% rate — the 1/30 observation at face value — would
+yield 0/200 only ~0.1% of the time, so **3.3% is excluded**. The 95% upper bound from 0/200 is
+**~1.5%** (rule of three). A 0.5% rate would produce this result ~37% of the time and remains
+entirely consistent. So: **not disproven, bounded.** The honest statement is that the rate is low
+enough that characterizing it costs more than the flake does.
+
+**The likelier explanation, and it is testable.** The 1/30 was observed **on the attribution
+scratch branch**, where H31's collision had been deliberately reverted and was actively firing — two
+tests fighting over one file, a test panicking on most runs, and the extra filesystem contention
+that comes with it. Those are precisely the conditions that widen *other* race windows. The
+`cursor_style` failure may have been **induced by the broken state created to prove the H31 fix**,
+rather than being a property of `main`. If it ever recurs, check first whether the run was under
+unusual contention before assuming a latent latch bug.
+
+**Disposition:** `watch`, not scheduled. Do not promote it on the "only known source of red runs"
+argument that justified H29 and H31 — those rested on measured rates (3/60 and 10/60); this rests on
+one observation now bounded below 1.5%. If a second independent observation appears on a clean tree,
+that changes the premise and it should be re-triaged then.
 
 **Almost certainly unrelated to H31.** That effort's revert touched only `config.rs`, and no
 mechanism connects a config scratch-path collision to the caret latch. The suspected class is the
