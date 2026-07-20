@@ -28,7 +28,21 @@ pub fn sanitize(name: &str) -> String {
 
 /// `$XDG_STATE_HOME/wordcartel`, created 0700 on Unix. Falls back to
 /// `~/.local/state/wordcartel` when `dirs::state_dir()` is None.
+///
+/// **In test builds this resolves to a per-process temp dir instead** (Effort ①, D5): every
+/// caller — production code reached from a test included — is redirected at this single
+/// chokepoint, so no test can write the developer's real session/swap files by forgetting a
+/// seam. The provisioning body below is identical in both builds, so assertions about the
+/// returned directory (mode 0700, path shape) stay meaningful.
+///
+/// Boundary: `cfg(test)` applies to the lib test binary and the in-source `e2e` module only.
+/// Integration binaries under `wordcartel/tests/` link the library WITHOUT it and would reach
+/// the real directory — none does today. The PTY smoke suite drives the real binary against the
+/// real directory deliberately; that is where real-state-dir behaviour is proven end-to-end.
 pub fn state_dir() -> io::Result<PathBuf> {
+    #[cfg(test)]
+    let base = std::env::temp_dir().join(format!("wcartel-test-state-{}", std::process::id()));
+    #[cfg(not(test))]
     let base = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no state dir"))?;
@@ -646,6 +660,31 @@ mod tests {
         let d = state_dir().unwrap();
         let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "state dir must be owner-only");
+    }
+
+    /// Effort ① D5: in test builds `state_dir()` must never resolve the developer's real XDG
+    /// state dir. This is the structural half of "a test never touches the user's real files" —
+    /// it closes the whole class at the chokepoint, so a test that forgets a seam damages
+    /// nothing ambient. A compiled assertion, not a textual scanner: there is nothing to evade.
+    ///
+    /// Boundary (deliberate, documented on `state_dir`): `cfg(test)` covers this lib test binary
+    /// and the in-source `e2e` module, NOT `wordcartel/tests/*` integration binaries, which link
+    /// the library without it. No current integration test calls `state_dir`.
+    #[test]
+    fn state_dir_in_test_builds_is_redirected_off_the_real_xdg_dir() {
+        let d = state_dir().expect("state dir resolves in test builds");
+        // The LOAD-BEARING assertion: the per-process component the redirect (and ONLY the
+        // redirect) produces. `starts_with(temp_dir())` alone is not enough — with
+        // XDG_STATE_HOME set under /tmp (e.g. /tmp/state) the UNPATCHED production path already
+        // satisfies it, so this guard would pass with no redirect at all while tests kept using
+        // ambient XDG state.
+        let expected = format!("wcartel-test-state-{}", std::process::id());
+        assert!(d.components().any(|c| c.as_os_str() == expected.as_str()),
+            "must resolve through the per-process redirect component {expected:?}; got {d:?}");
+        assert!(d.starts_with(std::env::temp_dir()),
+            "…and it must live under the temp dir, never the real XDG state dir; got {d:?}");
+        assert!(d.ends_with("wordcartel"),
+            "the wordcartel component is still appended, so path shapes match production: {d:?}");
     }
 
     #[test]
