@@ -1433,11 +1433,11 @@ created = "2026-07-19"
 
 [[item]]
 id = "H34"
-title = "cursor_style restore_caret_if_written_gated_by_latch flake — 1/30, then 0/200"
+title = "cursor_style restore_caret_if_written_gated_by_latch flake — 1/30, then 0/470"
 status = "watch"
 kind = "bug"
 size = "TBD"
 theme = "H"
-hook = "Seen once (1/30) on a deliberately-broken tree; 0/200 on clean main — rate bounded <1.5%"
+hook = "Seen once (1/30) on a deliberately-broken tree; 0/470 on clean main at two concurrencies — rate bounded <0.64%"
 doc = "ux-backlog.md#h34"
 created = "2026-07-20"

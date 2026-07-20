@@ -1078,18 +1078,27 @@ a migration blocker. Note the in-repo comment at `:574` already records the edit
 at 32-thread concurrency during H31's attribution check (2026-07-20). Observed incidentally; nobody
 was looking for it.
 
-## MEASURED 2026-07-20 — 0/200 on clean `main`; downgraded to `watch`
+## MEASURED 2026-07-20 — 0/470 on clean `main` across two concurrencies; `watch`
 
 A dedicated 200-run spike against `main` @ `33391ad` (`scratchpad/h31-gates/run_n.sh 200 <out>
 1777`, `rc=0`) produced **zero failures**. Verified independently of the harness summary: 200 logs
 present, every one `1777 passed; 0 failed; 1 ignored`, no `failures:` block anywhere, runtimes
 clustered 4.05-4.28 s.
 
-**What that does and does not establish.** A 3.3% rate — the 1/30 observation at face value — would
-yield 0/200 only ~0.1% of the time, so **3.3% is excluded**. The 95% upper bound from 0/200 is
-**~1.5%** (rule of three). A 0.5% rate would produce this result ~37% of the time and remains
-entirely consistent. So: **not disproven, bounded.** The honest statement is that the rate is low
-enough that characterizing it costs more than the flake does.
+A **second, longer spike** then ran **270 runs at 30 threads** (`run_n.sh 270 <out> 1777 30`,
+`rc=0`): also **zero failures**, 270 logs all clean, runtimes 4.03-4.35 s. The different thread
+count matters — it shuffles the interleavings, so this is a genuinely different experiment rather
+than a longer repeat, and a race invisible at one concurrency can surface at another.
+
+**Combined: 0 failures in 470 runs across two concurrencies on a clean tree.**
+
+**What that does and does not establish.** The 95% upper bound is now **~0.64%** (rule of three over
+470). A 1% rate is excluded at ~99%; the original 3.3% reading is excluded at roughly 1 in 7
+million. A 0.2% rate remains consistent and is not detectable at any budget worth spending here.
+Pooling runs at 32 and 30 threads is not strictly one sample, but the two results (0/200 and 0/270)
+each support the same conclusion independently, so the pooled figure is not load-bearing.
+So: **not disproven — bounded, and bounded tightly.** The rate is low enough that characterizing it
+would cost far more than the flake does.
 
 **The likelier explanation, and it is testable.** The 1/30 was observed **on the attribution
 scratch branch**, where H31's collision had been deliberately reverted and was actively firing — two
@@ -1099,7 +1108,9 @@ that comes with it. Those are precisely the conditions that widen *other* race w
 rather than being a property of `main`. If it ever recurs, check first whether the run was under
 unusual contention before assuming a latent latch bug.
 
-**Disposition:** `watch`, not scheduled. Do not promote it on the "only known source of red runs"
+**Disposition:** `watch`, not scheduled. **470 clean runs on a clean tree, against one failure on a
+deliberately-broken one, makes the induced-by-contention explanation the leading one** — but a
+negative cannot be proven and the entry stays open rather than dropped. Do not promote it on the "only known source of red runs"
 argument that justified H29 and H31 — those rested on measured rates (3/60 and 10/60); this rests on
 one observation now bounded below 1.5%. If a second independent observation appears on a clean tree,
 that changes the premise and it should be re-triaged then.
