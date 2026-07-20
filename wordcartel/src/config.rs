@@ -1337,7 +1337,8 @@ mod tests {
     fn files_type_filter_unknown_warns_and_defaults_documents() {
         let (cfg, warns) = load_files("unknown", "[files]\ntype_filter = \"spreadsheets\"\n");
         assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents);
-        assert!(warns.iter().any(|w| w.contains("files.type_filter")));
+        assert!(warns.iter().any(|w| w.contains("files.type_filter")),
+            "the invalid-value arm must warn by name (H31 diagnostic); warns was: {warns:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -1365,7 +1366,8 @@ mod tests {
     fn clipboard_provider_unknown_warns_and_defaults_auto() {
         let (cfg, warns) = load_clip("unknown", "[clipboard]\nprovider = \"telepathy\"\n");
         assert_eq!(cfg.clipboard.provider, ClipboardProvider::Auto);
-        assert!(warns.iter().any(|w| w.contains("clipboard.provider")));
+        assert!(warns.iter().any(|w| w.contains("clipboard.provider")),
+            "the invalid-value arm must warn by name (H31 diagnostic); warns was: {warns:?}");
     }
 
     #[test]
