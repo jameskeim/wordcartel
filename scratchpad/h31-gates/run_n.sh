@@ -123,6 +123,22 @@ for (( i = 1; i <= N; i++ )); do
     fails=$((fails + 1))
     print -r -- "run $i FAILED: $names"
   fi
+
+  # Cross-check the binary's exit code against what we parsed. `rc` was captured above and, until
+  # this check existed, never consulted — a variable that READS as though it gates something and
+  # does not. The two disagreeing means the log and the process disagree, and the log is what every
+  # number in this summary is derived from:
+  #   rc != 0 with no parsed names → the binary died without printing a `failures:` block
+  #     (signal, abort, harness crash), so the run's numbers are not trustworthy;
+  #   rc == 0 with parsed names    → structurally impossible; libtest exits 101 on failure.
+  # A non-zero rc WITH names is normal and expected — Task 1 deliberately runs while a flake fires.
+  if [[ $rc -ne 0 && -z "$names" ]]; then
+    fatal "$LOG: binary exited rc=$rc but no 'failures:' block parsed — died without reporting, VOID"
+  fi
+  if [[ $rc -eq 0 && -n "$names" ]]; then
+    fatal "$LOG: parsed failures ($names) but binary exited 0 — log and process disagree, VOID"
+  fi
+
   completed=$((completed + 1))
 done
 

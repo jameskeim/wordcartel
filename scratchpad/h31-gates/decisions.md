@@ -124,8 +124,9 @@ leaves the suite self-diagnosing if this class recurs.
    default threading; a failing run must show the read-error warning. Direct evidence of the mode.
 2. **Post-fix.** 60 whole-binary runs at default 32 threads, failures attributed by parsing the
    `failures:` block — NOT a bare test-name grep (libtest prints the name for passing runs too).
-   Baseline 10/60 → expect 0/60. At a true 16.7% rate, 60 clean runs is luck with probability
-   ≈ 1.7×10⁻⁵. Expect ~4-5 min runtime; an implausibly fast green did not run.
+   ~~Baseline 10/60 → expect 0/60. At a true 16.7% rate, 60 clean runs is luck with probability
+   ≈ 1.7×10⁻⁵.~~ **SUPERSEDED 2026-07-20 — see the second amendment below.** An implausibly fast
+   green did not run.
 3. **Attribution check.** On a scratch branch, revert ONLY the uniqueness (restore the shared
    `"unknown"` name) atop the otherwise-fixed tree; confirm the flake RETURNS within ~30 runs. This
    proves the unique path is the operative change, not an incidental timing shift from the fold.
@@ -185,3 +186,36 @@ magic constant) and requires a `--list` presence check on both `unknown` tests.
 - Effort ① lesson binding every proof step: **a verification step whose name promises more than it
   tests** (8 instances in one effort). Ask of each: could this print PASS while the thing it names
   is false? If the behaviour it names were absent, would it fail?
+
+
+---
+
+## AMENDMENT 2 · 2026-07-20 — the 60-run count rested on a premise execution overturned
+
+Criterion 2 above required 0 failures in 60 runs, justified by "at a true 16.7% rate, 60 clean runs
+is luck with probability ≈ 1.7×10⁻⁵". **The arithmetic was right; the premise was not.**
+
+Task 1 measured the pre-fix rate at **4/60 on a quiet machine**. The 10/60 baseline had been taken
+during the grounding sweep, while four agents were loading the box. The race window is
+**load-dependent, not constant** — effort ① saw the same effect far more starkly (4/60 at default
+load vs 39% under six-way contention).
+
+At the quiet ~6.7% rate, 60 clean runs is luck with probability ≈ **1.6×10⁻²** — roughly a thousand
+times weaker than the number this contract cited. The criterion would still have been *met* while
+proving far less than it claimed, which is this effort's signature defect wearing a statistical
+costume rather than a shell-scripting one.
+
+**What governs now:** 200 runs, 0 failures (P(0/200) ≈ 1×10⁻⁶ even at the quiet rate; any residual
+rate above ~1.5% excluded at 95%). Load cannot be relied upon to reproduce, so the answer is more
+runs rather than trying to recreate the contention.
+
+**Also standing, and more important than the count:** the attribution check is the *stronger*
+evidence and is not optional. A clean run is an **absence** — equally consistent with the fix
+working and with the test having been deleted, which is why the harness pins
+`passed + failed == expected_total` and confirms both colliding tests by exact `--list` match. The
+attribution check produces a **positive** result: revert only the uniqueness, and the failure
+returns. That cannot be manufactured by accidentally removing a test.
+
+**Result on execution:** 200/0 post-fix; attribution reproduced the flake at 3/30 with the recorded
+signature-1 mechanism, with Task 2's guard test failing 30/30 as a positive control proving the
+revert landed.

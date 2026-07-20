@@ -282,8 +282,17 @@ custom message and/or `file:line` — never by "the assertion text".
    `std::thread::available_parallelism()`, which diverges from `nproc` under cgroup limits or CPU
    affinity; an inferred figure could record 32 for a run performed with far fewer, false-greening
    the very concurrency the measurement depends on. **No `--shuffle` and no `RUST_TEST_SHUFFLE`**
-   (assert this, per §1 — a shuffled run changes what the measurement means). Baseline 10/60 → required 0/60. At the measured 16.7% rate, 60 clean runs is
-   luck with probability ≈ 1.7×10⁻⁵. Run-integrity checks, all required, carried from the grounding
+   (assert this, per §1 — a shuffled run changes what the measurement means).
+   **SUPERSEDED 2026-07-20 — required 0/200, not 0/60.** This criterion originally read "baseline
+   10/60 → required 0/60; at the measured 16.7% rate, 60 clean runs is luck with probability
+   ≈ 1.7×10⁻⁵". Execution falsified the premise: Task 1 measured the pre-fix rate at **4/60 on a
+   quiet machine**, against 10/60 taken while four grounding agents loaded the box. The race window
+   is **load-dependent, not constant** (effort ① saw 4/60 at default load vs 39% under six-way
+   contention). At the quiet ~6.7% rate, 60 clean runs is luck with probability ≈ 1.6×10⁻² — a
+   thousand times weaker than the figure this criterion cited. Since the load cannot be relied on,
+   the count was raised to **200** (P(0/200) ≈ 1×10⁻⁶ even at the quiet rate; any residual rate
+   above ~1.5% excluded at 95%). Recorded rather than silently rewritten: the original number was
+   not wrong arithmetic, it was correct arithmetic on a premise measurement later overturned. Run-integrity checks, all required, carried from the grounding
    map's audited protocol — parsing the `failures:` block **alone** goes false-green if a run aborts
    before printing it, output is dropped, or the wrong binary/filter ran:
    - the test binary is selected from cargo's JSON artifact stream, not an `ls -t` glob, and
