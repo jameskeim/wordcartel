@@ -540,14 +540,11 @@ mod tests {
 
     #[test]
     fn append_word_to_dict_creates_parent_dir() {
-        let temp_dir = format!("/tmp/wordcartel_test_{}", std::process::id());
-        let dict_path = std::path::PathBuf::from(&temp_dir)
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let dict_path = temp_dir.path()
             .join("subdir")
             .join("nested")
             .join("dictionary.txt");
-
-        // Clean up before test
-        let _ = std::fs::remove_dir_all(&temp_dir);
 
         // Should succeed even though parent dirs don't exist
         append_word_to_dict(&dict_path, "testword").expect("append should succeed");
@@ -555,9 +552,6 @@ mod tests {
         assert!(dict_path.exists(), "dictionary file should exist");
         let content = std::fs::read_to_string(&dict_path).expect("should read file");
         assert!(content.contains("testword"), "file should contain the appended word");
-
-        // Clean up after test
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

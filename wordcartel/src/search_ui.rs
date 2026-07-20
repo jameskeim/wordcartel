@@ -391,9 +391,8 @@ mod tests {
     /// second write. Asserts the on-disk file has one line and the provider saw a ReloadDictionary.
     #[test]
     fn diag_apply_selected_add_dict_writes_file_once_and_nudges_reload() {
-        let dir = format!("/tmp/wordcartel_adddict_{}", std::process::id());
-        let _ = std::fs::remove_dir_all(&dir);
-        let dict_path = std::path::PathBuf::from(&dir).join("dictionary.txt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dict_path = dir.path().join("dictionary.txt");
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
         e.diag_cfg.enabled = true;
         e.diag_cfg.dictionary = Some(dict_path.clone());
@@ -416,7 +415,6 @@ mod tests {
             matches!(c, crate::diag_provider::ProviderCall::NotifyChange { .. })),
             "no full re-check is dispatched — the client filter hides the word immediately");
         assert!(e.dictionary.contains("teh"), "word also suppressed client-side");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A17 T4: an invalid-regex replace-all refusal must land Sticky/Error — surviving a
