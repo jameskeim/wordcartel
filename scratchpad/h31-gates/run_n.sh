@@ -21,8 +21,8 @@ set -u
 fatal() { print -r -- "FATAL: $*"; exit 2 }
 
 # ---------------------------------------------------------------- arguments
-[[ $# -eq 3 ]] || fatal "usage: run_n.sh <N> <outdir> <expected_total>"
-N=$1; OUT=$2; EXPECTED=$3
+[[ $# -eq 3 || $# -eq 4 ]] || fatal "usage: run_n.sh <N> <outdir> <expected_total> [threads]"
+N=$1; OUT=$2; EXPECTED=$3; THREADS=${4:-32}
 
 # Validate VALUES, not just the argument count. An N of 0 (or a non-numeric N) makes the run loop
 # execute zero times while the summary still prints — a harness reporting success without running
@@ -56,11 +56,20 @@ fi
 # makes the number in the summary the number libtest uses, by construction, and makes runs
 # reproducible across machines.
 #
-# The value is 32 because the 10/60 baseline was measured at 32 threads; a different count is
-# not comparable to it. It must never be lowered toward 1 — the entire effort is invisible at
-# --test-threads=1.
-THREADS=32
+# The DEFAULT is 32 because H31's 10/60 baseline was measured at 32 threads; a different count is
+# not directly comparable to that baseline. It must never be lowered toward 1 — the H31 flake was
+# entirely invisible at --test-threads=1, and any race of that class will be.
+#
+# The optional 4th argument overrides it, for two legitimate uses:
+#   - varying concurrency deliberately, since a different thread count shuffles the interleavings
+#     and a race invisible at one count may surface at another;
+#   - leaving the machine some headroom (a full-core run saturates the box and gets lightweight
+#     watcher processes reaped — observed repeatedly during H31 and the H34 spike).
+# Whatever the value, it is what gets EXPORTED and what gets RECORDED in the summary, so the number
+# in the evidence is always the number libtest used. State the count when quoting any result: a
+# rate measured at one concurrency is not a rate measured at another.
 FLOOR=16
+[[ "$THREADS" == <-> && $THREADS -ge 1 ]] || fatal "threads must be a positive integer, got '$THREADS'"
 export RUST_TEST_THREADS=$THREADS
 CORES=$(nproc)   # recorded for context only; NOT the basis of any check
 [[ $THREADS -ge $FLOOR ]] || fatal "thread count $THREADS < floor $FLOOR — the 10/60 baseline was measured at 32; a lower count is not comparable"
