@@ -1173,10 +1173,20 @@ for i in $(seq 1 60); do
   "$BIN" >"$LOGS/run-$i.log" 2>&1 || fails=$((fails+1))
 done
 echo "failed runs: $fails / 60"
-grep -l "undo_and_redo_refresh_the_recovery_snapshot" "$LOGS"/run-*.log | wc -l
+# Match the FAILURE list, not the test name. libtest prints
+#   test editor::tests::undo_and_redo_refresh_the_recovery_snapshot ... ok
+# for a PASSING test too, so a bare-name grep matches all 60 logs regardless of outcome and
+# "must be 0" could never hold. Verified empirically: a passing run contains the name once.
+# The trailing `failures:` block lists failed tests indented by four spaces.
+grep -lE '^    editor::tests::undo_and_redo_refresh_the_recovery_snapshot$' "$LOGS"/run-*.log | wc -l
+# Guard the "0 passed; N filtered out, exits 0" class — a run that tested nothing also has no
+# failures. Every log must carry a real result line with a plausible passed-count.
+grep -hoE 'test result: ok\. [0-9]+ passed' "$LOGS"/run-*.log | awk '{ if ($4 < 1700) bad++ }
+  END { print "logs with an implausible passed-count: " bad+0 "  (must be 0)" }'
+ls -1 "$LOGS"/run-*.log | wc -l          # must be exactly 60
 rm -rf "$LOGS"
 ```
-Both numbers must be **0**. Note `"$BIN"` with no test-name argument runs the whole lib binary at
+All four numbers must be **0**, **0**, **0**, and **60** respectively. Note `"$BIN"` with no test-name argument runs the whole lib binary at
 default threads — that is the point; **do not add `--test-threads`.** A single green run is NOT
 evidence here: this test passes ~57 times in 60 even unfixed, which is exactly why the soak, not
 the test, is the verification.
