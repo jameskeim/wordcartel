@@ -786,6 +786,75 @@ mod tests {
         assert!(matches!(out, RunResult::Stdout(ref s) if s == "c\n"), "{out:?}");
     }
 
+    /// Important-1 (task-1 review): `ReapGuard::drop`'s terminate → kill → bounded-reap path was
+    /// entirely untested — mutation-proven by replacing the whole `Drop` body with a bare
+    /// `detach()` and observing every filter test, EPIPE regressions included, still pass. That
+    /// blind spot exists BECAUSE every early-return branch in `run_subprocess` (cancel, timeout,
+    /// too-large) already calls its own `terminate()`/`kill()` before returning, so driving the
+    /// guard only through the public API can never isolate its own kill/reap logic — the
+    /// explicit calls mask the difference. This test drives `ReapGuard` directly against a child
+    /// that ignores SIGTERM, so `terminate()` alone cannot touch it and the guard's `kill()` +
+    /// bounded-reap path is the ONLY thing capable of ending the child.
+    ///
+    /// `sh`'s `trap` behaviour is a platform fact, not a language guarantee, so we verify it
+    /// (rather than assume it) with a probe child before relying on it for the real assertion.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reap_guard_drop_kills_and_reaps_a_sigterm_ignoring_child() {
+        use subprocess::{Popen, PopenConfig, Redirection};
+
+        fn spawn_sigterm_ignoring_child() -> Popen {
+            Popen::create(
+                &["sh", "-c", "trap '' TERM; exec sleep 30"],
+                PopenConfig {
+                    stdin: Redirection::None,
+                    stdout: Redirection::None,
+                    stderr: Redirection::None,
+                    ..Default::default()
+                },
+            )
+            .expect("spawn a SIGTERM-ignoring probe/test child")
+        }
+
+        // ---- Platform-fact probe: confirm SIGTERM alone cannot end this child on THIS machine.
+        let mut probe = spawn_sigterm_ignoring_child();
+        std::thread::sleep(std::time::Duration::from_millis(100)); // let the trap install + exec
+        let _ = probe.terminate();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let probe_survived_term = probe.poll().is_none();
+        // Clean up the probe unconditionally, regardless of what the assert below does.
+        let _ = probe.kill();
+        let _ = probe.wait_timeout(std::time::Duration::from_millis(500));
+        if probe.poll().is_none() {
+            probe.detach();
+        }
+        assert!(probe_survived_term,
+            "probe child exited after SIGTERM alone — this machine's `sh` does not preserve an \
+             ignored SIGTERM across `exec`, so this test's premise does not hold here");
+
+        // ---- The real assertion: ReapGuard's OWN kill()+bounded-reap path, not the loop's.
+        let child = spawn_sigterm_ignoring_child();
+        let pid = child.pid().expect("a freshly spawned child has a pid");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let start = std::time::Instant::now();
+        { let _guard = ReapGuard(child); } // drop here — nothing else in this test signals it
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < std::time::Duration::from_secs(2),
+            "ReapGuard::drop must return promptly even against a SIGTERM-ignoring child (took \
+             {elapsed:?}) — a regression toward an unbounded wait() would hang here for ~30s");
+
+        // Give the kernel a brief moment to finish the teardown the drop initiated, then confirm
+        // the child is actually GONE (killed and reaped) — not merely detached-and-still-alive,
+        // which a bare `detach()` would also leave passing the wall-clock assertion above.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!crate::swap::pid_is_live(pid),
+            "child pid {pid} is still alive after ReapGuard::drop — a bare `detach()` never \
+             sends kill() at all, so the child would keep running its full 30s sleep, undetected \
+             by every other test in this suite");
+    }
+
     #[test]
     fn guarded_filter_maps_panic_to_runresult_err() {
         let r = guarded_filter(|| panic!("flt"));
