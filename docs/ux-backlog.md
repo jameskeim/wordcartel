@@ -1092,3 +1092,38 @@ scoped out of H31 (fork 1, ruled C, 2026-07-19) rather than folded in.
 **Forcing function:** `std::env::set_var` becomes `unsafe` in edition 2024, so this site must be
 addressed at the next edition bump regardless. Prefer fixing it deliberately over discovering it as
 a migration blocker. Note the in-repo comment at `:574` already records the edition caveat.
+
+### H34 — cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed
+<!-- item: H34 -->
+
+`cursor_style::tests::restore_caret_if_written_gated_by_latch` failed **1 of 30** whole-binary runs
+at 32-thread concurrency during H31's attribution check (2026-07-20), and **0 of 200** in H31's
+post-fix measurement. Observed incidentally; nobody was looking for it.
+
+**Almost certainly unrelated to H31.** That effort's revert touched only `config.rs`, and no
+mechanism connects a config scratch-path collision to the caret latch. The suspected class is the
+process-global `EVER_WROTE` latch in `cursor_style.rs` — an `AtomicBool` written by production
+`reconcile_cursor_style()` and by the panic hook, and read by `restore_caret_if_written`. The two
+tests touching it (`restore_latch_is_monotonic`, `restore_caret_if_written_gated_by_latch`) carry
+in-repo comments acknowledging it is "a process-global static shared across all tests in the
+binary" and are written to assert only monotonic, order-independent facts — so either that
+discipline has a gap, or something else writes the latch mid-test.
+
+**Do not treat 0/200 as exoneration.** Against a ~3.3% rate, 200 clean runs is statistically
+uncomfortable but not decisive, and a single observation is weak evidence of any rate. The honest
+statement is: observed once, rate unknown, mechanism unverified. Measure before diagnosing — H31's
+own filed hypothesis (process-global state) turned out to be WRONG; the cause there was a shared
+filesystem path, and the process-global census found nothing on the failing path at all.
+
+**This falsifies the "only known source of red runs" claim** that H29 and H31 both carried. Once
+H31 ships, this is the one known remaining source. That argument justified sequencing H29 and H31
+ahead of other work; whether it justifies the same here is a judgement call for whoever sequences
+next, not an automatic promotion — one observation is a far weaker premise than H31's measured
+10/60.
+
+**Tooling that already exists** (H31, 2026-07-20): `scratchpad/h31-gates/run_n.sh <N> <outdir>
+<expected_total>` — the audited measurement harness. It pins `RUST_TEST_THREADS=32`, rejects an
+inherited value, refuses to report a count for runs that did not happen, verifies per-file log
+integrity and `passed + failed == expected_total`, and attributes failures by parsing libtest's
+`failures:` block rather than a bare test-name grep. Use it rather than re-deriving one: two
+Critical false-green defects were found and fixed *inside* it across four review rounds.
