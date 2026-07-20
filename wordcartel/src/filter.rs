@@ -621,14 +621,23 @@ mod tests {
     }
 
     /// EPIPE regression: a child that never reads stdin at all still succeeds.
+    ///
+    /// `s.is_empty()` alone is satisfiable vacuously by any implementation that returns empty
+    /// output for the WRONG reason, so we also pin the property this test is really about: the
+    /// call must return promptly, not merely succeed after riding out (a portion of) the 10s
+    /// timeout budget.
     #[test]
     #[cfg(unix)]
     fn child_that_never_reads_stdin_still_succeeds() {
         let spec = spec_for(&["sh", "-c", "exit 0"], 10);
+        let start = std::time::Instant::now();
         match run_filter(&spec, big_stdin(), &CancelFlag::new()) {
             RunResult::Stdout(s) => assert!(s.is_empty(), "no output expected, got {s:?}"),
             other => panic!("expected empty Stdout, got {other:?}"),
         }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2),
+            "a child that never reads stdin must return promptly ({:?} elapsed), not merely \
+             succeed after riding out the timeout", start.elapsed());
     }
 
     /// EPIPE regression: bytes the child wrote BEFORE exiting stay readable in the pipe until
