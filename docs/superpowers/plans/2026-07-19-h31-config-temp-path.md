@@ -479,8 +479,10 @@ nothing.**
    - `filtered = 0` on every run;
    - `passed + failed == expected_total` on every run — any other total, high or low, voids the run;
    - failures attributed by parsing the `failures:` **block**, never a bare test-name grep.
-   - Additionally check yourself: all 60 logs exist (`ls "$OUT"/run-*.log | wc -l` → 60), and total
-     runtime was ~4–5 min. **An implausibly fast green did not run.**
+   - Additionally check yourself: all 200 logs exist (`ls "$OUT"/run-*.log | wc -l` → 200), and
+     total runtime was ~14-17 min (the loop is strictly sequential — one binary invocation at a
+     time, at ~4-5 s each; `RUST_TEST_THREADS=32` governs libtest's internal pool, not the
+     harness's). **An implausibly fast green did not run.**
 
 ### Steps — Part B: attribution check (spec §7.3)
 
