@@ -7,8 +7,58 @@ use std::sync::Mutex;
 /// Last-good snapshot, updated after each `apply`. The panic hook try_locks it.
 pub static LAST_GOOD: Mutex<Option<(Option<PathBuf>, ropey::Rope)>> = Mutex::new(None);
 
+/// Effort ①: serializes `record_snapshot` against the one test that ASSERTS on `LAST_GOOD`.
+///
+/// Not the `LAST_GOOD` mutex itself: `record_snapshot` writes via `try_lock` and SKIPS on
+/// contention (so the panic hook can never deadlock), so a test holding `LAST_GOOD` would
+/// suppress its own snapshots. This gate is taken BEFORE `LAST_GOOD` on every path — lock order
+/// is gate → LAST_GOOD, never the reverse.
+#[cfg(test)]
+pub(crate) static SNAPSHOT_GATE: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    /// True while THIS thread holds `SNAPSHOT_GATE`, so its own `record_snapshot` calls bypass
+    /// the gate instead of self-deadlocking on a non-reentrant mutex.
+    static GATE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII handle: while alive, every OTHER thread blocks in `record_snapshot` before touching
+/// `LAST_GOOD`, and this thread's own snapshots still land normally.
+#[cfg(test)]
+pub(crate) struct SnapshotGate(Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl SnapshotGate {
+    pub(crate) fn acquire() -> SnapshotGate {
+        // Poisoning is neutralized deliberately: a panicking gate holder must not cascade into
+        // every editing test's `apply`.
+        let g = SNAPSHOT_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        GATE_HELD.with(|c| c.set(true));
+        SnapshotGate(Some(g))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SnapshotGate {
+    fn drop(&mut self) {
+        GATE_HELD.with(|c| c.set(false));
+        self.0 = None; // release the gate AFTER clearing the flag
+    }
+}
+
 /// Record the post-edit snapshot (O(1) rope clone). Called from `Editor::apply`.
+///
+/// In test builds this first passes through `SNAPSHOT_GATE` (unless this thread holds it), so a
+/// test asserting on `LAST_GOOD` can serialize every other thread's writes. Production builds
+/// compile to exactly the `try_lock` write below.
 pub fn record_snapshot(path: Option<&Path>, rope: ropey::Rope) {
+    #[cfg(test)]
+    let _serial = if GATE_HELD.with(std::cell::Cell::get) {
+        None
+    } else {
+        Some(SNAPSHOT_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    };
     if let Ok(mut g) = LAST_GOOD.try_lock() {
         *g = Some((path.map(Path::to_path_buf), rope));
     }
