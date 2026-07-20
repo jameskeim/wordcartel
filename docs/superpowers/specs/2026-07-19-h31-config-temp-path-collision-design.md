@@ -246,24 +246,52 @@ an isolated or `--test-threads=1` run: **this flake is invisible at 1 thread and
 isolated green proves nothing.** Of every step below, effort ①'s question applies — could it print
 PASS while the thing it names is false? A green whose runtime is implausibly small did not run.
 
+### 7.0 The mutation rule (binding on this spec AND on the plan's verification steps)
+
+This criterion set got the same defect wrong **twice** — round 1 in the original §7.4, round 2
+inside the fix for it. Both instances had one shape: **a struct-wide flip meeting a multi-assertion
+test.** Rust's `assert!`/`assert_eq!` panic on the first failure, so a mutation that changes several
+fields read by a test with several assertions proves only that *something* broke; every assertion
+after the first is short-circuited away and could be deleted while the step still went green.
+
+**The rule, stated once so nothing downstream re-derives it a third time:**
+
+> A mutation must change **exactly one** property, and the required outcome must name the **one
+> assertion** that must fail — never merely "the test fails". Where a single-property mutation is
+> not possible, the required outcome must identify the failing assertion by its **custom message**
+> (or `file:line`), and the step must state why the narrower mutation was unavailable.
+
+Prefer splitting the mutation over reasoning about assertion order: a one-to-one mutation/assertion
+pairing removes the ordering question entirely, and ordering is exactly what both misses relied on.
+
+**Identification, precisely:** once §6 adds custom `assert!` messages, a failing assertion prints
+the **custom message**, not the raw assertion expression. Steps below therefore identify failures by
+custom message and/or `file:line` — never by "the assertion text".
+
 1. **Pre-fix observation.** With the §6 messages in place and the paths still shared, run the whole
-   test binary ~30× at default threading. Passing requires **at least one failing run**, AND that
-   run's printed `{warns:?}` containing the read-error string (`config: cannot read`). **Zero
-   failures in 30 runs is an INCONCLUSIVE result — not a pass**: re-run with more iterations or
-   escalate to the human. (At 16.7%, 30 clean runs has probability ≈ 0.4% — unlikely, not
-   impossible.) Record the observed mechanism verbatim; criterion 3 compares against it.
+   test binary ~30× at default threading, no shuffle. Passing requires **at least one failing run**;
+   that the failing test is **`files_type_filter_unknown_warns_and_defaults_documents`** failing at
+   its **warning assertion** (by §6 custom message, per §7.0); and that the printed `{warns:?}`
+   contains the read-error string (`config: cannot read`). **Zero failures in 30 runs is an
+   INCONCLUSIVE result — not a pass**: re-run with more iterations or escalate. (At 16.7%, 30 clean
+   runs has probability ≈ 0.4% — unlikely, not impossible.) Record the observed `warns` verbatim;
+   criterion 3 compares against it.
 2. **Post-fix measurement.** 60 whole-binary runs at default (32) threads, **no `--shuffle` and no
    `RUST_TEST_SHUFFLE` in the environment** (assert this, per §1 — a shuffled run changes what the
    measurement means). Baseline 10/60 → required 0/60. At the measured 16.7% rate, 60 clean runs is
    luck with probability ≈ 1.7×10⁻⁵. Run-integrity checks, all required, carried from the grounding
    map's audited protocol — parsing the `failures:` block **alone** goes false-green if a run aborts
    before printing it, output is dropped, or the wrong binary/filter ran:
-   - the test binary is selected from cargo's JSON artifact stream, not an `ls -t` glob, and the
-     target test is confirmed present via `--list`;
+   - the test binary is selected from cargo's JSON artifact stream, not an `ls -t` glob, and
+     **both** `files_type_filter_unknown_warns_and_defaults_documents` **and**
+     `clipboard_provider_unknown_warns_and_defaults_auto` are confirmed present via `--list`. This
+     closes the most direct false-green available to this effort: 0/60 is also what you get if the
+     fold silently dropped or renamed the flaky test out of the suite;
    - all 60 logs exist;
    - each log has **exactly one** `test result:` line;
-   - pass/fail totals match expectation (clean run = the full suite count passed, 0 failed) and no
-     log shows an implausibly small passed-count, which would indicate a filtered run;
+   - the passed-count is **exactly the baseline 1776** on every clean run (the fold changes no test
+     count — it removes helper functions, not `#[test]`s), 0 failed; any other total, high or low,
+     is a failed integrity check, not a pass;
    - failures attributed by parsing libtest's `failures:` **block** — never a bare test-name grep,
      since libtest prints the test name on passing runs too;
    - total runtime ~4–5 min; a far faster green did not run.
@@ -276,6 +304,13 @@ PASS while the thing it names is false? A green whose runtime is implausibly sma
    prove that shared naming reintroduces *a* flake, not *this* one. D4's message argument is what
    makes the tighter check cheap. Effort ① found a fix that would have gone green for an unrelated
    reason; this step is what prevents a decorative mechanism.
+
+   Two further conditions, from re-asking §7.0's question of this step: **(i)** the scratch revert
+   must be confined to the uniqueness token — confirm by `git diff` that the only change is the
+   path-construction expression, since a broader revert would re-establish the flake for reasons
+   this step would then misattribute; **(ii)** failing to reproduce within ~30 runs is
+   **INCONCLUSIVE, not a pass** (same ≈0.4% luck floor as criterion 1) — this step passes only on a
+   positive, mechanism-matched reproduction, never on absence.
 4. **Guard preservation — mutate the WARNING ARM, not the default.** The `ea01138` mutation as
    originally recorded (flip `FilesConfig::default()` to `{ show_clutter: true, type_filter: All }`)
    **cannot validate the warning assertion** and must not be used alone for that purpose: with the
@@ -285,24 +320,45 @@ PASS while the thing it names is false? A green whose runtime is implausibly sma
    different things, because `load_with_fs`'s `other =>` arm only pushes the warning — it does
    **not** assign `cfg.files.type_filter = Documents`; the `Documents` value observed by the first
    assertion comes from `Config::default()`. Required instead, both parts:
-   - **(a) Warning-arm mutation.** Remove or alter the `warns.push(...)` in the `other =>` branch of
-     the `raw.files.type_filter` match. Required outcome:
+   Both parts obey §7.0: one property per mutation, one named assertion per outcome.
+   - **(a) Warning-arm mutation** — target: the warning guard. Remove or alter **only** the
+     `warns.push(...)` in the `other =>` branch of the `raw.files.type_filter` match, changing
+     nothing else. Required outcome:
      `files_type_filter_unknown_warns_and_defaults_documents` fails **specifically at the warning
-     assertion** (`warns.iter().any(|w| w.contains("files.type_filter"))`), identified by the
-     panic's assertion text — not merely "the test fails". Revert.
-   - **(b) Default mutation**, as `ea01138` recorded, to confirm the *default-on-absent* guard still
-     holds: flip `FilesConfig::default()` to `{ show_clutter: true, type_filter: All }`, confirm
-     `files_filters_default_on_absent` fails, revert.
+     assertion** — identified by the §6 custom message (and/or its `file:line`), since that message,
+     not the assertion expression, is what Rust prints. A failure at the test's first assertion
+     instead means the mutation was not confined to the warning arm; that is a FAILED step, not a
+     pass. Revert.
+   - **(b) Single-field default mutation** — target: the default-on-absent guard. Flip **only**
+     `FilesConfig::default()`'s `type_filter` to `FileTypeFilter::All`, **leaving `show_clutter` at
+     `false`**. Required outcome: `files_filters_default_on_absent` fails **specifically at its
+     `"files.type_filter must default to Documents"` assertion**. Revert.
 
-   **On the record: the original form of this criterion was itself an instance of the defect class
-   §0 and the effort-① lesson warn about** — a verification step whose name promised more than it
-   tested, which would have printed PASS while the property it named ("the warning assertion still
-   bears load") was false. It was caught by the Codex spec gate, not by its author. The lesson
-   generalizes: ask it of the other four criteria too, which is why 1, 2, and 3 above were each
-   tightened in the same revision.
+     **Why the split rather than `ea01138`'s struct-wide flip:** that test asserts `show_clutter`
+     **first** and `type_filter` second, so the recorded `{ show_clutter: true, type_filter: All }`
+     mutation kills it at the `show_clutter` assertion and never evaluates the `type_filter` one —
+     which could then be deleted while this step still went green. Flipping one field makes the
+     mutation target and the asserted property one-to-one and removes the need to reason about
+     assertion order at all (§7.0). Optionally flip `show_clutter` alone as a separate mutation to
+     cover that assertion too; it is not load-bearing for H31 and is not required here.
+
+   **On the record: this criterion carried the very defect class §0 and the effort-① lesson warn
+   about — twice.** Round 1 caught the original form (a step that would have printed PASS while "the
+   warning assertion still bears load" was false). Round 2 caught the *fix* reproducing the identical
+   shape one level down, in 4(b). Both were caught by the Codex spec gate, not by their author, and
+   both came from the same generator: a struct-wide mutation meeting a multi-assertion test. That is
+   why §7.0 now states the rule once, rather than leaving each step to re-derive it — and why
+   criteria 1, 2, 3, and 5 were re-interrogated against the same question in this revision.
 5. **Standard gates.** `cargo test` green; `cargo build` and `cargo test --no-run` warning-free for
    `wordcartel`; `cargo clippy --workspace --all-targets` clean; `scripts/smoke/run.sh` run and its
    one-line summary quoted verbatim in the pre-merge report (advisory-pass).
+
+   Re-asked against §7.0: **a warning-free build proves nothing if nothing was rebuilt.** A cached
+   `cargo build`/`clippy` over an already-compiled tree emits no warnings by construction, so the
+   build and clippy runs must actually recompile the touched crate — `touch wordcartel/src/config.rs`
+   first (the project's own remedy for stale-analysis questions), and treat an implausibly fast
+   "clean" as not having run, exactly as criterion 2 treats a fast green. A `smoke: SKIP — …` line is
+   quoted verbatim as required, but is **not** evidence the smoke suite passed.
 
 ---
 
