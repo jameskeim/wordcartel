@@ -276,9 +276,13 @@ custom message and/or `file:line` — never by "the assertion text".
    INCONCLUSIVE result — not a pass**: re-run with more iterations or escalate. (At 16.7%, 30 clean
    runs has probability ≈ 0.4% — unlikely, not impossible.) Record the observed `warns` verbatim;
    criterion 3 compares against it.
-2. **Post-fix measurement.** 60 whole-binary runs at default (32) threads, **no `--shuffle` and no
-   `RUST_TEST_SHUFFLE` in the environment** (assert this, per §1 — a shuffled run changes what the
-   measurement means). Baseline 10/60 → required 0/60. At the measured 16.7% rate, 60 clean runs is
+2. **Post-fix measurement.** 60 whole-binary runs at **32 threads, pinned and recorded** — the
+   conditions the 10/60 baseline was measured under. The thread count must be *set* and reported
+   rather than inferred from `nproc`, because libtest falls back to
+   `std::thread::available_parallelism()`, which diverges from `nproc` under cgroup limits or CPU
+   affinity; an inferred figure could record 32 for a run performed with far fewer, false-greening
+   the very concurrency the measurement depends on. **No `--shuffle` and no `RUST_TEST_SHUFFLE`**
+   (assert this, per §1 — a shuffled run changes what the measurement means). Baseline 10/60 → required 0/60. At the measured 16.7% rate, 60 clean runs is
    luck with probability ≈ 1.7×10⁻⁵. Run-integrity checks, all required, carried from the grounding
    map's audited protocol — parsing the `failures:` block **alone** goes false-green if a run aborts
    before printing it, output is dropped, or the wrong binary/filter ran:

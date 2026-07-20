@@ -80,7 +80,8 @@ at `/usr/bin`). Shell is **zsh 5.9**.
     EMPTY in zsh. Write `cargo build -p wordcartel > "$L" 2>&1; rc=$?` — and note that a pipeline's
     status in zsh is the LAST command's, so `cargo … | tail` reads green even when cargo failed.
   - zsh does **not** word-split unquoted variables — use positional parameters or arrays if you
-    need splitting. `$(seq 1 N)` *does* split, which is how the harness loops.
+    need splitting. (`$(seq …)` *does* split — but the harness deliberately loops with zsh
+    arithmetic instead, so its iteration count never depends on an external command's output.)
   - Quote grep's `--include='*.rs'`: unquoted, zsh glob-expands it and the command dies with
     `no matches found`.
 - **Attribute test failures by parsing libtest's `failures:` BLOCK**, never a bare test-name grep —
@@ -156,8 +157,26 @@ guard from `ea01138` (spec §5).
    the helpers. This mirrors the existing message style in
    `config_over_cap_degrades_like_an_unreadable_file` in the same module.
 
-3. **Gates:** `cargo test` green, `cargo clippy --workspace --all-targets` clean,
-   `cargo build`/`cargo test --no-run` warning-free. Commit with the trailers:
+3. **Gates — read the exception before you run them.** `cargo clippy --workspace --all-targets`
+   clean and `cargo build`/`cargo test --no-run` warning-free are ordinary hard gates; the flake
+   cannot perturb them.
+
+   **`cargo test` is different at THIS task only.** The whole point of Task 1 is that the H31 flake
+   is still present — it is not fixed until Task 2 — so a `cargo test` run here has roughly a 1-in-6
+   chance of going red through the very defect this effort exists to remove. That is **expected and
+   is NOT a gate failure**, but only for one exact test:
+
+   > **`config::tests::files_type_filter_unknown_warns_and_defaults_documents`** failing at its
+   > warning assertion is expected at this stage. Note it in your report and proceed.
+   > **Any other failing test blocks the commit** — it is unrelated to H31 and must be investigated.
+
+   Determine which by parsing the `failures:` block (never a bare test-name grep — libtest prints
+   test names on passing runs too). If that one test is the only failure, re-run `cargo test` once
+   to confirm it passes on a subsequent run; a *deterministic* failure of it would mean something
+   other than the flake is wrong, and blocks. This exception exists only in Task 1: from Task 2
+   onward `cargo test` is a hard green gate, because the fix has landed.
+
+   Commit with the trailers:
    `test(h31): print warns on the two invalid-value assertions (D4, pre-fix diagnostic)`
 
 4. **The run harness ALREADY EXISTS — verify it, do not re-author it.** It is committed at
@@ -185,14 +204,22 @@ guard from `ea01138` (spec §5).
    - Output ends with `SUMMARY: runs=… failures=… expected_total=… threads=… binary=…`.
 
    It hard-fails (exit 2) on: a non-positive or non-numeric `N` or `expected_total`; an unwritable
-   outdir; `RUST_TEST_SHUFFLE` set; `RUST_TEST_THREADS` set at all; fewer than 16 effective threads;
-   no lib binary from cargo's JSON artifact stream; either `unknown` test missing from `--list` by
-   **exact line match**; any log without exactly one `test result:` line; any run with
-   `filtered != 0`; any run where `passed + failed != expected_total`. It records the observed
-   thread count in the summary so concurrency is evidence in the artifact, not an assumption.
+   outdir; `RUST_TEST_SHUFFLE` set; `RUST_TEST_THREADS` **inherited** from the environment; no lib
+   binary from cargo's JSON artifact stream; either `unknown` test missing from `--list` by **exact
+   line match**; any log without exactly one `test result:` line; any run with `filtered != 0`; any
+   run where `passed + failed != expected_total`; and **any shortfall between requested and
+   completed runs**.
 
-   Never pass `--shuffle` and never set `RUST_TEST_THREADS` or `RUST_TEST_SHUFFLE` — the harness
-   refuses rather than producing a clean summary from a run that never exercised the property.
+   **Concurrency:** the harness *sets* `RUST_TEST_THREADS=32` itself and records that value, rather
+   than inferring one from `nproc` — libtest falls back to `std::thread::available_parallelism()`,
+   which diverges from `nproc` under cgroup limits or affinity masks, so an inferred number could
+   read 32 while libtest ran with 4. Setting it makes the recorded number the number libtest used,
+   and makes runs reproducible. 32 matches the conditions the 10/60 baseline was measured under.
+   Do not set `RUST_TEST_THREADS` or `RUST_TEST_SHUFFLE` yourself — an inherited value is refused
+   rather than silently honoured.
+
+   **`runs=` in the summary is the COUNTED number of completed iterations**, not the requested `N`,
+   and a shortfall is fatal — a partial measurement must never be readable as a complete one.
 
 5. **Derive this task's `expected_total`** — do not copy a constant. At this point in the branch
    Task 2 has not run, so the working tree still holds the `main` baseline — count it in place (do
@@ -705,6 +732,41 @@ branch state at risk in a subagent's hands. Removed.
 15. **The `#[test]` delta count is lexical, not Rust-aware** (Minor) — noted in the plan so a future
     reader does not over-trust it, with the harness's own total check named as the authoritative
     cross-check.
+
+### Round 4 — both Criticals were inside the instrument itself
+
+The harness is the tool built to detect "reports success while the thing it names is false." Round 4
+found two instances of that defect *in the harness*. Worth stating plainly: building an instrument
+for a defect class does not exempt the instrument.
+
+16. **The harness could report success for runs that never happened** (Critical). The loop walked
+    `$(seq 1 $N)`, so its iteration count depended on an external command's output length; if `seq`
+    were missing, shadowed, or truncated, the body could run fewer times — or zero — while the
+    summary still printed `runs=$N failures=0`. Fixed by iterating with zsh arithmetic
+    (`for (( i = 1; i <= N; i++ ))`), counting completed iterations, hard-failing on any shortfall,
+    and **reporting the counted value rather than the requested one**.
+17. **The thread-floor check measured the wrong quantity** (Critical). It derived the count from
+    `nproc`, but libtest uses `std::thread::available_parallelism()` when `RUST_TEST_THREADS` is
+    unset, and the two diverge under cgroup CPU limits or affinity masks — so the check added
+    specifically to prevent a concurrency false-green could itself false-green, recording
+    `threads=32` for a run libtest performed with 4. Fixed by having the harness **set**
+    `RUST_TEST_THREADS=32` and record that: the number in the summary is then the number libtest
+    used by construction, and runs become reproducible across machines. The pre-existing
+    "reject `RUST_TEST_THREADS`" guard is reconciled by scoping it to an **inherited** value —
+    refusing an executor's environment while deliberately setting our own. 32 is the value the
+    10/60 baseline was measured at; the comment says so, so nobody lowers it.
+18. **Task 1's `cargo test` gate was probabilistic** (Important). Task 1 runs while the flake is
+    still present by design, so its own green gate had ~1-in-6 odds of tripping on the known defect,
+    with no instruction telling the executor whether to retry, stop, or report. Fixed by scoping the
+    exception to exactly one named test failing at its warning assertion — anything else still
+    blocks — requiring one confirming re-run (a *deterministic* failure means something else is
+    wrong), and stating that the exception exists in Task 1 only.
+
+**Process note, recorded because it cost a review round:** the round-3 report cited commit
+`2e5e5d7`, which does not exist; the real commit was `60f7acb`. A reviewer chased the phantom and a
+review run died partway through. Report hashes read back from `git log --oneline -1`, never ones you
+expect to have been created — the same discipline as verifying a created artifact with `git ls-tree`
+rather than trusting intent.
 
 ## Underdetermined in the spec, resolved here
 

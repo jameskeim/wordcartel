@@ -24,9 +24,10 @@ fatal() { print -r -- "FATAL: $*"; exit 2 }
 [[ $# -eq 3 ]] || fatal "usage: run_n.sh <N> <outdir> <expected_total>"
 N=$1; OUT=$2; EXPECTED=$3
 
-# Validate VALUES, not just the argument count. `seq 1 0` expands to nothing, so an N of 0 or a
-# non-numeric N would run zero tests and still print a success summary — a harness reporting
-# success without running anything is the purest form of the defect this effort exists to remove.
+# Validate VALUES, not just the argument count. An N of 0 (or a non-numeric N) makes the run loop
+# execute zero times while the summary still prints — a harness reporting success without running
+# anything is the purest form of the defect this effort exists to remove. The completed-iteration
+# count below is the second line of defence; this is the first.
 [[ "$N"        == <-> && $N        -ge 1 ]] || fatal "N must be a positive integer, got '$N'"
 [[ "$EXPECTED" == <-> && $EXPECTED -ge 1 ]] || fatal "expected_total must be a positive integer, got '$EXPECTED'"
 mkdir -p "$OUT" || fatal "cannot create outdir '$OUT'"
@@ -38,13 +39,31 @@ mkdir -p "$OUT" || fatal "cannot create outdir '$OUT'"
 # the thread count is an integrity check, and it is RECORDED in the summary as evidence
 # rather than assumed.
 [[ -z "${RUST_TEST_SHUFFLE:-}" ]] || fatal "RUST_TEST_SHUFFLE is set — ordering assumptions void"
-CORES=$(nproc)
+
+# Reject an INHERITED value first: silently honouring one would let an executor's environment
+# defeat concurrency and still get a clean summary.
 if [[ -n "${RUST_TEST_THREADS:-}" ]]; then
-  fatal "RUST_TEST_THREADS='$RUST_TEST_THREADS' is set — unset it; libtest must use full parallelism ($CORES)"
+  fatal "RUST_TEST_THREADS='$RUST_TEST_THREADS' inherited from the environment — unset it; this harness sets it deliberately"
 fi
-THREADS=$CORES   # libtest defaults to available parallelism when RUST_TEST_THREADS is unset
+
+# Then SET it ourselves, and record what we set.
+#
+# Why set it rather than infer it: with RUST_TEST_THREADS unset, libtest uses
+# std::thread::available_parallelism() (library/test/src/lib.rs, helpers/concurrency.rs), which
+# is NOT nproc — the two diverge under cgroup CPU limits or CPU affinity masks. A harness that
+# reported `nproc` could therefore print threads=32 while libtest actually ran with 4: a
+# concurrency false-green in the very check that exists to prevent one. Setting the variable
+# makes the number in the summary the number libtest uses, by construction, and makes runs
+# reproducible across machines.
+#
+# The value is 32 because the 10/60 baseline was measured at 32 threads; a different count is
+# not comparable to it. It must never be lowered toward 1 — the entire effort is invisible at
+# --test-threads=1.
+THREADS=32
 FLOOR=16
-[[ $THREADS -ge $FLOOR ]] || fatal "effective thread count $THREADS < floor $FLOOR — the 10/60 baseline was measured at 32; a lower count is not comparable"
+export RUST_TEST_THREADS=$THREADS
+CORES=$(nproc)   # recorded for context only; NOT the basis of any check
+[[ $THREADS -ge $FLOOR ]] || fatal "thread count $THREADS < floor $FLOOR — the 10/60 baseline was measured at 32; a lower count is not comparable"
 
 # ---------------------------------------------------------------- binary selection
 # From cargo's JSON artifact stream. NEVER an `ls -t` glob.
@@ -68,11 +87,17 @@ done
 
 # ---------------------------------------------------------------- runs
 print -r -- "binary:  $BIN"
-print -r -- "threads: $THREADS (cores=$CORES, RUST_TEST_THREADS unset, no shuffle)"
-print -r -- "expected_total: $EXPECTED   runs: $N"
+print -r -- "threads: $THREADS (set via RUST_TEST_THREADS; nproc=$CORES for context; no shuffle)"
+print -r -- "expected_total: $EXPECTED   runs requested: $N"
 
+# COUNT the iterations that actually complete. The loop previously walked `$(seq 1 $N)`, whose
+# length depends on an external command: if `seq` were missing, shadowed, or truncated, the body
+# would run fewer times — or zero — and the summary would still have reported `runs=$N failures=0`.
+# That is precisely the defect class this harness exists to catch, so it must not live inside it.
+# zsh arithmetic removes the external dependency, and `completed` is what the summary reports.
 fails=0
-for i in $(seq 1 $N); do
+completed=0
+for (( i = 1; i <= N; i++ )); do
   LOG="$OUT/run-$i.log"
   "$BIN" > "$LOG" 2>&1; rc=$?
 
@@ -98,6 +123,10 @@ for i in $(seq 1 $N); do
     fails=$((fails + 1))
     print -r -- "run $i FAILED: $names"
   fi
+  completed=$((completed + 1))
 done
 
-print -r -- "SUMMARY: runs=$N failures=$fails expected_total=$EXPECTED threads=$THREADS binary=$BIN"
+# The summary reports the COUNTED value, never the requested one, and a shortfall is fatal —
+# a partial measurement must not be readable as a complete one.
+[[ $completed -eq $N ]] || fatal "completed $completed of $N requested runs — partial measurement, VOID"
+print -r -- "SUMMARY: runs=$completed failures=$fails expected_total=$EXPECTED threads=$THREADS binary=$BIN"
