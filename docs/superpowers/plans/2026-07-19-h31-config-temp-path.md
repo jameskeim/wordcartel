@@ -73,14 +73,18 @@ at `/usr/bin`). Shell is **zsh 5.9**.
 - **Shell rules — zsh, not bash.** Each was a real defect in the previous effort:
   - No `pkill` / `killall` / any pattern-matched kill. Ever.
   - No glob-selected test binaries. Select via cargo's JSON artifact stream and confirm with
-    `--list` (Task 1 gives the exact commands).
+    `--list` — both are already implemented in `scratchpad/h31-gates/run_n.sh`; use it rather than
+    re-deriving them.
   - `mktemp -d` per step; no fixed temp paths in your scripts.
   - **Capture `$?` on the SAME LINE as the command.** `${PIPESTATUS[0]}` is bash-only and expands
-    EMPTY in zsh. Write `"$BIN" > "$LOG" 2>&1; rc=$?`.
+    EMPTY in zsh. Write `cargo build -p wordcartel > "$L" 2>&1; rc=$?` — and note that a pipeline's
+    status in zsh is the LAST command's, so `cargo … | tail` reads green even when cargo failed.
   - zsh does **not** word-split unquoted variables — use positional parameters or arrays if you
-    need splitting. `$(seq 1 60)` *does* split, and is used deliberately below.
+    need splitting. `$(seq 1 N)` *does* split, which is how the harness loops.
+  - Quote grep's `--include='*.rs'`: unquoted, zsh glob-expands it and the command dies with
+    `no matches found`.
 - **Attribute test failures by parsing libtest's `failures:` BLOCK**, never a bare test-name grep —
-  libtest prints the test name for PASSING runs too. Exact awk given in Task 1.
+  libtest prints the test name for PASSING runs too. The harness does this; do not hand-roll it.
 - **Commit trailers, verbatim, on every commit:**
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
@@ -111,9 +115,10 @@ be rejected — the observation is unobtainable once the flake is gone.
 ### Files
 
 - `wordcartel/src/config.rs` — two assertion messages, inside `#[cfg(test)] mod tests`.
-- `scratchpad/h31-gates/run_n.sh` — new, **committed**; the run harness Tasks 3 and 4 also use.
-- `scratchpad/h31-gates/observation-prefix.md` — new, **committed**; the recorded evidence Task 3's
-  attribution check compares against.
+- `scratchpad/h31-gates/run_n.sh` — **already committed and executable; consumed, not authored.**
+  The same file serves Tasks 3 and 4.
+- `scratchpad/h31-gates/observation-prefix.md` — new, **committed by this task**; the recorded
+  evidence Task 3's attribution check compares against.
 
 ### Interfaces
 
@@ -155,79 +160,39 @@ guard from `ea01138` (spec §5).
    `cargo build`/`cargo test --no-run` warning-free. Commit with the trailers:
    `test(h31): print warns on the two invalid-value assertions (D4, pre-fix diagnostic)`
 
-4. **Build the run harness and COMMIT it.** Tasks 3 and 4 both need it, and each task's executor
-   sees only its own brief and a fresh shell — a harness under `mktemp -d` would not exist for them.
-   Write it to the in-repo path **`scratchpad/h31-gates/run_n.sh`** (that directory is tracked, not
-   gitignored — verified) and `chmod +x` it. One audited copy, three consumers.
-
+4. **The run harness ALREADY EXISTS — verify it, do not re-author it.** It is committed at
+   **`scratchpad/h31-gates/run_n.sh`**, executable, and its guards have been exercised. Tasks 3 and
+   4 invoke the same file; a second transcribed copy would defeat the point of one audited harness.
+   Confirm before use:
    ```zsh
-   #!/bin/zsh
-   # H31 verification harness. Usage: run_n.sh <N> <outdir> <expected_total>
-   #
-   #   <expected_total> = the number of tests that must be ACCOUNTED FOR on every run,
-   #   i.e. passed + failed. Derived per task (see each task's brief) — never a magic
-   #   constant, because any task that adds a #[test] changes it.
-   #
-   # Exit 2 = integrity violation (the measurement is void, do not interpret it).
-   # Exit 0 = the runs happened and are trustworthy; test failures are REPORTED, not
-   #          treated as harness errors — Task 1 legitimately expects failures.
-   set -u
-   if [[ $# -ne 3 ]]; then print -r -- "usage: run_n.sh <N> <outdir> <expected_total>"; exit 2; fi
-   N=$1; OUT=$2; EXPECTED=$3; mkdir -p "$OUT"
-
-   if [[ -n "${RUST_TEST_SHUFFLE:-}" ]]; then
-     print -r -- "FATAL: RUST_TEST_SHUFFLE is set — ordering assumptions void"; exit 2
-   fi
-
-   # Binary from cargo's JSON artifact stream. NEVER an `ls -t` glob.
-   BIN=$(cargo test -p wordcartel --lib --no-run --message-format=json 2>/dev/null \
-     | jq -r 'select(.reason=="compiler-artifact")
-              | select(.target.kind[]=="lib")
-              | select(.executable != null) | .executable' | tail -1)
-   if [[ -z "$BIN" || ! -x "$BIN" ]]; then print -r -- "FATAL: no lib test binary"; exit 2; fi
-   print -r -- "binary: $BIN"
-
-   # Presence check. A 0-failure result is MEANINGLESS if the tests are not in the binary —
-   # a botched fold that dropped the flaky test would otherwise score a perfect run.
-   "$BIN" --list > "$OUT/list.txt" 2>&1; rc=$?
-   if [[ $rc -ne 0 ]]; then print -r -- "FATAL: --list failed rc=$rc"; exit 2; fi
-   for t in files_type_filter_unknown_warns_and_defaults_documents \
-            clipboard_provider_unknown_warns_and_defaults_auto; do
-     if ! grep -q "$t" "$OUT/list.txt"; then print -r -- "FATAL: $t absent from binary"; exit 2; fi
-   done
-
-   fails=0
-   for i in $(seq 1 $N); do
-     "$BIN" > "$OUT/run-$i.log" 2>&1; rc=$?
-     LOG="$OUT/run-$i.log"
-
-     # PER-FILE integrity. An aggregate `grep | sort | uniq -c` over all logs would let a
-     # log with zero result lines cancel one with two; this cannot.
-     nres=$(grep -c '^test result:' "$LOG")
-     if [[ $nres -ne 1 ]]; then
-       print -r -- "FATAL: $LOG has $nres 'test result:' lines (want exactly 1)"; exit 2
-     fi
-     line=$(grep '^test result:' "$LOG")
-     passed=$(print -r -- "$line"   | awk '{for(i=1;i<=NF;i++) if($i=="passed;")   print $(i-1)}')
-     failed=$(print -r -- "$line"   | awk '{for(i=1;i<=NF;i++) if($i=="failed;")   print $(i-1)}')
-     filtered=$(print -r -- "$line" | awk '{for(i=1;i<=NF;i++) if($i=="filtered")  print $(i-1)}')
-     if [[ $filtered -ne 0 ]]; then
-       print -r -- "FATAL: $LOG filtered=$filtered — a filtered run is not a whole-suite run"; exit 2
-     fi
-     if [[ $((passed + failed)) -ne $EXPECTED ]]; then
-       print -r -- "FATAL: $LOG passed+failed=$((passed + failed)), expected $EXPECTED"; exit 2
-     fi
-
-     # Attribute failures by parsing the `failures:` BLOCK — never a bare test-name grep,
-     # because libtest prints the test name for PASSING runs too.
-     names=$(awk '/^failures:$/{blk=1; next} /^test result:/{blk=0} blk && /^    [a-zA-Z]/{print $1}' "$LOG")
-     if [[ -n "$names" ]]; then
-       fails=$((fails + 1)); print -r -- "run $i FAILED: $names"
-     fi
-   done
-   print -r -- "SUMMARY: runs=$N failures=$fails expected_total=$EXPECTED binary=$BIN"
+   git ls-tree -r --name-only HEAD scratchpad/h31-gates/   # must list run_n.sh
+   test -x scratchpad/h31-gates/run_n.sh && print -r -- "harness present and executable"
    ```
-   Never pass `--shuffle`, and never set `RUST_TEST_SHUFFLE` (the harness refuses if it is set).
+   If it is absent, STOP and report rather than reconstructing it — the committed file is the one
+   that was reviewed, and a retyped copy is not.
+
+   **Interface** (read the file itself for the implementation and its per-check rationale):
+   ```zsh
+   scratchpad/h31-gates/run_n.sh <N> <outdir> <expected_total>
+   ```
+   - `<N>` — whole-binary runs; must be a positive integer.
+   - `<outdir>` — created if absent, must be writable; receives `list.txt` and `run-<i>.log`.
+   - `<expected_total>` — `passed + failed` required on EVERY run. Derived per task (step 5), never
+     a magic constant.
+   - **Exit 2 = integrity violation: the measurement is VOID; do not interpret any number it
+     printed.** Exit 0 = the runs happened and are trustworthy; test *failures* are reported in the
+     output, not treated as harness errors, because Task 1 legitimately expects failures.
+   - Output ends with `SUMMARY: runs=… failures=… expected_total=… threads=… binary=…`.
+
+   It hard-fails (exit 2) on: a non-positive or non-numeric `N` or `expected_total`; an unwritable
+   outdir; `RUST_TEST_SHUFFLE` set; `RUST_TEST_THREADS` set at all; fewer than 16 effective threads;
+   no lib binary from cargo's JSON artifact stream; either `unknown` test missing from `--list` by
+   **exact line match**; any log without exactly one `test result:` line; any run with
+   `filtered != 0`; any run where `passed + failed != expected_total`. It records the observed
+   thread count in the summary so concurrency is evidence in the artifact, not an assumption.
+
+   Never pass `--shuffle` and never set `RUST_TEST_THREADS` or `RUST_TEST_SHUFFLE` — the harness
+   refuses rather than producing a clean summary from a run that never exercised the property.
 
 5. **Derive this task's `expected_total`** — do not copy a constant. At this point in the branch
    Task 2 has not run, so the working tree still holds the `main` baseline — count it in place (do
@@ -266,14 +231,13 @@ guard from `ea01138` (spec §5).
    silently-vanished flake changes what the rest of this effort means.
 
 8. **Record the evidence** in `scratchpad/h31-gates/observation-prefix.md`: the binary path, the
-   failure count out of 30, the harness `SUMMARY:` line, and the **verbatim** panic block including
-   the `warns` vector. Tasks 3 and 4 compare against this text, so it must be committed, not left in
-   `$OUT`. Commit **both** the record and the harness (Tasks 3 and 4 depend on the harness existing
-   in the repo):
+   failure count out of 30, the harness `SUMMARY:` line (including its `threads=` field), and the
+   **verbatim** panic block including the `warns` vector. Tasks 3 and 4 compare against this text,
+   so it must be committed — `$OUT` is a `mktemp -d` and will not survive to their sessions:
    ```zsh
-   git add scratchpad/h31-gates/run_n.sh scratchpad/h31-gates/observation-prefix.md
+   git add scratchpad/h31-gates/observation-prefix.md
    ```
-   `docs(h31): record the pre-fix mechanism observation (30 runs, D4) + run harness`
+   `docs(h31): record the pre-fix mechanism observation (30 runs, D4)`
 
 ---
 
@@ -438,6 +402,13 @@ nothing.**
    `1777 passed; 0 failed; 1 ignored`. If the commands above disagree with that arithmetic, STOP:
    either the fold removed a test it should not have, or a task added one this plan does not know
    about. Re-derive, do not force the number.
+
+   **Caveat — the delta count is lexical, not Rust-aware.** `grep -c '#\[test\]'` counts the
+   attribute wherever it appears, including inside a comment or a string literal, and would miss one
+   written unusually (e.g. `#[cfg_attr(…, test)]`). It is correct for this branch's edits, which add
+   one ordinary `#[test]`, but do not over-trust it as a general census. The authoritative
+   cross-check is the harness's own `passed + failed == expected_total` on a real run: if the
+   derivation were wrong, every run would hard-fail with the actual total in the message.
 
 2. **Run 60 iterations** with the harness committed by Task 1:
    ```zsh
@@ -699,6 +670,41 @@ One further hazard, caught while applying the rule to the steps touched this rou
 derivation originally suggested `git switch --detach 60be3d1` to confirm the baseline. Task 1 runs
 before any source change, so the working tree *is* the baseline — the switch bought nothing and put
 branch state at risk in a subagent's hands. Removed.
+
+### Round 3 — the fix for round 2's Critical-2 recurred one layer up
+
+10. **The harness did not exist** (Critical). Round 2's Critical-2 was "Task 3 references a harness
+    that will not be in its environment." The fix described the harness's interface, named its path,
+    told three tasks to depend on it — and never created the file. The plan asserted "new,
+    **committed**" of a path that `git ls-tree` showed absent. **The lesson is the check, not the
+    file:** for anything a revision claims to create, run the command that proves the artifact
+    exists and read its output; do not infer existence from having intended it. Fixed by writing
+    `scratchpad/h31-gates/run_n.sh`, exercising its guards, committing it, and verifying with
+    `git ls-tree -r --name-only HEAD scratchpad/h31-gates/`. Task 1 now *verifies* the harness
+    rather than authoring it, and the plan carries its interface rather than a second copy of its
+    source — a retyped copy would not be the reviewed one.
+11. **The harness rejected `RUST_TEST_SHUFFLE` but not `RUST_TEST_THREADS`** (Critical). The entire
+    effort is invisible at one thread, so an executor whose environment carried
+    `RUST_TEST_THREADS=1` would have received a clean summary from a run that never exercised the
+    property. Fixed by rejecting `RUST_TEST_THREADS` outright, enforcing a ≥16 effective-thread
+    floor (the 10/60 baseline was measured at 32; a lower count is not comparable), and **recording
+    the observed thread count in the summary** so concurrency is evidence in the artifact rather
+    than an assumption.
+12. **The harness could report success having run zero tests** (Important). `seq 1 0` expands to
+    nothing, the loop body never executes, and `SUMMARY: runs=0 failures=0` still prints — the
+    purest instance of the defect class this effort exists to remove. Fixed by validating argument
+    *values*, not just their count: `N` and `expected_total` must be positive integers, the outdir
+    must exist and be writable. All guards were exercised and observed to exit 2.
+13. **The `--list` presence check was substring-based** (Important). `grep -q "$t"` would be
+    satisfied by a *renamed* test that merely contained the original name — defeating exactly the
+    check finding 3 above claims to close. Fixed with `grep -qx -- "<full::path>: test"`, matching
+    libtest's exact line format.
+14. **The spec had gone stale against the plan** (Important). Spec §7.2 still pinned "exactly the
+    baseline 1776" while the plan derived 1777. Fixed by carrying the *derived* form into the spec,
+    with `passed + failed` rather than `passed` so it holds on pre-fix runs too.
+15. **The `#[test]` delta count is lexical, not Rust-aware** (Minor) — noted in the plan so a future
+    reader does not over-trust it, with the harness's own total check named as the authoritative
+    cross-check.
 
 ## Underdetermined in the spec, resolved here
 

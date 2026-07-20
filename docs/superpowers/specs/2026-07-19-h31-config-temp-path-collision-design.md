@@ -289,9 +289,14 @@ custom message and/or `file:line` — never by "the assertion text".
      fold silently dropped or renamed the flaky test out of the suite;
    - all 60 logs exist;
    - each log has **exactly one** `test result:` line;
-   - the passed-count is **exactly the baseline 1776** on every clean run (the fold changes no test
-     count — it removes helper functions, not `#[test]`s), 0 failed; any other total, high or low,
-     is a failed integrity check, not a pass;
+   - **`passed + failed` equals a DERIVED expected total on every run** — never a hard-coded
+     constant, because any task that adds a `#[test]` changes it. The derivation is: baseline
+     **1776** (`main` @ `60be3d1`: 1777 `#[test]` attributes under `wordcartel/src`, minus the one
+     `#[ignore]`d `r1_typing_latency_bench` in `e2e.rs`) **+ `#[test]`s the branch adds − removes**.
+     The fold itself removes helper *functions*, not tests; the branch's uniqueness unit test adds
+     one, so the post-fix total is **1777**. Any other total, high or low, is a failed integrity
+     check, not a pass. Stating `passed + failed` rather than `passed` alone keeps the check usable
+     on the pre-fix runs, where failures are expected;
    - failures attributed by parsing libtest's `failures:` **block** — never a bare test-name grep,
      since libtest prints the test name on passing runs too;
    - total runtime ~4–5 min; a far faster green did not run.
