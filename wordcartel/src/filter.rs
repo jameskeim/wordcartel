@@ -882,9 +882,13 @@ mod tests {
         // The real child (under `ReapGuard`, below) is killed and reaped by the code under
         // test. The probe child is killed and reaped in the ordinary case, but has an explicit
         // fallback — if kill() plus a 500ms wait_timeout hasn't reaped it, `probe.detach()`
-        // (below) leaves it running as an orphaned `sleep 30` rather than block this test on a
-        // possibly-stuck reap. That pathological case is vanishingly unlikely, and even then the
-        // orphan is well inside any concurrent victim's timeout, so SHARED remains correct.
+        // (below) leaves it unreaped rather than block this test on a possibly-stuck reap. That
+        // pathological case is vanishingly unlikely, and even then it does not threaten a
+        // concurrent victim: kill() is SIGKILL against our own live child, so it cannot
+        // meaningfully fail — the process is dead either way — and a failed reap only leaves a
+        // ZOMBIE, whose fds were already closed at death. A zombie can't hold any victim's pipe
+        // ends open, which — not timeout arithmetic (a live 30 s process would in fact outlast a
+        // 10 s victim timeout) — is why SHARED remains correct.
         let _gate = spawn_gate_shared();
         use subprocess::{Popen, PopenConfig, Redirection};
 

@@ -1034,10 +1034,11 @@ mod tests {
         // (valueless, swept); differing bodies → Prompt (recoverable, spared and reported).
         //
         // `ts_ms` is NOW, not the `1` the other swap fixtures use, and that matters: the modal
-        // names only the newest few (`KEPT_SHOWN`) and the shared real state dir routinely
-        // carries a dozen older orphans from prior sessions. A `ts_ms: 1` fixture sorts to the
-        // BOTTOM and gets elided, so the assertion below would fail on ambient machine state
-        // rather than on this behaviour. A just-written swap is also the realistic case.
+        // names only the newest few (`KEPT_SHOWN`) and this test process's (redirected,
+        // per-process) state dir can carry older orphans left by earlier tests in the same run.
+        // A `ts_ms: 1` fixture sorts to the BOTTOM and gets elided, so the assertion below would
+        // fail on same-run litter rather than on this behaviour. A just-written swap is also the
+        // realistic case.
         let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
             let doc = std::env::temp_dir()

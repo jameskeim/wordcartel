@@ -37,8 +37,12 @@ pub fn sanitize(name: &str) -> String {
 ///
 /// Boundary: `cfg(test)` applies to the lib test binary and the in-source `e2e` module only.
 /// Integration binaries under `wordcartel/tests/` link the library WITHOUT it and would reach
-/// the real directory — none does today. The PTY smoke suite drives the real binary against the
-/// real directory deliberately; that is where real-state-dir behaviour is proven end-to-end.
+/// the real directory — none does today. Doc-tests compile without `cfg(test)` too and would
+/// reach the real directory the same way; the crate carries doc-tests (`# Examples` on public
+/// items, per house style — see the `Doc-tests wordcartel` section of a full `cargo test` run),
+/// but none of them call `state_dir` or anything in `swap`/`recovery` today, so this boundary is
+/// latent, not exercised. The PTY smoke suite drives the real binary against the real directory
+/// deliberately; that is where real-state-dir behaviour is proven end-to-end.
 pub fn state_dir() -> io::Result<PathBuf> {
     #[cfg(test)]
     let base = std::env::temp_dir().join(format!("wcartel-test-state-{}", std::process::id()));
@@ -858,9 +862,9 @@ mod tests {
         // Write an orphan scratch swap with a fake dead pid (999999 is unreachable
         // in practice; pid_is_live returns false for it on Linux since /proc/999999
         // won't exist unless the system is truly overloaded — we also check).
-        // Use a UNIQUE temp dir, not the shared real state dir: the finder returns
-        // the newest orphan across the whole dir, and the real state dir accumulates
-        // scratch-*.swp litter from other runs that would outrank our planted file.
+        // Use a UNIQUE temp dir, not this test process's (redirected, shared) state dir: the
+        // finder returns the newest orphan across the whole dir, and that dir accumulates
+        // scratch-*.swp litter from this file's OTHER tests that would outrank our planted file.
         let dir = std::env::temp_dir().join(format!(
             "wc-orphan-test-{}-{}",
             std::process::id(),
@@ -1163,8 +1167,10 @@ mod tests {
         let _ = std::fs::remove_file(&none_swap);
     }
 
-    /// End-to-end through the real state dir: the scan + oracle include a DiscardSilently swap and
-    /// exclude a Prompt swap. Membership-based (the shared state dir carries litter).
+    /// End-to-end through this test process's own state dir — since the Effort ① D5 redirect, a
+    /// per-process temp dir, not the developer's real XDG state dir. The scan + oracle include a
+    /// DiscardSilently swap and exclude a Prompt swap. Membership-based (this file's own tests
+    /// accumulate litter in that shared per-process dir across a run).
     #[test]
     fn enumerator_scan_includes_discard_silently_excludes_prompt() {
         let dir = state_dir().unwrap();
