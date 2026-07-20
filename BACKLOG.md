@@ -3,7 +3,7 @@
 
 # Backlog
 
-**41 open · 70 shipped · 2 dropped**
+**40 open · 71 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -43,7 +43,6 @@ Blocking Effort P: **0**
 | H28 | Un-pumped picker tests assert unreachable states | triage | feature | TBD |  | Un-pumped picker tests assert unreachable states |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | H30 | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes | triage | bug | TBD |  | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes |
-| H31 | config::files_type_filter_unknown flake — 10% of whole-binary runs | triage | bug | TBD |  | config::files_type_filter_unknown flake — 10% of whole-binary runs |
 | H32 | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam | triage | feature | TBD |  | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam |
 | H33 | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle | triage | feature | TBD |  | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle |
 | H34 | cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed | triage | feature | TBD |  | cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed |
@@ -55,10 +54,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>70 shipped</summary>
+<details><summary>71 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| H31 | config::files_type_filter_unknown flake — shared test temp path | 2026-07-20 | 44f1c14 |
 | C5 | File interface — unify save/write onto the picker + favorites/recent | 2026-07-19 | 30f502a |
 | H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | 2026-07-19 | b30f5aa |
 | H29 | recovery::LAST_GOOD process-global race makes the test gate non-deterministic | 2026-07-19 | b30f5aa |

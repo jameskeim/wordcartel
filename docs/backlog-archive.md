@@ -2399,3 +2399,57 @@ Two sibling flakes fire only under parallel load and pass at `--test-threads=1`:
 `filter::tests::run_filter_non_zero_exit_carries_stderr` (the latter has a genuinely load-sensitive
 10s spawn budget). Worth triaging together — the fix for a process-global race and the fix for a
 timing budget differ, but the symptom a contributor sees is identical.
+
+### H31 — config::files_type_filter_unknown flake — shared test temp path
+<!-- item: H31 -->
+
+**SHIPPED 2026-07-20** (merge `44f1c14`). Filed 2026-07-19 by effort ①, which measured it precisely
+and kept it out of scope.
+
+**The filed hypothesis was wrong, and the entry said so honestly.** H31 was flagged as "plausibly the
+same process-global-state class" effort ① existed to address, with the caveat that this was "a
+hypothesis from the failure shape, not a diagnosis; nobody has traced it." The process-global census
+found **nothing global on the failing path at all** — `warns` is a plain local `Vec::new()`. The
+shared state was a **filesystem path**.
+
+**Cause.** `config.rs`'s three byte-identical test helpers (`load_files`, `load_clip`, `load_diag`)
+built a scratch path from only `temp_dir()` + `process::id()` + a caller-supplied name. The pid is
+constant across every test in one binary, so the name was the sole uniqueness token — and two call
+sites passed `"unknown"`. Both resolved to `${TMPDIR}/wcartel-cfg-<pid>-unknown.toml`. Two failure
+signatures were observed: the clipboard test's `remove_file` deleting the file the files test had
+just written (`File::open` → `Err(NotFound)`, 3 of 4 observed), and a **torn write** where the reader
+saw a truncated TOML mid-`write_all` (1 of 4). A third variant — `warns: []` — is the same race with
+truncation at offset 0: an empty file parses cleanly under `#[serde(default)]` and emits no warning
+at all. The first assertion (`type_filter == Documents`) passed regardless, because `Documents` is
+also the struct default, so it could never distinguish "parsed my file" from "parsed nothing".
+
+**Why the twin never failed.** The mechanism is symmetric but the reachable interleaving space is
+not: libtest dispatches in sorted-name order, which pins the sign of the start-time offset, so only
+one of the four modes is reachable. The clipboard test was **shielded by scheduling, not safe**.
+
+**Fix.** `scratch_cfg_path` carries an `AtomicU64` counter (the idiom already used by `tempdir()` in
+the same module and 13 others — see H32); the three identical helpers fold into one `load_cfg`; five
+call sites repoint. Test-only, no production change. Chosen over a lock because two tests writing
+one path is a naming bug, not a resource conflict — a gate would have left the trap armed for the
+next helper.
+
+**Evidence.** 10/60 whole-binary failures at 32 threads before, **0/200 after**; attribution
+established by reverting *only* the uniqueness on a scratch branch, which brought the flake back at
+3/30 with the recorded mechanism. Guards re-proven by single-property mutations. A whole-branch gate
+compiled a probe confirming 1600 concurrent same-name calls all produce distinct paths.
+
+**Spun out:** H32 (crate-wide scratch-path seam), H33 (`set_var("HOME")`), H34 (a second flake the
+attribution check found incidentally — it falsifies the "only known source of red runs" claim this
+item carried).
+
+**The durable lesson** (see also the effort's spec §7.0): **when a defect is statistical, the
+verification apparatus becomes the primary risk surface and deserves more adversarial review than
+the change it validates.** ~20 instances of "a step that passes for a reason other than the one it
+names" were found across four spec rounds, four plan rounds, and execution — against a production
+change of one line. Three would each have produced a confident green over a still-broken suite: a
+mutation check that could not reach the assertion it named (short-circuit on assertion 1); a 0/60
+measurement indistinguishable from the fold having deleted the test; and a harness that could report
+60 clean runs having executed none. The last was inside the instrument built to prevent the first
+two. The reusable rule: **a mutation must change exactly one property, and the required outcome must
+name the one assertion that must fail.** The audited harness survives at
+`scratchpad/h31-gates/run_n.sh` — reuse it rather than re-deriving one.

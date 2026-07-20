@@ -1398,14 +1398,16 @@ created = "2026-07-19"
 
 [[item]]
 id = "H31"
-title = "config::files_type_filter_unknown flake — 10% of whole-binary runs"
-status = "triage"
+title = "config::files_type_filter_unknown flake — shared test temp path"
+status = "shipped"
 kind = "bug"
-size = "TBD"
+size = "S"
 theme = "H"
-hook = "config::files_type_filter_unknown flake — 10% of whole-binary runs"
-doc = "ux-backlog.md#h31"
+hook = "Two tests shared one scratch path; 10/60 failures → 0/200, attribution-proven"
+doc = "backlog-archive.md#h31"
 created = "2026-07-19"
+shipped_date = "2026-07-20"
+shipped_commit = "44f1c14"
 
 [[item]]
 id = "H32"
