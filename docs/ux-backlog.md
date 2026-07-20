@@ -1034,3 +1034,96 @@ Worth doing with the tools effort ① already built: measure at default threadin
 below 32 threads), and run an **attribution check** — the discipline that proved effort ①'s
 `LAST_GOOD` fix was load-bearing rather than coincidental. Do not validate a fix in isolation; that
 configuration never reproduces it.
+
+### H32 — Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam
+<!-- item: H32 -->
+
+Thirteen `#[cfg(test)]` modules each carry their own private scratch-path helper — `scratch_path`,
+`tempdir`, `scratch`, `tmp`, `private_dir`, `unique_dir`, `quit_tmp`, `unique_plugin_dir` — all the
+same shape: a fn-local `static SEQ/N: AtomicU32|U64`, `fetch_add(1, Relaxed)` at path construction,
+combined with `temp_dir()` + `process::id()`. Census (H31 grounding, 2026-07-19): `file.rs:238`,
+`settings.rs:631`, `save.rs:481`, `config.rs:939`, `file_browser_commit.rs:465`, `fsx.rs:483`,
+`fsx.rs:687`, `state.rs:166`, `swap.rs:596`, `app.rs:949`, `jobs_apply.rs:420`,
+`session_restore.rs:231`, `plugin/load.rs:881`.
+
+The idiom is CORRECT everywhere it appears — this is duplication, not a bug. It is filed because
+H31 was a case of the idiom being *available and not used*: three `config.rs` helpers built a path
+from `temp_dir()` + pid + a caller-supplied name with no counter, two callers passed the same name,
+and the resulting collision produced a 10-16% flake that went untraced for months. One crate-wide
+`pub(crate)` seam would make "get a scratch path" have exactly one answer.
+
+**Scoped deliberately OUT of H31** (fork 3, ruled 2026-07-19): it touches ~13 modules, which is the
+opposite of the small effort H31 was meant to be, and it would land immediately before the caret /
+prose-window group that wants quiet tooling. H31 instead folded its own three helpers into one, on
+the reasoning that changing what is *ergonomic* is the durable part.
+
+**Do NOT answer this with a textual scanner** banning raw `temp_dir().join(...)` — that option was
+considered and rejected at H31 fork 3, following effort ①'s decision D5: the existing
+`fs_chokepoint` scanner was measured to leave 5 of 6 evasion routes uncaught, with its own 7
+self-checks covering none of them. Adding a second scanner to answer a trust-in-gates problem is
+self-defeating. The structural answer is one seam, not one more check.
+
+### H33 — Test set_var(HOME) mutates process-wide state read by three config tests as an oracle
+<!-- item: H33 -->
+
+`wordcartel/src/file_browser_commit.rs:575`, inside test `absolute_and_home_relative_fields_are_honoured`:
+
+```rust
+std::env::set_var("HOME", &home);
+```
+
+with a restore at `:577-578` (`set_var` back, or `remove_var` if previously unset). This is the
+**only** `set_var`/`remove_var` in the entire workspace (verified by census, H31 grounding
+2026-07-19). It mutates process-wide `HOME` for the window between mutation and restore, with no
+synchronization against concurrently-running tests.
+
+Three `config.rs` tests read the real `HOME`/XDG dir as their assertion ORACLE, and so fall inside
+that window's reach: `diagnostics_default_dictionary_is_not_none`, `dictionary_tilde_is_expanded`,
+`dictionary_bare_tilde_expands_to_home`. Production `load_with_fs` also reads `dirs::home_dir()`
+for `~` expansion.
+
+**Never observed to fire.** In H31's 60-run measurement at default (32-thread) threading, the only
+failing test was the H31 target; these three never failed. Filed on structure, not on a symptom —
+this is the same *genus* as H31 (a test observing process state another test mutates) but a
+different *species*, and it has its own unresolved mechanism fork: inject the home dir through a
+seam, gate the mutation, or stop reading real `HOME` as an oracle at all. That fork is why it was
+scoped out of H31 (fork 1, ruled C, 2026-07-19) rather than folded in.
+
+**Forcing function:** `std::env::set_var` becomes `unsafe` in edition 2024, so this site must be
+addressed at the next edition bump regardless. Prefer fixing it deliberately over discovering it as
+a migration blocker. Note the in-repo comment at `:574` already records the edition caveat.
+
+### H34 — cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed
+<!-- item: H34 -->
+
+`cursor_style::tests::restore_caret_if_written_gated_by_latch` failed **1 of 30** whole-binary runs
+at 32-thread concurrency during H31's attribution check (2026-07-20), and **0 of 200** in H31's
+post-fix measurement. Observed incidentally; nobody was looking for it.
+
+**Almost certainly unrelated to H31.** That effort's revert touched only `config.rs`, and no
+mechanism connects a config scratch-path collision to the caret latch. The suspected class is the
+process-global `EVER_WROTE` latch in `cursor_style.rs` — an `AtomicBool` written by production
+`reconcile_cursor_style()` and by the panic hook, and read by `restore_caret_if_written`. The two
+tests touching it (`restore_latch_is_monotonic`, `restore_caret_if_written_gated_by_latch`) carry
+in-repo comments acknowledging it is "a process-global static shared across all tests in the
+binary" and are written to assert only monotonic, order-independent facts — so either that
+discipline has a gap, or something else writes the latch mid-test.
+
+**Do not treat 0/200 as exoneration.** Against a ~3.3% rate, 200 clean runs is statistically
+uncomfortable but not decisive, and a single observation is weak evidence of any rate. The honest
+statement is: observed once, rate unknown, mechanism unverified. Measure before diagnosing — H31's
+own filed hypothesis (process-global state) turned out to be WRONG; the cause there was a shared
+filesystem path, and the process-global census found nothing on the failing path at all.
+
+**This falsifies the "only known source of red runs" claim** that H29 and H31 both carried. Once
+H31 ships, this is the one known remaining source. That argument justified sequencing H29 and H31
+ahead of other work; whether it justifies the same here is a judgement call for whoever sequences
+next, not an automatic promotion — one observation is a far weaker premise than H31's measured
+10/60.
+
+**Tooling that already exists** (H31, 2026-07-20): `scratchpad/h31-gates/run_n.sh <N> <outdir>
+<expected_total>` — the audited measurement harness. It pins `RUST_TEST_THREADS=32`, rejects an
+inherited value, refuses to report a count for runs that did not happen, verifies per-file log
+integrity and `passed + failed == expected_total`, and attributes failures by parsing libtest's
+`failures:` block rather than a bare test-name grep. Use it rather than re-deriving one: two
+Critical false-green defects were found and fixed *inside* it across four review rounds.

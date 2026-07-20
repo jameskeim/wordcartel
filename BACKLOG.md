@@ -3,7 +3,7 @@
 
 # Backlog
 
-**38 open · 70 shipped · 2 dropped**
+**41 open · 70 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -44,6 +44,9 @@ Blocking Effort P: **0**
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | H30 | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes | triage | bug | TBD |  | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes |
 | H31 | config::files_type_filter_unknown flake — 10% of whole-binary runs | triage | bug | TBD |  | config::files_type_filter_unknown flake — 10% of whole-binary runs |
+| H32 | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam | triage | feature | TBD |  | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam |
+| H33 | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle | triage | feature | TBD |  | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle |
+| H34 | cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed | triage | feature | TBD |  | cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed |
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
 | PC | Lower-fit / principled plugin candidates | watch | research | TBD |  | Post-P: AI continuation (plugin-only on principle), book design, genre benchmarking. |

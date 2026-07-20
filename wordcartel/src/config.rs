@@ -1316,8 +1316,32 @@ mod tests {
     // pair `[files]` was copied from but left unguarded.
     // -----------------------------------------------------------------------
 
-    fn load_files(name: &str, body: &str) -> (Config, Vec<String>) {
-        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
+    // Unique per call. Two call sites pass the same `name` ("unknown"), so `name` is for
+    // readability only — the counter is what guarantees uniqueness. Mirrors `tempdir()`'s
+    // idiom in this module. A shared path was H31: one test's remove_file deleted another
+    // test's file between its write and its read.
+    fn scratch_cfg_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "wcartel-cfg-{}-{name}-{}.toml",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn scratch_cfg_paths_are_unique_even_for_one_name() {
+        // Two call sites legitimately pass the SAME name ("unknown" — the [files] and
+        // [clipboard] invalid-value tests), so `name` must not be what carries uniqueness.
+        // A shared path is H31: one test's remove_file deletes another's file mid-read.
+        let a = scratch_cfg_path("unknown");
+        let b = scratch_cfg_path("unknown");
+        assert_ne!(a, b, "same name must still yield distinct paths: {a:?} vs {b:?}");
+    }
+
+    fn load_cfg(name: &str, body: &str) -> (Config, Vec<String>) {
+        let p = scratch_cfg_path(name);
         std::fs::write(&p, body).unwrap();
         let out = load(std::slice::from_ref(&p));
         let _ = std::fs::remove_file(&p);
@@ -1335,37 +1359,31 @@ mod tests {
 
     #[test]
     fn files_type_filter_unknown_warns_and_defaults_documents() {
-        let (cfg, warns) = load_files("unknown", "[files]\ntype_filter = \"spreadsheets\"\n");
+        let (cfg, warns) = load_cfg("unknown", "[files]\ntype_filter = \"spreadsheets\"\n");
         assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents);
-        assert!(warns.iter().any(|w| w.contains("files.type_filter")));
+        assert!(warns.iter().any(|w| w.contains("files.type_filter")),
+            "the invalid-value arm must warn by name (H31 diagnostic); warns was: {warns:?}");
     }
 
     // -----------------------------------------------------------------------
     // [clipboard] provider config (C3 Task 4)
     // -----------------------------------------------------------------------
 
-    fn load_clip(name: &str, body: &str) -> (Config, Vec<String>) {
-        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
-        std::fs::write(&p, body).unwrap();
-        let out = load(std::slice::from_ref(&p));
-        let _ = std::fs::remove_file(&p);
-        out
-    }
-
     #[test]
     fn clipboard_provider_parses_all_values() {
         for (s, want) in [("auto", ClipboardProvider::Auto), ("native", ClipboardProvider::Native),
                           ("osc52", ClipboardProvider::Osc52), ("off", ClipboardProvider::Off)] {
-            let (cfg, _warns) = load_clip(s, &format!("[clipboard]\nprovider = \"{s}\"\n"));
+            let (cfg, _warns) = load_cfg(s, &format!("[clipboard]\nprovider = \"{s}\"\n"));
             assert_eq!(cfg.clipboard.provider, want, "value {s}");
         }
     }
 
     #[test]
     fn clipboard_provider_unknown_warns_and_defaults_auto() {
-        let (cfg, warns) = load_clip("unknown", "[clipboard]\nprovider = \"telepathy\"\n");
+        let (cfg, warns) = load_cfg("unknown", "[clipboard]\nprovider = \"telepathy\"\n");
         assert_eq!(cfg.clipboard.provider, ClipboardProvider::Auto);
-        assert!(warns.iter().any(|w| w.contains("clipboard.provider")));
+        assert!(warns.iter().any(|w| w.contains("clipboard.provider")),
+            "the invalid-value arm must warn by name (H31 diagnostic); warns was: {warns:?}");
     }
 
     #[test]
@@ -1386,24 +1404,16 @@ mod tests {
     // [diagnostics] linters + [diagnostics.harper] grammar override (SPINE Task 8)
     // -----------------------------------------------------------------------
 
-    fn load_diag(name: &str, body: &str) -> (Config, Vec<String>) {
-        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
-        std::fs::write(&p, body).unwrap();
-        let out = load(std::slice::from_ref(&p));
-        let _ = std::fs::remove_file(&p);
-        out
-    }
-
     #[test]
     fn harper_engine_table_overrides_grammar() {
-        let (cfg, _warns) = load_diag("harper-grammar",
+        let (cfg, _warns) = load_cfg("harper-grammar",
             "[diagnostics]\ngrammar = true\n[diagnostics.harper]\ngrammar = false\n");
         assert!(!cfg.diagnostics.grammar, "[diagnostics.harper].grammar overrides top-level");
     }
 
     #[test]
     fn linters_list_round_trips() {
-        let (cfg, _warns) = load_diag("linters", "[diagnostics]\nlinters = [\"harper\"]\n");
+        let (cfg, _warns) = load_cfg("linters", "[diagnostics]\nlinters = [\"harper\"]\n");
         assert_eq!(cfg.diagnostics.linters, Some(vec!["harper".to_string()]));
     }
 
