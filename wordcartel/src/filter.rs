@@ -518,6 +518,15 @@ mod tests {
     /// in `run_subprocess`: the leak is *into the other spawn sites* (`harper_ls`, `export`, the
     /// clipboard helpers), so it needs a process-global spawn lock spanning all of them, or a
     /// patched `subprocess`.
+    ///
+    /// Checked scope, so a future reader does not have to redo it: `export.rs` (:211, :227) also
+    /// calls `run_subprocess` and is victim-class, but no lib test drives that path today (the
+    /// export tests exercise `pandoc_argv` construction, not a real spawn). The other spawn
+    /// sites — `clipboard.rs`, `harper_ls.rs`, `export::probe_pandoc` — use
+    /// `std::process::Command`, which creates its pipes via `pipe2(O_CLOEXEC)` atomically and so
+    /// cannot inherit a foreign fd across this race; the `harper_ls` integration tests are
+    /// separate binaries with their own fd tables besides. Nothing outside this module's own
+    /// tests is currently exposed.
     static SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     /// Shared arm of [`SPAWN_GATE`], for a test whose child exits promptly. Poison-tolerant: one
@@ -733,9 +742,14 @@ mod tests {
         // accounts for combined captured bytes, so the flood trips TooLarge and
         // kills the child.  We run on a worker thread and assert it RETURNS
         // (a regression would time out here rather than wedge the whole suite).
+        //
+        // Takes the gate SHARED, like every other spawning test — H30's fd-inheritance race
+        // needs a foreign child to outlive a victim's timeout, and this one is killed as soon as
+        // combined output crosses `max_output`, well inside any victim's window.
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            let _gate = spawn_gate_shared();
             let spec = FilterSpec {
                 // ~200 KiB to stderr, far past the 64 KiB pipe buffer, tiny stdout.
                 argv: vec![
@@ -864,8 +878,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn reap_guard_drop_kills_and_reaps_a_sigterm_ignoring_child() {
-        // Shared, not exclusive: this test spawns, but both of its children are killed and
-        // reaped before it returns, so neither can outlive a concurrent test's timeout.
+        // Shared, not exclusive: this test spawns, but neither child is a long-lived holder.
+        // The real child (under `ReapGuard`, below) is killed and reaped by the code under
+        // test. The probe child is killed and reaped in the ordinary case, but has an explicit
+        // fallback — if kill() plus a 500ms wait_timeout hasn't reaped it, `probe.detach()`
+        // (below) leaves it running as an orphaned `sleep 30` rather than block this test on a
+        // possibly-stuck reap. That pathological case is vanishingly unlikely, and even then the
+        // orphan is well inside any concurrent victim's timeout, so SHARED remains correct.
         let _gate = spawn_gate_shared();
         use subprocess::{Popen, PopenConfig, Redirection};
 
@@ -940,6 +959,12 @@ mod tests {
     ///
     /// FAIL-VERIFY: replace the phase-2 loop with `guard.0.wait().unwrap_or(ExitStatus::Undetermined)`,
     /// watch this blow its 15s bound (the child sleeps 600s), then revert.
+    ///
+    /// The 15s bound below funds gate acquisition AND execution together — unlike T6
+    /// (`cancel_is_honoured_after_the_child_closes_its_outputs`), which budgets them separately
+    /// via a `ready_tx` handshake. Deliberate, not an oversight: this test has no second signal
+    /// racing the spawn (T6's problem), so slow acquisition can only delay it, never let it pass
+    /// via the wrong code path, and headroom is enormous today (the whole gated suite is ~1.9s).
     #[test]
     #[cfg(unix)]
     fn timeout_fires_when_a_child_closes_its_outputs_and_keeps_running() {
@@ -999,6 +1024,11 @@ mod tests {
     ///
     /// FAIL-VERIFY: add `let _ = _writer.map(|w| w.join());` before the terminal `match`, watch
     /// this blow its 20s bound, then revert.
+    ///
+    /// Like T5, the 20s bound below funds gate acquisition AND execution together rather than a
+    /// separate budget as in T6 — deliberate for the same reason: no second signal races this
+    /// test's spawn, so acquisition latency can only delay it, never reorder which code path it
+    /// takes, and today's headroom is enormous (the whole gated suite is ~1.9s).
     #[test]
     #[cfg(unix)]
     fn success_returns_promptly_when_a_descendant_inherits_stdin() {
