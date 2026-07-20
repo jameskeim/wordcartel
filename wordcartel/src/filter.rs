@@ -108,28 +108,93 @@ pub enum RunResult {
 // run_subprocess — bytes core (wired in Task 5 for binary export)
 // ---------------------------------------------------------------------------
 
-/// Spawn a subprocess, feed `stdin`, collect stdout bytes, enforce `timeout`
-/// and `max_output`, respect `cancel`.
+/// Per-iteration poll window. Short enough that cancel latency stays inside the budget; long
+/// enough not to burn CPU on well-behaved fast commands. Module-level (not inside
+/// `run_subprocess`) so `REAP_GRACE` can sit beside it and `ReapGuard` can reach it.
+const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Grace for the bounded reap in `ReapGuard::drop`. Small on purpose: reaping a process the
+/// kernel already destroyed with an uncatchable SIGKILL normally takes well under a millisecond,
+/// and this sits inside the cancel budget (≤ POLL to notice + ≤ REAP_GRACE to reap ≈ 70 ms
+/// requested — a target under normal scheduling, not a wall-clock guarantee).
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Owns the child for the whole of `run_subprocess` and guarantees, on EVERY exit — normal
+/// return, early return, or unwind — that dropping the inner `Popen` cannot block.
 ///
-/// ## API path chosen: poll-loop with per-iteration `limit_time`
+/// `Popen::drop` calls `self.wait()` (unbounded) whenever `detached == false` AND
+/// `child_state == Running`. This makes at least one of those false first. Two crate facts make
+/// the guard necessary rather than decorative: `kill()` leaves `child_state` as `Running`
+/// whatever it returns, and `waitpid` promotes to `Finished` only on a successful reap or
+/// `ECHILD` — so "we killed it" alone does not stop `Drop` from blocking.
+struct ReapGuard(subprocess::Popen);
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        // Already reaped (the normal success path) — `Popen::drop` will not wait.
+        if self.0.poll().is_some() { return; }
+        let _ = self.0.terminate();
+        let _ = self.0.kill();
+        // Bounded reap: no zombie in the normal case. If the reap is not CONFIRMED — kill failed,
+        // EINTR, uninterruptible sleep — detach so `Popen::drop` returns at once. Never `wait()`.
+        if !matches!(self.0.wait_timeout(REAP_GRACE), Ok(Some(_))) {
+            self.0.detach();
+        }
+    }
+}
+
+/// Feed the child's stdin from a dedicated thread.
 ///
-/// The `subprocess` crate's `Communicator` supports `limit_time(d).read()`
-/// which returns `Err(CommunicateError { error: TimedOut, capture: partial })`
-/// on a per-call deadline.  We call this in a tight loop (~50 ms per iteration)
-/// rather than a single blocking `communicate()`, so the `CancelFlag` is
-/// checked every ~50 ms and can kill the child promptly on Esc.
+/// An `Err` here — EPIPE included — means the child stopped reading, which is ORDINARY Unix
+/// filter semantics, not a failure: it is the entire bug this split exists to fix. The `File`
+/// drops when the closure ends, delivering EOF to a child still reading. Returns `None` (having
+/// closed stdin at once) when there is nothing to send.
 ///
-/// Size-cap behaviour: `limit_size(n)` makes `read()` return Ok once `n` bytes
-/// have accumulated (it does NOT return an error).  We detect the cap by
-/// checking `out_buf.len() >= max_output` after each successful read.
+/// The returned handle is NEVER joined — see `run_subprocess`. Joining would block on every
+/// process holding the pipe's read end, including descendants we never spawned and cannot see.
+// fs-chokepoint-allow: (a) the child's own stdin PIPE handle, not a path opened by us
+fn spawn_stdin_writer(stdin: Option<std::fs::File>, bytes: Vec<u8>)
+    -> Option<std::thread::JoinHandle<()>>
+{
+    let f = stdin?;
+    if bytes.is_empty() {
+        drop(f); // empty input: close stdin immediately so the child sees EOF
+        return None;
+    }
+    Some(std::thread::spawn(move || {
+        use std::io::Write;
+        let mut f = f;
+        let _ = f.write_all(&bytes);
+    }))
+}
+
+/// Spawn a subprocess, feed `stdin`, collect stdout bytes, enforce `timeout` and `max_output`,
+/// respect `cancel`.
 ///
-/// ## Deadlock safety
+/// ## Two phases, one guard
 ///
-/// `Communicator` on Unix uses `poll(2)` to multiplex stdin-write and
-/// stdout/stderr-read within a single thread, so it never deadlocks regardless
-/// of how large the input or output is.  We feed stdin during the same loop
-/// that drains stdout, matching the Python `subprocess.communicate()` model.
-#[allow(dead_code)] // wired in Task 5
+/// stdin does NOT go through the `Communicator`. The `subprocess` crate propagates an EPIPE from
+/// its internal stdin write as a fatal error and cannot resume afterwards (it neither clears its
+/// stdin handle nor drains the pending input), so an early-exiting child — `head -1`, `grep -q` —
+/// used to kill the run and discard output we had already captured. Instead a writer thread owns
+/// stdin, where EPIPE is ordinary filter semantics and is ignored.
+///
+/// * **Phase 1 (drain):** poll stdout/stderr with a per-iteration `limit_time`, checking `cancel`
+///   and the deadline every iteration. Ends at genuine EOF, or bails on the size cap.
+/// * **Phase 2 (reap):** the same cancel/deadline guard around a bounded `wait_timeout`. This
+///   phase exists because moving stdin out also moved it out of phase 1's protection: a child
+///   that closes its outputs and keeps running would otherwise block a plain `wait()` forever
+///   with nothing watching the deadline.
+///
+/// `ReapGuard` ensures `Popen::drop` can never block on any exit path, unwind included.
+///
+/// ## Size-cap behaviour (unchanged — see the CRITICAL note in the loop)
+///
+/// `limit_size(n)` makes `read()` return `Ok` once `n` COMBINED stdout+stderr bytes accumulate;
+/// it does not signal EOF. We detect the cap by checking the combined length after each read.
+// A flat, cohesive two-phase drain/reap loop: both phases share `deadline`, `guard` and the same
+// cancel/deadline preamble, so splitting them would separate state that must be read together.
+#[allow(clippy::too_many_lines)]
 pub fn run_subprocess(
     argv: &[String],
     shell: bool,
@@ -148,7 +213,7 @@ pub fn run_subprocess(
     };
 
     // Spawn with all three streams piped.
-    let mut child = match Popen::create(
+    let child = match Popen::create(
         &real_argv,
         PopenConfig {
             stdin: Redirection::Pipe,
@@ -160,38 +225,37 @@ pub fn run_subprocess(
         Ok(c) => c,
         Err(e) => return Err(FilterError::Spawn(e.to_string())),
     };
-
-    // Per-iteration poll window.  Short enough that cancel latency < 100 ms;
-    // long enough to not burn CPU on well-behaved fast commands.
-    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    // ORDERING CONSTRAINT: wrap IMMEDIATELY. Nothing panic-capable may run while the `Popen` is
+    // bare, or an unwind bypasses the guard and `Popen::drop` can block. Do not move this down.
+    let mut guard = ReapGuard(child);
 
     let deadline = std::time::Instant::now() + timeout;
-    let stdin_bytes = stdin.into_bytes();
-    let stdin_opt: Option<Vec<u8>> = if stdin_bytes.is_empty() {
-        // subprocess panics if input_data is None but stdin was redirected to Pipe.
-        // Passing Some(vec![]) closes stdin immediately after opening.
-        Some(vec![])
-    } else {
-        Some(stdin_bytes)
-    };
 
-    // Communicator takes ownership of the stdin bytes on first call; on timeout
-    // it returns partial data and we resume by calling read() again.
-    let mut comm = child.communicate_start(stdin_opt);
+    // Take stdin OUT of the Popen and hand it to the writer thread; `communicate_start(None)` is
+    // then legal (the crate asserts stdin.is_some() => input_data.is_some()) and the communicator
+    // never touches stdin at all. The handle is deliberately never joined.
+    let _writer = spawn_stdin_writer(guard.0.stdin.take(), stdin.into_bytes());
+
+    // DROP-ORDER CONSTRAINT: `comm` must stay declared AFTER `guard` (as it is here — it is
+    // built FROM `guard.0`), so that Rust's reverse-declaration-order drop closes our
+    // stdout/stderr read ends BEFORE `ReapGuard::drop` attempts its bounded reap. That is what
+    // lets the bounded reap succeed against a child blocked writing to a pipe we stopped
+    // draining. Breaking this order does not hang — it silently degrades the reap into a
+    // `detach()` fallback and leaks a zombie, which nothing in the suite would catch.
+    let mut comm = guard.0.communicate_start(None);
     let mut out_buf: Vec<u8> = Vec::new();
     let mut err_buf: Vec<u8> = Vec::new();
 
+    // ---- Phase 1: drain stdout/stderr under the cancel/deadline guard. ----
     loop {
-        // Check cancel first — Esc must kill the child within one POLL interval.
         if cancel.is_cancelled() {
-            let _ = child.terminate();
-            let _ = child.kill();
+            let _ = guard.0.terminate();
+            let _ = guard.0.kill();
             return Err(FilterError::Cancelled);
         }
-        // Check overall deadline.
         if std::time::Instant::now() >= deadline {
-            let _ = child.terminate();
-            let _ = child.kill();
+            let _ = guard.0.terminate();
+            let _ = guard.0.kill();
             return Err(FilterError::Timeout);
         }
 
@@ -205,7 +269,7 @@ pub fn run_subprocess(
         // budget against the combined captured total — NOT stdout alone.  If we
         // budgeted on stdout only, a child that floods stderr would never trip
         // the cap here, `read()` would return Ok via the size_limit break with a
-        // small stdout, and we would break to `child.wait()` while the child is
+        // small stdout, and we would break to the reap phase while the child is
         // still blocked writing stderr to a full pipe we stopped draining —
         // deadlocking forever.  The +1 lets us see one byte past the cap so we
         // can distinguish "exactly max_output captured" from "more pending".
@@ -224,8 +288,8 @@ pub fn run_subprocess(
                 // loop on `total >= size_limit` and returns Ok — it does NOT
                 // signal EOF).  The combined-overflow check below distinguishes
                 // them: if we are over the cap it was a size_limit break (kill +
-                // TooLarge — do NOT wait on a child that may still be writing),
-                // otherwise it is a genuine EOF and waiting is safe.
+                // TooLarge — do NOT reap a child that may still be writing),
+                // otherwise it is a genuine EOF and reaping is safe.
                 if let Some(o) = o {
                     out_buf.extend_from_slice(&o);
                 }
@@ -234,11 +298,11 @@ pub fn run_subprocess(
                 }
                 // Combined size check after accumulating this batch.
                 if out_buf.len() + err_buf.len() > max_output {
-                    let _ = child.terminate();
-                    let _ = child.kill();
+                    let _ = guard.0.terminate();
+                    let _ = guard.0.kill();
                     return Err(FilterError::TooLarge);
                 }
-                // Genuine EOF (both streams closed, under cap) — safe to wait.
+                // Genuine EOF (both streams closed, under cap) — go reap.
                 break;
             }
             Err(ce) => {
@@ -253,8 +317,8 @@ pub fn run_subprocess(
 
                 // Combined size cap — limit_size hit, or we accumulated too much.
                 if out_buf.len() + err_buf.len() > max_output {
-                    let _ = child.terminate();
-                    let _ = child.kill();
+                    let _ = guard.0.terminate();
+                    let _ = guard.0.kill();
                     return Err(FilterError::TooLarge);
                 }
 
@@ -262,19 +326,40 @@ pub fn run_subprocess(
                     // Per-iteration timeout expired — loop to check cancel/deadline.
                     continue;
                 } else {
-                    // Unexpected I/O error.
-                    let _ = child.terminate();
-                    let _ = child.kill();
+                    // A genuine stdout/stderr READ failure. Unreachable for stdin errors now:
+                    // no stdin write happens inside the communicator any more.
+                    let _ = guard.0.terminate();
+                    let _ = guard.0.kill();
                     return Err(FilterError::Spawn(ce.error.to_string()));
                 }
             }
         }
     }
 
-    // Wait for the child to exit (it has already closed its streams).
-    let status = child.wait().unwrap_or(ExitStatus::Undetermined);
-    let stderr_str =
-        String::from_utf8_lossy(&err_buf).into_owned();
+    // ---- Phase 2: reap under the SAME guard. Never a blocking `wait()`. ----
+    let status = loop {
+        if cancel.is_cancelled() {
+            let _ = guard.0.terminate();
+            let _ = guard.0.kill();
+            return Err(FilterError::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = guard.0.terminate();
+            let _ = guard.0.kill();
+            return Err(FilterError::Timeout);
+        }
+        let slice = POLL.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        match guard.0.wait_timeout(slice) {
+            Ok(Some(st)) => break st,
+            Ok(None) => continue,
+            // Preserves today's `unwrap_or(Undetermined)` fallback. NOTE: this arm leaves
+            // `child_state == Running` (the crate sets Finished only on success or ECHILD) —
+            // `ReapGuard`, not this arm, is what stops `Popen::drop` blocking here.
+            Err(_) => break ExitStatus::Undetermined,
+        }
+    };
+
+    let stderr_str = String::from_utf8_lossy(&err_buf).into_owned();
 
     match status {
         ExitStatus::Exited(0) => Ok(out_buf),
@@ -393,6 +478,71 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
+    /// A filter spec for the EPIPE regression tests: direct exec (no shell wrapper), the real
+    /// 64 MiB cap, and a caller-chosen timeout.
+    fn spec_for(argv: &[&str], timeout_secs: u64) -> FilterSpec {
+        FilterSpec {
+            argv: argv.iter().map(|s| (*s).to_string()).collect(),
+            shell: false,
+            disposition: Disposition::Filter,
+            input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(timeout_secs),
+            max_output: crate::limits::MAX_FILTER_OUTPUT,
+        }
+    }
+
+    /// 1 MiB — far past the 64 KiB default Linux pipe buffer, so a child that stops reading
+    /// leaves our writer genuinely blocked mid-write. This is what makes the EPIPE deterministic
+    /// instead of a race we lose 39% of the time under load.
+    fn big_stdin() -> String {
+        "x".repeat(1024 * 1024)
+    }
+
+    /// Test-only gate against the fd-inheritance race filed as **H30** — see that item before
+    /// touching this. `subprocess 0.2.15` creates its pipes with a bare `libc::pipe()` and only
+    /// sets `FD_CLOEXEC` afterwards, in a separate `fcntl` (`popen::set_inheritable`). A
+    /// `fork()+exec` on another thread inside that window inherits the pipes of every filter
+    /// running concurrently. If the inheriting child then outlives the victim's timeout it holds
+    /// the victim's stdout/stderr WRITE ends open, the victim's drain loop never sees EOF, and
+    /// the victim fails with `Timeout` — observed as 3 failures in 10 suite runs, a *different*
+    /// victim each time, with one long-lived child seen holding four foreign pipe fds.
+    ///
+    /// Deliberately NOT a blanket serialization of the filter suite. A short-lived child makes
+    /// the leak invisible — it returns the fds in milliseconds, long before any victim's 10s
+    /// timeout — which is why this suite was green for as long as every child exited promptly.
+    /// So ordinary spawning tests take this gate SHARED and still run concurrently exactly as
+    /// they did before; only the three tests that keep a child alive for 30–600s, longer than
+    /// any victim's timeout, take it EXCLUSIVE.
+    ///
+    /// **Remove this gate and both helpers when H30 is fixed at its root.** The fix cannot live
+    /// in `run_subprocess`: the leak is *into the other spawn sites* (`harper_ls`, `export`, the
+    /// clipboard helpers), so it needs a process-global spawn lock spanning all of them, or a
+    /// patched `subprocess`.
+    ///
+    /// Checked scope, so a future reader does not have to redo it: `export.rs` (:211, :227) also
+    /// calls `run_subprocess` and is victim-class, but no lib test drives that path today (the
+    /// export tests exercise `pandoc_argv` construction, not a real spawn). The other spawn
+    /// sites — `clipboard.rs`, `harper_ls.rs`, `export::probe_pandoc` — use
+    /// `std::process::Command`, which creates its pipes via `pipe2(O_CLOEXEC)` atomically and so
+    /// cannot inherit a foreign fd across this race; the `harper_ls` integration tests are
+    /// separate binaries with their own fd tables besides. Nothing outside this module's own
+    /// tests is currently exposed.
+    static SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Shared arm of [`SPAWN_GATE`], for a test whose child exits promptly. Poison-tolerant: one
+    /// panicking test must not cascade into unrelated failures across the whole suite.
+    fn spawn_gate_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+        SPAWN_GATE.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Exclusive arm of [`SPAWN_GATE`], for a test that keeps a child alive past another test's
+    /// timeout. Must be held across the `run_filter` call, because `fork()` is the moment the
+    /// inheriting happens: with no other filter's pipes open at that instant, the long-lived
+    /// child inherits nothing foreign and the rest of its life is harmless.
+    fn spawn_gate_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+        SPAWN_GATE.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // A17 T8 — driven through the real submit path (builds the spec, then calls `dispatch_filter`,
     // whose read-only entry guard fires before scheduling) — avoids constructing a private FilterSpec.
     #[test]
@@ -442,6 +592,7 @@ mod tests {
 
     #[test]
     fn run_filter_identity_cat() {
+        let _gate = spawn_gate_shared();
         let spec = FilterSpec {
             argv: vec!["cat".into()],
             shell: false,
@@ -456,6 +607,7 @@ mod tests {
 
     #[test]
     fn run_filter_transform_tr() {
+        let _gate = spawn_gate_shared();
         let spec = FilterSpec {
             argv: vec!["tr".into(), "a-z".into(), "A-Z".into()],
             shell: false,
@@ -470,6 +622,7 @@ mod tests {
 
     #[test]
     fn run_filter_non_zero_exit_carries_stderr() {
+        let _gate = spawn_gate_shared();
         let spec = FilterSpec {
             argv: vec![
                 "sh".into(),
@@ -491,9 +644,76 @@ mod tests {
         }
     }
 
+    /// EPIPE regression (spec §1.1): a child that exits after reading part of stdin is ORDINARY
+    /// Unix filter semantics. Its output must survive. Before the fix the communicator's stdin
+    /// write raced the child's exit and returned Err(Spawn("Broken pipe (os error 32)")).
+    #[test]
+    #[cfg(unix)]
+    fn early_exiting_child_keeps_its_output() {
+        let _gate = spawn_gate_shared();
+        let spec = spec_for(&["head", "-c", "5"], 10);
+        match run_filter(&spec, big_stdin(), &CancelFlag::new()) {
+            RunResult::Stdout(s) => assert_eq!(s, "xxxxx",
+                "an early-exiting filter's captured output must survive EPIPE on stdin"),
+            other => panic!("expected Stdout, got {other:?}"),
+        }
+    }
+
+    /// EPIPE regression: the child's REAL exit status and stderr must survive, not be replaced by
+    /// a Spawn error. This is the hardened form of `run_filter_non_zero_exit_carries_stderr`,
+    /// which lost this race ~39% of the time under six-way parallel load.
+    #[test]
+    #[cfg(unix)]
+    fn early_exiting_child_reports_its_real_nonzero_status() {
+        let _gate = spawn_gate_shared();
+        let spec = spec_for(&["sh", "-c", "head -c 4 >/dev/null; echo boom >&2; exit 3"], 10);
+        match run_filter(&spec, big_stdin(), &CancelFlag::new()) {
+            RunResult::Err(FilterError::NonZero { code, stderr }) => {
+                assert!(code.contains('3'), "the child's real exit code, not a Spawn error: {code}");
+                assert!(stderr.contains("boom"), "stderr survives the EPIPE: {stderr}");
+            }
+            other => panic!("expected NonZero, got {other:?}"),
+        }
+    }
+
+    /// EPIPE regression: a child that never reads stdin at all still succeeds.
+    ///
+    /// `s.is_empty()` alone is satisfiable vacuously by any implementation that returns empty
+    /// output for the WRONG reason, so we also pin the property this test is really about: the
+    /// call must return promptly, not merely succeed after riding out (a portion of) the 10s
+    /// timeout budget.
+    #[test]
+    #[cfg(unix)]
+    fn child_that_never_reads_stdin_still_succeeds() {
+        let _gate = spawn_gate_shared();
+        let spec = spec_for(&["sh", "-c", "exit 0"], 10);
+        let start = std::time::Instant::now();
+        match run_filter(&spec, big_stdin(), &CancelFlag::new()) {
+            RunResult::Stdout(s) => assert!(s.is_empty(), "no output expected, got {s:?}"),
+            other => panic!("expected empty Stdout, got {other:?}"),
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2),
+            "a child that never reads stdin must return promptly ({:?} elapsed), not merely \
+             succeed after riding out the timeout", start.elapsed());
+    }
+
+    /// EPIPE regression: bytes the child wrote BEFORE exiting stay readable in the pipe until
+    /// EOF, so the drain must collect them rather than discarding them with the EPIPE.
+    #[test]
+    #[cfg(unix)]
+    fn output_buffered_before_child_exit_is_not_lost() {
+        let _gate = spawn_gate_shared();
+        let spec = spec_for(&["sh", "-c", "echo out; exit 0"], 10);
+        match run_filter(&spec, big_stdin(), &CancelFlag::new()) {
+            RunResult::Stdout(s) => assert_eq!(s, "out\n"),
+            other => panic!("expected Stdout, got {other:?}"),
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn run_filter_rejects_oversized() {
+        let _gate = spawn_gate_shared();
         // `yes` floods stdout; a tiny cap must abort with TooLarge.
         let spec = FilterSpec {
             argv: vec!["yes".into()],
@@ -522,9 +742,14 @@ mod tests {
         // accounts for combined captured bytes, so the flood trips TooLarge and
         // kills the child.  We run on a worker thread and assert it RETURNS
         // (a regression would time out here rather than wedge the whole suite).
+        //
+        // Takes the gate SHARED, like every other spawning test — H30's fd-inheritance race
+        // needs a foreign child to outlive a victim's timeout, and this one is killed as soon as
+        // combined output crosses `max_output`, well inside any victim's window.
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            let _gate = spawn_gate_shared();
             let spec = FilterSpec {
                 // ~200 KiB to stderr, far past the 64 KiB pipe buffer, tiny stdout.
                 argv: vec![
@@ -553,6 +778,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn filter_output_above_old_1mib_cap_succeeds_under_new_cap() {
+        let _gate = spawn_gate_shared();
         // Emit ~2 MiB through `cat`; with MAX_FILTER_OUTPUT (64 MiB) this must NOT hit the cap.
         let input = "x".repeat(2 * 1024 * 1024);
         let expected_len = input.len();
@@ -573,6 +799,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_filter_rejects_non_utf8() {
+        let _gate = spawn_gate_shared();
         let spec = FilterSpec {
             argv: vec!["printf".into(), "\\xff".into()],
             shell: false,
@@ -589,6 +816,7 @@ mod tests {
 
     #[test]
     fn run_filter_missing_binary_is_spawn_error() {
+        let _gate = spawn_gate_shared();
         let spec = FilterSpec {
             argv: vec!["wcartel-no-such-binary-xyz".into()],
             shell: false,
@@ -606,6 +834,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn shell_pipeline_survives_quoted_whitespace() {
+        let _gate = spawn_gate_shared();
         // shell: true — a single verbatim-line argv element, run through `sh -c`.
         // A plain pipeline works:
         let pipeline = FilterSpec {
@@ -634,6 +863,87 @@ mod tests {
         assert!(matches!(out, RunResult::Stdout(ref s) if s == "c\n"), "{out:?}");
     }
 
+    /// Important-1 (task-1 review): `ReapGuard::drop`'s terminate → kill → bounded-reap path was
+    /// entirely untested — mutation-proven by replacing the whole `Drop` body with a bare
+    /// `detach()` and observing every filter test, EPIPE regressions included, still pass. That
+    /// blind spot exists BECAUSE every early-return branch in `run_subprocess` (cancel, timeout,
+    /// too-large) already calls its own `terminate()`/`kill()` before returning, so driving the
+    /// guard only through the public API can never isolate its own kill/reap logic — the
+    /// explicit calls mask the difference. This test drives `ReapGuard` directly against a child
+    /// that ignores SIGTERM, so `terminate()` alone cannot touch it and the guard's `kill()` +
+    /// bounded-reap path is the ONLY thing capable of ending the child.
+    ///
+    /// `sh`'s `trap` behaviour is a platform fact, not a language guarantee, so we verify it
+    /// (rather than assume it) with a probe child before relying on it for the real assertion.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reap_guard_drop_kills_and_reaps_a_sigterm_ignoring_child() {
+        // Shared, not exclusive: this test spawns, but neither child is a long-lived holder.
+        // The real child (under `ReapGuard`, below) is killed and reaped by the code under
+        // test. The probe child is killed and reaped in the ordinary case, but has an explicit
+        // fallback — if kill() plus a 500ms wait_timeout hasn't reaped it, `probe.detach()`
+        // (below) leaves it unreaped rather than block this test on a possibly-stuck reap. That
+        // pathological case is vanishingly unlikely, and even then it does not threaten a
+        // concurrent victim: kill() is SIGKILL against our own live child, so it cannot
+        // meaningfully fail — the process is dead either way — and a failed reap only leaves a
+        // ZOMBIE, whose fds were already closed at death. A zombie can't hold any victim's pipe
+        // ends open, which — not timeout arithmetic (a live 30 s process would in fact outlast a
+        // 10 s victim timeout) — is why SHARED remains correct.
+        let _gate = spawn_gate_shared();
+        use subprocess::{Popen, PopenConfig, Redirection};
+
+        fn spawn_sigterm_ignoring_child() -> Popen {
+            Popen::create(
+                &["sh", "-c", "trap '' TERM; exec sleep 30"],
+                PopenConfig {
+                    stdin: Redirection::None,
+                    stdout: Redirection::None,
+                    stderr: Redirection::None,
+                    ..Default::default()
+                },
+            )
+            .expect("spawn a SIGTERM-ignoring probe/test child")
+        }
+
+        // ---- Platform-fact probe: confirm SIGTERM alone cannot end this child on THIS machine.
+        let mut probe = spawn_sigterm_ignoring_child();
+        std::thread::sleep(std::time::Duration::from_millis(100)); // let the trap install + exec
+        let _ = probe.terminate();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let probe_survived_term = probe.poll().is_none();
+        // Clean up the probe unconditionally, regardless of what the assert below does.
+        let _ = probe.kill();
+        let _ = probe.wait_timeout(std::time::Duration::from_millis(500));
+        if probe.poll().is_none() {
+            probe.detach();
+        }
+        assert!(probe_survived_term,
+            "probe child exited after SIGTERM alone — this machine's `sh` does not preserve an \
+             ignored SIGTERM across `exec`, so this test's premise does not hold here");
+
+        // ---- The real assertion: ReapGuard's OWN kill()+bounded-reap path, not the loop's.
+        let child = spawn_sigterm_ignoring_child();
+        let pid = child.pid().expect("a freshly spawned child has a pid");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let start = std::time::Instant::now();
+        { let _guard = ReapGuard(child); } // drop here — nothing else in this test signals it
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < std::time::Duration::from_secs(2),
+            "ReapGuard::drop must return promptly even against a SIGTERM-ignoring child (took \
+             {elapsed:?}) — a regression toward an unbounded wait() would hang here for ~30s");
+
+        // Give the kernel a brief moment to finish the teardown the drop initiated, then confirm
+        // the child is actually GONE (killed and reaped) — not merely detached-and-still-alive,
+        // which a bare `detach()` would also leave passing the wall-clock assertion above.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!crate::swap::pid_is_live(pid),
+            "child pid {pid} is still alive after ReapGuard::drop — a bare `detach()` never \
+             sends kill() at all, so the child would keep running its full 30s sleep, undetected \
+             by every other test in this suite");
+    }
+
     #[test]
     fn guarded_filter_maps_panic_to_runresult_err() {
         let r = guarded_filter(|| panic!("flt"));
@@ -643,5 +953,113 @@ mod tests {
     #[test]
     fn describe_error_renders_panicked() {
         assert!(describe_error(&FilterError::Panicked("x".into())).to_lowercase().contains("internal"));
+    }
+
+    /// Timeout must stay enforced after stdout/stderr hit EOF. Moving stdin to a writer thread
+    /// also moved it out of the drain loop's protection, so a child that closes its outputs and
+    /// keeps running would block a plain `wait()` forever with nothing watching the deadline.
+    /// Phase 2 is what prevents that. Runs on a worker thread so a regression times out the
+    /// harness instead of wedging the whole suite.
+    ///
+    /// FAIL-VERIFY: replace the phase-2 loop with `guard.0.wait().unwrap_or(ExitStatus::Undetermined)`,
+    /// watch this blow its 15s bound (the child sleeps 600s), then revert.
+    ///
+    /// The 15s bound below funds gate acquisition AND execution together — unlike T6
+    /// (`cancel_is_honoured_after_the_child_closes_its_outputs`), which budgets them separately
+    /// via a `ready_tx` handshake. Deliberate, not an oversight: this test has no second signal
+    /// racing the spawn (T6's problem), so slow acquisition can only delay it, never let it pass
+    /// via the wrong code path, and headroom is enormous today (the whole gated suite is ~1.9s).
+    #[test]
+    #[cfg(unix)]
+    fn timeout_fires_when_a_child_closes_its_outputs_and_keeps_running() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _gate = spawn_gate_exclusive();  // H30 — see SPAWN_GATE
+            let spec = spec_for(&["sh", "-c", "exec >/dev/null 2>/dev/null; sleep 600"], 1);
+            let _ = tx.send(run_filter(&spec, big_stdin(), &CancelFlag::new()));
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15))
+            .expect("run_filter must return at its deadline, not block on a child that closed its streams");
+        assert!(matches!(out, RunResult::Err(FilterError::Timeout)), "expected Timeout, got {out:?}");
+    }
+
+    /// Esc must still work on a child that has stopped talking but not died — the cancel check
+    /// has to survive into phase 2, not stop at stdout/stderr EOF.
+    ///
+    /// FAIL-VERIFY: delete the `cancel.is_cancelled()` arm from the phase-2 loop, watch this fall
+    /// back to the 60s timeout and blow its 15s bound, then revert.
+    #[test]
+    #[cfg(unix)]
+    fn cancel_is_honoured_after_the_child_closes_its_outputs() {
+        use std::sync::mpsc;
+        let cancel = CancelFlag::new();
+        let worker_flag = cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _gate = spawn_gate_exclusive();  // H30 — see SPAWN_GATE
+            let _ = ready_tx.send(());
+            let spec = spec_for(&["sh", "-c", "exec >/dev/null 2>/dev/null; sleep 600"], 60);
+            let _ = tx.send(run_filter(&spec, big_stdin(), &worker_flag));
+        });
+        // Start the 200 ms clock only once the worker actually HOLDS the gate. Otherwise a slow
+        // acquisition could let `cancel()` fire before `run_filter` even spawns, and the test
+        // would pass via the PHASE-1 cancel check without ever exercising phase 2 — the thing it
+        // names. (The gate is the only reason this handshake is needed; it goes with the gate.)
+        ready_rx.recv_timeout(std::time::Duration::from_secs(15))
+            .expect("worker must acquire the spawn gate");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        cancel.cancel();
+        let out = rx.recv_timeout(std::time::Duration::from_secs(15))
+            .expect("cancel must be honoured after stdout/stderr EOF, not wait for the timeout");
+        assert!(matches!(out, RunResult::Err(FilterError::Cancelled)), "expected Cancelled, got {out:?}");
+    }
+
+    /// The SUCCESS path must not block when a DESCENDANT inherits stdin. Reaping the direct child
+    /// says nothing about its children: here the shell exits 0 while a backgrounded `sleep` holds
+    /// the stdin pipe open, so the writer stays blocked in `write_all`. Joining that writer would
+    /// hang here — after every timeout and cancel check has already stopped.
+    ///
+    /// The `exec 3<&0` … `<&3` shape is REQUIRED and verified by probe (see the task's probe
+    /// step): without the explicit `<&3`, bash hands a background job /dev/null for fd 0, nothing
+    /// holds the pipe, and this test silently passes against a broken implementation.
+    /// `sleep 30` (not 600) so a soak run does not strand long-lived processes.
+    ///
+    /// FAIL-VERIFY: add `let _ = _writer.map(|w| w.join());` before the terminal `match`, watch
+    /// this blow its 20s bound, then revert.
+    ///
+    /// Like T5, the 20s bound below funds gate acquisition AND execution together rather than a
+    /// separate budget as in T6 — deliberate for the same reason: no second signal races this
+    /// test's spawn, so acquisition latency can only delay it, never reorder which code path it
+    /// takes, and today's headroom is enormous (the whole gated suite is ~1.9s).
+    #[test]
+    #[cfg(unix)]
+    fn success_returns_promptly_when_a_descendant_inherits_stdin() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Acquired BEFORE the clock starts, so waiting for the gate can never be charged to
+            // the `elapsed < 5s` assertion below.
+            let _gate = spawn_gate_exclusive();  // H30 — see SPAWN_GATE
+            let spec = spec_for(
+                &["sh", "-c", "exec 3<&0; exec >/dev/null 2>/dev/null; sleep 30 <&3 & exit 0"],
+                10,
+            );
+            let started = std::time::Instant::now();
+            let out = run_filter(&spec, big_stdin(), &CancelFlag::new());
+            let _ = tx.send((out, started.elapsed()));
+        });
+        let (out, elapsed) = rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("must not block on a descendant holding stdin open");
+        match out {
+            RunResult::Stdout(ref s) => assert!(s.is_empty(),
+                "the shell's outputs went to /dev/null, so stdout is empty; got {s:?}"),
+            other => panic!("expected empty Stdout, got {other:?}"),
+        }
+        // Load-bearing: without this a future implementation that stalls to the 10s deadline and
+        // THEN returns a success would pass the assertion above. Generous against loaded runs.
+        assert!(elapsed < std::time::Duration::from_secs(5),
+            "must return on the child's exit, not stall to the deadline; took {elapsed:?}");
     }
 }

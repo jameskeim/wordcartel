@@ -1816,10 +1816,19 @@ mod tests {
         assert_eq!(e.active().desired_col, Some(3), "a no-op redo must not reset desired_col");
     }
 
+    /// Effort ①: this test ASSERTS the value of the process-global `LAST_GOOD`, which every other
+    /// editing test writes via `apply`/`undo`/`redo`. Without serialization an unrelated test's
+    /// snapshot lands between this test's write and its read (measured: 3/60 runs at default
+    /// `--test-threads`, 0/300 isolated — captured values were other tests' buffer text).
+    ///
+    /// `SnapshotGate` blocks OTHER threads inside `record_snapshot` before they touch `LAST_GOOD`,
+    /// while this thread bypasses the gate so its own snapshots still land. Holding `LAST_GOOD`
+    /// itself would be self-defeating: `record_snapshot` writes via `try_lock` and SKIPS on
+    /// contention, so this test's own snapshots would be dropped and it would assert on a stale
+    /// value.
     #[test]
     fn undo_and_redo_refresh_the_recovery_snapshot() {
-        // Serialize the shared LAST_GOOD latch for this thread by taking it, seeding a sentinel,
-        // dropping the guard, then acting. (Global; other threads may race — see plan note.)
+        let _gate = crate::recovery::SnapshotGate::acquire();
         struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "X".into())], 4);

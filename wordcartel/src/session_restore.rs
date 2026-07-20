@@ -374,7 +374,9 @@ mod tests {
         let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
         let (tx, _rx) = std::sync::mpsc::channel();
         e.open_file_browser(&crate::test_support::test_fs(), &tx, dir.clone());
-        // select "note.md" and simulate Enter via the browser's open path:
+        // NOT a simulated Enter: this calls the clean-path open handler DIRECTLY, bypassing the
+        // picker's intercept, selection and highlight entirely. It covers `open_into_current`'s
+        // clean-buffer behaviour, nothing about Enter dispatch.
         open_into_current(&mut e, &crate::fsx::RealFs, &dir.join("note.md")); // the clean-path the Enter handler takes
         assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
         let _ = std::fs::remove_dir_all(&dir);

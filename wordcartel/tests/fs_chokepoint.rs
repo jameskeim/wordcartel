@@ -31,9 +31,13 @@ use std::path::{Path, PathBuf};
 /// is defined in terms of, so a per-hit marker on each would be noise.
 ///
 /// Deliberately NOT listed, though earlier drafts listed them:
-///   * `filter.rs` and `harper_ls.rs` — verified to contain ZERO raw filesystem calls. Their
-///     clause-(a) exemption covers what the CHILD PROCESS does, which this scanner cannot
-///     see and does not attempt to. Listing them would imply they hold exempt raw calls.
+///   * `harper_ls.rs` — verified to contain ZERO raw filesystem calls. Its clause-(a)
+///     exemption covers what the CHILD PROCESS does, which this scanner cannot see and does
+///     not attempt to. Listing it would imply it holds an exempt raw call.
+///   * `filter.rs` — NOT zero: it carries one per-hit clause-(a) marker, on
+///     `spawn_stdin_writer`'s `std::fs::File` stdin-pipe-handle parameter. That is a TYPE in a
+///     signature, not a filesystem call, which is why a whole-file entry still isn't warranted
+///     — a NEW raw call added to this file must still carry its own marker or fail the gate.
 ///   * `recovery.rs` — verified to contain zero raw filesystem calls in production; the panic
 ///     dump goes through `swap::write_atomic` -> `fsx::atomic_replace`. It was listed as
 ///     "(d)-adjacent", which conflated two different things: it IS an ownership exception

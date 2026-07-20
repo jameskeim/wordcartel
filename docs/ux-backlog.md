@@ -931,3 +931,58 @@ Two candidate resolutions, and the choice is a product call: either Export honou
 when the flow was entered from Write-Block, or the redirect states plainly that it is leaving block
 scope. Related: a Row-2 confirm onto a `.docx` target does not currently say the write would be
 plain markdown.
+
+### H30 — subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes
+<!-- item: H30 -->
+
+`subprocess 0.2.15` creates its pipes with a bare `libc::pipe()` and only sets `CLOEXEC` in a
+later `fcntl`. Any `fork()+exec` that happens in that window inherits the fds. Found 2026-07-19
+during effort ① Task 2, and confirmed **directly** rather than by reading: mid-suite, a test child
+held four *foreign* pipe fds (17/22/28/33) belonging to other filter tests. Holding their
+stdout/stderr write ends open means those tests never see EOF and ride their full 10 s timeout —
+measured 7 pass / 3 fail over 10 runs, a different victim each time.
+
+**This is a production race, not only a test artifact.** There are four spawn sites:
+`filter::run_subprocess` (`Popen::create`), `harper_ls` (`Command::new("harper-ls")`, **long-lived**),
+`export` (pandoc), and `clipboard`. Rust's `std::process::Command` makes its *own* pipes CLOEXEC, but
+a child it forks still inherits any non-CLOEXEC fd that exists at fork time. So a `harper-ls` spawned
+during a filter's `Popen::create` window can hold that filter's write ends open **for the rest of the
+session**, and the filter then rides its whole timeout. The window is microseconds and needs a
+concurrent spawn, so it is rare — but `harper-ls` being long-lived makes the consequence durable
+rather than transient.
+
+**Why it was invisible until now:** every prior filter-test child exited in milliseconds. Effort ①'s
+T5/T6/T7 are the first to hold a child alive long enough for the inheritance to matter.
+
+**Why effort ① did not fix it.** The leak is *into other spawn sites*, so it cannot be fixed inside
+`run_subprocess`; it needs a process-global spawn lock covering all four sites, or a patched/forked
+crate. That is a design effort in its own right, and it is **Effort-P adjacent** — `wc.async` (PD)
+adds more spawn sites and would inherit the same hazard. Effort ① serialized its own tests instead
+(the proportionate local fix) and filed this.
+
+**Candidate resolutions:** (1) a process-global spawn mutex every spawn site takes — simple, but
+easy for a new site to forget, so it wants the same registration-seam treatment as other invariants
+here; (2) replace `subprocess` with a `pipe2(O_CLOEXEC)`-based spawn; (3) patch/vendor the crate.
+Note `cargo deny` already tracks the dependency.
+
+### H31 — config::files_type_filter_unknown flake — 10% of whole-binary runs
+<!-- item: H31 -->
+
+`config::tests::files_type_filter_unknown_warns_and_defaults_documents` fails ~10% of
+whole-binary runs (measured 6/60 during effort ①'s soak; earlier observations put it in a 7-13%
+band). It passes in isolation and at `--test-threads=1`. Failure is always the same assertion at
+`config.rs:1340` — `assertion failed: warns.iter().any(...)`.
+
+Added by C5 Task 24. Effort ① measured it precisely and kept it **out of scope** — it was neither of
+that effort's two targets — but flagged it as **plausibly the same process-global-state class**
+effort ① exists to address, i.e. a test observing state another concurrently-running test mutates.
+That is a hypothesis from the failure shape, not a diagnosis; nobody has traced it.
+
+Effort ① fixed its own two flakes (`filter` EPIPE 39%→0 under contention; `LAST_GOOD` 3/60→0/60) and
+this is now the **only known source of red runs** in the suite, so it is what makes `cargo test`
+non-deterministic today — the same argument that motivated H29.
+
+Worth doing with the tools effort ① already built: measure at default threading (it is invisible
+below 32 threads), and run an **attribution check** — the discipline that proved effort ①'s
+`LAST_GOOD` fix was load-bearing rather than coincidental. Do not validate a fix in isolation; that
+configuration never reproduces it.
