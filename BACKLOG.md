@@ -3,7 +3,7 @@
 
 # Backlog
 
-**40 open · 68 shipped · 2 dropped**
+**38 open · 70 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -38,11 +38,9 @@ Blocking Effort P: **0**
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
-| H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | triage | feature | TBD |  | Flaky test: filter::run_filter_non_zero_exit_carries_stderr. INVESTIGATED 2026-07-13: NOT reproducible in 85 runs (60 isolated + 25 full-parallel, 0 failures). run_subprocess reviewed — carefully written: concurrent drain, deadlock-safe (combined stdout+stderr limit_size), EPIPE-on-stdin handled by the subprocess crate, breaks to child.wait() only on genuine both-streams-EOF so err_buf holds all stderr. No clear race by inspection. MOST PLAUSIBLE vector: child.wait().unwrap_or(Undetermined) — if wait() ever yields Undetermined, code='Undetermined' has no '3', so the CODE assert fails (not the stderr one). NEXT: on recurrence, capture the actual panic message (which assert / 'got <other>') — it pinpoints code-vs-stderr. Do NOT weaken the test (would mask a real intermittent wait() result); do NOT guess-fix the deadlock-safe loop without a repro. |
 | H26 | fs-chokepoint guard: use-tree parsing for full soundness | triage | feature | TBD |  | fs-chokepoint guard: use-tree parsing for full soundness |
 | H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | triage | feature | TBD |  | dispatch signatures: pass DispatchCtx instead of 8 loose args |
 | H28 | Un-pumped picker tests assert unreachable states | triage | feature | TBD |  | Un-pumped picker tests assert unreachable states |
-| H29 | recovery::LAST_GOOD process-global race makes the test gate non-deterministic | triage | feature | TBD |  | recovery::LAST_GOOD process-global race makes the test gate non-deterministic |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | H30 | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes | triage | bug | TBD |  | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes |
 | H31 | config::files_type_filter_unknown flake — 10% of whole-binary runs | triage | bug | TBD |  | config::files_type_filter_unknown flake — 10% of whole-binary runs |
@@ -54,11 +52,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>68 shipped</summary>
+<details><summary>70 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | C5 | File interface — unify save/write onto the picker + favorites/recent | 2026-07-19 | 30f502a |
+| H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | 2026-07-19 | b30f5aa |
+| H29 | recovery::LAST_GOOD process-global race makes the test gate non-deterministic | 2026-07-19 | b30f5aa |
 | S8 | Prose lenses — POS-driven stylistic X-rays (4-lens spine) | 2026-07-18 | 1570ea8 |
 | A16 | Format menu: drop redundant Transform entry | 2026-07-17 | 505f093 |
 | A21 | Overlay mouse interaction model — hover-highlights, wheel-scrolls-viewport | 2026-07-17 | 3f0bc11 |

@@ -2365,3 +2365,37 @@ overlay (reinforces H21's value). Config/persistence surface for Layer 2. `S2`/`
 
 **Size:** M for Layers 1–2 (save-mode picker + favorites/persistence + command-surface wiring); L if it grows
 toward projects (which should be S2 instead). Good candidate for the Fable-first, writer-first pipeline.
+
+### H20 — Flaky test: filter::run_filter_non_zero_exit_carries_stderr
+<!-- item: H20 -->
+
+**Observed (v0.4.0 release gate, 2026-07-11):** `filter::tests::run_filter_non_zero_exit_carries_stderr`
+failed in one of two back-to-back `cargo test --workspace` runs, then passed **10/10** on isolated
+re-run — a genuine flaky test, not a regression (it predates 0.3.0; commit `7834562`, the filter
+subprocess engine). A flaky test in the suite undermines the `cargo test` merge GATE (a real failure
+could hide behind "probably just the flake," and a flake can spuriously block a merge). **Direction:**
+find the race — likely a subprocess spawn/stderr-capture timing assumption on non-zero exit (stderr
+read vs. child-exit ordering, or a too-tight timing/poll assumption) — and make the assertion
+deterministic (wait on the condition, not a timing window; cf. condition-based-waiting). Low effort,
+high hygiene value before Effort P. Anchor: `wordcartel/src/filter.rs`
+(`run_filter_non_zero_exit_carries_stderr` + the sync subprocess engine it exercises).
+
+*(Captured 2026-07-11 from the v0.4.0 release gate.)*
+
+### H29 — recovery::LAST_GOOD process-global race makes the test gate non-deterministic
+<!-- item: H29 -->
+
+`editor::tests::undo_and_redo_refresh_the_recovery_snapshot` fails intermittently — roughly 2 runs
+in 14 — on a race over the process-global `recovery::LAST_GOOD`. `git log -S` places it on `main`
+since **H22**; it is not a C5 regression, and C5 deliberately left it alone.
+
+It matters because it makes `cargo test` — a merge GATE — non-deterministic. Every effort since H22
+has had to tell its implementers and reviewers "this one is a known flake, re-run it, don't chase
+it," which is exactly the instruction that trains someone to re-run a *real* failure instead of
+reading it.
+
+Two sibling flakes fire only under parallel load and pass at `--test-threads=1`:
+`config::tests::files_type_filter_unknown_warns_and_defaults_documents` and
+`filter::tests::run_filter_non_zero_exit_carries_stderr` (the latter has a genuinely load-sensitive
+10s spawn budget). Worth triaging together — the fix for a process-global race and the fix for a
+timing budget differ, but the symptom a contributor sees is identical.
