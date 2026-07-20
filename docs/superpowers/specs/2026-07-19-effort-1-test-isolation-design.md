@@ -506,8 +506,11 @@ therefore different from T5/T6's: not "the right error arrives", but "**a succes
 arrives promptly**".
 
 - **T7 — success path returns promptly when a descendant inherits stdin (the round-2 Critical
-  regression):** `argv ["sh","-c","exec 3<&0; exec >/dev/null 2>/dev/null; sleep 600 <&3 & exit 0"]`,
-  **1 MiB stdin**, `timeout: Duration::from_secs(10)`. On a worker thread with harness
+  regression):** `argv ["sh","-c","exec 3<&0; exec >/dev/null 2>/dev/null; sleep 30 <&3 & exit 0"]`
+  (the shipped test uses `sleep 30`, not the 600 shown in this rev's design and in §1.4.1's probe
+  — deliberate soak hygiene: the grandchild outlives the test by design, and 600 s across a 60×
+  soak would strand sixty ten-minute processes; the shorter sleep proves the same mechanism. See
+  History), **1 MiB stdin**, `timeout: Duration::from_secs(10)`. On a worker thread with harness
   `recv_timeout(20s)`, assert **both**:
   1. the result is `RunResult::Stdout(s)` with `s.is_empty()` — the shell's outputs went to
      `/dev/null` and it exited 0, so success is the correct verdict; **and**
@@ -516,8 +519,9 @@ arrives promptly**".
 
   Assertion 2 is load-bearing and must not be dropped as "flaky-looking": without it a future
   implementation that stalls until the deadline and *then* returns a success would pass
-  assertion 1. Against rev 2's join-after-reap design this test blocks ~600 s and the harness
-  fails; against the no-join design it returns in milliseconds.
+  assertion 1. Against rev 2's join-after-reap design this test blocks ~30 s (the shipped
+  descendant lifetime) and the harness fails; against the no-join design it returns in
+  milliseconds.
   FAIL-VERIFY for the plan: re-add `let _ = writer.join();` before the terminal `match`, watch
   T7 hang and fail its harness bound, then revert.
 
@@ -810,7 +814,7 @@ path"), each behavior lists the evidence that proves it on the real path:
 | EPIPE fix semantics | T1–T4: real early-exiting children (`head -c`, `sh -c … exit 3`) with 1 MiB stdin forcing a guaranteed EPIPE through the real `run_filter → run_subprocess → Popen` path; deterministic FAIL against the old code, PASS against the new |
 | timeout still enforced while stdin is unwritten and the child is alive | **T5**: real child that closes stdout/stderr then sleeps 600 s, 1 MiB stdin, 1 s timeout, bounded harness wait → `Timeout` in ~1 s (hangs 600 s against a blocking-`wait()` implementation) |
 | cancel still enforced on the same child | **T6**: same child, cancel fired at ~200 ms → `Cancelled` promptly |
-| success path returns promptly when a descendant inherits stdin | **T7**: real child that backgrounds `sleep 600 <&3` on the *inherited* stdin (fd-0 holder confirmed by `/proc/<pid>/fd/0` probe, §1.4.1) and exits 0, 1 MiB stdin → `Stdout("")` in < 5 s against a 10 s timeout (hangs ~600 s against a join-after-reap implementation) |
+| success path returns promptly when a descendant inherits stdin | **T7**: real child that backgrounds `sleep 30 <&3` (shipped value — 600 in this rev's design and §1.4.1's probe, shortened for soak hygiene; same mechanism, see History) on the *inherited* stdin (fd-0 holder confirmed by `/proc/<pid>/fd/0` probe, §1.4.1) and exits 0, 1 MiB stdin → `Stdout("")` in < 5 s against a 10 s timeout (hangs ~30 s against a join-after-reap implementation) |
 | each test's scenario actually occurs | **§1.4.1 probe**, re-run on the implementing machine: `/proc/<pid>/fd/0` readlink showing the intended holder — the acceptance criterion is the probe output, not shell reasoning (rev 3's T7 read plausibly and created nothing) |
 | EPIPE fix under the measured failure mode | §7 protocol: 60× full lib binary at **default** `--test-threads` + 6×6 process contention — the exact conditions that produced 4/60 and 14/36 — with zero filter-test failures |
 | cap/deadlock reasoning preserved | `run_filter_large_stderr_does_not_deadlock` and `run_filter_rejects_oversized` pass unmodified |
@@ -855,7 +859,10 @@ path"), each behavior lists the evidence that proves it on the real path:
   today zero integration tests reach `state_dir()`; the doc comment records the boundary so a
   future integration test author sees it.
 - **`too_many_lines`:** `run_subprocess` gains and loses lines; the `spawn_stdin_writer` split
-  keeps it under threshold without an `#[allow]`.
+  narrows the gap but does not close it — the shipped function still carries
+  `#[allow(clippy::too_many_lines)]` with a one-line rationale (a flat, cohesive two-phase
+  drain/reap loop whose state must be read together), reviewed and accepted in Task 1's review.
+  See History.
 
 ---
 
@@ -916,6 +923,19 @@ Because there is no CI, the pre-merge report must show these commands and their 
 
 ## History
 
+- 2026-07-19 (rev 9) — **Fable whole-branch gate, Minor 1: two spec-vs-code drift corrections,
+  code governs, no design change.** (a) §5 claimed the `spawn_stdin_writer` split keeps
+  `run_subprocess` under the `too_many_lines` threshold "without an `#[allow]`"; the shipped
+  function keeps `#[allow(clippy::too_many_lines)]` with a one-line rationale, reviewed and
+  accepted in Task 1's review — the split narrows the gap, it does not close it. (b) §1.4/T7 and
+  the §3 evidence table said the descendant sleeps 600 s; the shipped T7 uses `sleep 30`,
+  deliberately shortened during implementation for soak hygiene — T7's grandchild outlives the
+  test by design (it is never joined or waited on), and 600 s across a 60× soak would strand
+  sixty ten-minute orphan processes. The shorter sleep proves the identical mechanism (which
+  process holds fd 0, and that the harness bound is crossed against a broken implementation) at a
+  fraction of the residual cost. Both are the code catching up to a reality the spec hadn't
+  recorded, not a redesign — §1.4.1's probe table is left as the historical record of what was
+  actually probed (with 600) before the sleep was shortened.
 - 2026-07-19 (rev 8) — **Codex gate round 7, sole Minor: wording scope only, no design content.**
   Rev 7's "no hard wall-clock claim survives anywhere" was false as stated — T5/T7 assert concrete
   thresholds (`recv_timeout`, `elapsed < 5s`). Per the coordinator's ruling the **claim's scope**
