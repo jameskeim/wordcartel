@@ -964,3 +964,25 @@ adds more spawn sites and would inherit the same hazard. Effort ① serialized i
 easy for a new site to forget, so it wants the same registration-seam treatment as other invariants
 here; (2) replace `subprocess` with a `pipe2(O_CLOEXEC)`-based spawn; (3) patch/vendor the crate.
 Note `cargo deny` already tracks the dependency.
+
+### H31 — config::files_type_filter_unknown flake — 10% of whole-binary runs
+<!-- item: H31 -->
+
+`config::tests::files_type_filter_unknown_warns_and_defaults_documents` fails ~10% of
+whole-binary runs (measured 6/60 during effort ①'s soak; earlier observations put it in a 7-13%
+band). It passes in isolation and at `--test-threads=1`. Failure is always the same assertion at
+`config.rs:1340` — `assertion failed: warns.iter().any(...)`.
+
+Added by C5 Task 24. Effort ① measured it precisely and kept it **out of scope** — it was neither of
+that effort's two targets — but flagged it as **plausibly the same process-global-state class**
+effort ① exists to address, i.e. a test observing state another concurrently-running test mutates.
+That is a hypothesis from the failure shape, not a diagnosis; nobody has traced it.
+
+Effort ① fixed its own two flakes (`filter` EPIPE 39%→0 under contention; `LAST_GOOD` 3/60→0/60) and
+this is now the **only known source of red runs** in the suite, so it is what makes `cargo test`
+non-deterministic today — the same argument that motivated H29.
+
+Worth doing with the tools effort ① already built: measure at default threading (it is invisible
+below 32 threads), and run an **attribution check** — the discipline that proved effort ①'s
+`LAST_GOOD` fix was load-bearing rather than coincidental. Do not validate a fix in isolation; that
+configuration never reproduces it.
