@@ -79,17 +79,34 @@ matches only the three helper lines in `config.rs`; no other file uses the prefi
    distinguish "parsed my file" from "parsed nothing". The second assertion panics. This is exactly
    the measured failure: one test, always the same assertion, byte-identical panic.
 
-**Why 10/60 for F and 0/60 for C.** The mechanism is symmetric; the reachable interleaving space is
-not. Every failure mode requires the opposing event to land inside the victim's write→read gap, and
-that gap closes at `File::open` (POSIX unlink of an already-open fd is harmless). Three of the four
-modes require F to start at or before C; sorted-order dispatch pins the sign of that offset, so only
-"C's `remove_file` kills F's file" is reachable. **The clipboard test is not safe — it is shielded
-by scheduling.** Fixing the collision fixes both.
+**Why 10/60 for F and 0/60 for C — a strongly-supported explanation, NOT a proof.** The mechanism is
+symmetric; the reachable interleaving space appears not to be. Every failure mode requires the
+opposing event to land inside the victim's write→read gap, and that gap closes at `File::open`
+(POSIX unlink of an already-open fd is harmless). Three of the four modes require F to *start* at or
+before C. libtest's default order is alphabetical and its runner pops from the front while
+`pending < concurrency`, so C is **dispatched** first, which biases the offset's sign and makes only
+"C's `remove_file` kills F's file" likely.
 
-**Verified clean, so out of the fix:** `config_over_cap_degrades_like_an_unreadable_file` builds its
-own path but under a distinct prefix (`wc-cfg-cap-{pid}/config.toml`) and cannot collide. The
-`tempdir()` helper in the same module uses `static N: AtomicU64` with prefix `wc-cfg-{pid}-{n}` and
-is already correct — it is the idiom this spec adopts.
+Three limits on that argument, stated so no reviewer mistakes it for exclusion:
+
+- **Dispatch order is not execution order.** Once threads are spawned, the OS may schedule a
+  later-dispatched test sooner. The symmetric modes are improbable, not impossible; 0/60 for C is
+  consistent with a small rate, not with a rate of zero.
+- **`--shuffle` / `RUST_TEST_SHUFFLE` voids the assumption entirely**, randomizing order and making
+  every mode roughly equally reachable. The verification runs in §7 must therefore not use shuffle,
+  and must assert that they did not (§7.2) — a shuffled run silently changes what the measurement
+  means.
+- Accordingly: **the clipboard test is not safe — it is shielded by scheduling.** Both tests carry
+  the same defect. Fixing the collision fixes both, and the fix does not depend on which direction
+  fires.
+
+**Verified clean against the current tree, so out of the fix:**
+`config_over_cap_degrades_like_an_unreadable_file` builds its own path,
+`wc-cfg-cap-{pid}/config.toml`, with no counter. It **does not collide with the current helpers or
+call sites** — the prefix differs and it is the sole user of that scheme — but it is not
+collision-*proof* by construction, and is a latent instance of exactly what H32's crate-wide seam
+would remove. The `tempdir()` helper in the same module uses `static N: AtomicU64` with prefix
+`wc-cfg-{pid}-{n}` and is already correct — it is the idiom this spec adopts.
 
 **Correction to the grounding map, recorded:** map §2 left the `Err` vs `Ok(None)` question open and
 raised the possibility that a vanished file yields a *silently empty* `warns`. It does not; it
@@ -191,8 +208,15 @@ This effort **does not touch either assertion expression**. The test
 `assert_eq!(cfg.files.type_filter, FileTypeFilter::Documents)` and
 `assert!(warns.iter().any(|w| w.contains("files.type_filter")))` verbatim; only a message argument
 is appended to the second (§6), and only the helper it calls is renamed.
-`files_filters_default_on_absent` is not modified at all. The mutation-verified property therefore survives by construction,
-and §7 step 4 re-runs the original mutation to prove it rather than asserting it.
+`files_filters_default_on_absent` is not modified at all. The mutation-verified property therefore
+survives by construction, and §7 criterion 4 proves it rather than asserting it.
+
+One correction to `ea01138`'s own record, carried into §7.4: the commit's mutation (flipping
+`FilesConfig::default()`) validates the **default-on-absent** guard but **not** the warning
+assertion — with the default flipped, the warning test fails at its first assertion and never
+reaches the second. Mutating the `other =>` arm's `warns.push` is what exercises the warning guard,
+which is why §7.4 requires both mutations. This does not weaken `ea01138`'s conclusion that
+`[files]` needed guarding; it narrows which of its two tests that particular mutation proved.
 
 This is also the reason D2's option C (rewrite the assertion to be order-independent) was rejected:
 any such rewrite would have to stop requiring that *this* input produced *this* warning, which is
@@ -223,21 +247,59 @@ isolated green proves nothing.** Of every step below, effort ①'s question appl
 PASS while the thing it names is false? A green whose runtime is implausibly small did not run.
 
 1. **Pre-fix observation.** With the §6 messages in place and the paths still shared, run the whole
-   test binary ~30× at default threading. A failing run **must** print the read-error warning in the
-   `warns` vector. This is direct evidence of the mechanism, obtained before the fix exists.
-2. **Post-fix measurement.** 60 whole-binary runs at default (32) threads. Failures attributed by
-   parsing libtest's `failures:` **block** — never a bare test-name grep, since libtest prints the
-   test name on passing runs too. Baseline 10/60 → required 0/60. At the measured 16.7% rate, 60
-   clean runs is luck with probability ≈ 1.7×10⁻⁵. Expect ~4–5 min total; a far faster green did not
-   run.
+   test binary ~30× at default threading. Passing requires **at least one failing run**, AND that
+   run's printed `{warns:?}` containing the read-error string (`config: cannot read`). **Zero
+   failures in 30 runs is an INCONCLUSIVE result — not a pass**: re-run with more iterations or
+   escalate to the human. (At 16.7%, 30 clean runs has probability ≈ 0.4% — unlikely, not
+   impossible.) Record the observed mechanism verbatim; criterion 3 compares against it.
+2. **Post-fix measurement.** 60 whole-binary runs at default (32) threads, **no `--shuffle` and no
+   `RUST_TEST_SHUFFLE` in the environment** (assert this, per §1 — a shuffled run changes what the
+   measurement means). Baseline 10/60 → required 0/60. At the measured 16.7% rate, 60 clean runs is
+   luck with probability ≈ 1.7×10⁻⁵. Run-integrity checks, all required, carried from the grounding
+   map's audited protocol — parsing the `failures:` block **alone** goes false-green if a run aborts
+   before printing it, output is dropped, or the wrong binary/filter ran:
+   - the test binary is selected from cargo's JSON artifact stream, not an `ls -t` glob, and the
+     target test is confirmed present via `--list`;
+   - all 60 logs exist;
+   - each log has **exactly one** `test result:` line;
+   - pass/fail totals match expectation (clean run = the full suite count passed, 0 failed) and no
+     log shows an implausibly small passed-count, which would indicate a filtered run;
+   - failures attributed by parsing libtest's `failures:` **block** — never a bare test-name grep,
+     since libtest prints the test name on passing runs too;
+   - total runtime ~4–5 min; a far faster green did not run.
 3. **Attribution check.** On a scratch branch, revert **only** the uniqueness (restore the shared
-   `"unknown"` name, keeping the fold and the messages) and confirm the flake **returns** within ~30
-   runs. This proves the unique path is the operative change rather than an incidental timing shift
-   introduced by the fold. Effort ① found a fix that would have gone green for an unrelated reason;
-   this step is what prevents a decorative mechanism.
-4. **Guard preservation.** Re-run the `ea01138` mutation: flip `FilesConfig::default()` to
-   `{ show_clutter: true, type_filter: FileTypeFilter::All }`, confirm **both** `files_*` tests
-   fail, then revert. Proves the load-bearing assertion still bears load after the fold.
+   `"unknown"` name, keeping the fold and the messages) and confirm the flake returns within ~30
+   runs — **and that the returned failure's `{warns:?}` matches the mechanism recorded in criterion
+   1**, not merely that the same test fails at the same assertion. Two distinct sub-mechanisms
+   (`Err(NotFound)`, or having read C's `[clipboard]` TOML and collected only a `clipboard.provider`
+   warning) produce an identical panic line, so without the `warns` comparison this step would only
+   prove that shared naming reintroduces *a* flake, not *this* one. D4's message argument is what
+   makes the tighter check cheap. Effort ① found a fix that would have gone green for an unrelated
+   reason; this step is what prevents a decorative mechanism.
+4. **Guard preservation — mutate the WARNING ARM, not the default.** The `ea01138` mutation as
+   originally recorded (flip `FilesConfig::default()` to `{ show_clutter: true, type_filter: All }`)
+   **cannot validate the warning assertion** and must not be used alone for that purpose: with the
+   default flipped, `files_type_filter_unknown_warns_and_defaults_documents` fails at its **first**
+   assertion (`cfg.files.type_filter == Documents`) and never evaluates the warning assertion, which
+   could be deleted outright while this step still went green. The two assertions test genuinely
+   different things, because `load_with_fs`'s `other =>` arm only pushes the warning — it does
+   **not** assign `cfg.files.type_filter = Documents`; the `Documents` value observed by the first
+   assertion comes from `Config::default()`. Required instead, both parts:
+   - **(a) Warning-arm mutation.** Remove or alter the `warns.push(...)` in the `other =>` branch of
+     the `raw.files.type_filter` match. Required outcome:
+     `files_type_filter_unknown_warns_and_defaults_documents` fails **specifically at the warning
+     assertion** (`warns.iter().any(|w| w.contains("files.type_filter"))`), identified by the
+     panic's assertion text — not merely "the test fails". Revert.
+   - **(b) Default mutation**, as `ea01138` recorded, to confirm the *default-on-absent* guard still
+     holds: flip `FilesConfig::default()` to `{ show_clutter: true, type_filter: All }`, confirm
+     `files_filters_default_on_absent` fails, revert.
+
+   **On the record: the original form of this criterion was itself an instance of the defect class
+   §0 and the effort-① lesson warn about** — a verification step whose name promised more than it
+   tested, which would have printed PASS while the property it named ("the warning assertion still
+   bears load") was false. It was caught by the Codex spec gate, not by its author. The lesson
+   generalizes: ask it of the other four criteria too, which is why 1, 2, and 3 above were each
+   tightened in the same revision.
 5. **Standard gates.** `cargo test` green; `cargo build` and `cargo test --no-run` warning-free for
    `wordcartel`; `cargo clippy --workspace --all-targets` clean; `scripts/smoke/run.sh` run and its
    one-line summary quoted verbatim in the pre-merge report (advisory-pass).
@@ -265,8 +327,18 @@ them: the folded helper's exact identifier and the exact counter placement withi
 plan-level details within D2's ruling, not design forks; and the H33/H32 deferrals are ruled, not
 pending.
 
-One residual fact worth stating plainly rather than papering over: §1 step 5 is, until acceptance
-criterion 1 runs, an **inference** from the code paths, not an observation — the current logs cannot
-distinguish `Err(NotFound)` from "parsed the clipboard's TOML". Both are the same root cause and
-both fail the same assertion, so no design choice depends on which fires; criterion 1 exists
-precisely to settle it before the fix lands.
+Three residuals stated plainly rather than papered over, all held to the same standard:
+
+1. **The read-error mechanism is inference until criterion 1 runs.** §1 step 5 is derived from the
+   code paths, not observed — the current logs cannot distinguish `Err(NotFound)` from "parsed the
+   clipboard's TOML". Both are the same root cause and both fail the same assertion, so no design
+   choice depends on which fires; criterion 1 exists precisely to settle it before the fix lands,
+   and criterion 3 then holds the post-fix evidence to the same mechanism.
+2. **The asymmetry explanation is not an exclusion proof.** Dispatch order is verified alphabetical,
+   but dispatch order is not execution order, so the symmetric failure modes are improbable rather
+   than impossible, and 0/60 for the clipboard test is evidence of a low rate, not a zero one. The
+   fix does not depend on resolving this: the collision is a defect in both directions and is
+   removed in both.
+3. **The measurement's validity is conditional on no shuffle.** `--shuffle` /
+   `RUST_TEST_SHUFFLE` would void the ordering assumption silently, which is why §7.2 requires
+   asserting their absence rather than assuming it.
