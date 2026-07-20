@@ -129,11 +129,54 @@ leaves the suite self-diagnosing if this class recurs.
 3. **Attribution check.** On a scratch branch, revert ONLY the uniqueness (restore the shared
    `"unknown"` name) atop the otherwise-fixed tree; confirm the flake RETURNS within ~30 runs. This
    proves the unique path is the operative change, not an incidental timing shift from the fold.
-4. **Guard preservation.** Re-run the `ea01138` mutation: flip `FilesConfig::default()` to
-   `{true, All}`, confirm both `files_*` tests fail, revert. Proves the load-bearing assertion still
-   bears load.
+4. **Guard preservation.** ~~Re-run the `ea01138` mutation: flip `FilesConfig::default()` to
+   `{true, All}`, confirm both `files_*` tests fail, revert.~~ **SUPERSEDED — see the amendment
+   below. As written this step COULD NOT FAIL in the way it claimed.**
 5. Standard gates: `cargo test`, warning-free build for touched crates, `cargo clippy --workspace
    --all-targets` clean, smoke suite run and its one-line summary quoted verbatim.
+
+---
+
+## AMENDMENT 2026-07-19 — criterion 4 was defective as ratified
+
+Recorded rather than silently rewritten, because the superseded text was human-ratified and the
+correction is instructive.
+
+**What was wrong.** Criterion 4 above claimed that flipping `FilesConfig::default()` to
+`{true, All}` and watching both `files_*` tests fail proves the warning assertion still bears load.
+It does not. With the default flipped, `files_type_filter_unknown_warns_and_defaults_documents`
+fails at its **first** assertion (`cfg.files.type_filter == Documents`) and never evaluates the
+warning assertion — which could be deleted outright while this step still went green. The two
+assertions test different things: `load_with_fs`'s `other =>` arm only pushes the warning, it does
+not assign `cfg.files.type_filter`; the `Documents` the first assertion sees comes from
+`Config::default()`.
+
+Caught by the Codex spec gate (round 1), not by its author, not by the controller who carried it
+into this record, and not at ratification. The first fix — retargeting the mutation at
+`files_filters_default_on_absent` — **reproduced the same defect one level down**, because that test
+asserts `show_clutter` first and the mutation flipped both fields. Caught by gate round 2.
+
+**What governs now** (spec §7.4, plan Task 4), two mutations, each one property, each naming the one
+assertion that must fail:
+- **(a)** Remove/alter the `warns.push` in the `raw.files.type_filter` `other =>` arm as a
+  *compiling* no-op; require failure **specifically at the warning assertion**. A build error is
+  NOT a passing outcome. A failure at the test's first assertion means the mutation was not confined
+  to the warning arm — that is a FAILED step.
+- **(b)** Flip `type_filter` **alone** to `All`, leaving `show_clutter` at `false`; require failure
+  specifically at the `files.type_filter must default to Documents` assertion of
+  `files_filters_default_on_absent`.
+- `git diff --exit-code -- wordcartel/src/config.rs` after EACH revert, before the next mutation —
+  confirming the target test passes again does not prove byte-for-byte reversion.
+
+**The rule this produced** (spec §7.0, inherited by the plan): *a mutation must change exactly ONE
+property, and the required outcome must name the ONE assertion that must fail* — never merely "the
+test fails". The generator of both misses was a struct-wide flip meeting a multi-assertion test,
+with short-circuit evaluation eating everything after the first assertion.
+
+**Also superseded:** criterion 2's "expect 0/60" is necessary but not sufficient — 0/60 is equally
+what you get if the fold drops or renames the test. It now additionally pins
+`passed + failed == expected_total` (a DERIVED count: baseline 1776 + tests this branch adds, not a
+magic constant) and requires a `--list` presence check on both `unknown` tests.
 
 ## Standing context
 
