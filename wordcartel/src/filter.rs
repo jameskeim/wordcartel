@@ -236,6 +236,12 @@ pub fn run_subprocess(
     // never touches stdin at all. The handle is deliberately never joined.
     let _writer = spawn_stdin_writer(guard.0.stdin.take(), stdin.into_bytes());
 
+    // DROP-ORDER CONSTRAINT: `comm` must stay declared AFTER `guard` (as it is here — it is
+    // built FROM `guard.0`), so that Rust's reverse-declaration-order drop closes our
+    // stdout/stderr read ends BEFORE `ReapGuard::drop` attempts its bounded reap. That is what
+    // lets the bounded reap succeed against a child blocked writing to a pipe we stopped
+    // draining. Breaking this order does not hang — it silently degrades the reap into a
+    // `detach()` fallback and leaks a zombie, which nothing in the suite would catch.
     let mut comm = guard.0.communicate_start(None);
     let mut out_buf: Vec<u8> = Vec::new();
     let mut err_buf: Vec<u8> = Vec::new();
