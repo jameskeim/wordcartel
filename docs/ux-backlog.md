@@ -931,3 +931,36 @@ Two candidate resolutions, and the choice is a product call: either Export honou
 when the flow was entered from Write-Block, or the redirect states plainly that it is leaving block
 scope. Related: a Row-2 confirm onto a `.docx` target does not currently say the write would be
 plain markdown.
+
+### H30 — subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes
+<!-- item: H30 -->
+
+`subprocess 0.2.15` creates its pipes with a bare `libc::pipe()` and only sets `CLOEXEC` in a
+later `fcntl`. Any `fork()+exec` that happens in that window inherits the fds. Found 2026-07-19
+during effort ① Task 2, and confirmed **directly** rather than by reading: mid-suite, a test child
+held four *foreign* pipe fds (17/22/28/33) belonging to other filter tests. Holding their
+stdout/stderr write ends open means those tests never see EOF and ride their full 10 s timeout —
+measured 7 pass / 3 fail over 10 runs, a different victim each time.
+
+**This is a production race, not only a test artifact.** There are four spawn sites:
+`filter::run_subprocess` (`Popen::create`), `harper_ls` (`Command::new("harper-ls")`, **long-lived**),
+`export` (pandoc), and `clipboard`. Rust's `std::process::Command` makes its *own* pipes CLOEXEC, but
+a child it forks still inherits any non-CLOEXEC fd that exists at fork time. So a `harper-ls` spawned
+during a filter's `Popen::create` window can hold that filter's write ends open **for the rest of the
+session**, and the filter then rides its whole timeout. The window is microseconds and needs a
+concurrent spawn, so it is rare — but `harper-ls` being long-lived makes the consequence durable
+rather than transient.
+
+**Why it was invisible until now:** every prior filter-test child exited in milliseconds. Effort ①'s
+T5/T6/T7 are the first to hold a child alive long enough for the inheritance to matter.
+
+**Why effort ① did not fix it.** The leak is *into other spawn sites*, so it cannot be fixed inside
+`run_subprocess`; it needs a process-global spawn lock covering all four sites, or a patched/forked
+crate. That is a design effort in its own right, and it is **Effort-P adjacent** — `wc.async` (PD)
+adds more spawn sites and would inherit the same hazard. Effort ① serialized its own tests instead
+(the proportionate local fix) and filed this.
+
+**Candidate resolutions:** (1) a process-global spawn mutex every spawn site takes — simple, but
+easy for a new site to forget, so it wants the same registration-seam treatment as other invariants
+here; (2) replace `subprocess` with a `pipe2(O_CLOEXEC)`-based spawn; (3) patch/vendor the crate.
+Note `cargo deny` already tracks the dependency.
