@@ -1142,3 +1142,10 @@ inherited value, refuses to report a count for runs that did not happen, verifie
 integrity and `passed + failed == expected_total`, and attributes failures by parsing libtest's
 `failures:` block rather than a bare test-name grep. Use it rather than re-deriving one: two
 Critical false-green defects were found and fixed *inside* it across four review rounds.
+
+### H35 — Position-space newtypes to tag confusable byte spaces
+<!-- item: H35 -->
+
+Position-space newtypes to tag confusable byte spaces
+
+*(Captured 2026-07-20 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
