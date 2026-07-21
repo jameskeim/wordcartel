@@ -43,6 +43,10 @@ pub enum BlockRole {
     FrontMatter,
     /// A block-level HTML comment (`<!-- ... -->`), distinct from a list item.
     Comment,
+    /// A GFM table (`BlockKind::Table`). Verbatim-class for prose purposes — never a
+    /// prose window (B14) — but painted as plain text (`SemanticElement::Text`), so
+    /// off-lens rendering is byte-identical to its old Paragraph-default classification.
+    Table,
 }
 
 /// A byte range of a logical line tagged with the [`Style`] to render over it.
@@ -129,7 +133,8 @@ mod tests {
             super::BlockRole::Paragraph=>0, super::BlockRole::Heading(_)=>1,
             super::BlockRole::BlockQuote=>2, super::BlockRole::ListItem=>3,
             super::BlockRole::CodeBlock=>4, super::BlockRole::ThematicBreak=>5,
-            super::BlockRole::FrontMatter=>6, super::BlockRole::Comment=>7 } }
+            super::BlockRole::FrontMatter=>6, super::BlockRole::Comment=>7,
+            super::BlockRole::Table=>8 } }
         // compile-guard: every LineRender variant must be named (exhaustive match).
         fn _exhaustive_line_render(r: super::LineRender) -> u8 { match r {
             super::LineRender::Concealed=>0, super::LineRender::RawPlain=>1,

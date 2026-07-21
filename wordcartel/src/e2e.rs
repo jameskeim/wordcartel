@@ -3214,3 +3214,26 @@ fn e2e_eof_caret_below_ventilated_block_on_lens() {
     assert_eq!(cy, last_content_row + 1,
         "EOF caret directly below the ventilated block, not glued to its last row (B10 on-lens)");
 }
+
+/// B14 lens/e2e (spec §7.3.4): ventilate ON renders table rows VERBATIM per-line — no
+/// ventilated window anchors on a table line, and the literal delimiter row appears on
+/// screen. Pre-B14 red: the vent_blocks assert (the table, classified prose, IS ventilated).
+#[test]
+fn e2e_ventilate_renders_table_verbatim_not_as_sentences() {
+    let text = "One two. Three four.\n\n| First. | Second. |\n|---|---|\n| Third. | Fourth. |\n";
+    let mut h = Harness::new(text, None, (40, 12));
+    {
+        let mut ed = h.editor.borrow_mut();
+        ed.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    {
+        let ed = h.editor.borrow();
+        let table_line = ed.active().document.buffer.byte_to_line(text.find("| First").unwrap());
+        assert!(!ed.active().view.vent_blocks.contains_key(&table_line),
+            "no ventilated window anchored on the table (deterministic B14 signal)");
+    }
+    assert!(h.screen_contains("| First. | Second. |"),
+        "table header row renders literally under the lens");
+}

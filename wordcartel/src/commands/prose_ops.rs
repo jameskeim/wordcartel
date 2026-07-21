@@ -370,6 +370,83 @@ mod tests {
         assert_eq!(move_sentence_down(&mut e, &TestClock(0)), CommandResult::Noop);
     }
 
+    /// B14 decline pins. The TERMINATORS INSIDE THE CELLS are load-bearing: pre-B14 the
+    /// table classifies as prose and `sentence_spans` segments on the periods, so every
+    /// mutation below ACTS (returns Handled and mutates the table). A terminator-free
+    /// table collapses to ONE span and `move_sentence` Noops coincidentally at its
+    /// paragraph-edge arm — an unchanged-buffer assert would be green for the WRONG
+    /// reason (the vacuous-pin hazard). Each pin therefore asserts the decline path's
+    /// DISTINGUISHING signals: Noop + the decline status text; byte-identity is support.
+    const TABLE_DOC: &str =
+        "Intro prose here.\n\n| First. | Second. |\n|---|---|\n| Third. | Fourth. |\n\nOutro prose follows.\n";
+
+    /// Pre-B14 red: Handled — swaps the cell "sentences" inside the table (caret in the
+    /// first span, further spans follow). Post-B14: prose_window_at → None → decline.
+    #[test]
+    fn move_sentence_declines_on_table() {
+        let mut e = Editor::new_from_text(TABLE_DOC, None, (80, 12));
+        crate::derive::rebuild(&mut e);
+        let before = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(
+            TABLE_DOC.find("First").unwrap());
+        assert_eq!(move_sentence_down(&mut e, &TestClock(0)), CommandResult::Noop,
+            "decline, not a sentence swap inside the table");
+        assert_eq!(e.status_text(), "no sentence here", "the decline status (distinguishing signal)");
+        let after = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        assert_eq!(before, after, "buffer byte-identical (supporting assert)");
+    }
+
+    /// Pre-B14 red: Handled + status "split paragraph" — the caret's cell "sentence" is not
+    /// at the window start (`sf > ps`), so a paragraph break is spliced INTO the table.
+    /// Post-B14: prose_sentence_at → Err → decline.
+    #[test]
+    fn break_paragraph_here_declines_on_table() {
+        let mut e = Editor::new_from_text(TABLE_DOC, None, (80, 12));
+        crate::derive::rebuild(&mut e);
+        let before = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(
+            TABLE_DOC.find("Third").unwrap());
+        assert_eq!(break_paragraph_here(&mut e, &TestClock(0)), CommandResult::Noop,
+            "decline, not a paragraph break spliced into the table");
+        assert_eq!(e.status_text(), "no sentence here", "the decline status (distinguishing signal)");
+        let after = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        assert_eq!(before, after, "buffer byte-identical (supporting assert)");
+    }
+
+    /// Pre-B14 red: Handled — the table (as "prose") merges with the FOLLOWING real prose
+    /// paragraph ("Outro prose follows."), which is exactly the wrong edit. Post-B14:
+    /// prose_window_at → None → decline with merge's own message.
+    #[test]
+    fn merge_paragraph_forward_declines_on_table() {
+        let mut e = Editor::new_from_text(TABLE_DOC, None, (80, 12));
+        crate::derive::rebuild(&mut e);
+        let before = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(
+            TABLE_DOC.find("Third").unwrap());
+        assert_eq!(merge_paragraph_forward(&mut e, &TestClock(0)), CommandResult::Noop,
+            "decline, not a table-with-prose merge");
+        assert_eq!(e.status_text(), "no paragraph here", "the decline status (distinguishing signal)");
+        let after = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        assert_eq!(before, after, "buffer byte-identical (supporting assert)");
+    }
+
+    /// Pre-B14 red: Handled + status "split sentence" — the caret sits strictly inside the
+    /// first cell "sentence" (`sf < h < st`), so a ". " terminator is inserted into the
+    /// cell and the following char capitalized. Post-B14: prose_sentence_at → Err → decline.
+    #[test]
+    fn split_sentence_at_caret_declines_on_table() {
+        let mut e = Editor::new_from_text(TABLE_DOC, None, (80, 12));
+        crate::derive::rebuild(&mut e);
+        let before = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(
+            TABLE_DOC.find("irst").unwrap()); // strictly inside "First." — sf < h < st
+        assert_eq!(split_sentence_at_caret(&mut e, &TestClock(0)), CommandResult::Noop,
+            "decline, not a terminator spliced into the cell");
+        assert_eq!(e.status_text(), "no sentence here", "the decline status (distinguishing signal)");
+        let after = e.active().document.buffer.slice(0..e.active().document.buffer.len());
+        assert_eq!(before, after, "buffer byte-identical (supporting assert)");
+    }
+
     /// Single-undo granularity (spec §data-integrity): one `move_sentence_down` produces one
     /// undo step — an undo restores the pre-move buffer exactly.
     #[test]

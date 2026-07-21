@@ -206,7 +206,7 @@ pub fn block_kind_label(role: wordcartel_core::style::BlockRole) -> &'static str
     match role {
         Paragraph => "paragraph", Heading(_) => "heading", BlockQuote => "block quote",
         ListItem => "list item", CodeBlock => "code block", ThematicBreak => "rule",
-        FrontMatter => "front matter", Comment => "comment",
+        FrontMatter => "front matter", Comment => "comment", Table => "table",
     }
 }
 
@@ -1677,5 +1677,33 @@ mod tests {
         assert_eq!(e.status_text(), "No file name — use Save As");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    /// B14: the SELECT path declines on a table and names the kind via block_kind_label
+    /// (spec §7.3.2 — the mutations' own plain messages deliberately do NOT name it).
+    #[test]
+    fn select_sentence_declines_on_table_naming_the_kind() {
+        let doc = "| First. | Second. |\n|---|---|\n| Third. | Fourth. |\n";
+        let mut e = crate::editor::Editor::new_from_text(doc, None, (60, 12));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(doc.find("Third").unwrap());
+        assert_eq!(run(Command::SelectScope(Scope::Sentence), &mut e, &TestClock(0)),
+            CommandResult::Noop, "decline, not a cell-sentence selection");
+        assert_eq!(e.status_text(), "no sentence here (table)");
+    }
+
+    /// B14: prose_window_at/prose_sentence_at decline on tables with NonProse(Table)
+    /// (spec §7.3.2). Names BlockRole::Table, so it could not compile before Step 5.
+    #[test]
+    fn prose_window_and_sentence_decline_on_table() {
+        let doc = "| First. | Second. |\n|---|---|\n| Third. | Fourth. |\n";
+        let e = crate::editor::Editor::new_from_text(doc, None, (60, 12));
+        let b = doc.find("Third").unwrap();
+        assert_eq!(prose_window_at(&e, b), None, "no prose window inside a table");
+        match prose_sentence_at(&e, b) {
+            Err(NonProse(role)) => assert_eq!(role, wordcartel_core::style::BlockRole::Table),
+            Ok(span) => panic!("expected NonProse(Table), got Ok({span:?})"),
+        }
     }
 }
