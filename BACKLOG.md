@@ -3,7 +3,7 @@
 
 # Backlog
 
-**40 open · 72 shipped · 2 dropped**
+**37 open · 75 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -31,9 +31,6 @@ Blocking Effort P: **0**
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A22 | Write-Block Redirect exports the whole document, not the marked block | triage | feature | TBD |  | Write-Block Redirect exports the whole document, not the marked block |
-| B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | triage | feature | TBD |  | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) |
-| B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | triage | feature | TBD |  | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) |
-| B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | triage | feature | TBD |  | S4-INTRODUCED REGRESSION (re-recorded 2026-07-20; the filing said pre-existing): at merge base ef03888 select (commands.rs Scope::Sentence) and paint (render.rs, now gather_row_ctx) both used raw nav::paragraph_range_at — identical, no divergence; S4 (600cb92 + 2cece7e) content-anchored SELECT only, leaving the FocusGranularity::Sentence paint arm raw. Caret in a <=3-space indent -> painted active-sentence region diverges from select (SEE==SELECT violation on the PAINT side). Fix: route the paint arm through commands::prose_sentence_at (content-anchored, saturating), raw fallback on decline. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
@@ -54,10 +51,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>72 shipped</summary>
+<details><summary>75 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | 2026-07-21 | 39d3d4d |
+| B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | 2026-07-21 | 192ae0e |
+| B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | 2026-07-20 | 4419986 |
 | H31 | config::files_type_filter_unknown flake — shared test temp path | 2026-07-20 | 44f1c14 |
 | C5 | File interface — unify save/write onto the picker + favorites/recent | 2026-07-19 | 30f502a |
 | H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | 2026-07-19 | b30f5aa |

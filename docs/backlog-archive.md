@@ -576,6 +576,51 @@ uniform), ventilate moot (sentence displays content-trimmed → a negative guard
 row vs B10 phantom LOGICAL line). Docs: `docs/superpowers/specs/2026-07-16-b17-...-design.md` + plan. Command-surface
 N/A.
 
+### B14 — Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines)
+<!-- item: B14 -->
+
+**Shipped by Effort 2** (`4419986`, 2026-07-20) — added `BlockRole::Table` and mapped `BlockKind::Table`
+in `kind_to_role` (`wordcartel-core`), giving GFM tables a non-prose identity so every `role_at` consumer
+heals at once: `ventilate::prose_block_at` declines (the lens renders table rows verbatim), `select_sentence`
+and all four prose mutations (`move_sentence`, `break_paragraph_here`, `merge_paragraph_forward`,
+`split_sentence_at_caret` / "Split Sentence") decline, and `lenses::prose_paragraph_ranges` drops tables from
+the POS/diagnostics sweep. Tables paint as `SemanticElement::Text` — the current paragraph default — so zero
+visual delta (the whole-branch probe executed `layout()` under `Table` vs `Paragraph`: display rows, prefix
+glyph, and the full ColMap bijection were identical). Enforcement split: five exhaustive `BlockRole` matches
+(`role_precedence`=Table⇒0, `block_kind_label`, `role_element`, `prefix_element`, the `_exhaustive_block_role`
+test guard) are compiler-forced; the `kind_to_role` arm is not (catch-all `_ => None`) and is guarded by a
+value test. Origin: deferred out of S4 (decision F3-A) to avoid reaching into core block classification mid-effort.
+
+### B15 — Shrink into a folded region leaves the caret on a hidden line (no SnapOut)
+<!-- item: B15 -->
+
+**Shipped by Effort 2** (`39d3d4d`, 2026-07-21) — **the shipped fix SUPERSEDES the filed direction.** The
+filing proposed snapping the caret OUT of the fold via `registry::snap_caret_out_of_fold`, but that helper
+collapses the selection (`Selection::single`), which would destroy the selection Shrink/Expand just produced.
+The human decision (2026-07-20) adopted the opposite: a new `commands::reveal_selection_head` REVEALS the
+covering fold (`place_caret_visible(.., CaretPlace::UnfoldTo)` — unfolds ancestors, mutates only the fold set,
+never the selection) and KEEPS the selection. Applied in BOTH the Shrink and Expand arms, ordered BEFORE
+`set_selection_range` so a single tree rebuild sees the post-unfold fold state; fast-outs on `folds.is_empty()`
+(perf law). Whole-branch probes confirmed selection survival and next-op coherence (second shrink, doubly-nested
+folds, five successive expands, a following insert — buffer byte-identical). Origin: deferred Minor from the S4
+whole-branch gate (F4-A stateless shrink dropped the old pop-based SnapOut; the fix stays stateless — no
+`sel_history`).
+
+### B16 — Scope::Sentence highlight window drifts from content-anchored select on indented prose
+<!-- item: B16 -->
+
+**Shipped by Effort 2** (`192ae0e`, 2026-07-21) — an **S4-introduced regression** (re-recorded 2026-07-20; the
+filing said pre-existing). At the S4 merge base `ef03888` the select arm (`commands.rs` `Scope::Sentence`) and
+the paint arm (`render.rs`, `gather_row_ctx`) were mechanically identical (both raw `nav::paragraph_range_at`);
+S4 (`600cb92` + `2cece7e`) content-anchored SELECT only, leaving the `FocusGranularity::Sentence` paint arm raw
+— so a caret in a ≤3-space CommonMark indent painted an active-sentence region that diverged from the selection
+(a SEE==SELECT violation on the paint side). Fix: the paint window is single-sourced through
+`commands::prose_sentence_at` (content-anchored, saturating — never a bare `head - ps`), extracted into
+`render.rs::focus_region_at` (which keeps `gather_row_ctx` under the `too_many_lines` threshold with no `allow`);
+`FocusGranularity::Paragraph` stays raw (still agrees with `Scope::Paragraph` select). The whole-branch probe
+proved SEE==SELECT across 11 adversarial docs at every caret byte, and that the historical raw window always
+satisfied `ps <= h` (so the old bare subtraction never actually underflowed).
+
 ### B10 — EOF caret glued to last content line (shared caret_line clamp)
 <!-- item: B10 -->
 
