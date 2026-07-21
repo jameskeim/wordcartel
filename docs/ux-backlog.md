@@ -524,13 +524,6 @@ tellable only if there is one seam to register into. (`DiagSource::Plugin` antic
   lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
 - Config namespace and persistence; interaction with the density presets (E1).
 
-### B10 — EOF caret glued to last content line (shared caret_line clamp)
-<!-- item: B10 -->
-
-EOF caret glued to last content line (shared caret_line clamp)
-
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
-
 ### E10 — Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle
 <!-- item: E10 -->
 
@@ -635,71 +628,6 @@ feels that don't all bother equally. Observations to test against real use:
 Grounding when picked up: the window-aware resolver (`ventilate::resolve`), `nav` motions, and the
 sentence-segmentation the lens shares with `select-sentence` (S5's detector). Slots as an S-theme follow-on to
 S6. Scope only after the user names the specific moment it feels wrong — do NOT boil the ocean.
-
-### B14 — Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines)
-<!-- item: B14 -->
-
-**Origin (2026-07-14):** surfaced by the S4 Codex spec-gate while grounding S4's SEE==SELECT decline
-predicate against the SHIPPED S6 ventilate lens (`docs/backlog-archive.md#s6`). **Not an S4 bug — a
-pre-existing gap in shipped S6.** The lens's prose test, `ventilate::prose_block_at`, declines a block
-only when `role_at(byte) != BlockRole::Paragraph`. But `BlockRole` has **no `Table` variant** and
-`kind_to_role` does **not** map `BlockKind::Table` to a non-paragraph role — so a markdown table
-classifies as prose, and the lens **ventilates it** (segments its row text as "sentences" one per
-row-group + a rhythm gutter), which is wrong: a table is not prose.
-
-**Consequence for S4 (why it was found here):** S4's `select_sentence`/mutations decline exactly what
-the lens declines (SEE==SELECT), so S4 inherits this — a table currently reads as prose to
-`select_sentence` too. S4 (spec `2026-07-14-s4-prose-surgery-design.md`, decision F3-A) deliberately
-scoped this OUT: it declines the lens's *current* set (heading / list / code / blockquote / front-matter
-/ comment) and treats tables as prose to stay literally SEE==SELECT, rather than reach into core block
-classification mid-effort. So this item is the elevation of that deferred piece back to its true home
-(S6/core).
-
-**Fix direction (when picked up):** give tables a non-paragraph identity so BOTH the lens and any
-SEE==SELECT consumer decline them — add a `BlockRole::Table` (or fold into an existing non-prose role)
-and map `BlockKind::Table` in `kind_to_role` (`wordcartel-core/src/style.rs`), then confirm
-`prose_block_at` (`ventilate.rs`) declines it and the lens renders the table verbatim. Small core change;
-re-verify the lens's no-op-when-off invariant and add a table fixture to the ventilate tests. Low
-priority (cosmetic: a ventilated table is ugly but non-destructive; toggle off → byte-identical).
-Grounding anchors: `ventilate::prose_block_at`, `kind_to_role` + `BlockRole` (`style.rs`),
-`BlockKind::Table` (`block_tree.rs`).
-
-### B15 — Shrink into a folded region leaves the caret on a hidden line (no SnapOut)
-<!-- item: B15 -->
-
-**Origin (2026-07-14):** deferred Minor from the S4 whole-branch final gate (Fable ruled GO-compatible,
-not a merge blocker). S4's F4-A stateless `ShrinkSelection` deleted the old pop-based
-`place_caret_visible(SnapOut)` along with `sel_history`. Fable's probe confirmed: when the current
-selection's `from()` is **already inside a folded body** (selection made before folding, or extended
-into a fold), a shrink can leave the caret on a `FoldView::is_hidden` line — typing would edit invisible
-text. Esoteric precondition (every natural ladder path evaluates at a canonical rung's `from()` and lands
-on visible bytes; symmetric with `ExpandSelection`, which never snapped).
-
-**Fix direction:** apply the SAME guard the S4 I-2 fix added to `block_move`/`swap` —
-`registry::snap_caret_out_of_fold` (`place_caret_visible(.., CaretPlace::SnapOut)`) — AFTER
-`ShrinkSelection` re-derives, so the caret snaps out of any fold. **Must stay stateless** — do NOT
-re-introduce `sel_history` (that would undo F4-A). Low priority. Related: S4 T3 (F4-A stateless shrink),
-the S4 I-2 block_move/swap snap guard. Anchors: `commands.rs::ShrinkSelection`,
-`registry::snap_caret_out_of_fold`, `fold::normalize_caret`.
-
-### B16 — Scope::Sentence highlight window drifts from content-anchored select on indented prose
-<!-- item: B16 -->
-
-**Origin (2026-07-14):** found by the S4 whole-branch Fable review — but **PRE-EXISTING** (present at
-the S4 merge base `ef03888`, NOT introduced by S4). S4 made `select_sentence` + the mutations
-content-anchored (via `commands::prose_window_at` → `ventilate::line_content_byte`), so SELECT now agrees
-with the S6 lens on indented prose. But the **active-sentence HIGHLIGHT paint** (`render.rs` ~505-508,
-the `Scope::Sentence` render path) still derives its window from the **raw** `nav::paragraph_range_at(head)`.
-So with the caret in a ≤3-space CommonMark indent, the *painted* active-sentence region diverges from what
-`select_sentence` actually selects — a SEE==SELECT violation on the PAINT side that S4 left standing
-(outside its blast radius).
-
-**Fix direction:** route the highlight window through the same content-byte anchor the select/mutation
-path uses (`prose_window_at` / `line_content_byte`) so the painted region matches the selection. Small,
-localized to the `Scope::Sentence` paint arm. Related: S4 (content-anchored select), C-11
-(content-byte classification). Anchors: `render.rs` `Scope::Sentence` highlight (~:505),
-`commands::prose_window_at`, `nav::paragraph_range_at`.
-
 
 ### H23 — palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom)
 <!-- item: H23 -->
@@ -1142,3 +1070,10 @@ inherited value, refuses to report a count for runs that did not happen, verifie
 integrity and `passed + failed == expected_total`, and attributes failures by parsing libtest's
 `failures:` block rather than a bare test-name grep. Use it rather than re-deriving one: two
 Critical false-green defects were found and fixed *inside* it across four review rounds.
+
+### H35 — Position-space newtypes to tag confusable byte spaces
+<!-- item: H35 -->
+
+Position-space newtypes to tag confusable byte spaces
+
+*(Captured 2026-07-20 via `scripts/backlog add`; flesh out the triage prose when picked up.)*

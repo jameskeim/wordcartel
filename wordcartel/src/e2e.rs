@@ -2178,6 +2178,35 @@ fn e2e_focus_dims_right_rows_under_ventilate_indented() {
     assert!(!content_dim(s2_row).is_empty(), "sentence 2 row's CONTENT dimmed — origin-correct focus region");
 }
 
+/// B16 red-first e2e: caret INSIDE the indent, focus-Sentence — the heading row above must be
+/// DIMMED (outside the content-anchored sentence). Pre-fix the mis-derived raw region includes
+/// the heading, so its row renders undimmed.
+#[test]
+fn e2e_focus_sentence_dims_heading_when_caret_in_indent() {
+    let text = "# Head\n  Para one goes on. It then ends.\n";
+    let mut h = Harness::new(text, None, (50, 10));
+    {
+        let mut ed = h.editor.borrow_mut();
+        // Focus dimming paints via the DIM modifier only under a no-color theme (the
+        // established pattern from the shipped ventilate-indented focus e2e).
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.view_opts.focus = true;
+        ed.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(text.find("  Para").unwrap());
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    let head_row = (0..10u16).find(|&y| h.row(y).contains("Head")).expect("heading on screen");
+    let para_row = (0..10u16).find(|&y| h.row(y).contains("Para one")).expect("para on screen");
+    assert!(!h.dim_cols(head_row).is_empty(),
+        "heading row dimmed — outside the content-anchored sentence (pre-fix it sat INSIDE the mis-derived region)");
+    // Sanity (passes pre- and post-fix — the first sentence is inside the region either way):
+    let p_col = h.row(para_row).find("Para").expect("Para col") as u16;
+    assert!(!h.dim_cols(para_row).contains(&p_col), "first sentence itself not dimmed");
+}
+
 #[test]
 fn e2e_search_highlight_lands_on_right_bytes_in_multiline_ventilated_block() {
     // T-search-window / T-paint-origin (IMPORTANT 4 — NON-vacuous): a real search match on the SECOND
@@ -3166,4 +3195,107 @@ fn journey_open_save_export_saveas_reopen() {
         "Enter on a recents row REOPENS that document — the buffer actually changed");
 
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// B10 (shipped 44eacab) screen-level pin: the EOF caret's REPORTED terminal cell sits on the
+/// row BELOW the last content row — the first cursor_pos() caret-cell assert outside the
+/// cursor-picker tests (the B10 value pins never paint a frame). Every coordinate is derived
+/// by landmark scan, never a literal cell.
+#[test]
+fn e2e_eof_caret_renders_below_last_content_row() {
+    let text = "alpha\nbeta\n";
+    let mut h = Harness::new(text, None, (40, 12));
+    {
+        let mut ed = h.editor.borrow_mut();
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(text.len());
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    let alpha_row = (0..12u16).find(|&y| h.row(y).contains("alpha")).expect("alpha on screen");
+    let beta_row = (0..12u16).find(|&y| h.row(y).contains("beta")).expect("beta on screen");
+    let (cx, cy) = h.cursor_pos();
+    assert_eq!(cy, beta_row + 1, "EOF caret row = one below the last content row (B10)");
+    let alpha_col = h.row(alpha_row).find("alpha").expect("alpha col") as u16;
+    assert_eq!(cx, alpha_col, "EOF caret col = the text left margin (derived from the alpha landmark)");
+}
+
+/// B10 on-lens twin of the pin above: with ventilate ON, the EOF phantom line renders as its
+/// own row DIRECTLY BELOW the ventilated block (the screen-level twin of
+/// `t_i1_eof_phantom_is_own_entry_not_a_zero_row_prose_overwrite`).
+#[test]
+fn e2e_eof_caret_below_ventilated_block_on_lens() {
+    let text = "One two. Three four.\n";
+    let mut h = Harness::new(text, None, (40, 12));
+    {
+        let mut ed = h.editor.borrow_mut();
+        ed.active_mut().view.ventilate = true;
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(text.len());
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    let last_content_row = (0..12u16)
+        .rev()
+        .find(|&y| ["One", "two", "Three", "four"].iter().any(|w| h.row(y).contains(w)))
+        .expect("ventilated paragraph on screen");
+    let (_cx, cy) = h.cursor_pos();
+    assert_eq!(cy, last_content_row + 1,
+        "EOF caret directly below the ventilated block, not glued to its last row (B10 on-lens)");
+}
+
+/// B14 lens/e2e (spec §7.3.4): ventilate ON renders table rows VERBATIM per-line — no
+/// ventilated window anchors on a table line, and the literal delimiter row appears on
+/// screen. Pre-B14 red: the vent_blocks assert (the table, classified prose, IS ventilated).
+#[test]
+fn e2e_ventilate_renders_table_verbatim_not_as_sentences() {
+    let text = "One two. Three four.\n\n| First. | Second. |\n|---|---|\n| Third. | Fourth. |\n";
+    let mut h = Harness::new(text, None, (40, 12));
+    {
+        let mut ed = h.editor.borrow_mut();
+        ed.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    {
+        let ed = h.editor.borrow();
+        let table_line = ed.active().document.buffer.byte_to_line(text.find("| First").unwrap());
+        assert!(!ed.active().view.vent_blocks.contains_key(&table_line),
+            "no ventilated window anchored on the table (deterministic B14 signal)");
+    }
+    assert!(h.screen_contains("| First. | Second. |"),
+        "table header row renders literally under the lens");
+}
+
+/// B15 red-first e2e (spec §7.2.5): shrink with from() inside a folded body — the shrunk-to
+/// sentence must be ON SCREEN afterwards (fold opened) with the caret cell on its row.
+/// Pre-fix the text stays hidden while the selection claims it.
+#[test]
+fn e2e_shrink_into_fold_reveals_selected_text_on_screen() {
+    let text = "## A\nAlpha one. Beta two.\n## B\nOther text here.\n";
+    let mut h = Harness::new(text, None, (50, 12));
+    let clock = SharedClock::new(0);
+    {
+        let mut ed = h.editor.borrow_mut();
+        let a = text.find("## A").unwrap();
+        let pf = text.find("Alpha").unwrap();
+        let pt = text.find("\n## B").unwrap();
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(pt, pf);
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    assert!(!h.screen_contains("Alpha one."), "precondition: body hidden while folded");
+    {
+        let mut ed = h.editor.borrow_mut();
+        let r = crate::commands::run(
+            crate::commands::Command::ShrinkSelection, &mut ed, &clock);
+        assert!(matches!(r, crate::commands::CommandResult::Handled));
+    }
+    h.render();
+    assert!(h.screen_contains("Alpha one."), "shrunk-to sentence visible (fold opened)");
+    let sel_row = (0..12u16).find(|&y| h.row(y).contains("Alpha one.")).expect("revealed row");
+    let (_cx, cy) = h.cursor_pos();
+    assert_eq!(cy, sel_row, "caret cell sits on the revealed row");
 }

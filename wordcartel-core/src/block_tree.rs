@@ -237,6 +237,7 @@ fn role_precedence(r: &crate::style::BlockRole) -> u8 {
     use crate::style::BlockRole::*;
     match r {
         CodeBlock      => 0,
+        Table          => 0,
         Heading(_)     => 1,
         Comment        => 2,
         ThematicBreak  => 2,
@@ -262,6 +263,7 @@ fn kind_to_role(kind: &BlockKind) -> Option<crate::style::BlockRole> {
         BlockKind::BlockQuote => Some(BlockRole::BlockQuote),
         BlockKind::HtmlComment => Some(BlockRole::Comment),
         BlockKind::FrontMatter => Some(BlockRole::FrontMatter),
+        BlockKind::Table => Some(BlockRole::Table),
         _ => None,
     }
 }
@@ -1716,6 +1718,24 @@ mod tests {
         assert_eq!(t.role_at(4), Paragraph);
         // a byte past document end -> Paragraph
         assert_eq!(t.role_at(doc.len() + 5), Paragraph);
+    }
+
+    /// B14 red-first guard for the ONE non-compiler-forced migration site: the
+    /// `kind_to_role` `BlockKind::Table` arm. With that arm absent this test fails
+    /// (role_at never upgrades table bytes off the Paragraph default) while the build
+    /// stays green — the compiler cannot force a `_ => None` catch-all to grow an arm.
+    #[test]
+    fn role_at_classifies_gfm_table_as_table() {
+        let src = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let t = full_parse(src);
+        let b = src.find('1').expect("cell byte");
+        assert_eq!(t.role_at(b), crate::style::BlockRole::Table, "table cell byte classifies Table");
+        // Reachable half of the role_precedence derivation (spec §4.3 change 3): a table
+        // nested in a blockquote must still classify Table (rank 0 beats BlockQuote's 4).
+        let src2 = "> | A |\n> |---|\n> | 1 |\n";
+        let t2 = full_parse(src2);
+        let b2 = src2.rfind('1').expect("nested cell byte");
+        assert_eq!(t2.role_at(b2), crate::style::BlockRole::Table, "table inside blockquote is still Table");
     }
 
     // -----------------------------------------------------------------------

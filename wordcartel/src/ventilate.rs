@@ -886,4 +886,20 @@ mod tests {
                 "sentence display {display:?} ends in whitespace — a phantom row could leak under the lens");
         }
     }
+
+    /// B14: a table declines the prose window at its content byte — the lens renders it
+    /// through the per-line verbatim arm, never ventilates it. The prose block above is
+    /// the positive control.
+    #[test]
+    fn table_declines_prose_window() {
+        let e = Editor::new_from_text(
+            "Intro prose here.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n", None, (80, 24));
+        let buf = &e.active().document.buffer;
+        let blocks = e.active().document.blocks();
+        let text = buf.slice(0..buf.len());
+        let t = text.find("| A").unwrap();
+        let c = line_content_byte(buf, buf.byte_to_line(t)).expect("table row has content");
+        assert!(prose_block_at(blocks, buf, c).is_none(), "table declines (B14)");
+        assert!(prose_block_at(blocks, buf, 0).is_some(), "prose above still resolves (control)");
+    }
 }

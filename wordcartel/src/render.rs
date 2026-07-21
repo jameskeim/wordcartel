@@ -89,6 +89,7 @@ fn role_element(role: wordcartel_core::style::BlockRole) -> SE {
         R::FrontMatter    => SE::FrontMatter,
         R::Comment        => SE::Comment,
         R::Paragraph      => SE::Text,
+        R::Table          => SE::Text,
     }
 }
 
@@ -107,7 +108,7 @@ fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
         // The remaining roles never carry a prefix glyph (no prefix_glyph is
         // produced for them), so this fn is not reached for them; name them
         // explicitly so a future BlockRole forces a deliberate choice here.
-        R::Paragraph | R::CodeBlock | R::FrontMatter | R::Comment => SE::ListMarker,
+        R::Paragraph | R::CodeBlock | R::FrontMatter | R::Comment | R::Table => SE::ListMarker,
     }
 }
 
@@ -524,34 +525,48 @@ struct RowCtx<'a> {
     prose_lens: &'a [crate::lenses::PosMatch],
 }
 
+/// The active focus region (byte span) when focus mode is on — `None` when off.
+/// Paragraph granularity: raw `nav::paragraph_range_at` at the caret — deliberately raw,
+/// because `Scope::Paragraph` select is also raw and they agree today; content-anchoring
+/// this arm alone would CREATE the B16 drift class in reverse (spec §4.1).
+/// Sentence granularity: SEE==SELECT — the region IS `commands::prose_sentence_at`'s span
+/// (the select path's own content-anchored window + segmentation, with its saturating rel
+/// offset — a hand-rolled `head - ps` would underflow when the caret sits in the indent).
+/// On decline (heading/list/code/blockquote/front-matter/comment/table, or a content-less
+/// line) fall back to the pre-S4 raw derivation so focus dimming still functions on
+/// non-prose blocks exactly as before (B16).
+fn focus_region_at(editor: &Editor) -> Option<(usize, usize)> {
+    if !editor.view_opts.focus { return None; }
+    let buf = &editor.active().document.buffer;
+    let blocks = editor.active().document.blocks();
+    let head = nav::head(editor);
+    let region = match editor.view_opts.focus_granularity {
+        crate::config::FocusGranularity::Paragraph => nav::paragraph_range_at(blocks, buf, head),
+        crate::config::FocusGranularity::Sentence => {
+            match crate::commands::prose_sentence_at(editor, head) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Raw fallback: `ps <= head` holds for a raw window (block-span or
+                    // line-run start at/before the query byte); saturating_sub is
+                    // H7-style hardening on this measure path, not a behavior change.
+                    let (ps, pe) = nav::paragraph_range_at(blocks, buf, head);
+                    let win = buf.slice(ps..pe);
+                    let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, head.saturating_sub(ps));
+                    (ps + sf, ps + st)
+                }
+            }
+        }
+    };
+    Some(region)
+}
+
 /// Snapshot the row loop's per-frame inputs (render() phases 6–7). has_block/block_hidden/
 /// diag_active/prose_lens_active are gather-time locals feeding use_placed/diag_all/prose_lens;
 /// only the 13 fields the paint path reads are kept in RowCtx.
 fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     let scroll = editor.active().view.scroll;
 
-    // Compute the active focus region once (before the row loop) when focus is on.
-    // For Paragraph: use paragraph_range_at at the caret.
-    // For Sentence: scope paragraph_range_at first, then sentence_bounds within that window.
-    let focus_region: Option<(usize, usize)> = if editor.view_opts.focus {
-        let buf = &editor.active().document.buffer;
-        let blocks = editor.active().document.blocks();
-        let head = nav::head(editor);
-        let region = match editor.view_opts.focus_granularity {
-            crate::config::FocusGranularity::Paragraph => {
-                nav::paragraph_range_at(blocks, buf, head)
-            }
-            crate::config::FocusGranularity::Sentence => {
-                let (ps, pe) = nav::paragraph_range_at(blocks, buf, head);
-                let win = buf.slice(ps..pe);
-                let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, head - ps);
-                (ps + sf, ps + st)
-            }
-        };
-        Some(region)
-    } else {
-        None
-    };
+    let focus_region = focus_region_at(editor);
 
     // Collect sorted logical line indices from the layout cache.
     let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
@@ -1501,6 +1516,54 @@ mod tests {
         // (assert the helper render uses to decide, not pixels — see Step 3 for the fn)
         assert!(!crate::render::row_is_active(0, "Para one.".len(), from, to), "para one dimmed");
         assert!(crate::render::row_is_active(from, to, from, to), "active row bright");
+    }
+
+    /// B16 red-first: with the caret INSIDE a ≤3-space CommonMark indent, the sentence focus
+    /// region must equal what select-sentence computes (SEE==SELECT on the paint side).
+    /// Pre-fix: the raw paragraph_range_at gap fallback (caret byte < paragraph block start)
+    /// windows over the whole non-blank line RUN — swallowing the heading above — so the
+    /// "sentence" region starts at byte 0.
+    #[test]
+    fn focus_sentence_region_equals_select_with_caret_in_indent() {
+        let doc = "# Head\n  Para one goes on. It then ends.\n";
+        let mut e = Editor::new_from_text(doc, None, (80, 24));
+        e.view_opts.focus = true;
+        e.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+        let h = doc.find("  Para").unwrap(); // the FIRST indent space — inside the indent
+        set_caret(&mut e, h);
+        derive::rebuild(&mut e);
+        let region = gather_row_ctx(&e).focus_region.expect("focus on");
+        // Concrete discriminator (derived from the fixture): the region starts at the
+        // CONTENT byte "Para…", never at byte 0 (which would include "# Head").
+        assert_eq!(region.0, doc.find("Para").unwrap(),
+            "region starts at the content byte, not the gap-fallback window start");
+        // And the full SEE==SELECT equality: paint == select, same helper.
+        let expected = crate::commands::prose_sentence_at(&e, h).expect("indented prose resolves");
+        assert_eq!(region, expected, "paint window == select window (SEE==SELECT)");
+    }
+
+    /// B16 decline-path lock (GREEN before AND after the fix): on a non-prose caret line the
+    /// region stays the raw fallback — today's exact computation — so focus dimming keeps
+    /// working on headings (spec §7.1.2).
+    #[test]
+    fn focus_sentence_region_on_heading_keeps_raw_fallback() {
+        let doc = "# Head\n\nPara one.\n";
+        let mut e = Editor::new_from_text(doc, None, (80, 24));
+        e.view_opts.focus = true;
+        e.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+        let h = doc.find("Head").unwrap(); // caret inside the heading text
+        set_caret(&mut e, h);
+        derive::rebuild(&mut e);
+        let expected = {
+            let buf = &e.active().document.buffer;
+            let blocks = e.active().document.blocks();
+            let (ps, pe) = crate::nav::paragraph_range_at(blocks, buf, h);
+            let win = buf.slice(ps..pe);
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, h.saturating_sub(ps));
+            (ps + sf, ps + st)
+        };
+        assert_eq!(gather_row_ctx(&e).focus_region, Some(expected),
+            "declined line keeps the raw fallback region");
     }
 
     /// Viewport-gated highlight scan:

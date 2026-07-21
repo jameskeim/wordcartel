@@ -509,4 +509,17 @@ mod tests {
         e.active_mut().reconcile.maybe_stale = false;
         assert_eq!((dl)(&e, 10_000), None, "deadline None after the one skip");
     }
+
+    /// B14: the POS/diagnostics sweep's paragraph census excludes tables — the consumer the
+    /// filing missed (its own doc comment already promised "must NOT analyze … tables").
+    #[test]
+    fn prose_paragraph_ranges_excludes_tables() {
+        let doc = "Intro prose here.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nOutro prose.\n";
+        let e = Editor::new_from_text(doc, None, (60, 12));
+        let ranges = prose_paragraph_ranges(&e);
+        let table_byte = doc.find("| A").unwrap();
+        assert!(ranges.iter().all(|&(s, t)| !(s <= table_byte && table_byte < t)),
+            "no analyzed range covers the table");
+        assert!(ranges.iter().any(|&(s, _)| s == 0), "intro prose still analyzed (control)");
+    }
 }
