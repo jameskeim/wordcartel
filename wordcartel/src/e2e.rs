@@ -2178,6 +2178,35 @@ fn e2e_focus_dims_right_rows_under_ventilate_indented() {
     assert!(!content_dim(s2_row).is_empty(), "sentence 2 row's CONTENT dimmed — origin-correct focus region");
 }
 
+/// B16 red-first e2e: caret INSIDE the indent, focus-Sentence — the heading row above must be
+/// DIMMED (outside the content-anchored sentence). Pre-fix the mis-derived raw region includes
+/// the heading, so its row renders undimmed.
+#[test]
+fn e2e_focus_sentence_dims_heading_when_caret_in_indent() {
+    let text = "# Head\n  Para one goes on. It then ends.\n";
+    let mut h = Harness::new(text, None, (50, 10));
+    {
+        let mut ed = h.editor.borrow_mut();
+        // Focus dimming paints via the DIM modifier only under a no-color theme (the
+        // established pattern from the shipped ventilate-indented focus e2e).
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.view_opts.focus = true;
+        ed.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(text.find("  Para").unwrap());
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    let head_row = (0..10u16).find(|&y| h.row(y).contains("Head")).expect("heading on screen");
+    let para_row = (0..10u16).find(|&y| h.row(y).contains("Para one")).expect("para on screen");
+    assert!(!h.dim_cols(head_row).is_empty(),
+        "heading row dimmed — outside the content-anchored sentence (pre-fix it sat INSIDE the mis-derived region)");
+    // Sanity (passes pre- and post-fix — the first sentence is inside the region either way):
+    let p_col = h.row(para_row).find("Para").expect("Para col") as u16;
+    assert!(!h.dim_cols(para_row).contains(&p_col), "first sentence itself not dimmed");
+}
+
 #[test]
 fn e2e_search_highlight_lands_on_right_bytes_in_multiline_ventilated_block() {
     // T-search-window / T-paint-origin (IMPORTANT 4 — NON-vacuous): a real search match on the SECOND
