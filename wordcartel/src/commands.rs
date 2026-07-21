@@ -310,6 +310,28 @@ fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
     nav::ensure_visible(editor);
 }
 
+/// B15: a rung derived from a `from()` inside a folded body lands the head (`f` — C-9
+/// head-at-start) on a hidden line, where typing would edit invisible text. REVEAL the
+/// target (`CaretPlace::UnfoldTo` → `unfold_ancestors_of`, which opens every covering fold
+/// and touches nothing else) rather than snapping out: `registry::snap_caret_out_of_fold`
+/// collapses to `Selection::single`, which would destroy the selection expand/shrink just
+/// derived. Ordered BEFORE `set_selection_range` so its single `derive::rebuild` +
+/// `nav::ensure_visible` see the post-unfold fold set (`FoldState::remove` bumps the epoch
+/// the `active_fold_view` cache keys on). No folds → return with no walk (R1 discipline);
+/// folds elsewhere → the `is_hidden` check keeps them closed.
+fn reveal_selection_head(editor: &mut Editor, f: usize) {
+    if editor.active().folds.is_empty() {
+        return;
+    }
+    let line = {
+        let buf = &editor.active().document.buffer;
+        buf.byte_to_line(f.min(buf.len()))
+    };
+    if editor.active_fold_view().is_hidden(line) {
+        place_caret_visible(editor, f, CaretPlace::UnfoldTo);
+    }
+}
+
 /// Expand/shrink rungs, finest → coarsest. A data table (spec §3.4) — adding a rung is a table
 /// edit, not dispatcher growth. A declined scope (`Sentence` on non-prose, `Section` with no
 /// enclosing heading) yields an empty range and is skipped by the strict-containment test.
@@ -553,7 +575,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 if f <= cf && t >= ct && (f < cf || t > ct) { next = Some((f, t)); break; }
             }
             match next {
-                Some((f, t)) => { set_selection_range(editor, f, t); CommandResult::Handled }
+                Some((f, t)) => {
+                    reveal_selection_head(editor, f); // B15: before set_selection_range
+                    set_selection_range(editor, f, t);
+                    CommandResult::Handled
+                }
                 None => CommandResult::Noop,
             }
         }
@@ -568,7 +594,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 if f >= cf && t <= ct && (f > cf || t < ct) && f < t { inner = Some((f, t)); break; }
             }
             match inner {
-                Some((f, t)) => { set_selection_range(editor, f, t); CommandResult::Handled }
+                Some((f, t)) => {
+                    reveal_selection_head(editor, f); // B15: before set_selection_range
+                    set_selection_range(editor, f, t);
+                    CommandResult::Handled
+                }
                 None => CommandResult::Noop,
             }
         }
@@ -1419,6 +1449,107 @@ mod tests {
         run(Command::InsertChar('!'), &mut e, &TestClock(1));
         e.undo();
         run(Command::ShrinkSelection, &mut e, &TestClock(2)); // no panic, no stale state
+    }
+
+    // -------------------------------------------------------------------------
+    // B15 (effort-2-caret-prose-window): reveal the target head before setting
+    // the selection (both arms) — reveal-and-keep-selection, not snap-and-collapse.
+    // -------------------------------------------------------------------------
+
+    /// B15 red-first (Shrink): from() inside a folded body → the shrink must (a) KEEP the
+    /// selection (the snap_caret_out_of_fold path would Selection::single it away — the
+    /// collapse hole, spec §4.2), (b) land the head on a VISIBLE line, (c) open the
+    /// covering fold (UnfoldTo), (d) still pick the exact LADDER rung.
+    #[test]
+    fn shrink_into_folded_body_unfolds_and_keeps_selection() {
+        let doc = "## A\nAlpha one. Beta two.\n## B\nOther text here.\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let a = doc.find("## A").unwrap();
+        let pf = doc.find("Alpha").unwrap();
+        let pt = doc.find("\n## B").unwrap();
+        // Select A's body paragraph content BEFORE folding (C-9: head lands at from()).
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(pt, pf);
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+
+        let r = run(Command::ShrinkSelection, &mut ed, &TestClock(0));
+
+        assert_eq!(r, CommandResult::Handled);
+        let sel = ed.active().document.selection.primary();
+        assert!(!sel.is_empty(), "selection survives (no Selection::single collapse)");
+        // Expected rung: the FIRST sentence at from() — Document/Section/Paragraph are not
+        // strict-inner here, so the ladder lands on Sentence (derived, not hardcoded):
+        let expected = prose_sentence_at(&ed, pf).expect("prose sentence at from()");
+        assert_eq!((sel.from(), sel.to()), expected, "the LADDER's Sentence rung");
+        let fv = ed.active_fold_view();
+        let head_line = ed.active().document.buffer.byte_to_line(sel.head);
+        assert!(!fv.is_hidden(head_line), "head on a visible line after shrink");
+        assert!(!ed.active().folds.folded().iter().any(|&hb| hb == a),
+            "covering fold opened (UnfoldTo semantics)");
+    }
+
+    /// B15 red-first (Expand): a collapsed caret inside a folded body (the session-resume
+    /// shape) — expand's first growing rung starts on a hidden line; same four properties.
+    #[test]
+    fn expand_from_caret_in_folded_body_unfolds_and_keeps_selection() {
+        let doc = "## A\nAlpha one. Beta two.\n## B\nOther text here.\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let a = doc.find("## A").unwrap();
+        let inside = doc.find("Beta").unwrap();
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(inside);
+
+        let r = run(Command::ExpandSelection, &mut ed, &TestClock(0));
+
+        assert_eq!(r, CommandResult::Handled);
+        let sel = ed.active().document.selection.primary();
+        assert!(!sel.is_empty(), "a selection was produced, not collapsed");
+        let fv = ed.active_fold_view();
+        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(sel.head)),
+            "head on a visible line after expand");
+        assert!(!ed.active().folds.folded().iter().any(|&hb| hb == a),
+            "covering fold opened (UnfoldTo semantics)");
+    }
+
+    /// B15 regression lock (GREEN before and after): no folds → shrink touches no fold
+    /// state (epoch unchanged — the R1-discipline fast-out) and behaves as today.
+    #[test]
+    fn shrink_with_no_folds_does_not_touch_fold_state() {
+        let doc = "Alpha one. Beta two.\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let pf = doc.find("Alpha").unwrap();
+        let pt = doc.find('\n').unwrap();
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(pt, pf);
+        let e0 = ed.active().folds.epoch();
+        assert_eq!(run(Command::ShrinkSelection, &mut ed, &TestClock(0)), CommandResult::Handled);
+        assert_eq!(ed.active().folds.epoch(), e0, "no fold walk, no epoch bump");
+    }
+
+    /// B15 regression lock (GREEN before and after): folds ELSEWHERE (head not hidden)
+    /// stay closed — the reveal fires only when the target head is actually hidden.
+    #[test]
+    fn shrink_with_folds_elsewhere_leaves_them_closed() {
+        let doc = "## A\nHidden body.\n## B\nAlpha one. Beta two.\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let a = doc.find("## A").unwrap();
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+        let pf = doc.find("Alpha").unwrap();
+        let pt = doc.len() - 1; // end of B's paragraph content (before the final \n)
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(pt, pf);
+        let e0 = ed.active().folds.epoch();
+        assert_eq!(run(Command::ShrinkSelection, &mut ed, &TestClock(0)), CommandResult::Handled);
+        assert_eq!(ed.active().folds.epoch(), e0, "unrelated fold untouched");
+        assert!(ed.active().folds.folded().iter().any(|&hb| hb == a), "A stays folded");
     }
 
     #[test]

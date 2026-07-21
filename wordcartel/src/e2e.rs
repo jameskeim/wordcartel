@@ -3266,3 +3266,36 @@ fn e2e_ventilate_renders_table_verbatim_not_as_sentences() {
     assert!(h.screen_contains("| First. | Second. |"),
         "table header row renders literally under the lens");
 }
+
+/// B15 red-first e2e (spec §7.2.5): shrink with from() inside a folded body — the shrunk-to
+/// sentence must be ON SCREEN afterwards (fold opened) with the caret cell on its row.
+/// Pre-fix the text stays hidden while the selection claims it.
+#[test]
+fn e2e_shrink_into_fold_reveals_selected_text_on_screen() {
+    let text = "## A\nAlpha one. Beta two.\n## B\nOther text here.\n";
+    let mut h = Harness::new(text, None, (50, 12));
+    let clock = SharedClock::new(0);
+    {
+        let mut ed = h.editor.borrow_mut();
+        let a = text.find("## A").unwrap();
+        let pf = text.find("Alpha").unwrap();
+        let pt = text.find("\n## B").unwrap();
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(pt, pf);
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    assert!(!h.screen_contains("Alpha one."), "precondition: body hidden while folded");
+    {
+        let mut ed = h.editor.borrow_mut();
+        let r = crate::commands::run(
+            crate::commands::Command::ShrinkSelection, &mut ed, &clock);
+        assert!(matches!(r, crate::commands::CommandResult::Handled));
+    }
+    h.render();
+    assert!(h.screen_contains("Alpha one."), "shrunk-to sentence visible (fold opened)");
+    let sel_row = (0..12u16).find(|&y| h.row(y).contains("Alpha one.")).expect("revealed row");
+    let (_cx, cy) = h.cursor_pos();
+    assert_eq!(cy, sel_row, "caret cell sits on the revealed row");
+}
