@@ -576,6 +576,20 @@ uniform), ventilate moot (sentence displays content-trimmed → a negative guard
 row vs B10 phantom LOGICAL line). Docs: `docs/superpowers/specs/2026-07-16-b17-...-design.md` + plan. Command-surface
 N/A.
 
+### B10 — EOF caret glued to last content line (shared caret_line clamp)
+<!-- item: B10 -->
+
+**Shipped by S4 T9** (`44eacab`, 2026-07-14; reached main in the S4 merge `10b847e`) —
+`nav::caret_line` dropped its `h.min(len-1)` clamp for `h.min(len)`, so an EOF caret
+(`h == buf.len()`) maps to the trailing phantom LOGICAL line instead of gluing to the last
+content line's row; identical on and off the ventilate lens (the phantom line stays its own
+`line_layouts` entry). Value pins: `caret_line_at_eof_maps_to_phantom_line_not_last_content`,
+`trailing_space_before_eof_stacks_flush_row_above_b10_phantom_line` (B17 flush-row stacking),
+`t_i1_eof_phantom_is_own_entry_not_a_zero_row_prose_overwrite` (on-lens). **Record note:** filed
+2026-07-13, fixed 2026-07-14 inside S4, but carried as `triage` until Effort ② (2026-07-20)
+corrected the record and added the first screen-level caret-cell pins
+(`e2e_eof_caret_renders_below_last_content_row`, `e2e_eof_caret_below_ventilated_block_on_lens`).
+
 ### B7 — Selected menu-item text too light / less legible
 <!-- item: B7 -->
 

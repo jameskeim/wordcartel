@@ -524,13 +524,6 @@ tellable only if there is one seam to register into. (`DiagSource::Plugin` antic
   lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
 - Config namespace and persistence; interaction with the density presets (E1).
 
-### B10 — EOF caret glued to last content line (shared caret_line clamp)
-<!-- item: B10 -->
-
-EOF caret glued to last content line (shared caret_line clamp)
-
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
-
 ### E10 — Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle
 <!-- item: E10 -->
 
@@ -685,14 +678,16 @@ the S4 I-2 block_move/swap snap guard. Anchors: `commands.rs::ShrinkSelection`,
 ### B16 — Scope::Sentence highlight window drifts from content-anchored select on indented prose
 <!-- item: B16 -->
 
-**Origin (2026-07-14):** found by the S4 whole-branch Fable review — but **PRE-EXISTING** (present at
-the S4 merge base `ef03888`, NOT introduced by S4). S4 made `select_sentence` + the mutations
-content-anchored (via `commands::prose_window_at` → `ventilate::line_content_byte`), so SELECT now agrees
-with the S6 lens on indented prose. But the **active-sentence HIGHLIGHT paint** (`render.rs` ~505-508,
-the `Scope::Sentence` render path) still derives its window from the **raw** `nav::paragraph_range_at(head)`.
-So with the caret in a ≤3-space CommonMark indent, the *painted* active-sentence region diverges from what
-`select_sentence` actually selects — a SEE==SELECT violation on the PAINT side that S4 left standing
-(outside its blast radius).
+**Origin (2026-07-14):** found by the S4 whole-branch Fable review. **RE-RECORDED 2026-07-20: an
+S4-INTRODUCED REGRESSION, not pre-existing** — at the S4 merge base `ef03888` the select arm
+(`commands.rs` `Scope::Sentence`) and the paint arm (`render.rs`, now inside `gather_row_ctx`)
+were mechanically identical (both raw `nav::paragraph_range_at`), so no divergence existed; S4
+(`600cb92` + `2cece7e`) content-anchored SELECT only (via `commands::prose_window_at` →
+`ventilate::line_content_byte`) and left the **active-sentence HIGHLIGHT paint** deriving its
+window from the **raw** `nav::paragraph_range_at(head)`. So with the caret in a ≤3-space
+CommonMark indent, the *painted* active-sentence region diverges from what `select_sentence`
+actually selects — a SEE==SELECT violation on the PAINT side created by S4's one-sided
+rerouting.
 
 **Fix direction:** route the highlight window through the same content-byte anchor the select/mutation
 path uses (`prose_window_at` / `line_content_byte`) so the painted region matches the selection. Small,

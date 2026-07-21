@@ -3,7 +3,7 @@
 
 # Backlog
 
-**41 open · 71 shipped · 2 dropped**
+**40 open · 72 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -11,7 +11,6 @@ Blocking Effort P: **0**
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
-| B10 | EOF caret glued to last content line (shared caret_line clamp) | triage | bug | S |  | Pre-existing, surfaced by S6 (2026-07-13): a caret at buf.len() maps onto the last CONTENT line's row instead of the trailing empty/phantom line, via the shared nav::caret_line `h.min(len-1)` clamp — fires IDENTICALLY on and off the ventilate lens (so NOT an S6 regression; S6's fix deliberately did not touch the shared path to preserve no-op-when-off). Cosmetic EOF cursor position; a real fix must change the shared clamp and re-verify off-lens behavior. Low priority. |
 | B12 | Lone block-begin marker renders nothing (^KB before ^KK is invisible) | needs-design | bug | S |  | Found in the cursor-system review. Effort-9A shipped the marked-block system WITHOUT rendering a LONE begin marker: after ^KB (block-begin) with no ^KK (block-end) yet, there is NO visual indication a start is set — only a complete begin+end region paints (SE::MarkedBlock). The writer can't see they set a mark. Fix: render the pending_block_begin position. Superseded by B13 (styled boundaries) which does this properly for all markers; filed separately as the acute defect. ~S. |
 | B13 | Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs) | needs-design | feature | S |  | C2 of the cursor-system review (docs/design/cursor-system-concept-review.md). Render marked-block BEGIN/END (and the lone-begin, closing B12) as STYLED BOUNDARY CELLS — a reverse/underline/theme treatment on the boundary column — NOT injected bracket glyphs. Decision 2026-07-13: the WordStar [ ]-bracket model was predicated on hardware-terminal capabilities; styled boundary cells are the modern, cheaper choice (~15% of the B-full injected-marker cost) with the IDENTICAL data model. Explicitly NOT B-full (Fork B: injected display-only marker columns via layout()/ColMap — reuses the ventilate/ColMap regime but Medium + highest correctness stakes; deferred unless a real need appears). No byte injection, no ColMap change -> no data-safety surface. Must honor the terminal-plain/no-color fallback (reverse/underline, not color alone). ~S. |
 | H23 | palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom) | triage | debt | S |  | Surfaced by the H21 whole-branch Fable probe (2026-07-16), PRE-EXISTING (byte-identical on main). chrome_geom::palette_overlay_rect computes ov_w = w*3/5 in u16; w*3 overflows u16 at terminal width >= 21846 (debug panic / release wrap-then-clamp). Reachable only via an absurd/hostile terminal Resize — NOT data-loss, NOT a merge blocker; same arithmetic-soundness class as H7. Fix: do the *3/5 in u32 (or saturating_mul) + clamp back; sweep sibling *_overlay_rect helpers. Batch into a future H7-style geom/panic sweep. |
@@ -34,7 +33,7 @@ Blocking Effort P: **0**
 | A22 | Write-Block Redirect exports the whole document, not the marked block | triage | feature | TBD |  | Write-Block Redirect exports the whole document, not the marked block |
 | B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | triage | feature | TBD |  | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) |
 | B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | triage | feature | TBD |  | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) |
-| B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | triage | feature | TBD |  | Scope::Sentence highlight window drifts from content-anchored select on indented prose |
+| B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | triage | feature | TBD |  | S4-INTRODUCED REGRESSION (re-recorded 2026-07-20; the filing said pre-existing): at merge base ef03888 select (commands.rs Scope::Sentence) and paint (render.rs, now gather_row_ctx) both used raw nav::paragraph_range_at — identical, no divergence; S4 (600cb92 + 2cece7e) content-anchored SELECT only, leaving the FocusGranularity::Sentence paint arm raw. Caret in a <=3-space indent -> painted active-sentence region diverges from select (SEE==SELECT violation on the PAINT side). Fix: route the paint arm through commands::prose_sentence_at (content-anchored, saturating), raw fallback on decline. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
@@ -55,7 +54,7 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>71 shipped</summary>
+<details><summary>72 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
@@ -75,6 +74,7 @@ Blocking Effort P: **0**
 | H22 | Universal edit chokepoint — route all internal edits through submit_transaction (M2 boundary) | 2026-07-16 | cf42284 |
 | H24 | H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit | 2026-07-16 | 94f0338 |
 | A17 | Messaging / notification system — routed, browsable, plugin-emittable | 2026-07-15 | 2efc9fe |
+| B10 | EOF caret glued to last content line (shared caret_line clamp) | 2026-07-14 | 44eacab |
 | B11 | Modal/overlay caret parked under the modal (query field shows no caret) | 2026-07-14 | c740ba4 |
 | B8 | Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore | 2026-07-14 | c740ba4 |
 | S4 | Prose text objects — structural selection + operator layer | 2026-07-14 | 10b847e |
