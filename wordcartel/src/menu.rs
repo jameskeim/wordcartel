@@ -39,6 +39,22 @@ pub(crate) fn category_label_pub(cat: MenuCategory) -> &'static str {
     category_label(cat)
 }
 
+/// Short bar labels for the compressed rung (B9, spec §3.2 — LOCKED strings): only long
+/// categories shorten; File/Edit/View stay full. Exhaustive on purpose — a new category
+/// must consciously pick its short form (house pattern-matching rule).
+pub(crate) fn category_label_short(cat: MenuCategory) -> &'static str {
+    match cat {
+        MenuCategory::File => "File",
+        MenuCategory::Edit => "Edit",
+        MenuCategory::Block => "Blk",
+        MenuCategory::Format => "Fmt",
+        MenuCategory::View => "View",
+        MenuCategory::Documents => "Docs",
+        MenuCategory::Settings => "Set",
+        MenuCategory::Export => "Exp",
+    }
+}
+
 /// A live/data-driven menu section: rows are computed from `&Editor` state rather than
 /// drawn from registered commands (contrast the static `raw` rows in `grouped_commands`,
 /// below). The registration seam for such sections (module-structure GATE — new dynamic

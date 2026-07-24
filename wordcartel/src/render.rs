@@ -1252,6 +1252,34 @@ mod tests {
         }
     }
 
+    /// B9 (spec §6b): the bar compresses through the §3.2 ladder instead of clipping. Widths
+    /// cover both sides of every rung boundary; the clipped widths {10, 20, 35} join in the
+    /// marker test once `»` exists (Task 3).
+    #[test]
+    fn the_menu_bar_compresses_through_the_ladder_instead_of_clipping() {
+        use crate::config::MenuBarMode;
+        for (w, expect, absent) in [
+            (80u16, " Documents  Settings ", ""),
+            (62, " Documents  Settings ", ""),
+            (61, "Documents Settings Export", " Documents  "),
+            (54, "Documents Settings Export", " Documents  "),
+            (53, "Blk Fmt View Docs Set Exp", "Documents"),
+            (36, " File Edit Blk Fmt View Docs Set Exp", "Documents"),
+        ] {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, w, 8);
+            assert_eq!(buf.area.width, w, "{w}: painter must not resize the frame");
+            let row0 = row_string(&buf, 0);
+            assert!(row0.contains(expect), "{w} cols: bar {row0:?} must contain {expect:?}");
+            if !absent.is_empty() {
+                assert!(!row0.contains(absent), "{w} cols: bar {row0:?} must NOT contain {absent:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_detail_box_too_tall_for_the_frame_announces_what_it_dropped() {
         // On a short terminal the box is clamped to the rows available above the status row.

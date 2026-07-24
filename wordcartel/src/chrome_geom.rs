@@ -3,14 +3,42 @@
 
 use ratatui::layout::Rect;
 
+/// B9 — the responsive bar's ladder rung, widest-first (spec §3.2). Selected per frame as
+/// a pure function of (area.width, cats): no stored state, so paint and mouse re-derive
+/// identical geometry every frame (the A21/H21 lockstep lesson made structural).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BarRung { FullPadded, Full, Short }
+
+/// The ONE producer of a bar cell's text (spec §3.3). Layout MEASURES this string and the
+/// painter RENDERS it, so cell width and painted width agree by construction.
+pub(crate) fn menu_bar_cell_text(cat: crate::registry::MenuCategory, rung: BarRung) -> String {
+    match rung {
+        BarRung::FullPadded => format!(" {} ", crate::menu::category_label_pub(cat)),
+        BarRung::Full => format!(" {}", crate::menu::category_label_pub(cat)),
+        BarRung::Short => format!(" {}", crate::menu::category_label_short(cat)),
+    }
+}
+
+/// Widest rung whose summed cell widths fit `area.width`; `Short` is the floor (below its
+/// total the bar clips and the `»` marker appears). Thresholds are COMPUTED from the label
+/// strings — for today's eight categories: FullPadded ≥ 62, Full ≥ 54, Short ≥ 36.
+pub(crate) fn menu_bar_rung(area: Rect, cats: &[crate::registry::MenuCategory]) -> BarRung {
+    let total = |rung: BarRung| -> u32 {
+        cats.iter().map(|c| menu_bar_cell_text(*c, rung).chars().count() as u32).sum()
+    };
+    if total(BarRung::FullPadded) <= area.width as u32 { BarRung::FullPadded }
+    else if total(BarRung::Full) <= area.width as u32 { BarRung::Full }
+    else { BarRung::Short }
+}
+
 /// Compute bar label rects from a raw category slice (static MENU_ORDER or dynamic group list).
 /// Returns `(index_into_cats, rect)` for each category.
 pub(crate) fn menu_bar_layout_cats(area: Rect, cats: &[crate::registry::MenuCategory]) -> Vec<(usize, Rect)> {
+    let rung = menu_bar_rung(area, cats);
     let mut out = Vec::new();
     let mut x = area.x;
     for (i, cat) in cats.iter().enumerate() {
-        let label = crate::menu::category_label_pub(*cat);
-        let wgt = label.chars().count() as u16 + 2; // 1 space padding each side
+        let wgt = menu_bar_cell_text(*cat, rung).chars().count() as u16;
         out.push((i, Rect::new(x, area.y, wgt, 1)));
         x = x.saturating_add(wgt);
     }
@@ -647,5 +675,32 @@ mod tests {
         assert_eq!(file_browser_row_at(area, &fb, col, row + 1), None,
             "the row below the last entry is the footer, not a selectable entry");
         fb.selected = last;
+    }
+
+    // ---- B9 responsive bar ladder --------------------------------------------------
+
+    /// B9 (spec §3.2): the three-rung ladder's derived thresholds for today's 8 categories.
+    /// A future label/category change must consciously re-derive this table (and spec §3.2).
+    #[test]
+    fn menu_bar_rung_thresholds_for_the_eight_categories() {
+        use crate::registry::MENU_ORDER;
+        let at = |w: u16| menu_bar_rung(Rect::new(0, 0, w, 8), &MENU_ORDER);
+        assert_eq!(at(80), BarRung::FullPadded);
+        assert_eq!(at(62), BarRung::FullPadded, "62 is the full-padded total");
+        assert_eq!(at(61), BarRung::Full);
+        assert_eq!(at(54), BarRung::Full, "54 is the full+leading-space total");
+        assert_eq!(at(53), BarRung::Short);
+        assert_eq!(at(36), BarRung::Short, "36 is the short total");
+        assert_eq!(at(35), BarRung::Short, "below the floor the bar stays Short and clips");
+    }
+
+    /// B9: at the Short floor every category fits exactly — the bar ends flush at col 36.
+    #[test]
+    fn menu_bar_layout_fits_every_category_at_the_short_floor() {
+        use crate::registry::MENU_ORDER;
+        let bar = menu_bar_layout_cats(Rect::new(0, 0, 36, 8), &MENU_ORDER);
+        assert_eq!(bar.len(), 8);
+        let (_, last) = bar.last().expect("eight rects");
+        assert_eq!(last.x + last.width, 36, "compressed bar ends flush at 36 cols");
     }
 }

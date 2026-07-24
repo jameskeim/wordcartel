@@ -14,7 +14,8 @@ use crate::{
     editor::Editor,
     render::ChromeStyles,
     chrome_geom::{
-        menu_bar_layout, menu_bar_layout_cats, menu_dropdown_rect,
+        menu_bar_cell_text, menu_bar_layout, menu_bar_layout_cats, menu_bar_rung,
+        menu_dropdown_rect,
         palette_overlay_rect, windowed_indicator, file_browser_list_h, file_browser_overlay_rect,
     },
 };
@@ -673,26 +674,24 @@ pub(crate) fn paint_menu_bar(frame: &mut Frame, editor: &mut Editor, cs: &Chrome
     frame.buffer_mut().set_style(bar_row, cs.menu_closed);
     match editor.menu {
         Some(ref menu) if !menu.groups.is_empty() => {
-            // Paint the menu bar (one label per category)
+            // Paint the menu bar (one label per category) at the responsive rung (B9).
+            let cats: Vec<crate::registry::MenuCategory> =
+                menu.groups.iter().map(|g| g.0).collect();
+            let rung = menu_bar_rung(menu_area, &cats);
             let bar = menu_bar_layout(menu_area, &menu.groups);
             for (i, rect) in &bar {
-                let cat = menu.groups[*i].0;
-                let label = crate::menu::category_label_pub(cat);
-                let text = format!(" {label} ");
-                let style = if *i == menu.open {
-                    cs.menu_open
-                } else {
-                    cs.menu_closed
-                };
+                let text = menu_bar_cell_text(menu.groups[*i].0, rung);
+                let style = if *i == menu.open { cs.menu_open } else { cs.menu_closed };
                 frame.render_widget(Paragraph::new(text).style(style), *rect);
             }
         }
         _ => {
             // Inactive bar (pinned / auto-revealed / unbuilt placeholder): static
-            // labels, all closed-style, no dropdown, no highlight.
+            // labels, all closed-style, no dropdown, no highlight — same rung ladder.
+            let rung = menu_bar_rung(menu_area, &crate::registry::MENU_ORDER);
             for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
-                let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
-                frame.render_widget(Paragraph::new(format!(" {label} ")).style(cs.menu_closed), *rect);
+                let text = menu_bar_cell_text(crate::registry::MENU_ORDER[*i], rung);
+                frame.render_widget(Paragraph::new(text).style(cs.menu_closed), *rect);
             }
         }
     }
