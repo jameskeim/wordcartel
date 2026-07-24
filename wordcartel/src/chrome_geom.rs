@@ -89,13 +89,17 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
     let (_, label_rect) = bar.get(open)?;
     let leaves = &groups.get(open)?.1;
     if leaves.is_empty() { return None; }
-    let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
+    let width = (leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2)
+        .min(area.width); // never wider than the whole area (B9 §3.5)
+    if width == 0 { return None; } // area.width == 0 — nothing to paint into
     let avail_below = area.height.saturating_sub(1) as usize; // rows under the bar
     let list_h = leaves.len().min(15).min(avail_below);
     if list_h == 0 { return None; } // cramped terminal: no room — never paint past the boundary
-    Some(Rect::new(label_rect.x, area.y + 1,
-        width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))),
-        list_h as u16))
+    // B9 §3.5 shift-left-to-fit: anchor at the label where it fits, else slide left so the
+    // box's right edge lands on the area's — the dropdown is ALWAYS fully on-screen (I3),
+    // even for a clipped-label category opened by keyboard.
+    let x = label_rect.x.min(area.right().saturating_sub(width));
+    Some(Rect::new(x, area.y + 1, width, list_h as u16))
 }
 
 pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
@@ -606,6 +610,42 @@ mod tests {
             .map(|i| (format!("item{i}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         vec![(crate::registry::MenuCategory::Edit, leaves)]
+    }
+
+    /// Eight real categories, each one leaf; the OPEN one gets a long leaf so its natural
+    /// dropdown width exceeds the room right of its label.
+    #[cfg(test)]
+    fn eight_cat_groups(open_leaf: &str)
+        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)>
+    {
+        crate::registry::MENU_ORDER.iter().map(|&cat| {
+            let label = if cat == crate::registry::MenuCategory::Export { open_leaf.to_string() }
+                        else { "item".to_string() };
+            (cat, vec![(label, crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right")))])
+        }).collect()
+    }
+
+    /// B9 §3.5: a right-edge category's dropdown shifts LEFT to fit at its natural width
+    /// instead of clamping into a sliver; on a wide area the anchor is unchanged (no churn).
+    #[test]
+    fn menu_dropdown_shifts_left_to_fit_instead_of_slivering() {
+        let leaf = "a long export item label!!";
+        let want_w = leaf.chars().count() as u16 + 2;
+        let groups = eight_cat_groups(leaf);
+        let open = 7; // Export — the last, right-edge category
+        let area = Rect::new(0, 0, 60, 24); // Full rung: Export's label right edge is col 54
+        let label_x = menu_bar_layout(area, &groups)[open].1.x;
+        let r = menu_dropdown_rect(area, &groups, open).expect("dropdown");
+        assert_eq!(r.width, want_w, "natural width, not a sliver");
+        assert!(r.x < label_x, "shifted left of its label");
+        assert_eq!(r.x + r.width, area.right(), "right edge lands on the area's");
+        assert_eq!(menu_dropdown_row_at(area, &groups, open, 0, r.x + 1, r.y), Some(0),
+            "hit-test agrees with the shifted box");
+        let wide = Rect::new(0, 0, 120, 24);
+        let wide_label_x = menu_bar_layout(wide, &groups)[open].1.x;
+        let rw = menu_dropdown_rect(wide, &groups, open).expect("dropdown");
+        assert_eq!(rw.x, wide_label_x, "anchor unchanged when the natural width fits");
+        assert_eq!(rw.width, want_w);
     }
 
     /// T14-a: dropdown height is `leaves.min(15).min(avail_below)`, NOT the raw leaf count.
