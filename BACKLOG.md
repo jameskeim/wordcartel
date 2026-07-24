@@ -3,7 +3,7 @@
 
 # Backlog
 
-**37 open · 75 shipped · 2 dropped**
+**36 open · 76 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -35,7 +35,6 @@ Blocking Effort P: **0**
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
 | H26 | fs-chokepoint guard: use-tree parsing for full soundness | triage | feature | TBD |  | fs-chokepoint guard: use-tree parsing for full soundness |
-| H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | triage | feature | TBD |  | dispatch signatures: pass DispatchCtx instead of 8 loose args |
 | H28 | Un-pumped picker tests assert unreachable states | triage | feature | TBD |  | Un-pumped picker tests assert unreachable states |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | H30 | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes | triage | bug | TBD |  | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes |
@@ -51,10 +50,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>75 shipped</summary>
+<details><summary>76 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | 2026-07-24 | 48105e0 |
 | B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | 2026-07-21 | 39d3d4d |
 | B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | 2026-07-21 | 192ae0e |
 | B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | 2026-07-20 | 4419986 |

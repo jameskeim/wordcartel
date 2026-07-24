@@ -10,16 +10,10 @@
 /// `Msg::Input(Event::Key(k))` arm body (Effort H1 T9); the call site still runs inside
 /// `reduce`'s normal `match`, so the version-hook epilogue (spec §8.1-A) still sees
 /// key-driven edits — this is NOT given interception early-return semantics.
-#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub(crate) fn handle_key(
     k: crossterm::event::KeyEvent,
     editor: &mut crate::editor::Editor,
-    reg: &crate::registry::Registry,
-    keymap: &crate::keymap::KeyTrie,
-    ex: &dyn crate::jobs::Executor,
-    clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
-    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    ctx: &crate::overlays::DispatchCtx,
 ) {
     // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
     // interception blocks ABOVE this point. Here in normal mode the order is
@@ -38,14 +32,14 @@ pub(crate) fn handle_key(
         }
     } else if let Some(chord) = crate::keymap::from_key_event(k) {
         editor.pending_keys.push(chord);
-        match keymap.resolve(&editor.pending_keys) {
+        match ctx.keymap.resolve(&editor.pending_keys) {
             crate::keymap::Resolution::Command(id) => {
                 editor.pending_keys.clear();
                 editor.clear_transient_status();
-                let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(),
-                    fs: std::sync::Arc::clone(fs) };
-                reg.dispatch(id, &mut ctx);
-                crate::app::hydrate_overlays(editor, reg, keymap);
+                let mut rctx = crate::registry::Ctx { editor, clock: ctx.clock, executor: ctx.ex,
+                    msg_tx: ctx.msg_tx.clone(), fs: std::sync::Arc::clone(ctx.fs) };
+                ctx.reg.dispatch(id, &mut rctx);
+                crate::app::hydrate_overlays(editor, ctx.reg, ctx.keymap);
             }
             crate::keymap::Resolution::Pending => {
                 editor.set_status(crate::status::StatusKind::Info, format!("{} …", crate::keymap::chords_display(&editor.pending_keys)));
@@ -60,7 +54,7 @@ pub(crate) fn handle_key(
                         if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT)
                         {
-                            crate::commands::run(crate::commands::Command::InsertChar(c), editor, clock);
+                            crate::commands::run(crate::commands::Command::InsertChar(c), editor, ctx.clock);
                         }
                     }
                 }

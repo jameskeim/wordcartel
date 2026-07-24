@@ -2512,3 +2512,42 @@ measurement indistinguishable from the fold having deleted the test; and a harne
 two. The reusable rule: **a mutation must change exactly one property, and the required outcome must
 name the one assertion that must fail.** The audited harness survives at
 `scratchpad/h31-gates/run_n.sh` — reuse it rather than re-deriving one.
+
+### H27 — dispatch signatures: pass DispatchCtx instead of 8 loose args
+<!-- item: H27 -->
+
+**Shipped by Effort H27** (`48105e0`, 2026-07-24) — **corrects the filing's "collapse the seven
+signatures … delete all seven allows."** Grounding (Fable, twice-gated by Codex) showed the seven
+`too_many_arguments` allows split 5 + 2, and that forcing the last two costs far more than it pays:
+
+- **5 collapsed** onto the existing `overlays::DispatchCtx` (`reg/keymap/ex/clock/msg_tx/fs`,
+  deliberately excluding `&mut Editor` — the H21 aliasing rationale), allow deleted:
+  `app::reduce_dispatch`, `input::handle_key`, `mouse::handle`, `app::dispatch_overlay_command`,
+  `menu::dispatch_row_action`.
+- **`app::reduce` retained flat (Q1 → R1).** It is the loop entry; its 8 args mirror the run loop's
+  owned state 1:1, and it becomes the *sole* production `DispatchCtx` construction site (builds the
+  ctx, threads `&ctx` down). Collapsing it would relocate — not remove — the loose args (up into the
+  run loop, where `keymap`/`reg` are `mut`) and force ~146 test-call edits. Allow retained, comment
+  rewritten to state the facade role.
+- **`plugin::pump::drain_one_dispatch` retained flat (Q2 → retain).** Its bundle is genuinely *not*
+  `DispatchCtx`: no `keymap` in the pump path, and the editor arrives as `&Rc<RefCell<Editor>>`.
+  Allow retained, comment rewritten to state the bundle mismatch.
+- **2 untagged allows out of scope** (`file_browser_commit::redirect_to_export`,
+  `jobs_apply::apply_filter_done`) — different bundles, untouched.
+
+`mouse::handle` demoted `pub → pub(crate)` (its collapsed signature takes the crate-private
+`DispatchCtx`, so a `pub` fn would trip `private_interfaces`). Its **86 in-module test calls** —
+undercounted as 3 in the first map draft, caught by the Codex gate — migrated via **Q3 → (d′)**: a
+name-only rename to a new `#[cfg(test)] handle_flat` seam that builds the ctx and forwards each
+call's own `clock`/`fs` into it (so the 12 deliberately-varied-clock double-click/dwell timing tests
+stay correct by construction); the 3 external qualified sites build a ctx each. End state: exactly 5
+`too_many_arguments` — 4 justified production (2 out-of-scope + `reduce` + `drain_one_dispatch`) +
+1 test-only seam.
+
+Zero behavior change, proven by execution: the whole-branch gate ran the *same* probe on pre-H27
+`c9afca3` and on the branch across all five dispatch arms → **23/23 state fingerprints
+byte-identical**, and mutation-tested the `handle_flat` seam (froze its clock → a timing test
+correctly failed; a `DeadFs` → the fs tests correctly failed). Both final gates clean (Fable PASS +
+Codex GO). Origin: deferred out of C5 Task 5 (2026-07-18); the "surprise on size" the effort-①
+measurement flagged (2026-07-19) is exactly what R1/(d′) absorb. See also [[H1]] — the god-object
+split this anti-regrowth lint exists to prevent recurring.
