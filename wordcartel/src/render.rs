@@ -4268,4 +4268,19 @@ mod tests {
             "the section after the fold repaints on the very next visible row: {screen:?}");
         assert!(screen[2].contains("body of b."), "the un-folded section's own body is untouched: {screen:?}");
     }
+
+    // -----------------------------------------------------------------------
+    // Effort group ③ Task 5 — H23 extreme-width belt-and-braces (spec §6d/§9.1)
+    // -----------------------------------------------------------------------
+
+    /// H23 belt-and-braces (spec §6d): after the seed widen, no full-render path multiplies
+    /// the width — one draw at an absurd hostile-Resize width must neither panic nor resize
+    /// the frame. Height 4 keeps the TestBackend cell grid small (~87K cells).
+    #[test]
+    fn extreme_width_full_render_survives() {
+        let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (21846, 4));
+        derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 21846, 4);
+        assert_eq!((buf.area.width, buf.area.height), (21846, 4));
+    }
 }
