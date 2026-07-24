@@ -3,14 +3,42 @@
 
 use ratatui::layout::Rect;
 
+/// B9 — the responsive bar's ladder rung, widest-first (spec §3.2). Selected per frame as
+/// a pure function of (area.width, cats): no stored state, so paint and mouse re-derive
+/// identical geometry every frame (the A21/H21 lockstep lesson made structural).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BarRung { FullPadded, Full, Short }
+
+/// The ONE producer of a bar cell's text (spec §3.3). Layout MEASURES this string and the
+/// painter RENDERS it, so cell width and painted width agree by construction.
+pub(crate) fn menu_bar_cell_text(cat: crate::registry::MenuCategory, rung: BarRung) -> String {
+    match rung {
+        BarRung::FullPadded => format!(" {} ", crate::menu::category_label_pub(cat)),
+        BarRung::Full => format!(" {}", crate::menu::category_label_pub(cat)),
+        BarRung::Short => format!(" {}", crate::menu::category_label_short(cat)),
+    }
+}
+
+/// Widest rung whose summed cell widths fit `area.width`; `Short` is the floor (below its
+/// total the bar clips and the `»` marker appears). Thresholds are COMPUTED from the label
+/// strings — for today's eight categories: FullPadded ≥ 62, Full ≥ 54, Short ≥ 36.
+pub(crate) fn menu_bar_rung(area: Rect, cats: &[crate::registry::MenuCategory]) -> BarRung {
+    let total = |rung: BarRung| -> u32 {
+        cats.iter().map(|c| menu_bar_cell_text(*c, rung).chars().count() as u32).sum()
+    };
+    if total(BarRung::FullPadded) <= area.width as u32 { BarRung::FullPadded }
+    else if total(BarRung::Full) <= area.width as u32 { BarRung::Full }
+    else { BarRung::Short }
+}
+
 /// Compute bar label rects from a raw category slice (static MENU_ORDER or dynamic group list).
 /// Returns `(index_into_cats, rect)` for each category.
 pub(crate) fn menu_bar_layout_cats(area: Rect, cats: &[crate::registry::MenuCategory]) -> Vec<(usize, Rect)> {
+    let rung = menu_bar_rung(area, cats);
     let mut out = Vec::new();
     let mut x = area.x;
     for (i, cat) in cats.iter().enumerate() {
-        let label = crate::menu::category_label_pub(*cat);
-        let wgt = label.chars().count() as u16 + 2; // 1 space padding each side
+        let wgt = menu_bar_cell_text(*cat, rung).chars().count() as u16;
         out.push((i, Rect::new(x, area.y, wgt, 1)));
         x = x.saturating_add(wgt);
     }
@@ -23,18 +51,55 @@ pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCatego
     menu_bar_layout_cats(area, &cats)
 }
 
+/// B9 (spec §3.4) — Some(column of the bar's LAST cell) iff even the floor rung clips (the
+/// last label rect's right edge exceeds the area's); None when everything fits. The painter
+/// draws the dim `»` there and `menu_bar_label_at` treats the same column as label-free, so
+/// the marker and its dead column can never disagree (I5).
+pub(crate) fn menu_bar_marker_col(area: Rect, cats: &[crate::registry::MenuCategory]) -> Option<u16> {
+    if area.width == 0 { return None; }
+    let clipped = menu_bar_layout_cats(area, cats).last()
+        .is_some_and(|(_, r)| r.right() > area.right());
+    clipped.then(|| area.right().saturating_sub(1))
+}
+
+/// B9 — THE bar hit-test (replaces the three hand-parallel find-closures in mouse.rs:
+/// mouse_menu's Moved and Down arms + the inactive CellHit::MenuBar arm). Returns the index
+/// into `cats` whose label cell contains `(col, row)`; None off every label or on the active
+/// marker column.
+pub(crate) fn menu_bar_label_at(area: Rect, cats: &[crate::registry::MenuCategory],
+    col: u16, row: u16) -> Option<usize>
+{
+    if menu_bar_marker_col(area, cats) == Some(col) { return None; }
+    menu_bar_layout_cats(area, cats).into_iter()
+        .find(|(_, r)| col >= r.x && col < r.x + r.width && row == r.y)
+        .map(|(i, _)| i)
+}
+
+/// Groups-shaped wrapper over `menu_bar_label_at` — mirrors the existing `menu_bar_layout` /
+/// `menu_bar_layout_cats` pair so the two active-menu mouse arms need no cats plumbing.
+pub(crate) fn menu_bar_hit(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)],
+    col: u16, row: u16) -> Option<usize>
+{
+    let cats: Vec<crate::registry::MenuCategory> = groups.iter().map(|g| g.0).collect();
+    menu_bar_label_at(area, &cats, col, row)
+}
+
 pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize) -> Option<Rect> {
     let bar = menu_bar_layout(area, groups);
     let (_, label_rect) = bar.get(open)?;
     let leaves = &groups.get(open)?.1;
     if leaves.is_empty() { return None; }
-    let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
+    let width = (leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2)
+        .min(area.width); // never wider than the whole area (B9 §3.5)
+    if width == 0 { return None; } // area.width == 0 — nothing to paint into
     let avail_below = area.height.saturating_sub(1) as usize; // rows under the bar
     let list_h = leaves.len().min(15).min(avail_below);
     if list_h == 0 { return None; } // cramped terminal: no room — never paint past the boundary
-    Some(Rect::new(label_rect.x, area.y + 1,
-        width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))),
-        list_h as u16))
+    // B9 §3.5 shift-left-to-fit: anchor at the label where it fits, else slide left so the
+    // box's right edge lands on the area's — the dropdown is ALWAYS fully on-screen (I3),
+    // even for a clipped-label category opened by keyboard.
+    let x = label_rect.x.min(area.right().saturating_sub(width));
+    Some(Rect::new(x, area.y + 1, width, list_h as u16))
 }
 
 pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
@@ -84,7 +149,10 @@ pub(crate) fn windowed_indicator(selected: usize, total: usize, list_h: usize)
 pub(crate) fn palette_overlay_rect(area: Rect, row_count: usize) -> Rect {
     let w = area.width;
     let h = area.height;
-    let ov_w = (w * 3 / 5).clamp(30, 80).min(w);
+    // H23: widen the *3/5 to u32 — `w * 3` overflows u16 at w >= 21846 (hostile Resize).
+    // The narrowing back is exact ((65535*3)/5 = 39321 < 65536); no debug_assert on purpose —
+    // nothing is left to assert after widening (spec §4.4, human-approved).
+    let ov_w = ((w as u32 * 3 / 5) as u16).clamp(30, 80).min(w);
     let list_h: u16 = crate::list_window::list_h_for(row_count, h) as u16;
     let ov_h = (list_h + 3).min(h);
     let ov_x = area.x.saturating_add((w.saturating_sub(ov_w)) / 2);
@@ -469,6 +537,21 @@ mod tests {
         assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
     }
 
+    /// H23 (spec §6a): the overlay width math survives every u16 width. The seed defect was
+    /// `w * 3` overflowing u16 at w >= 21846 (debug panic; release wrap-then-clamp) — 21845 is
+    /// the last width whose w*3 fits u16, so the pair documents the boundary.
+    #[test]
+    fn palette_overlay_rect_survives_extreme_widths() {
+        for w in [21845u16, 21846, 30000, u16::MAX] {
+            let area = Rect::new(0, 0, w, 24);
+            let r = palette_overlay_rect(area, 10);
+            assert!(r.width >= 30 && r.width <= 80.min(w),
+                "w={w}: ov_w {} outside [30, min(80, w)]", r.width);
+            assert!(r.x as u32 + r.width as u32 <= w as u32, "w={w}: past the right edge: {r:?}");
+            assert!(r.y as u32 + r.height as u32 <= 24, "w={w}: past the bottom edge: {r:?}");
+        }
+    }
+
     /// `cursor_picker_row_at` at a tall terminal (all 7 rows visible, `scroll_top == 0`):
     /// hit index equals the row offset from the list top; a click on the sample row
     /// (below the list) misses.
@@ -527,6 +610,42 @@ mod tests {
             .map(|i| (format!("item{i}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         vec![(crate::registry::MenuCategory::Edit, leaves)]
+    }
+
+    /// Eight real categories, each one leaf; the OPEN one gets a long leaf so its natural
+    /// dropdown width exceeds the room right of its label.
+    #[cfg(test)]
+    fn eight_cat_groups(open_leaf: &str)
+        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)>
+    {
+        crate::registry::MENU_ORDER.iter().map(|&cat| {
+            let label = if cat == crate::registry::MenuCategory::Export { open_leaf.to_string() }
+                        else { "item".to_string() };
+            (cat, vec![(label, crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right")))])
+        }).collect()
+    }
+
+    /// B9 §3.5: a right-edge category's dropdown shifts LEFT to fit at its natural width
+    /// instead of clamping into a sliver; on a wide area the anchor is unchanged (no churn).
+    #[test]
+    fn menu_dropdown_shifts_left_to_fit_instead_of_slivering() {
+        let leaf = "a long export item label!!";
+        let want_w = leaf.chars().count() as u16 + 2;
+        let groups = eight_cat_groups(leaf);
+        let open = 7; // Export — the last, right-edge category
+        let area = Rect::new(0, 0, 60, 24); // Full rung: Export's label right edge is col 54
+        let label_x = menu_bar_layout(area, &groups)[open].1.x;
+        let r = menu_dropdown_rect(area, &groups, open).expect("dropdown");
+        assert_eq!(r.width, want_w, "natural width, not a sliver");
+        assert!(r.x < label_x, "shifted left of its label");
+        assert_eq!(r.x + r.width, area.right(), "right edge lands on the area's");
+        assert_eq!(menu_dropdown_row_at(area, &groups, open, 0, r.x + 1, r.y), Some(0),
+            "hit-test agrees with the shifted box");
+        let wide = Rect::new(0, 0, 120, 24);
+        let wide_label_x = menu_bar_layout(wide, &groups)[open].1.x;
+        let rw = menu_dropdown_rect(wide, &groups, open).expect("dropdown");
+        assert_eq!(rw.x, wide_label_x, "anchor unchanged when the natural width fits");
+        assert_eq!(rw.width, want_w);
     }
 
     /// T14-a: dropdown height is `leaves.min(15).min(avail_below)`, NOT the raw leaf count.
@@ -629,5 +748,59 @@ mod tests {
         assert_eq!(file_browser_row_at(area, &fb, col, row + 1), None,
             "the row below the last entry is the footer, not a selectable entry");
         fb.selected = last;
+    }
+
+    // ---- B9 responsive bar ladder --------------------------------------------------
+
+    /// B9 (spec §3.2): the three-rung ladder's derived thresholds for today's 8 categories.
+    /// A future label/category change must consciously re-derive this table (and spec §3.2).
+    #[test]
+    fn menu_bar_rung_thresholds_for_the_eight_categories() {
+        use crate::registry::MENU_ORDER;
+        let at = |w: u16| menu_bar_rung(Rect::new(0, 0, w, 8), &MENU_ORDER);
+        assert_eq!(at(80), BarRung::FullPadded);
+        assert_eq!(at(62), BarRung::FullPadded, "62 is the full-padded total");
+        assert_eq!(at(61), BarRung::Full);
+        assert_eq!(at(54), BarRung::Full, "54 is the full+leading-space total");
+        assert_eq!(at(53), BarRung::Short);
+        assert_eq!(at(36), BarRung::Short, "36 is the short total");
+        assert_eq!(at(35), BarRung::Short, "below the floor the bar stays Short and clips");
+    }
+
+    /// B9: at the Short floor every category fits exactly — the bar ends flush at col 36.
+    #[test]
+    fn menu_bar_layout_fits_every_category_at_the_short_floor() {
+        use crate::registry::MENU_ORDER;
+        let bar = menu_bar_layout_cats(Rect::new(0, 0, 36, 8), &MENU_ORDER);
+        assert_eq!(bar.len(), 8);
+        let (_, last) = bar.last().expect("eight rects");
+        assert_eq!(last.x + last.width, 36, "compressed bar ends flush at 36 cols");
+    }
+
+    /// B9 (spec §3.4): the marker exists exactly when even the Short floor clips.
+    #[test]
+    fn menu_bar_marker_col_appears_only_below_the_short_floor() {
+        use crate::registry::MENU_ORDER;
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 80, 8), &MENU_ORDER), None);
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 36, 8), &MENU_ORDER), None);
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 35, 8), &MENU_ORDER), Some(34));
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 10, 8), &MENU_ORDER), Some(9));
+    }
+
+    /// B9 (I5): every category is hittable at its cell; the marker column never is, even
+    /// though a clipped label rect covers it.
+    #[test]
+    fn menu_bar_label_at_hits_every_category_and_never_the_marker() {
+        use crate::registry::MENU_ORDER;
+        let area = Rect::new(0, 0, 40, 8); // Short rung — everything visible
+        for (i, r) in menu_bar_layout_cats(area, &MENU_ORDER) {
+            assert_eq!(menu_bar_label_at(area, &MENU_ORDER, r.x + 1, 0), Some(i),
+                "category {i} must be hittable at its cell");
+        }
+        assert_eq!(menu_bar_label_at(area, &MENU_ORDER, 39, 0), None, "off the flush bar end");
+        let clipped = Rect::new(0, 0, 35, 8);
+        let mc = menu_bar_marker_col(clipped, &MENU_ORDER).expect("clipped at 35");
+        assert_eq!(menu_bar_label_at(clipped, &MENU_ORDER, mc, 0), None,
+            "the marker column is not a label hit");
     }
 }

@@ -262,6 +262,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Wrap-guide line (painted BEFORE the text-row loop so text overwrites it)
     // -----------------------------------------------------------------------
     if editor.view_opts.wrap_guide {
+        // H23 census: raw adds safe — wrap_column is clamped to [20, 9999] at both entry
+        // points (config.rs load; prompts::wrap_column_submit) and text_left < w/2.
         let gx = area.x + tg.text_left + editor.view_opts.wrap_column;
         let within_viewport = gx < area.x + w;
         let not_scrollbar_col = !(editor.mouse.scrollbar_visible && gx == area.x + w - 1);
@@ -1247,6 +1249,64 @@ mod tests {
             let buf = term.backend().buffer();
             assert_eq!(buf.area.width, w, "{w}x{h}: the painter must not resize the frame");
             assert_eq!(buf.area.height, h);
+        }
+    }
+
+    /// B9 (spec §6b): the bar compresses through the §3.2 ladder instead of clipping. Widths
+    /// cover both sides of every rung boundary; the clipped widths {10, 20, 35} join in the
+    /// marker test once `»` exists (Task 3).
+    #[test]
+    fn the_menu_bar_compresses_through_the_ladder_instead_of_clipping() {
+        use crate::config::MenuBarMode;
+        for (w, expect, absent) in [
+            (80u16, " Documents  Settings ", ""),
+            (62, " Documents  Settings ", ""),
+            (61, "Documents Settings Export", " Documents  "),
+            (54, "Documents Settings Export", " Documents  "),
+            (53, "Blk Fmt View Docs Set Exp", "Documents"),
+            (36, " File Edit Blk Fmt View Docs Set Exp", "Documents"),
+        ] {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, w, 8);
+            assert_eq!(buf.area.width, w, "{w}: painter must not resize the frame");
+            let row0 = row_string(&buf, 0);
+            assert!(row0.contains(expect), "{w} cols: bar {row0:?} must contain {expect:?}");
+            if !absent.is_empty() {
+                assert!(!row0.contains(absent), "{w} cols: bar {row0:?} must NOT contain {absent:?}");
+            }
+        }
+    }
+
+    /// B9 (spec §6b, clipped widths): below the Short floor the bar clips and the dim `»`
+    /// marker owns the last bar column; at and above the floor there is no marker.
+    /// RED as sequenced (post-T2, pre-marker-paint): no `»` paints yet — the last-column
+    /// cell is a clipped Short-label glyph.
+    #[test]
+    fn below_the_floor_the_bar_clips_and_shows_the_overflow_marker() {
+        use crate::config::MenuBarMode;
+        use ratatui::style::Modifier;
+        for w in [35u16, 20, 10] {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, w, 8);
+            let row0 = row_string(&buf, 0);
+            assert!(row0.starts_with(" File"), "{w}: bar still leads with File: {row0:?}");
+            assert_eq!(row0.chars().last(), Some('»'), "{w}: marker in the last column: {row0:?}");
+            assert!(buf[(w - 1, 0)].style().add_modifier.contains(Modifier::DIM),
+                "{w}: the marker cell is DIM");
+        }
+        for w in [36u16, 53, 80] {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            derive::rebuild(&mut e);
+            let row0 = row_string(&render_to_buffer(&mut e, w, 8), 0);
+            assert!(!row0.contains('»'), "{w}: no marker at or above the floor: {row0:?}");
         }
     }
 
@@ -4207,5 +4267,20 @@ mod tests {
         assert!(screen[1].contains(HEADING_GLYPHS[1]) && screen[1].contains('B'),
             "the section after the fold repaints on the very next visible row: {screen:?}");
         assert!(screen[2].contains("body of b."), "the un-folded section's own body is untouched: {screen:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Effort group ③ Task 5 — H23 extreme-width belt-and-braces (spec §6d/§9.1)
+    // -----------------------------------------------------------------------
+
+    /// H23 belt-and-braces (spec §6d): after the seed widen, no full-render path multiplies
+    /// the width — one draw at an absurd hostile-Resize width must neither panic nor resize
+    /// the frame. Height 4 keeps the TestBackend cell grid small (~87K cells).
+    #[test]
+    fn extreme_width_full_render_survives() {
+        let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (21846, 4));
+        derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 21846, 4);
+        assert_eq!((buf.area.width, buf.area.height), (21846, 4));
     }
 }

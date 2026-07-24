@@ -362,27 +362,6 @@ best validates — the markup-rendering capability; treat it as a P design ancho
 *(Auto-created during the backlog-manifest migration. Status/size/kind live in `backlog.toml`; flesh out the triage prose here when the item is picked up.)*
 
 
-### B9 — Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols)
-<!-- item: B9 -->
-
-**Surfaced by the command-surface curation effort (2026-07-10, Task 6.1 verify).** That effort added
-two menu categories (`Block`, `Documents`), growing the menu bar to 8 categories ≈ **62 columns**
-(`File 6 + Edit 6 + Block 7 + Format 8 + View 6 + Documents 11 + Settings 10 + Export 8`).
-`chrome_geom::menu_bar_layout_cats` has **no horizontal windowing** (only the dropdown has *vertical*
-windowing) — so below ~62 cols the trailing categories clip: verified at 60×24 the bar renders
-`… Settings Expor` (Export's label loses its last char) and Export's right-anchored dropdown renders
-clipped to the right-edge column, i.e. **mouse-unreachable / unreadable** for the clipped tail.
-**Keyboard reach is intact** (F10 + Left/Right cycles to and opens the clipped category via
-`menu::intercept`), so this is a cosmetic/mouse degradation, not data loss — which is why it was
-accepted for the effort's merge and filed here rather than expanding that effort's scope.
-
-**Direction (when picked up):** add horizontal overflow handling to `menu_bar_layout_cats` — either a
-scrolling/windowed bar (shift the visible category window to keep the active category on-screen, mirror
-the dropdown's `list_window` approach) or a right-edge overflow affordance. Anchors:
-`chrome_geom::menu_bar_layout_cats`, `menu::intercept` (keyboard cycle), the dropdown `list_window`
-(vertical-windowing precedent), the tiny-terminal guard.
-
-
 ### A15 — About command/menu item that shows the splash
 <!-- item: A15 -->
 
@@ -629,34 +608,6 @@ Grounding when picked up: the window-aware resolver (`ventilate::resolve`), `nav
 sentence-segmentation the lens shares with `select-sentence` (S5's detector). Slots as an S-theme follow-on to
 S6. Scope only after the user names the specific moment it feels wrong — do NOT boil the ocean.
 
-### H23 — palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom)
-<!-- item: H23 -->
-
-**Surfaced by the H21 whole-branch Fable probe (2026-07-16), Minor — PRE-EXISTING, not introduced by H21**
-(verified byte-identical on `main` at 1c8d10e). `chrome_geom::palette_overlay_rect` computes the overlay width
-as `let ov_w = (w * 3 / 5)…` in `u16`; the intermediate `w * 3` overflows `u16` for a terminal width `w ≥ 21846`
-— a debug-build panic, or a release wrap that then clamps. Fable's degenerate-area probe (300×100 and extreme
-coordinates) hit it. Reachable only via an absurd/hostile terminal `Resize` (no real terminal is ~21846 columns),
-so it is **not a data-loss or normal-use hazard** and was **not a merge blocker** for H21 — but it is the same
-arithmetic-soundness class H7 audited (widen the intermediate, or `saturating_mul`/`u32`). **Fix:** compute the
-`* 3 / 5` in `u32` (or use `saturating_*`) and clamp back to `u16`, in `chrome_geom.rs::palette_overlay_rect`;
-sweep the sibling `*_overlay_rect` helpers for the same pattern while there. Anchor: `wordcartel/src/chrome_geom.rs`
-(`palette_overlay_rect` and the other overlay-rect helpers it shares the `w * k / n` shape with).
-
-**Scope when picked up — this IS an H7-style geom sweep, not a one-line fix.** Treat the `palette_overlay_rect`
-overflow as the *seed/exemplar*, not the whole item: when H23 is worked, audit every geometry helper (the
-`chrome_geom.rs` rect functions and any `w * k / n` / `area.width *`-shaped arithmetic in the layout/render path)
-for the same overflow/underflow class H7 covered. Apply H7's **blast-radius stance** ([[wordcartel-h7-blast-radius-stance]]):
-these are **render/geometry (parse-class) paths**, not mutation paths — so the guard is `debug_assert` + a **safe
-release clamp** (compute in `u32`/`saturating_*`, clamp back to `u16`), *not* a loud release panic and never a silent
-garbage wrap. Small and cold, so it batches cleanly as its own mini-sweep effort or as a rider on the next
-hardening pass — but the *scope is the sweep*, and the fix pattern (widen-compute-then-clamp under a debug_assert)
-is already decided here so it's ready to go.
-
-*(Captured 2026-07-16 from the H21 final Fable gate. H7-sweep framing recorded 2026-07-16.)*
-
-
-
 ### H25 — compose::face_to_ratatui is add-only — can't express modifier subtraction
 <!-- item: H25 -->
 
@@ -785,7 +736,6 @@ intercept" — these two are the last holdouts.
 Either make them reachable (assert the warning in a state a writer can actually be in) or retire
 them. A test that passes for the wrong reason is worse than no test: it reports coverage of a path
 nobody is checking.
-
 
 
 ---

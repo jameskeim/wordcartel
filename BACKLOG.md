@@ -3,7 +3,7 @@
 
 # Backlog
 
-**36 open · 76 shipped · 2 dropped**
+**34 open · 78 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -13,7 +13,6 @@ Blocking Effort P: **0**
 |---|---|---|---|---|---|---|
 | B12 | Lone block-begin marker renders nothing (^KB before ^KK is invisible) | needs-design | bug | S |  | Found in the cursor-system review. Effort-9A shipped the marked-block system WITHOUT rendering a LONE begin marker: after ^KB (block-begin) with no ^KK (block-end) yet, there is NO visual indication a start is set — only a complete begin+end region paints (SE::MarkedBlock). The writer can't see they set a mark. Fix: render the pending_block_begin position. Superseded by B13 (styled boundaries) which does this properly for all markers; filed separately as the acute defect. ~S. |
 | B13 | Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs) | needs-design | feature | S |  | C2 of the cursor-system review (docs/design/cursor-system-concept-review.md). Render marked-block BEGIN/END (and the lone-begin, closing B12) as STYLED BOUNDARY CELLS — a reverse/underline/theme treatment on the boundary column — NOT injected bracket glyphs. Decision 2026-07-13: the WordStar [ ]-bracket model was predicated on hardware-terminal capabilities; styled boundary cells are the modern, cheaper choice (~15% of the B-full injected-marker cost) with the IDENTICAL data model. Explicitly NOT B-full (Fork B: injected display-only marker columns via layout()/ColMap — reuses the ventilate/ColMap regime but Medium + highest correctness stakes; deferred unless a real need appears). No byte injection, no ColMap change -> no data-safety surface. Must honor the terminal-plain/no-color fallback (reverse/underline, not color alone). ~S. |
-| H23 | palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom) | triage | debt | S |  | Surfaced by the H21 whole-branch Fable probe (2026-07-16), PRE-EXISTING (byte-identical on main). chrome_geom::palette_overlay_rect computes ov_w = w*3/5 in u16; w*3 overflows u16 at terminal width >= 21846 (debug panic / release wrap-then-clamp). Reachable only via an absurd/hostile terminal Resize — NOT data-loss, NOT a merge blocker; same arithmetic-soundness class as H7. Fix: do the *3/5 in u32 (or saturating_mul) + clamp back; sweep sibling *_overlay_rect helpers. Batch into a future H7-style geom/panic sweep. |
 | H25 | compose::face_to_ratatui is add-only — can't express modifier subtraction | triage | debt | S |  | compose only ADDS modifiers (no sub_modifier path), so a face's dim can't clear a DIM an underlay wrote; B7 worked around it at the ChromeStyles cache seam |
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | A18 | Snippet / abbreviation expansion (trigger to text; dynamic placeholders; cursor stop) | needs-design | feature | SM |  | Type an abbreviation -> canned text (sign-offs, boilerplate, dynamic date/time/clipboard). Our OWN proto-demo already exists: insert_date.lua (P1 command demo — inserts dynamic text), which is why a plugin is the natural home. External prior art: helowrite/src/snippets.py — flat trigger=replacement config, non-word-char boundary guard, longest-first, %PLACEHOLDER. AVOID their mechanism: find_trigger scans the WHOLE prefix per trigger = O(document) (violates theme-R / O(edited)) and can match a non-caret occurrence; silent except:pass; no cursor stop. OUR design: bounded-suffix detection ending AT the caret (O(edited)); word boundary via our UAX-29 machinery; expansion via submit_transaction (undo-atomic, M2); dynamic placeholders (%DATE/%TIME/%CLIPBOARD, reuse C3); ADD a final-cursor stop ($0) they skip; typed errors -> status line. HOME: an Effort-P plugin (P2 on-edit hook + command; insert_date.lua shows the shape) or a small core command. ~SM. |
@@ -31,7 +30,6 @@ Blocking Effort P: **0**
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A22 | Write-Block Redirect exports the whole document, not the marked block | triage | feature | TBD |  | Write-Block Redirect exports the whole document, not the marked block |
-| B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
 | H26 | fs-chokepoint guard: use-tree parsing for full soundness | triage | feature | TBD |  | fs-chokepoint guard: use-tree parsing for full soundness |
@@ -50,10 +48,12 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>76 shipped</summary>
+<details><summary>78 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | 2026-07-24 | 72928e3 |
+| H23 | palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom) | 2026-07-24 | a8063e3 |
 | H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | 2026-07-24 | 48105e0 |
 | B15 | Shrink into a folded region leaves the caret on a hidden line (no SnapOut) | 2026-07-21 | 39d3d4d |
 | B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | 2026-07-21 | 192ae0e |

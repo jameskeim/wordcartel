@@ -356,6 +356,29 @@ discrete variants) untouched; `a3b_placement_sweep_categories` flipped to expect
 
 ## Theme B — rendering
 
+### B9 — Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols)
+<!-- item: B9 -->
+
+**Shipped by group ③** (`72928e3` + `4b0edb9` + `17131a0`, 2026-07-24) — **the shipped fix is
+option C, not the filed "clip/windowing."** `chrome_geom::menu_bar_layout_cats` had no horizontal
+handling, so below ~62 cols the trailing categories clipped and became mouse-unreachable. Grounding
+surfaced a third option beyond the filing's windowed-bar/right-edge-affordance pair and the human
+chose it: a **responsive label-compression ladder** — a pure function of `(area.width, cats)` with
+ZERO stored state, so paint and all three mouse hit-test sites stay in lockstep by construction
+(the A21/H21 drift lesson made structural). Four rungs: **≥62** full labels + 2-space padding
+(byte-identical to the old bar) → **54–61** full labels + single leading space → **36–53**
+abbreviated (`Blk`/`Fmt`/`Docs`/`Set`/`Exp` — human-picked, only the long labels shorten; File/Edit/
+View stay full) → **4–35** abbreviated + a dim `»` clip marker (visual-only; the marker column and
+the clipped tail dispatch nothing). Every category stays visible and mouse-reachable down to 36
+cols. Two things folded in beyond the filed one-liner (human-approved): the **three duplicated
+menu-bar hit-test closures were consolidated into one `menu_bar_label_at`** (paint + hit-test share
+it → SEE==CLICK proven across the whole width domain by the whole-branch probe), and
+`menu_dropdown_rect` now **shifts left to fit** instead of clamping a right-side category's dropdown
+into an unreadable sliver (+ an explicit `None` at `area.width == 0`). Command-surface contract: N/A
+(compression is automatic-responsive, not a user-settable option). Both final gates clean (Fable
+whole-branch PASS + Codex pre-merge GO). Origin: filed 2026-07-10 from the command-surface curation
+effort; grounded + specced Fable-first, spec Codex-GO r1, plan Codex-GO after r3.
+
 ### B1 — Word-boundary wrap (UAX #14)
 <!-- item: B1 -->
 
@@ -1142,6 +1165,28 @@ currently effectively unreachable via real input since the open overlay consumes
 ---
 
 ## Theme H — code health / engineering health
+
+### H23 — palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom)
+<!-- item: H23 -->
+
+**Shipped by group ③** (`a8063e3`, 2026-07-24) — **corrects the filing's "sweep the sibling
+`*_overlay_rect` helpers … this IS an H7-style geom sweep, not a one-line fix."** Two crate-wide
+greps during grounding proved `chrome_geom::palette_overlay_rect`'s `(w * 3 / 5)` is the **only**
+u16 geometry multiply in the whole shell crate; every other overlay-rect helper gets its width by
+*calling* `palette_overlay_rect`, so they inherit the fix automatically — there are no siblings to
+sweep. The fix is one line: widen the `* 3 / 5` to `u32` and clamp back to `u16`
+(`((w as u32 * 3 / 5) as u16).clamp(30, 80).min(w)`), **with NO `debug_assert`** — after widening
+there is no invariant left to assert (`w ≥ 21846` is an absurd-but-valid input, not a violated
+invariant, and the u32 result is exact), so the filing's "under a `debug_assert`" letter was
+deliberately dropped (human-approved deviation that honors the H7 stance's *substance*: safe release
+behavior, no silent garbage wrap). The spec RECORDS the audited-safe sites as the census rather than
+churning them — the load-bearing fact the sweep turned on is that ratatui `Rect::new` **saturates**
+(`width = x.saturating_add(width) - x`), which clears every `r.x + r.width` comparison, plus the
+`render.rs` `place_cursor` arms are already H7-guarded. Real harm was a **debug-build panic at
+`w ≥ 21846`** (a hostile/absurd Resize; PTY winsize is u16 so it is representable, but no real
+terminal is that wide) — release wrapped then clamped in-range, so not data-loss. Origin: surfaced
+by the H21 whole-branch Fable probe (2026-07-16), shipped as a small rider on B9 in group ③. See
+also [[wordcartel-h7-blast-radius-stance]].
 
 ### H7 — Panic-safety & arithmetic-soundness audit
 <!-- item: H7 -->

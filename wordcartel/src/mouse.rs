@@ -191,9 +191,7 @@ pub(crate) fn mouse_menu(editor: &mut Editor, ev: MouseEvent, area: ratatui::lay
         let hit_area = crate::chrome_geom::menu_area(area);
         let bar_hit: Option<usize> = {
             let groups = &editor.menu.as_ref().unwrap().groups;
-            crate::chrome_geom::menu_bar_layout(hit_area, groups).into_iter()
-                .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
-                .map(|(cat, _)| cat)
+            crate::chrome_geom::menu_bar_hit(hit_area, groups, ev.column, ev.row)
         };
         if let Some(cat) = bar_hit {
             let m = editor.menu.as_mut().unwrap();
@@ -259,9 +257,7 @@ pub(crate) fn mouse_menu(editor: &mut Editor, ev: MouseEvent, area: ratatui::lay
         // scoped borrows → owned hit results
         let bar_hit: Option<usize> = {
             let groups = &editor.menu.as_ref().unwrap().groups;
-            crate::chrome_geom::menu_bar_layout(hit_area, groups).into_iter()
-                .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
-                .map(|(cat, _)| cat)
+            crate::chrome_geom::menu_bar_hit(hit_area, groups, ev.column, ev.row)
         };
         let row_action: Option<crate::menu::MenuRowAction> = {
             let groups = &editor.menu.as_ref().unwrap().groups;
@@ -869,10 +865,8 @@ pub(crate) fn handle(
             if let CellHit::MenuBar = hit {
                 // Inactive bar: open the dropdown AT the clicked category (hydrated
                 // by reduce's post-handle hydrate_overlays call).
-                let cats_hit = crate::chrome_geom::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER)
-                    .into_iter()
-                    .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
-                    .map(|(i, _)| i);
+                let cats_hit = crate::chrome_geom::menu_bar_label_at(
+                    area, &crate::registry::MENU_ORDER, ev.column, ev.row);
                 if let Some(order_idx) = cats_hit {
                     editor.menu = Some(crate::menu::empty_at(order_idx));
                 }
@@ -1349,6 +1343,85 @@ mod tests {
         handle_flat(&mut e, up, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(!e.mouse.dragging, "dragging must be cleared when Up(Left) arrives during overlay");
         assert!(!e.mouse.scrollbar_dragging, "scrollbar_dragging must be cleared when Up(Left) arrives during overlay");
+    }
+
+    // -----------------------------------------------------------------------
+    // group3 T3: B9 `»` overflow marker + consolidated bar hit-test
+    // -----------------------------------------------------------------------
+
+    /// B9 (spec §6c, I5): on a clipped bar the last column belongs to the `»` marker and a
+    /// click there is INERT. RED as sequenced (post-T2 layout, pre-T3 migration): at 35 cols
+    /// Exp's SHORT-rung cell spans [32, 36), so the un-migrated CellHit::MenuBar closure opens
+    /// Export from col 34; after the migration the marker column returns no label. Cols 32–33
+    /// (Exp's still-visible cells) keep opening it, before and after.
+    #[test]
+    fn click_on_the_marker_column_is_inert_but_visible_cells_still_open() {
+        use crate::config::MenuBarMode;
+        let (reg, ex, clk, tx, km) = ctx();
+        let mk = |w: u16| {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            crate::derive::rebuild(&mut e);
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            e
+        };
+        // The marker column (last bar column on a clipped bar) is inert.
+        let mut e = mk(35);
+        handle_flat(&mut e, down(34, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        assert!(e.menu.is_none(), "a click on the » marker column must do nothing");
+        // A still-visible cell of the same partially-clipped category still opens it.
+        let mut e = mk(35);
+        handle_flat(&mut e, down(32, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        assert_eq!(e.menu.as_ref().map(|m| m.open), Some(7),
+            "Exp's visible cells (32–33) still open Export");
+        // Narrower: at 20 cols the last column (19) sits inside View's cell [18, 23) — inert too.
+        let mut e = mk(20);
+        handle_flat(&mut e, down(19, 0), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
+        assert!(e.menu.is_none(), "the marker column is inert at every clipped width");
+    }
+
+    /// B9 (spec §6c) — regression PIN, green-on-arrival: compressed-cell clicks already work
+    /// through the pre-consolidation closures (Task 2 made the shared layout rung-aware); this
+    /// pins every category through the migrated inactive-bar arm so the 3.4 refactor cannot
+    /// silently drop one. NOT red-first — behavior-preserving refactor (H27 precedent).
+    #[test]
+    fn narrow_bar_click_opens_every_category_from_its_compressed_cell() {
+        use crate::config::MenuBarMode;
+        let (reg, ex, clk, tx, km) = ctx();
+        for idx in 0..crate::registry::MENU_ORDER.len() {
+            let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+            crate::derive::rebuild(&mut e);
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            let area = ratatui::layout::Rect::new(0, 0, 40, 8);
+            let bar = crate::chrome_geom::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER);
+            let (_, r) = bar.iter().find(|(i, _)| *i == idx).expect("all eight cells laid out");
+            handle_flat(&mut e, down(r.x + 1, 0), &reg, &km, &ex, &clk, &tx,
+                &crate::test_support::test_fs());
+            assert_eq!(e.menu.as_ref().map(|m| m.open), Some(idx),
+                "category {idx} must open from its compressed cell");
+        }
+    }
+
+    /// B9 (spec §6c) — regression PIN, green-on-arrival (same refactor-oracle reasoning):
+    /// hover on the ACTIVE compressed bar switches the open category, before and after the
+    /// Moved-arm migration.
+    #[test]
+    fn narrow_bar_hover_switches_categories_on_the_compressed_cells() {
+        let (reg, ex, clk, tx, km) = ctx();
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        e.menu = Some(crate::menu::empty());
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let area = ratatui::layout::Rect::new(0, 0, 40, 8);
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        let bar = crate::chrome_geom::menu_bar_layout(hit_area, &groups);
+        let (target, r) = bar[bar.len() - 1]; // the last built category's compressed cell
+        assert_ne!(e.menu.as_ref().unwrap().open, target, "precondition: not already open");
+        handle_flat(&mut e, moved(r.x + 1, 0), &reg, &km, &ex, &clk, &tx,
+            &crate::test_support::test_fs());
+        assert_eq!(e.menu.as_ref().unwrap().open, target, "hover switched to the hovered cell");
     }
 
     // -----------------------------------------------------------------------
