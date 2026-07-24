@@ -51,6 +51,39 @@ pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCatego
     menu_bar_layout_cats(area, &cats)
 }
 
+/// B9 (spec §3.4) — Some(column of the bar's LAST cell) iff even the floor rung clips (the
+/// last label rect's right edge exceeds the area's); None when everything fits. The painter
+/// draws the dim `»` there and `menu_bar_label_at` treats the same column as label-free, so
+/// the marker and its dead column can never disagree (I5).
+pub(crate) fn menu_bar_marker_col(area: Rect, cats: &[crate::registry::MenuCategory]) -> Option<u16> {
+    if area.width == 0 { return None; }
+    let clipped = menu_bar_layout_cats(area, cats).last()
+        .is_some_and(|(_, r)| r.right() > area.right());
+    clipped.then(|| area.right().saturating_sub(1))
+}
+
+/// B9 — THE bar hit-test (replaces the three hand-parallel find-closures in mouse.rs:
+/// mouse_menu's Moved and Down arms + the inactive CellHit::MenuBar arm). Returns the index
+/// into `cats` whose label cell contains `(col, row)`; None off every label or on the active
+/// marker column.
+pub(crate) fn menu_bar_label_at(area: Rect, cats: &[crate::registry::MenuCategory],
+    col: u16, row: u16) -> Option<usize>
+{
+    if menu_bar_marker_col(area, cats) == Some(col) { return None; }
+    menu_bar_layout_cats(area, cats).into_iter()
+        .find(|(_, r)| col >= r.x && col < r.x + r.width && row == r.y)
+        .map(|(i, _)| i)
+}
+
+/// Groups-shaped wrapper over `menu_bar_label_at` — mirrors the existing `menu_bar_layout` /
+/// `menu_bar_layout_cats` pair so the two active-menu mouse arms need no cats plumbing.
+pub(crate) fn menu_bar_hit(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)],
+    col: u16, row: u16) -> Option<usize>
+{
+    let cats: Vec<crate::registry::MenuCategory> = groups.iter().map(|g| g.0).collect();
+    menu_bar_label_at(area, &cats, col, row)
+}
+
 pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize) -> Option<Rect> {
     let bar = menu_bar_layout(area, groups);
     let (_, label_rect) = bar.get(open)?;
@@ -702,5 +735,32 @@ mod tests {
         assert_eq!(bar.len(), 8);
         let (_, last) = bar.last().expect("eight rects");
         assert_eq!(last.x + last.width, 36, "compressed bar ends flush at 36 cols");
+    }
+
+    /// B9 (spec §3.4): the marker exists exactly when even the Short floor clips.
+    #[test]
+    fn menu_bar_marker_col_appears_only_below_the_short_floor() {
+        use crate::registry::MENU_ORDER;
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 80, 8), &MENU_ORDER), None);
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 36, 8), &MENU_ORDER), None);
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 35, 8), &MENU_ORDER), Some(34));
+        assert_eq!(menu_bar_marker_col(Rect::new(0, 0, 10, 8), &MENU_ORDER), Some(9));
+    }
+
+    /// B9 (I5): every category is hittable at its cell; the marker column never is, even
+    /// though a clipped label rect covers it.
+    #[test]
+    fn menu_bar_label_at_hits_every_category_and_never_the_marker() {
+        use crate::registry::MENU_ORDER;
+        let area = Rect::new(0, 0, 40, 8); // Short rung — everything visible
+        for (i, r) in menu_bar_layout_cats(area, &MENU_ORDER) {
+            assert_eq!(menu_bar_label_at(area, &MENU_ORDER, r.x + 1, 0), Some(i),
+                "category {i} must be hittable at its cell");
+        }
+        assert_eq!(menu_bar_label_at(area, &MENU_ORDER, 39, 0), None, "off the flush bar end");
+        let clipped = Rect::new(0, 0, 35, 8);
+        let mc = menu_bar_marker_col(clipped, &MENU_ORDER).expect("clipped at 35");
+        assert_eq!(menu_bar_label_at(clipped, &MENU_ORDER, mc, 0), None,
+            "the marker column is not a label hit");
     }
 }

@@ -1280,6 +1280,36 @@ mod tests {
         }
     }
 
+    /// B9 (spec §6b, clipped widths): below the Short floor the bar clips and the dim `»`
+    /// marker owns the last bar column; at and above the floor there is no marker.
+    /// RED as sequenced (post-T2, pre-marker-paint): no `»` paints yet — the last-column
+    /// cell is a clipped Short-label glyph.
+    #[test]
+    fn below_the_floor_the_bar_clips_and_shows_the_overflow_marker() {
+        use crate::config::MenuBarMode;
+        use ratatui::style::Modifier;
+        for w in [35u16, 20, 10] {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, w, 8);
+            let row0 = row_string(&buf, 0);
+            assert!(row0.starts_with(" File"), "{w}: bar still leads with File: {row0:?}");
+            assert_eq!(row0.chars().last(), Some('»'), "{w}: marker in the last column: {row0:?}");
+            assert!(buf[(w - 1, 0)].style().add_modifier.contains(Modifier::DIM),
+                "{w}: the marker cell is DIM");
+        }
+        for w in [36u16, 53, 80] {
+            let mut e = Editor::new_from_text("hello\n", None, (w, 8));
+            e.menu_bar_mode = MenuBarMode::Pinned;
+            e.menu = None;
+            derive::rebuild(&mut e);
+            let row0 = row_string(&render_to_buffer(&mut e, w, 8), 0);
+            assert!(!row0.contains('»'), "{w}: no marker at or above the floor: {row0:?}");
+        }
+    }
+
     #[test]
     fn a_detail_box_too_tall_for_the_frame_announces_what_it_dropped() {
         // On a short terminal the box is clamped to the rows available above the status row.

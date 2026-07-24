@@ -5,6 +5,7 @@
 
 use ratatui::{
     layout::{Position, Rect},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
@@ -14,7 +15,7 @@ use crate::{
     editor::Editor,
     render::ChromeStyles,
     chrome_geom::{
-        menu_bar_cell_text, menu_bar_layout, menu_bar_layout_cats, menu_bar_rung,
+        menu_bar_cell_text, menu_bar_layout, menu_bar_layout_cats, menu_bar_marker_col, menu_bar_rung,
         menu_dropdown_rect,
         palette_overlay_rect, windowed_indicator, file_browser_list_h, file_browser_overlay_rect,
     },
@@ -694,6 +695,17 @@ pub(crate) fn paint_menu_bar(frame: &mut Frame, editor: &mut Editor, cs: &Chrome
                 frame.render_widget(Paragraph::new(text).style(cs.menu_closed), *rect);
             }
         }
+    }
+    // B9 §3.4: dim `»` in the bar's last column whenever even the floor rung clips. Same
+    // cats source as the arm that just painted, so marker and layout can never disagree.
+    let cats: Vec<crate::registry::MenuCategory> = match editor.menu {
+        Some(ref menu) if !menu.groups.is_empty() => menu.groups.iter().map(|g| g.0).collect(),
+        _ => crate::registry::MENU_ORDER.to_vec(),
+    };
+    if let Some(mc) = menu_bar_marker_col(menu_area, &cats) {
+        frame.render_widget(
+            Paragraph::new("»").style(cs.menu_closed.add_modifier(Modifier::DIM)),
+            Rect::new(mc, area.y, 1, 1));
     }
 }
 
