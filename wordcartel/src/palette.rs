@@ -130,7 +130,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                             }
                         } else {
                             // Command-palette row: dispatch through registry.
-                            crate::app::dispatch_overlay_command(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, row.id, ctx.fs);
+                            crate::app::dispatch_overlay_command(editor, ctx, row.id);
                         }
                     }
                 }

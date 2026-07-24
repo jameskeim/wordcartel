@@ -276,6 +276,8 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = crate::test_support::TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
+        let fs = crate::test_support::test_fs();
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &fs };
         let mut e = Editor::new_from_text("hello\n", None, (40, 12));
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
         e.scrollbar_mode = crate::config::TransientMode::Auto;
@@ -283,7 +285,7 @@ mod tests {
         // A move onto row 0 (menu-bar dwell region) and the right edge (scrollbar region).
         for (col, row) in [(5u16, 0u16), (39u16, 5u16)] {
             let ev = MouseEvent { kind: MouseEventKind::Moved, column: col, row, modifiers: KeyModifiers::NONE };
-            crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx, &crate::test_support::test_fs());
+            crate::mouse::handle(&mut e, ev, &ctx);
         }
         assert!(e.mouse.menu_reveal_due.is_none(), "no menu dwell armed under splash");
         assert!(e.mouse.scrollbar_reveal_due.is_none(), "no scrollbar dwell armed under splash");
@@ -299,6 +301,8 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = crate::test_support::TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
+        let fs = crate::test_support::test_fs();
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx, fs: &fs };
         let mut e = Editor::new_from_text("hello world\ntwo\n", None, (40, 12));
         crate::derive::rebuild(&mut e);
         e.open_palette();
@@ -307,7 +311,7 @@ mod tests {
         // would move the caret; under the palette it is consumed (close-away or no-op).
         let ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 11,
             modifiers: KeyModifiers::NONE };
-        crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx, &crate::test_support::test_fs());
+        crate::mouse::handle(&mut e, ev, &ctx);
         // Either the palette closed (click-away) or stayed; in NEITHER case did the editor
         // caret jump to the clicked cell — the event never reached the editor gesture path.
         assert_eq!(crate::nav::head(&e), before, "click under palette did not move the caret");

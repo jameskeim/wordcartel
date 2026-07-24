@@ -227,7 +227,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     }
                 } // menu borrow dropped here
                 if let Some(action) = selected {
-                    dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action, ctx.fs);
+                    dispatch_row_action(editor, ctx, action);
                 }
             }
         }
@@ -245,20 +245,14 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
 /// palette's buffer-switcher rows already use (`mouse::route_overlay`'s palette branch).
 /// The Documents dynamic menu (Task 4.2, `DYNAMIC_SECTIONS`) is the first built menu rows
 /// to carry `SwitchBuffer`.
-#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub(crate) fn dispatch_row_action(
     editor: &mut crate::editor::Editor,
-    reg: &crate::registry::Registry,
-    keymap: &crate::keymap::KeyTrie,
-    ex: &dyn crate::jobs::Executor,
-    clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    ctx: &crate::overlays::DispatchCtx,
     action: MenuRowAction,
-    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     match action {
         MenuRowAction::Command(id) =>
-            crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id, fs),
+            crate::app::dispatch_overlay_command(editor, ctx, id),
         MenuRowAction::SwitchBuffer(bid) => {
             editor.menu = None;
             if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {

@@ -242,7 +242,8 @@ impl PluginHost {
     /// synchronously inside that borrow (builtin handlers never call Lua); a `Plugin` entry
     /// enqueues a `PluginCall` back onto `editor.pending_plugin_calls`, picked up by the next
     /// re-drain iteration. The borrow drops before any Lua runs.
-    #[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
+    // bundle ≠ DispatchCtx: no keymap in the pump path; editor is an Rc handle, not &mut
+    #[allow(clippy::too_many_arguments)]
     fn drain_one_dispatch(
         &self,
         editor: &Rc<RefCell<Editor>>,

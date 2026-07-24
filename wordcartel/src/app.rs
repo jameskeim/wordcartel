@@ -206,23 +206,19 @@ pub(crate) fn fold_and_continue(editor: &mut crate::editor::Editor, ex: &dyn cra
 
 /// Close the active overlay, dispatch `id` via the registry, drain executor results,
 /// then hydrate any overlay opened by the dispatched command.
-#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
 pub(crate) fn dispatch_overlay_command(
     editor: &mut Editor,
-    reg: &crate::registry::Registry,
-    keymap: &crate::keymap::KeyTrie,
-    ex: &dyn crate::jobs::Executor,
-    clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<Msg>,
+    ctx: &crate::overlays::DispatchCtx,
     id: crate::registry::CommandId,
-    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
 ) {
     crate::overlays::close_all(editor);
-    let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
-    reg.dispatch(id, &mut ctx);
-    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs); }
+    let mut rctx = crate::registry::Ctx {
+        editor, clock: ctx.clock, executor: ctx.ex, msg_tx: ctx.msg_tx.clone(), fs: std::sync::Arc::clone(ctx.fs),
+    };
+    ctx.reg.dispatch(id, &mut rctx);
+    for o in ctx.ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs); }
     // Hydrate any overlay the dispatched command may have opened (Codex 3c).
-    hydrate_overlays(editor, reg, keymap);
+    hydrate_overlays(editor, ctx.reg, ctx.keymap);
 }
 
 #[cfg(test)]
@@ -236,7 +232,9 @@ pub fn menu_select_for_test(
 ) {
     editor.menu = None;
     let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), reg);
-    dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id, &crate::test_support::test_fs());
+    let fs = crate::test_support::test_fs();
+    let ctx = crate::overlays::DispatchCtx { reg, keymap: &keymap, ex, clock, msg_tx, fs: &fs };
+    dispatch_overlay_command(editor, &ctx, id);
 }
 
 /// Process one message. Returns true while the app should keep running.
@@ -245,7 +243,8 @@ pub fn menu_select_for_test(
 /// `reduce_dispatch`, then arms the diagnostics re-arm seam on the single exit path — this covers
 /// every `Handled::Done` early-return inside `reduce_dispatch` AND its normal tail (spec §2.2 item 1;
 /// E7 T3).
-#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
+// entry facade: args mirror the run loop's owned state 1:1; the ctx is BUILT here and threaded down
+#[allow(clippy::too_many_arguments)]
 pub fn reduce(
     msg: Msg,
     editor: &mut Editor,
@@ -275,7 +274,8 @@ pub fn reduce(
     }
     let before_id = editor.active().id;
     let before_version = editor.active().document.version;
-    let keep = reduce_dispatch(msg, editor, reg, keymap, ex, clock, msg_tx, fs);
+    let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx, fs };
+    let keep = reduce_dispatch(msg, editor, &ctx);
     crate::diagnostics_run::arm_if_edited(editor, before_id, before_version, clock);
     keep
 }
@@ -283,29 +283,18 @@ pub fn reduce(
 /// The interceptor chain + message match, extracted from `reduce` so the single `arm_if_edited`
 /// seam in `reduce` wraps every exit path (H1 dispatch-hub discipline). Behavior-identical to the
 /// pre-E7 body minus the inline diagnostics arm (now `arm_if_edited`, called from `reduce`).
-#[allow(clippy::too_many_arguments)] // C5 T5: +fs threads the seam through every dispatch site
-fn reduce_dispatch(
-    msg: Msg,
-    editor: &mut Editor,
-    reg: &Registry,
-    keymap: &crate::keymap::KeyTrie,
-    ex: &dyn Executor,
-    clock: &dyn Clock,
-    msg_tx: &std::sync::mpsc::Sender<Msg>,
-    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
-) -> bool {
+fn reduce_dispatch(msg: Msg, editor: &mut Editor, ctx: &crate::overlays::DispatchCtx) -> bool {
     // Overlay/modal input dispatch (H21). Real chain order: splash row FIRST, then the
     // `marks` chord pre-stage, then the remaining overlay rows in ALL order. `marks` is NOT
     // a table row (chord state, no overlay struct) — it sits between the splash row and the
     // rest to preserve today's `splash → marks → others` precedence (spec §2.6).
-    let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx, fs };
     let mut msg = msg;
-    msg = match (crate::overlays::OverlayId::Splash.row().intercept)(msg, editor, &ctx) {
+    msg = match (crate::overlays::OverlayId::Splash.row().intercept)(msg, editor, ctx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    msg = match crate::marks::intercept(msg, editor, &ctx) {
+    msg = match crate::marks::intercept(msg, editor, ctx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     for id in &crate::overlays::OverlayId::ALL[1..] {
-        msg = match (id.row().intercept)(msg, editor, &ctx) {
+        msg = match (id.row().intercept)(msg, editor, ctx) {
             crate::app::Handled::Done(k) => return k,
             crate::app::Handled::Pass(m) => m,
         };
@@ -314,13 +303,13 @@ fn reduce_dispatch(
     let before = editor.active().document.version; // post-interceptor; feeds last_edit_at only
     match msg {
         Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press =>
-            crate::input::handle_key(k, editor, reg, keymap, ex, clock, msg_tx, fs),
+            crate::input::handle_key(k, editor, ctx),
         Msg::Input(Event::Paste(text)) => {
             if let Some(mb) = editor.minibuffer.as_mut() {
                 for ch in text.chars() { mb.insert(ch); }
             } else if !text.is_empty() {
                 let bid = editor.active().id;
-                if crate::jobs_apply::insert_paste_text(editor, bid, &text, clock) {
+                if crate::jobs_apply::insert_paste_text(editor, bid, &text, ctx.clock) {
                     editor.register.set(text);
                 }
             }
@@ -334,48 +323,48 @@ fn reduce_dispatch(
             crate::nav::ensure_visible(editor);
         }
         Msg::Input(Event::Mouse(ev)) => {
-            crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx, fs);
+            crate::mouse::handle(editor, ev, ctx);
             // A click-opened menu placeholder must be built before the next render —
             // the key-dispatch path hydrates; the mouse path must too (A1 spec C1).
-            hydrate_overlays(editor, reg, keymap);
+            hydrate_overlays(editor, ctx.reg, ctx.keymap);
         }
         Msg::Input(_) => {}
-        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs),
+        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
-            crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+            crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
         Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**fs);
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**ctx.fs);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
-            crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
+            crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, ctx.clock);
         }
         Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
         Msg::DiagProviderEvent { source, event } =>
-            crate::diag_provider::apply_provider_event(editor, source, event, clock),
-        Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx, fs),
+            crate::diag_provider::apply_provider_event(editor, source, event, ctx.clock),
+        Msg::Tick => crate::timers::on_tick(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
         Msg::ListingDone { epoch, dir, result } => {
             crate::file_browser::apply_listing_done(editor, epoch, dir, result);
         }
         Msg::RecentsProbed { epoch, rows } => {
             crate::recents::apply_recents_probed(editor, epoch, rows);
         }
-        Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
+        Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, ctx.clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Intercepted in the run loop before `reduce` (see run()); unreachable here.
         // Arm required only for exhaustiveness. Do not process the shutdown here.
         Msg::InputThreadDied => {}
     }
     if editor.active().document.version != before {
-        editor.active_mut().last_edit_at = Some(clock.now_ms());
+        editor.active_mut().last_edit_at = Some(ctx.clock.now_ms());
         // NOTE: the old `if editor.diag_cfg.enabled { …arm… }` block is REMOVED — arm_if_edited
         // (called from reduce, keyed on active id + version) subsumes it (E7 T3).
     }
     // Fold any other results that became ready while handling this message.
-    for o in ex.drain() {
-        crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx, fs);
+    for o in ctx.ex.drain() {
+        crate::jobs_apply::apply_job_outcome(o, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs);
     }
     !editor.quit
 }
