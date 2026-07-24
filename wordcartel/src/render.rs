@@ -262,6 +262,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Wrap-guide line (painted BEFORE the text-row loop so text overwrites it)
     // -----------------------------------------------------------------------
     if editor.view_opts.wrap_guide {
+        // H23 census: raw adds safe — wrap_column is clamped to [20, 9999] at both entry
+        // points (config.rs load; prompts::wrap_column_submit) and text_left < w/2.
         let gx = area.x + tg.text_left + editor.view_opts.wrap_column;
         let within_viewport = gx < area.x + w;
         let not_scrollbar_col = !(editor.mouse.scrollbar_visible && gx == area.x + w - 1);

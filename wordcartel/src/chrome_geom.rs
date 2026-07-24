@@ -84,7 +84,10 @@ pub(crate) fn windowed_indicator(selected: usize, total: usize, list_h: usize)
 pub(crate) fn palette_overlay_rect(area: Rect, row_count: usize) -> Rect {
     let w = area.width;
     let h = area.height;
-    let ov_w = (w * 3 / 5).clamp(30, 80).min(w);
+    // H23: widen the *3/5 to u32 — `w * 3` overflows u16 at w >= 21846 (hostile Resize).
+    // The narrowing back is exact ((65535*3)/5 = 39321 < 65536); no debug_assert on purpose —
+    // nothing is left to assert after widening (spec §4.4, human-approved).
+    let ov_w = ((w as u32 * 3 / 5) as u16).clamp(30, 80).min(w);
     let list_h: u16 = crate::list_window::list_h_for(row_count, h) as u16;
     let ov_h = (list_h + 3).min(h);
     let ov_x = area.x.saturating_add((w.saturating_sub(ov_w)) / 2);
@@ -467,6 +470,21 @@ mod tests {
         // 30 rows → list_h capped at 15, ov_h=15+3=18
         let r30 = palette_overlay_rect(area, 30);
         assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
+    }
+
+    /// H23 (spec §6a): the overlay width math survives every u16 width. The seed defect was
+    /// `w * 3` overflowing u16 at w >= 21846 (debug panic; release wrap-then-clamp) — 21845 is
+    /// the last width whose w*3 fits u16, so the pair documents the boundary.
+    #[test]
+    fn palette_overlay_rect_survives_extreme_widths() {
+        for w in [21845u16, 21846, 30000, u16::MAX] {
+            let area = Rect::new(0, 0, w, 24);
+            let r = palette_overlay_rect(area, 10);
+            assert!(r.width >= 30 && r.width <= 80.min(w),
+                "w={w}: ov_w {} outside [30, min(80, w)]", r.width);
+            assert!(r.x as u32 + r.width as u32 <= w as u32, "w={w}: past the right edge: {r:?}");
+            assert!(r.y as u32 + r.height as u32 <= 24, "w={w}: past the bottom edge: {r:?}");
+        }
     }
 
     /// `cursor_picker_row_at` at a tall terminal (all 7 rows visible, `scroll_top == 0`):
