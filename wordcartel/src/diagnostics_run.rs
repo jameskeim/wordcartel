@@ -455,6 +455,33 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     }
 }
 
+/// The engine-management dynamic menu rows (E10 §11): one row per registered engine,
+/// state-in-label ("on" / "off" / "warming…" / "not installed"), dispatching that engine's
+/// toggle command — menu ⊆ palette by construction. `Plugin` sources are skipped (their
+/// rows are E12's plugin-contributed-menu effort). Availability is lazily discovered: an
+/// absent binary reads "on" until Review first attempts a spawn (spec §11 display note).
+pub fn engine_menu_rows(editor: &Editor) -> Vec<(String, crate::menu::MenuRowAction)> {
+    use crate::diag_provider::Availability;
+    editor.diag_providers.sources().filter_map(|src| {
+        let cmd = match src {
+            DiagSource::Harper => "toggle_engine_harper",
+            DiagSource::LTeX => "toggle_engine_ltex",
+            DiagSource::Vale => "toggle_engine_vale",
+            DiagSource::Plugin(_) => return None,
+        };
+        let state = if !editor.diag_providers.is_enabled(src) { "off" }
+            else {
+                match editor.diag_providers.availability(src) {
+                    Some(Availability::Unavailable) => "not installed",
+                    Some(Availability::Starting) => "warming…",
+                    _ => "on", // Idle | Ready | None-entry (unreachable for a listed source)
+                }
+            };
+        Some((format!("{} — {}", src.label(), state),
+            crate::menu::MenuRowAction::Command(crate::registry::CommandId(cmd))))
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,5 +1348,59 @@ mod tests {
         assert!(calls.lock().unwrap().iter().any(|c|
             matches!(c, crate::diag_provider::ProviderCall::Suspend)),
             "fire delegates to suspend_all_idle_heavy (every entry; SUSPENDABLE gating is provider-side)");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 9 (E10 §11): engine_menu_rows — the state-in-label matrix.
+    // ------------------------------------------------------------------
+
+    /// The COMPLETE spec-§11 label matrix — every cell of enabled×availability:
+    /// disabled → "off" (wins over availability); enabled+Unavailable → "not installed";
+    /// enabled+Starting → "warming…"; enabled+Ready → "on"; enabled+Idle → "on"; and the
+    /// Plugin-source skip. Two fixture editors cover the five cells across three sources.
+    #[test]
+    fn engine_menu_rows_state_labels_and_toggle_actions() {
+        use crate::diag_provider::{Availability, RecordingProvider};
+        use crate::menu::MenuRowAction;
+        use crate::registry::CommandId;
+        /// A fixture editor with the three core engines at the given (availability, enabled).
+        fn fixture(cells: [(DiagSource, Availability, bool); 3]) -> crate::editor::Editor {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+            for (src, avail, enabled) in cells {
+                e.diag_providers.install(Box::new(RecordingProvider::new()
+                    .with_source(src).with_availability(avail)), enabled);
+            }
+            e
+        }
+
+        // Scenario A: on (Ready) / warming… / not installed — all ENABLED — plus Plugin skip.
+        let mut e = fixture([
+            (DiagSource::Harper, Availability::Ready, true),
+            (DiagSource::LTeX, Availability::Starting, true),
+            (DiagSource::Vale, Availability::Unavailable, true),
+        ]);
+        e.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Plugin("mock"))), true); // skipped: no command (E12)
+        let rows = engine_menu_rows(&e);
+        assert_eq!(rows.len(), 3, "Plugin sources are skipped (spec §11)");
+        assert_eq!(rows[0], ("Harper — on".to_string(),
+            MenuRowAction::Command(CommandId("toggle_engine_harper"))));
+        assert_eq!(rows[1], ("LTeX — warming…".to_string(),
+            MenuRowAction::Command(CommandId("toggle_engine_ltex"))));
+        assert_eq!(rows[2], ("vale — not installed".to_string(),
+            MenuRowAction::Command(CommandId("toggle_engine_vale"))),
+            "enabled + Unavailable → not installed");
+
+        // Scenario B: the remaining cells — enabled+Idle → "on"; disabled → "off" (wins over
+        // availability, here a Ready recorder).
+        let e2 = fixture([
+            (DiagSource::Harper, Availability::Idle, true),
+            (DiagSource::LTeX, Availability::Ready, false),
+            (DiagSource::Vale, Availability::Starting, false),
+        ]);
+        let rows2 = engine_menu_rows(&e2);
+        assert_eq!(rows2[0].0, "Harper — on", "enabled + Idle (not yet summoned) → on");
+        assert_eq!(rows2[1].0, "LTeX — off", "disabled wins over Ready availability");
+        assert_eq!(rows2[2].0, "vale — off", "disabled wins over Starting availability");
     }
 }

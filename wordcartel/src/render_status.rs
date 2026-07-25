@@ -16,8 +16,9 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
     let name = crate::workspace::buffer_display_name(editor, editor.active().id);
     let head = format!("[{idx}/{count}] {name}");
     // Task 6 (SPINE §8.3): the Review label follows the switchable lens, gaining attribution
-    // (`REVIEW · <lens>`) only when the LENS engine is *live* (Ready) — Idle/Starting/Unavailable
-    // all show plain `REVIEW`, so the label asserts a working checker for whichever engine is
+    // (`REVIEW · <lens>`) when the LENS engine is *live* (Ready); E10 §12 adds a steady
+    // `REVIEW · warming <lens>…` while the engine is Starting. Idle/Unavailable show plain
+    // `REVIEW`, so the label asserts a working (or warming) checker for whichever engine is
     // actually being shown (spec §10). One mutex read, behind the Review arm only.
     let mode_text: std::borrow::Cow<'static, str> = match editor.active().view.mode {
         crate::editor::RenderMode::LivePreview => "PREVIEW".into(),
@@ -25,9 +26,16 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
         crate::editor::RenderMode::SourcePlain => "SOURCE".into(),
         crate::editor::RenderMode::Review => {
             let lens = editor.active_analysis_source;
-            if editor.diag_providers.availability(lens) == Some(crate::diag_provider::Availability::Ready) {
-                format!("REVIEW · {}", lens.label()).into()
-            } else { "REVIEW".into() }
+            match editor.diag_providers.availability(lens) {
+                // The label asserts a WORKING checker for the shown engine (SPINE §8.3)…
+                Some(crate::diag_provider::Availability::Ready) =>
+                    format!("REVIEW · {}", lens.label()).into(),
+                // …and E10 §12 adds the steady warming state — render-derived, self-clearing
+                // on the Starting→Ready flip, incapable of animating (no timer, no loop).
+                Some(crate::diag_provider::Availability::Starting) =>
+                    format!("REVIEW · warming {}…", lens.label()).into(),
+                _ => "REVIEW".into(), // Idle / Unavailable / no entry: plain (unchanged)
+            }
         }
     };
     let mut text = if editor.status_text().is_empty() {
@@ -175,28 +183,30 @@ mod tests {
         assert!(crate::render_status::status_left_text(&e).contains("[REVIEW]"), "review mode labels [REVIEW]");
     }
 
-    /// Effort A §10: a *live* provider attributes the Review label with its source's label; a
-    /// non-Ready provider shows plain REVIEW.
+    /// Effort A §10 + E10 §12: the Review attribution matrix. Ready → the engine label;
+    /// Starting → the STEADY warming label (changed by E10 — pre-E10 Starting was plain);
+    /// Idle / Unavailable → plain REVIEW, no attribution dot.
     #[test]
-    fn status_line_attributes_review_only_when_provider_ready() {
+    fn status_line_review_attribution_matrix() {
         use crate::diag_provider::{RecordingProvider, Availability};
         use wordcartel_core::diagnostics::DiagSource;
-        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
-        e.active_mut().view.mode = crate::editor::RenderMode::Review;
-        e.diag_providers.install(Box::new(RecordingProvider::new()
-            .with_source(DiagSource::Harper).with_availability(Availability::Ready)), true);
+        let with_availability = |a: Availability| {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+            e.active_mut().view.mode = crate::editor::RenderMode::Review;
+            e.diag_providers.install(Box::new(RecordingProvider::new()
+                .with_source(DiagSource::Harper).with_availability(a)), true);
+            crate::render_status::status_left_text(&e)
+        };
         // The label comes from DiagSource::Harper.label(), not the provider's own identity.
-        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW · Harper]"),
+        assert!(with_availability(Availability::Ready).contains("[REVIEW · Harper]"),
             "Ready → attribution");
-
-        let mut e2 = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
-        e2.active_mut().view.mode = crate::editor::RenderMode::Review;
-        e2.diag_providers.install(Box::new(RecordingProvider::new()
-            .with_source(DiagSource::Harper).with_availability(Availability::Starting)), true);
-        assert!(crate::render_status::status_left_text(&e2).contains("[REVIEW]"),
-            "Starting → plain REVIEW");
-        assert!(!crate::render_status::status_left_text(&e2).contains("·"),
-            "no attribution dot when not Ready");
+        assert!(with_availability(Availability::Starting).contains("[REVIEW · warming Harper…]"),
+            "Starting → the steady warming label (E10 §12)");
+        for quiet in [Availability::Idle, Availability::Unavailable] {
+            let s = with_availability(quiet);
+            assert!(s.contains("[REVIEW]") && !s.contains("·"),
+                "Idle/Unavailable → plain REVIEW, no attribution dot: {s}");
+        }
     }
 
     #[test]
