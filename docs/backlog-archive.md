@@ -356,6 +356,35 @@ discrete variants) untouched; `a3b_placement_sweep_categories` flipped to expect
 
 ## Theme B — rendering
 
+### B12 — Lone block-begin marker renders nothing (^KB before ^KK is invisible)
+<!-- item: B12 -->
+
+**Shipped by effort ④** (`2f1bb56`, 2026-07-24) — a lone `pending_block_begin` (^KB set, ^KK not yet)
+now PAINTS a boundary cell on the anchor glyph plus a `BLK…` status segment, via the new
+`block_paint.rs` seam — the writer can see the mark is set. The render `use_placed` gate was also
+fixed to force the placed-paint path for a lone pending anchor or bare marks (previously
+`pending_block_begin` had zero render-side reads). Shipped alongside B13, which does the styling
+properly for all markers.
+
+### B13 — Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)
+<!-- item: B13 -->
+
+**Shipped by effort ④** (impl `f5a8b82`+`2f1bb56`+`ea87473`, 2026-07-24) — B-lite styled boundary
+cells (no injected glyphs, zero `ColMap`/layout impact) via a new `block_paint.rs` seam that owns all
+landmark classification/paint (render.rs NET-SHRANK). The completed-block **interior was quieted** to a
+per-theme bg tint, and a new `SE::MarkedBlockBoundary` carries strong begin/end cues (end boundary =
+last interior glyph). **Scope expanded to 1B** (human decision — make *all* landmarks visible, not just
+the block): char marks + numbered bookmarks 0-9 now paint via `SE::LandmarkGlyph` presence cells + a
+`· MK <ids>` caret-line status identity segment; `BLK↑/↓` directional off-screen hints; and **C2**
+folded in — `clear_mark` (interactive) + `clear_marks`, the first mark-removal commands (marks were
+previously only overwritable). **H25 was confirmed NOT a blocker**: the boundary/landmark styling is
+purely additive (reverse+bold+underline vs reverse+italic+underline over the tint), so compose-modifier
+subtraction was never needed and H25 stays open, untouched. terminal-plain/no-color honored (interior
+reverse+dim, additive modifier boundaries) — the whole-branch probe proved boundary/landmark/interior
+mutually distinct at runtime across all 22 builtin themes. B-full (injected marker columns via
+`layout()`/`ColMap`) explicitly still out of scope. Pipeline: Fable-first, spec Codex-READY (2 byte-
+boundary edge folds), plan Codex-GO (TDD-coverage + intermediate-green folds), both final gates clean.
+
 ### B9 — Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols)
 <!-- item: B9 -->
 

@@ -559,31 +559,6 @@ Bundled example plugins — full-featured writer plugins + authoring tutorials (
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
 
-### B12 — Lone block-begin marker renders nothing (^KB before ^KK is invisible)
-<!-- item: B12 -->
-
-Lone block-begin marker renders nothing (^KB before ^KK is invisible)
-
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
-
-### B13 — Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)
-<!-- item: B13 -->
-
-Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)
-
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
-
-**Anti-regrowth constraint (record for the spec + plan).** This effort adds new boundary
-commands *and* new render arms — exactly the H1 dispatch-attractor shape. As of 2026-07-14 the two
-guarded hubs sit close to their `module_budgets` caps: `app.rs` production ≈920/1000 (~80 lines
-headroom), `render.rs` production ≈821/900 (~79). New command registration must land through the
-registry rows / feature-module handlers, and the styled-boundary paint must land in a
-`render_*`/feature module invoked by a thin arm — **not** as inline bodies grown into `reduce` /
-`reduce_dispatch` / `place_cursor`. The spec AND the plan each state how they honor this (the
-command-surface contract already binds the command half); the `too_many_lines` + `module_budgets`
-GATEs enforce it, but with this little headroom, plan for the seam up front rather than discovering
-it at the merge gate.
-
 ### S9 — In-lens editing feel — refine caret/motion/reflow inside the ventilate lens
 <!-- item: S9 -->
 
