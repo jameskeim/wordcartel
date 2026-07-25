@@ -508,9 +508,8 @@ pub fn fold_marker_for(editor: &crate::editor::Editor, l: usize) -> Option<usize
 // ---------------------------------------------------------------------------
 
 /// Per-frame inputs the row-paint loop reads (render() phases 6–7). EXACTLY the
-/// 12 fields paint_rows/row_spans_* read. has_block/block_hidden/diag_active are
-/// gather-time locals feeding use_placed/diag_all — NOT fields (a written-but-unread
-/// field would trip the warning-free gate).
+/// 12 fields paint_rows/row_spans_* read. diag_active is a gather-time local feeding
+/// diag_all — NOT a field (a written-but-unread field would trip the warning-free gate).
 struct RowCtx<'a> {
     scroll: usize,
     focus_region: Option<(usize, usize)>,
@@ -562,9 +561,9 @@ fn focus_region_at(editor: &Editor) -> Option<(usize, usize)> {
     Some(region)
 }
 
-/// Snapshot the row loop's per-frame inputs (render() phases 6–7). has_block/block_hidden/
-/// diag_active/prose_lens_active are gather-time locals feeding use_placed/diag_all/prose_lens;
-/// only the 13 fields the paint path reads are kept in RowCtx.
+/// Snapshot the row loop's per-frame inputs (render() phases 6–7). diag_active/
+/// prose_lens_active are gather-time locals feeding diag_all/prose_lens; only the 13
+/// fields the paint path reads are kept in RowCtx.
 fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     let scroll = editor.active().view.scroll;
 
@@ -618,8 +617,6 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     // Snapshot the persistent marked block (Effort 9A). A visible (non-hidden)
     // block is painted on the placed path; a hidden block is never painted.
     let marked_block = editor.active().marked_block;
-    let block_hidden = marked_block.is_some_and(|b| b.hidden);
-    let has_block = marked_block.is_some() && !block_hidden;
 
     // Active prose lens (S8 Task 5): the active category's slice iff a lens is on AND the
     // store is current for this version; `active_pos_matches` is the single source of truth
@@ -630,11 +627,15 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     let prose_lens_active = !prose_lens.is_empty();
 
     // Use the placed-path builder when search is active, valid diagnostics exist,
-    // a non-empty selection must be painted, a visible marked block must be
-    // painted, or an active prose lens has matches (segs path does no per-glyph
-    // styling). Computed ONCE (Codex): a visible block forces the placed path
-    // even with no selection/search/diag.
-    let use_placed = !hl_window.is_empty() || diag_active || has_sel || has_block || prose_lens_active;
+    // a non-empty selection must be painted, a visible marked block/pending anchor/
+    // bare mark must be painted, or an active prose lens has matches (segs path does
+    // no per-glyph styling). Computed ONCE (Codex): a visible block forces the placed
+    // path even with no selection/search/diag. `BlockPaint::wants_placed` (Effort ④
+    // T3) is the single source of truth for the landmark half of this gate — it
+    // closes the B12 gap where a lone pending anchor or bare marks (no completed,
+    // visible block) failed to force the placed path.
+    let use_placed = !hl_window.is_empty() || diag_active || has_sel
+        || crate::block_paint::gather(editor).wants_placed() || prose_lens_active;
 
     // SourcePlain is the only mode with no semantic colour; LivePreview and
     // SourceHighlighted both paint role + inline styles (SH's raw markers carry

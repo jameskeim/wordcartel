@@ -14,6 +14,7 @@ pub mod render;
 pub mod render_status;
 pub mod render_overlays;
 pub mod chrome_geom;
+pub mod block_paint;
 pub mod term;
 pub mod panicx;
 pub mod prompt;
