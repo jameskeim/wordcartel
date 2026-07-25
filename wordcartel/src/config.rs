@@ -191,6 +191,10 @@ pub struct ViewConfig {
     pub measure: bool,
     pub wrap_column: u16,
     pub wrap_guide: bool,
+    /// In-text landmark paint (block boundaries/tint, pending ^KB cell, mark cells —
+    /// `[view] landmarks_visible`). Default true (④'s always-on). OFF suppresses the
+    /// paint at the `block_paint::gather` seam; the status segments always survive (B18).
+    pub landmarks_visible: bool,
     pub word_count: bool,
     pub scrollbar: TransientMode,
     pub status_line: TransientMode,
@@ -207,7 +211,7 @@ impl Default for ViewConfig {
     fn default() -> Self {
         ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
             focus_granularity: FocusGranularity::Paragraph, measure: false,
-            wrap_column: 72, wrap_guide: false, word_count: false,
+            wrap_column: 72, wrap_guide: false, landmarks_visible: true, word_count: false,
             // status_line defaults On (idle info line always shown out of the box —
             // preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
             scrollbar: TransientMode::Auto, status_line: TransientMode::On, splash: true,
@@ -420,6 +424,7 @@ struct RawView {
     measure: Option<bool>,
     wrap_column: Option<u16>,
     wrap_guide: Option<bool>,
+    landmarks_visible: Option<bool>,
     word_count: Option<bool>,
     scrollbar: Option<String>,
     status_line: Option<String>,
@@ -542,6 +547,7 @@ pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Confi
         if let Some(v) = raw.view.focus { cfg.view.focus = v; }
         if let Some(v) = raw.view.measure { cfg.view.measure = v; }
         if let Some(v) = raw.view.wrap_guide { cfg.view.wrap_guide = v; }
+        if let Some(v) = raw.view.landmarks_visible { cfg.view.landmarks_visible = v; }
         if let Some(v) = raw.view.word_count { cfg.view.word_count = v; }
         if let Some(v) = raw.view.splash { cfg.view.splash = v; }
         if let Some(a) = raw.view.typewriter_anchor {
@@ -819,6 +825,18 @@ mod tests {
         let (cfg, warns) = load(&[p]);
         assert!(warns.is_empty());
         assert!(!cfg.view.splash, "a layer that SETS the field overrides the default");
+    }
+
+    #[test]
+    fn view_landmarks_visible_defaults_on_and_folds_from_a_layer() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert!(cfg.view.landmarks_visible, "built-in default is on (④ always-on)");
+        let d = tempdir();
+        let p = write(&d, "landmarks.toml", "[view]\nlandmarks_visible = false\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        assert!(!cfg.view.landmarks_visible, "a layer that SETS the field overrides the default");
     }
 
     #[test]
