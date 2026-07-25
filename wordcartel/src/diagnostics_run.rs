@@ -379,7 +379,7 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
         for name in list {
             if !catalog.iter().any(|s| s.config_name() == name) {
                 warns.push(format!(
-                    "config: diagnostics.linters — unknown engine \"{name}\" (known: harper)"));
+                    "config: diagnostics.linters — unknown engine \"{name}\" (known: harper, ltex, vale)"));
             }
         }
     }
@@ -391,6 +391,7 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
                     grammar: cfg.diagnostics.grammar,
                     dictionary: cfg.diagnostics.dictionary.clone(),
                     max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
+                    language: None,
                 })),
             // Exhaustive — future core engines add arms; LTeX/Vale/Plugin are not in the catalog yet.
             DiagSource::LTeX | DiagSource::Vale | DiagSource::Plugin(_) => continue,

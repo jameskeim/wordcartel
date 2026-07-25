@@ -172,7 +172,7 @@ mod tests {
     use wordcartel_core::diagnostics::Suggestion;
 
     fn cfg(grammar: bool) -> ProviderConfig {
-        ProviderConfig { grammar, dictionary: None, max_file_length: 10_000 }
+        ProviderConfig { grammar, dictionary: None, max_file_length: 10_000, language: None }
     }
 
     // ── test helpers: extract Sends / emitted DiagnosticsDone from a Vec<Action> ────────────────
@@ -300,7 +300,7 @@ mod tests {
         assert!(on["linters"].get("SentenceCapitalization").is_none(),
             "grammar on → grammar linters left at server defaults (absent)");
         let with_dict = HarperState::new(ProviderConfig { grammar: true,
-            dictionary: Some("/d.txt".into()), max_file_length: 5 }).settings_object();
+            dictionary: Some("/d.txt".into()), max_file_length: 5, language: None }).settings_object();
         assert_eq!(with_dict["userDictPath"], json!("/d.txt"));
         assert_eq!(with_dict["maxFileLength"], json!(5));
     }

@@ -908,7 +908,7 @@ mod tests {
     }
 
     fn cfg() -> ProviderConfig {
-        ProviderConfig { grammar: true, dictionary: None, max_file_length: 10_000 }
+        ProviderConfig { grammar: true, dictionary: None, max_file_length: 10_000, language: None }
     }
 
     fn sends(acts: &[Action]) -> Vec<&Value> {

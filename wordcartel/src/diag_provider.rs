@@ -21,6 +21,9 @@ pub struct ProviderConfig {
     pub grammar: bool,
     pub dictionary: Option<std::path::PathBuf>,
     pub max_file_length: u64,
+    /// Engine language code (ltex); `None` for engines without a language knob (E10 §9 —
+    /// the one engine-varying field; harper/vale receive `None` and ignore it).
+    pub language: Option<String>,
 }
 
 /// Lifecycle events a provider emits asynchronously, delivered as `Msg::DiagProviderEvent`.
@@ -169,6 +172,7 @@ impl PartialEq for ProviderConfig {
         self.grammar == other.grammar
             && self.dictionary == other.dictionary
             && self.max_file_length == other.max_file_length
+            && self.language == other.language
     }
 }
 
@@ -243,7 +247,7 @@ mod tests {
     fn recording_provider_records_every_call_in_order() {
         let mut p = RecordingProvider::new();
         p.ensure_running();
-        p.configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9 });
+        p.configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9, language: None });
         let accepted = p.notify_change(BufferId(3), 7, Some("/f.md".into()), "text".into());
         assert_eq!(accepted, Accepted::Yes, "default recorder accepts");
         p.notify_close(BufferId(3));
@@ -252,7 +256,7 @@ mod tests {
 
         assert_eq!(p.calls(), vec![
             ProviderCall::EnsureRunning,
-            ProviderCall::Configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9 }),
+            ProviderCall::Configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9, language: None }),
             ProviderCall::NotifyChange { buffer_id: BufferId(3), version: 7, path: Some("/f.md".into()), text: "text".into() },
             ProviderCall::NotifyClose(BufferId(3)),
             ProviderCall::ReloadDictionary,
