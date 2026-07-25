@@ -41,10 +41,10 @@ pub(crate) enum CommitOutcome {
 /// 1. `~/`-prefixed -> home-relative.
 /// 2. absolute      -> as typed.
 /// 3. otherwise     -> joined onto `dir`, NOT onto cwd.
-pub(crate) fn resolve_field(dir: &Path, field: &str) -> PathBuf {
+pub(crate) fn resolve_field(dir: &Path, field: &str, home: Option<&Path>) -> PathBuf {
     let t = field.trim();
-    if let Some(rest) = t.strip_prefix("~/") {
-        return dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(t));
+    if t.starts_with("~/") {
+        return crate::pathx::expand_tilde(t, home);
     }
     let p = PathBuf::from(t);
     if p.is_absolute() { p } else { dir.join(p) }
@@ -114,7 +114,8 @@ pub(crate) fn classify_destination_enter(
         };
     }
 
-    let resolved = resolve_field(dir, trimmed);
+    let home = dirs::home_dir();
+    let resolved = resolve_field(dir, trimmed, home.as_deref());
 
     // Row 3 — the one genuinely ambiguous case, resolved TOWARD DESCEND. A directory named
     // `chapter-one` in the list while Enter creates a FILE `chapter-one.md` beside it is the
@@ -545,33 +546,29 @@ mod tests {
         let d = tmp("resolve-rel");
         let cwd = std::env::current_dir().expect("cwd");
         assert_ne!(d, cwd, "test premise: fb.dir and cwd must differ");
-        assert_eq!(resolve_field(&d, "chapter.md"), d.join("chapter.md"));
-        assert_eq!(resolve_field(&d, "drafts/ch1.md"), d.join("drafts/ch1.md"),
+        assert_eq!(resolve_field(&d, "chapter.md", None), d.join("chapter.md"));
+        assert_eq!(resolve_field(&d, "drafts/ch1.md", None), d.join("drafts/ch1.md"),
             "a relative path WITH segments also resolves under fb.dir");
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
     fn absolute_and_home_relative_fields_are_honoured() {
-        // The `~/` assertion is MANDATORY, not conditional. It was originally guarded by
-        // `if let Some(home) = dirs::home_dir()`, which meant the entire tilde-expansion
-        // branch could be missing and this test would still pass on any container without
-        // a resolvable home — a vacuous pass exactly where the interesting behaviour is.
-        // `dirs::home_dir()` reads $HOME on unix, so the test SETS it and owns the answer.
+        // The `~/` assertion is MANDATORY, not conditional. It was once guarded by
+        // `if let Some(home) = dirs::home_dir()` (a vacuous pass on any container without
+        // a resolvable home), then made mandatory by mutating $HOME — the workspace's only
+        // env mutation, and `unsafe` from edition 2024. H33: the test OWNS the home answer
+        // by passing it, so nothing is mutated and the assertion still cannot vanish.
         //
         // FAIL-VERIFY: delete the `~/` arm from `resolve_field`, watch this fail.
         let d = tmp("resolve-abs");
-        assert_eq!(resolve_field(&d, "/etc/hosts"), std::path::PathBuf::from("/etc/hosts"));
+        assert_eq!(resolve_field(&d, "/etc/hosts", None),
+            std::path::PathBuf::from("/etc/hosts"));
 
         let home = tmp("resolve-home");
-        let prior = std::env::var_os("HOME");
-        // Edition 2021: `set_var` is safe here (it becomes `unsafe` only in edition 2024).
-        std::env::set_var("HOME", &home);
-        let got = resolve_field(&d, "~/notes.md");
-        match prior { Some(v) => std::env::set_var("HOME", v),
-                      None    => std::env::remove_var("HOME") }
+        let got = resolve_field(&d, "~/notes.md", Some(&home));
         assert_eq!(got, home.join("notes.md"),
-            "`~/` expands against the home dir, unconditionally asserted");
+            "`~/` expands against the injected home dir, unconditionally asserted");
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&d);
