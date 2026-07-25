@@ -356,6 +356,28 @@ discrete variants) untouched; `a3b_placement_sweep_categories` flipped to expect
 
 ## Theme B — rendering
 
+### B18 — Landmark visibility toggle — hide marks/block markers in-text while editing
+<!-- item: B18 -->
+
+**Shipped by effort B18** (`c1e2456`, 2026-07-24) — the ④ follow-on. A boolean view option
+`view_opts.landmarks_visible` (default TRUE — ④'s always-on) with a `toggle_landmarks` command (View
+menu, `MenuMark::OnOff`). When OFF it hides ALL in-text landmark paint — block boundaries, interior
+tint, the pending `^KB` cell, and `LandmarkGlyph` mark cells — via a SINGLE early-return gate in
+`block_paint::gather` (an empty `BlockPaint` makes `wants_placed()` false, `patch_glyph` a no-op,
+`trailing_marker` None). The status segments (`· BLK`, `· MK <ids>`, `BLK↑/↓`, `· BLK…`) SURVIVE
+because `render_status.rs` reads the model directly and is untouched — so a writer gets a clean
+composing surface but still knows the landmarks exist and can jump to them (Fork 1). Mirrors the
+`toggle_wrap_guide` template end-to-end, INCLUDING settings persistence (a deliberate OFF persists
+across sessions via the SettingsSnapshot/OView diff chain). Inline flip (no shared setter — matches
+the five existing bool view toggles; Law 6 is not test-enforced for single-path mutation); no default
+keybinding (palette + View-menu reach); pending `^KB` hidden when OFF is accepted (the `· BLK…` status
+carries the mid-mark feedback). Composes with the per-block `block_toggle_hidden` (the new gate is
+outermost) with zero changes. ZERO production edits to render.rs/render_status.rs; the whole
+production diff is a ~7-line `gather` guard + the option-plumbing template. Marginal perf win when
+OFF (a buffer whose only placed-path trigger was landmarks drops to the cheaper segs render path).
+Both final gates clean (Fable whole-branch PASS — probes closed the tint/trailing-marker gap + did
+the real serialize→reload restart path + mutation-tested for non-vacuity; Codex pre-merge GO).
+
 ### B12 — Lone block-begin marker renders nothing (^KB before ^KK is invisible)
 <!-- item: B12 -->
 

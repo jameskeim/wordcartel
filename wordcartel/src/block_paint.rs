@@ -27,7 +27,14 @@ pub(crate) struct BlockPaint {
 enum CellKind { Boundary, Pending, Landmark, Interior }
 
 /// Gather the active buffer's landmark state. O(#marks log #marks), once per frame.
+/// B18: when the user has toggled landmark visibility OFF, return the empty snapshot —
+/// every consumer (wants_placed / patch_glyph / trailing_marker) no-ops on it, so ALL
+/// in-text landmark paint is suppressed at this single seam. The status segments
+/// (render_status.rs) read the Editor directly and deliberately survive (Fork 1).
 pub(crate) fn gather(editor: &Editor) -> BlockPaint {
+    if !editor.view_opts.landmarks_visible {
+        return BlockPaint { block: None, pending: None, landmarks: Vec::new() };
+    }
     let b = editor.active();
     let mut landmarks: Vec<usize> = b.marks.values().copied().collect();
     landmarks.sort_unstable();
@@ -227,6 +234,31 @@ mod tests {
         let p = gather(&e);
         assert!(p.block.is_none(), "hidden block filtered at gather");
         assert_eq!(p.landmarks, vec![2, 7], "sorted + deduped");
+    }
+
+    // --- B18: the global visibility gate ---
+    #[test]
+    fn gather_gated_off_returns_the_empty_snapshot() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        e.active_mut().marked_block = Some(MarkedBlock { start: 0, end: 5, hidden: false });
+        e.active_mut().pending_block_begin = Some(7);
+        e.active_mut().marks.insert('a', 2);
+        e.view_opts.landmarks_visible = false;
+        let p = gather(&e);
+        assert!(p.block.is_none() && p.pending.is_none() && p.landmarks.is_empty(),
+            "OFF: gather returns the empty snapshot");
+        assert!(!p.wants_placed(), "OFF: landmarks never force the placed path");
+    }
+    #[test]
+    fn gather_global_gate_composes_with_per_block_hidden() {
+        // ON + per-block hidden → filtered (④ behavior — green-on-arrival pin).
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        e.active_mut().marked_block = Some(MarkedBlock { start: 0, end: 5, hidden: true });
+        assert!(gather(&e).block.is_none(), "per-block hidden filtered when globally ON");
+        // OFF + NOT hidden → still empty (the global gate is outermost — the RED half).
+        e.active_mut().marked_block = Some(MarkedBlock { start: 0, end: 5, hidden: false });
+        e.view_opts.landmarks_visible = false;
+        assert!(!gather(&e).wants_placed(), "global OFF hides a visible block");
     }
 
     // --- trailing marker (via a real Editor; LivePreview is the default mode) ---
