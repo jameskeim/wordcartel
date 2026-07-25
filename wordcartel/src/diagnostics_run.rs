@@ -366,8 +366,8 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
 /// site the config fold's `linters` comment points at (SPINE Task 8, spec §9).
 pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
-    // The core catalog in cycle order. Effort b appends ltex/vale here.
-    let catalog: &[DiagSource] = &[DiagSource::Harper];
+    // The core catalog in cycle order. T6 appends Vale here.
+    let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX];
     // Which engines are enabled: None → all core; Some(list) → exactly the named (config_name).
     let enabled_of = |src: DiagSource| -> bool {
         match &cfg.diagnostics.linters {
@@ -379,7 +379,8 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
         for name in list {
             if !catalog.iter().any(|s| s.config_name() == name) {
                 warns.push(format!(
-                    "config: diagnostics.linters — unknown engine \"{name}\" (known: harper, ltex, vale)"));
+                    "config: diagnostics.linters — unknown engine \"{name}\" (known: {})",
+                    catalog.iter().map(|s| s.config_name()).collect::<Vec<_>>().join(", ")));
             }
         }
     }
@@ -393,8 +394,16 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
                     max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
                     language: None,
                 })),
-            // Exhaustive — future core engines add arms; LTeX/Vale/Plugin are not in the catalog yet.
-            DiagSource::LTeX | DiagSource::Vale | DiagSource::Plugin(_) => continue,
+            DiagSource::LTeX => Box::new(crate::lsp_client::LspProvider::<crate::ltex_ls::LtexEngine>::new(
+                msg_tx.clone(),
+                crate::diag_provider::ProviderConfig {
+                    grammar: cfg.diagnostics.grammar,
+                    dictionary: None, // per-engine dictionaries are E11's (spec §14.2)
+                    max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for ltex (spec §9)
+                    language: Some(cfg.diagnostics.ltex_language.clone()),
+                })),
+            // Exhaustive — future core engines add arms; Vale/Plugin are not in the catalog yet.
+            DiagSource::Vale | DiagSource::Plugin(_) => continue,
         };
         editor.diag_providers.install(provider, enabled_of(src));
     }
@@ -1173,5 +1182,21 @@ mod tests {
         install_core_providers(&mut e, &cfg, &tx, &mut warns);
         assert!(!e.diag_providers.is_enabled(DiagSource::Harper), "empty list enables nothing");
         assert!(warns.is_empty(), "no unknown names to warn about");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 5 (E10): install_core_providers — the ltex catalog arm.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn install_core_providers_registers_ltex_after_harper() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
+        let sources: Vec<DiagSource> = e.diag_providers.sources().collect();
+        assert!(sources.starts_with(&[DiagSource::Harper, DiagSource::LTeX]),
+            "cycle order: harper first, ltex second (spec §13 catalog)");
+        assert!(warns.is_empty());
     }
 }

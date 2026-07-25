@@ -49,6 +49,26 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     fn classify(d: &Value) -> DiagnosticKind;
 }
 
+/// The shared spelling-vs-grammar fallback heuristic (E10 §7/§8): a lowercase "spell"
+/// substring across code/source/message. Engine classifiers try their own rule-id tables
+/// first and fall through to this. (harper's `classify_lsp` keeps its original private copy —
+/// the T1 pin; the two bodies are intentionally identical.)
+pub(crate) fn classify_spell_heuristic(d: &Value) -> DiagnosticKind {
+    let code = match d.get("code") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    if code.to_lowercase().contains("spell") { return DiagnosticKind::Spelling; }
+    let source = d.get("source").and_then(|s| s.as_str()).unwrap_or("");
+    let message = d.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    if format!("{source} {message}").to_lowercase().contains("spell") {
+        DiagnosticKind::Spelling
+    } else {
+        DiagnosticKind::Grammar
+    }
+}
+
 /// Grace after `shutdown` before the pump forces `exit` + kills the child (bounded quit latency).
 const SHUTDOWN_GRACE_MS: u64 = 1_000;
 /// Respawn budget per session — the initial spawn counts as the first (spec §3.4; anti-crash-loop).
