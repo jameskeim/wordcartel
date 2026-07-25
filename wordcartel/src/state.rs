@@ -162,15 +162,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "wc-state-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_support::scratch_dir("state")
     }
 
     #[test]

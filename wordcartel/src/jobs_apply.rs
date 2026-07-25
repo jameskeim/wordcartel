@@ -416,13 +416,9 @@ pub(crate) fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
 mod tests {
     use super::*;
     use crate::test_support::TestClock;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn quit_tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "wc-c4-{}-{}-{}.md",
-            tag, std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+        crate::test_support::scratch_path(&format!("c4-{tag}.md"))
     }
 
     #[test]

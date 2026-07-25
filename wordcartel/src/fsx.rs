@@ -683,12 +683,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     fn unique_dir(label: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "wc-fsx-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), label));
-        std::fs::create_dir_all(&d).expect("create dir");
-        d
+        crate::test_support::scratch_dir(&format!("fsx-{label}"))
     }
 
     #[cfg(unix)]

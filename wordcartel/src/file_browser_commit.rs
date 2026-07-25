@@ -461,13 +461,7 @@ mod tests {
         FileEntry { name: name.into(), kind, is_symlink: false, broken: false }
     }
     fn tmp(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "wc-commit-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), label));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
-        d
+        crate::test_support::scratch_dir(&format!("commit-{label}"))
     }
 
     // ---- The four rows of the decision table, in order ----------------------------

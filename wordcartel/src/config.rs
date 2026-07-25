@@ -953,15 +953,7 @@ mod tests {
 
     // tiny temp-dir helper (unique; avoids real $HOME)
     fn tempdir() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "wc-cfg-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::test_support::scratch_dir("cfg")
     }
 
     #[test]
@@ -1340,13 +1332,7 @@ mod tests {
     // idiom in this module. A shared path was H31: one test's remove_file deleted another
     // test's file between its write and its read.
     fn scratch_cfg_path(name: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "wcartel-cfg-{}-{name}-{}.toml",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
+        crate::test_support::scratch_path(&format!("cfg-{name}.toml"))
     }
 
     #[test]
