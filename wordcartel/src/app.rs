@@ -498,7 +498,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let anchor = cli.path.as_ref()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-    let xdg = dirs::config_dir();
+    let xdg = crate::pathx::PlatformDirs::from_env().config_dir;
     let hand_paths = config::config_layer_paths_with_fs(&*fs, &cli, xdg.as_deref(), &anchor);
     // The overrides layer: ABOVE the hand chain, BELOW --config (spec D3). --no-config
     // empties hand_paths and skips the overrides too (config_layer_paths returned early).

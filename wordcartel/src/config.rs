@@ -487,11 +487,12 @@ pub(crate) fn config_layer_paths_with_fs(
 #[allow(clippy::too_many_lines)] // config parse — one arm per config key
 pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
     // fs-chokepoint-allow: (w) the `RealFs` wrapper itself — its `*_with_fs` seam is what injected callers use
-    load_with_fs(&crate::fsx::RealFs, paths)
+    load_with_fs(&crate::fsx::RealFs, paths, &crate::pathx::PlatformDirs::from_env())
 }
 
 #[allow(clippy::too_many_lines)] // config parse — one arm per config key
-pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Config, Vec<String>) {
+pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf],
+    pdirs: &crate::pathx::PlatformDirs) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut warns = Vec::new();
     for p in paths {
@@ -659,19 +660,11 @@ pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Confi
             }
         }
         if let Some(s) = raw.diagnostics.dictionary {
-            // Fix A7: expand a leading `~/` (or bare `~`) to the home directory so
-            // paths like `~/foo/dict.txt` work correctly.  Without expansion a raw
-            // PathBuf would write to a literal `~` directory.
-            let expanded = if s == "~" {
-                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"))
-            } else if let Some(rest) = s.strip_prefix("~/") {
-                dirs::home_dir()
-                    .map(|h| h.join(rest))
-                    .unwrap_or_else(|| std::path::PathBuf::from(&s))
-            } else {
-                std::path::PathBuf::from(&s)
-            };
-            cfg.diagnostics.dictionary = Some(expanded);
+            // Fix A7: expand a leading `~/` (or bare `~`) to the home directory so paths
+            // like `~/foo/dict.txt` work correctly — via the pathx seam, against the home
+            // the CALLER resolved (H33: no env read below the boundary).
+            cfg.diagnostics.dictionary =
+                Some(crate::pathx::expand_tilde(&s, pdirs.home.as_deref()));
         }
         if let Some(v) = raw.diagnostics.linters { cfg.diagnostics.linters = Some(v); }
         // unknown linter names are validated against the core catalog in
@@ -683,10 +676,8 @@ pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf]) -> (Confi
         let layer_dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
         // Resolve a layer's `file` (~ expand + relative-to-this-config) if present.
         let resolved_file = rt.file.as_ref().map(|s| {
-            if s == "~" {
-                dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
-            } else if let Some(rest) = s.strip_prefix("~/") {
-                dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(s))
+            if s == "~" || s.starts_with("~/") {
+                crate::pathx::expand_tilde(s, pdirs.home.as_deref())
             } else {
                 let pb = PathBuf::from(s);
                 if pb.is_absolute() { pb } else { layer_dir.join(pb) }
@@ -1451,7 +1442,8 @@ mod tests {
         let p = d.join("config.toml");
         std::fs::write(&p, vec![b'#'; (crate::limits::MAX_CONFIG_BYTES + 1) as usize])
             .expect("seed oversized");
-        let (cfg, warns) = load_with_fs(&crate::fsx::RealFs, std::slice::from_ref(&p));
+        let (cfg, warns) = load_with_fs(&crate::fsx::RealFs, std::slice::from_ref(&p),
+            &crate::pathx::PlatformDirs { home: None, config_dir: None });
         assert_eq!(cfg.state.max_entries, Config::default().state.max_entries,
             "over-cap config falls back to defaults");
         // Names the OVER-CAP branch specifically. `|| w.contains("cannot read")` would let a
