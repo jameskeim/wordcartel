@@ -64,6 +64,7 @@ fn provider_flags_a_misspelling_and_respects_the_dictionary() {
         grammar: true,
         dictionary: Some(dict_path.clone()),
         max_file_length: 10_000_000,
+        language: None,
     };
     let mut provider = HarperLs::new(msg_tx, cfg.clone());
     provider.ensure_running();

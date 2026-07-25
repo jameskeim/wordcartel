@@ -123,6 +123,37 @@ pub fn arm_if_edited(editor: &mut Editor, before_id: BufferId, before_version: u
     }
 }
 
+/// E10 §6: observe the summon-predicate TRANSITION at the reduce-exit seam (the
+/// arm_if_edited chokepoint — every normal reduce exit; the sole bypass is the debug-only
+/// WCARTEL_SMOKE_PANIC branch, a panic path). Arm the idle-suspend deadline on leaving
+/// Review (mode change OR buffer switch), clear it on re-entry. Edge-triggered, never
+/// level-triggered (the resource law). The arm gate is ENABLEMENT only — started-ness is
+/// guarded provider-side (spec §6: no accessor; LspProvider::suspend no-ops unless
+/// SUSPENDABLE && started).
+pub fn idle_shutdown_track(editor: &mut Editor, summoned_before: bool,
+    clock: &dyn wordcartel_core::history::Clock) {
+    let summoned_now = should_run_diagnostics(editor);
+    if summoned_before && !summoned_now {
+        if editor.diag_providers.is_enabled(DiagSource::LTeX)
+            && editor.diag_cfg.ltex_idle_shutdown_min > 0
+        {
+            editor.diag_idle_due = Some(clock.now_ms()
+                .saturating_add(editor.diag_cfg.ltex_idle_shutdown_min.saturating_mul(60_000)));
+        }
+    } else if !summoned_before && summoned_now {
+        editor.diag_idle_due = None;
+    }
+}
+
+/// E10 §6: the one-shot fire — reached the due ⇒ clear it and suspend the heavy engines
+/// (only SUSPENDABLE providers act). No re-arm until the next leaving-Review transition.
+pub fn diag_idle_fire(editor: &mut Editor, now: u64) {
+    if matches!(editor.diag_idle_due, Some(due) if now >= due) {
+        editor.diag_idle_due = None;
+        editor.diag_providers.suspend_all_idle_heavy();
+    }
+}
+
 /// Fan out to every ENABLED source whose re-check is due at `now` (spec §7): snapshot the active
 /// buffer ONCE, apply the whole-document `DIAG_MAX_SEND_BYTES` cap once, then hand the snapshot to
 /// `dispatch_one` per due source — each source consumes its own slot's deadline and latches
@@ -366,8 +397,8 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
 /// site the config fold's `linters` comment points at (SPINE Task 8, spec §9).
 pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
-    // The core catalog in cycle order. Effort b appends ltex/vale here.
-    let catalog: &[DiagSource] = &[DiagSource::Harper];
+    // The complete core catalog in cycle order (E10 T6).
+    let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale];
     // Which engines are enabled: None → all core; Some(list) → exactly the named (config_name).
     let enabled_of = |src: DiagSource| -> bool {
         match &cfg.diagnostics.linters {
@@ -379,7 +410,8 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
         for name in list {
             if !catalog.iter().any(|s| s.config_name() == name) {
                 warns.push(format!(
-                    "config: diagnostics.linters — unknown engine \"{name}\" (known: harper)"));
+                    "config: diagnostics.linters — unknown engine \"{name}\" (known: {})",
+                    catalog.iter().map(|s| s.config_name()).collect::<Vec<_>>().join(", ")));
             }
         }
     }
@@ -391,9 +423,26 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
                     grammar: cfg.diagnostics.grammar,
                     dictionary: cfg.diagnostics.dictionary.clone(),
                     max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
+                    language: None,
                 })),
-            // Exhaustive — future core engines add arms; LTeX/Vale/Plugin are not in the catalog yet.
-            DiagSource::LTeX | DiagSource::Vale | DiagSource::Plugin(_) => continue,
+            DiagSource::LTeX => Box::new(crate::lsp_client::LspProvider::<crate::ltex_ls::LtexEngine>::new(
+                msg_tx.clone(),
+                crate::diag_provider::ProviderConfig {
+                    grammar: cfg.diagnostics.grammar,
+                    dictionary: None, // per-engine dictionaries are E11's (spec §14.2)
+                    max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for ltex (spec §9)
+                    language: Some(cfg.diagnostics.ltex_language.clone()),
+                })),
+            DiagSource::Vale => Box::new(crate::lsp_client::LspProvider::<crate::vale_ls::ValeEngine>::new(
+                msg_tx.clone(),
+                crate::diag_provider::ProviderConfig {
+                    grammar: cfg.diagnostics.grammar,
+                    dictionary: None,
+                    max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for vale (spec §9)
+                    language: None,
+                })),
+            // Exhaustive — every core engine has an arm; Plugin engines are not in this catalog.
+            DiagSource::Plugin(_) => continue,
         };
         editor.diag_providers.install(provider, enabled_of(src));
     }
@@ -404,6 +453,46 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     if let Some(first) = editor.diag_providers.enabled_sources().next() {
         editor.active_analysis_source = first;
     }
+    // E10 §13: the config-only default-engine override — applied ONLY when the named engine
+    // is enabled; known-but-disabled falls back loudly. (Unknown NAMES were already rejected
+    // at the config fold.) Direct field write, matching the seed above — construction, not
+    // set_analysis_source (which would status-message).
+    if let Some(want) = cfg.diagnostics.default_engine {
+        if editor.diag_providers.is_enabled(want) {
+            editor.active_analysis_source = want;
+        } else {
+            warns.push(format!(
+                "config: diagnostics.default_engine — \"{}\" is not enabled; using {}",
+                want.config_name(), editor.active_analysis_source.label()));
+        }
+    }
+}
+
+/// The engine-management dynamic menu rows (E10 §11): one row per registered engine,
+/// state-in-label ("on" / "off" / "warming…" / "not installed"), dispatching that engine's
+/// toggle command — menu ⊆ palette by construction. `Plugin` sources are skipped (their
+/// rows are E12's plugin-contributed-menu effort). Availability is lazily discovered: an
+/// absent binary reads "on" until Review first attempts a spawn (spec §11 display note).
+pub fn engine_menu_rows(editor: &Editor) -> Vec<(String, crate::menu::MenuRowAction)> {
+    use crate::diag_provider::Availability;
+    editor.diag_providers.sources().filter_map(|src| {
+        let cmd = match src {
+            DiagSource::Harper => "toggle_engine_harper",
+            DiagSource::LTeX => "toggle_engine_ltex",
+            DiagSource::Vale => "toggle_engine_vale",
+            DiagSource::Plugin(_) => return None,
+        };
+        let state = if !editor.diag_providers.is_enabled(src) { "off" }
+            else {
+                match editor.diag_providers.availability(src) {
+                    Some(Availability::Unavailable) => "not installed",
+                    Some(Availability::Starting) => "warming…",
+                    _ => "on", // Idle | Ready | None-entry (unreachable for a listed source)
+                }
+            };
+        Some((format!("{} — {}", src.label(), state),
+            crate::menu::MenuRowAction::Command(crate::registry::CommandId(cmd))))
+    }).collect()
 }
 
 #[cfg(test)]
@@ -1172,5 +1261,190 @@ mod tests {
         install_core_providers(&mut e, &cfg, &tx, &mut warns);
         assert!(!e.diag_providers.is_enabled(DiagSource::Harper), "empty list enables nothing");
         assert!(warns.is_empty(), "no unknown names to warn about");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 5 (E10): install_core_providers — the ltex catalog arm.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn install_core_providers_registers_ltex_after_harper() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
+        let sources: Vec<DiagSource> = e.diag_providers.sources().collect();
+        assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale],
+            "the complete E10 catalog in cycle order");
+        assert!(warns.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Task 10 (E10 §13): the config-only default-engine seed override.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_engine_overrides_the_seed_when_enabled() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.default_engine = Some(DiagSource::LTeX);
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert_eq!(e.active_analysis_source, DiagSource::LTeX, "spec §13 override");
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn default_engine_disabled_falls_back_with_a_warning() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.default_engine = Some(DiagSource::Vale);
+        cfg.diagnostics.linters = Some(vec!["harper".into(), "ltex".into()]); // vale NOT enabled
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper,
+            "known-but-disabled → harper-first fallback (spec §13)");
+        assert!(warns.iter().any(|w| w.contains("default_engine")),
+            "the fallback is loud (config warning), never silent");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 8 (E10 §6): idle_shutdown_track / diag_idle_fire — the leaving-Review
+    // transition seam that arms the heavy (ltex) engine's suspend deadline.
+    // ------------------------------------------------------------------
+
+    fn ltex_enabled_editor() -> crate::editor::Editor {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        e.diag_cfg.enabled = true;
+        e
+    }
+
+    #[test]
+    fn leaving_review_arms_the_idle_due_and_reentry_clears_it() {
+        use crate::test_support::TestClock;
+        let mut e = ltex_enabled_editor();
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        // true → false (mode change out of Review).
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        idle_shutdown_track(&mut e, before, &TestClock::new(1_000));
+        assert_eq!(e.diag_idle_due, Some(1_000 + 15 * 60_000), "default 15 min (spec §6)");
+        // false → true (re-entry) clears.
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        idle_shutdown_track(&mut e, before, &TestClock::new(2_000));
+        assert_eq!(e.diag_idle_due, None, "the grace: re-entry cancels");
+    }
+
+    #[test]
+    fn buffer_switch_out_of_review_also_arms() {
+        use crate::test_support::TestClock;
+        let mut e = ltex_enabled_editor();
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        e.install_scratch(); // a second, non-Review buffer
+        let before = should_run_diagnostics(&e); // true (active is the Review buffer)
+        e.switch_to_index(1); // scratch — Draft mode
+        idle_shutdown_track(&mut e, before, &TestClock::new(500));
+        assert!(e.diag_idle_due.is_some(),
+            "the predicate transition fires on buffer switches, not only set_render_mode (spec §6)");
+    }
+
+    #[test]
+    fn no_arm_when_ltex_disabled_or_zero_config_or_no_transition() {
+        use crate::test_support::TestClock;
+        // Disabled ltex: never arms.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        idle_shutdown_track(&mut e, before, &TestClock::new(0));
+        assert_eq!(e.diag_idle_due, None, "no ltex entry → no arm");
+        // Zero config: never arms.
+        let mut e = ltex_enabled_editor();
+        e.diag_cfg.ltex_idle_shutdown_min = 0;
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        idle_shutdown_track(&mut e, before, &TestClock::new(0));
+        assert_eq!(e.diag_idle_due, None, "0 = keep warm forever (ruling 3)");
+        // No transition: staying out of Review is a no-op (edge-triggered, not level).
+        let mut e = ltex_enabled_editor();
+        idle_shutdown_track(&mut e, false, &TestClock::new(0));
+        assert_eq!(e.diag_idle_due, None);
+    }
+
+    #[test]
+    fn diag_idle_fire_suspends_and_clears_once() {
+        let mut e = ltex_enabled_editor();
+        let rec = crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper);
+        let calls = rec.calls_handle();
+        e.diag_providers.install(Box::new(rec), true);
+        e.diag_idle_due = Some(1_000);
+        diag_idle_fire(&mut e, 999);
+        assert!(e.diag_idle_due.is_some(), "not yet due");
+        diag_idle_fire(&mut e, 1_000);
+        assert_eq!(e.diag_idle_due, None, "one-shot: cleared on fire");
+        assert!(calls.lock().unwrap().iter().any(|c|
+            matches!(c, crate::diag_provider::ProviderCall::Suspend)),
+            "fire delegates to suspend_all_idle_heavy (every entry; SUSPENDABLE gating is provider-side)");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 9 (E10 §11): engine_menu_rows — the state-in-label matrix.
+    // ------------------------------------------------------------------
+
+    /// The COMPLETE spec-§11 label matrix — every cell of enabled×availability:
+    /// disabled → "off" (wins over availability); enabled+Unavailable → "not installed";
+    /// enabled+Starting → "warming…"; enabled+Ready → "on"; enabled+Idle → "on"; and the
+    /// Plugin-source skip. Two fixture editors cover the five cells across three sources.
+    #[test]
+    fn engine_menu_rows_state_labels_and_toggle_actions() {
+        use crate::diag_provider::{Availability, RecordingProvider};
+        use crate::menu::MenuRowAction;
+        use crate::registry::CommandId;
+        /// A fixture editor with the three core engines at the given (availability, enabled).
+        fn fixture(cells: [(DiagSource, Availability, bool); 3]) -> crate::editor::Editor {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+            for (src, avail, enabled) in cells {
+                e.diag_providers.install(Box::new(RecordingProvider::new()
+                    .with_source(src).with_availability(avail)), enabled);
+            }
+            e
+        }
+
+        // Scenario A: on (Ready) / warming… / not installed — all ENABLED — plus Plugin skip.
+        let mut e = fixture([
+            (DiagSource::Harper, Availability::Ready, true),
+            (DiagSource::LTeX, Availability::Starting, true),
+            (DiagSource::Vale, Availability::Unavailable, true),
+        ]);
+        e.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Plugin("mock"))), true); // skipped: no command (E12)
+        let rows = engine_menu_rows(&e);
+        assert_eq!(rows.len(), 3, "Plugin sources are skipped (spec §11)");
+        assert_eq!(rows[0], ("Harper — on".to_string(),
+            MenuRowAction::Command(CommandId("toggle_engine_harper"))));
+        assert_eq!(rows[1], ("LTeX — warming…".to_string(),
+            MenuRowAction::Command(CommandId("toggle_engine_ltex"))));
+        assert_eq!(rows[2], ("vale — not installed".to_string(),
+            MenuRowAction::Command(CommandId("toggle_engine_vale"))),
+            "enabled + Unavailable → not installed");
+
+        // Scenario B: the remaining cells — enabled+Idle → "on"; disabled → "off" (wins over
+        // availability, here a Ready recorder).
+        let e2 = fixture([
+            (DiagSource::Harper, Availability::Idle, true),
+            (DiagSource::LTeX, Availability::Ready, false),
+            (DiagSource::Vale, Availability::Starting, false),
+        ]);
+        let rows2 = engine_menu_rows(&e2);
+        assert_eq!(rows2[0].0, "Harper — on", "enabled + Idle (not yet summoned) → on");
+        assert_eq!(rows2[1].0, "LTeX — off", "disabled wins over Ready availability");
+        assert_eq!(rows2[2].0, "vale — off", "disabled wins over Starting availability");
     }
 }

@@ -274,9 +274,11 @@ pub fn reduce(
     }
     let before_id = editor.active().id;
     let before_version = editor.active().document.version;
+    let before_summoned = crate::diagnostics_run::should_run_diagnostics(editor); // E10 §6
     let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx, fs };
     let keep = reduce_dispatch(msg, editor, &ctx);
     crate::diagnostics_run::arm_if_edited(editor, before_id, before_version, clock);
+    crate::diagnostics_run::idle_shutdown_track(editor, before_summoned, clock);
     keep
 }
 

@@ -21,6 +21,9 @@ pub struct ProviderConfig {
     pub grammar: bool,
     pub dictionary: Option<std::path::PathBuf>,
     pub max_file_length: u64,
+    /// Engine language code (ltex); `None` for engines without a language knob (E10 §9 —
+    /// the one engine-varying field; harper/vale receive `None` and ignore it).
+    pub language: Option<String>,
 }
 
 /// Lifecycle events a provider emits asynchronously, delivered as `Msg::DiagProviderEvent`.
@@ -48,6 +51,9 @@ pub trait DiagnosticsProvider: std::fmt::Debug {
     /// Best-effort: ask the server to re-read `userDictPath` (a config resend). NOT a writer.
     fn reload_dictionary(&mut self);
     fn shutdown(&mut self);
+    /// E10 §5: ask a heavy engine to release its child process until next summoned.
+    /// Default no-op — only suspendable LSP providers (ltex) override behavior.
+    fn suspend(&mut self) {}
 }
 
 /// The registered diagnostic engines, identified by `DiagSource`. Insertion order is the lens
@@ -116,6 +122,10 @@ impl ProviderSet {
     pub fn shutdown_all(&mut self) {
         for e in self.entries.iter_mut() { e.provider.shutdown(); }
     }
+    /// Fire the idle suspend at every entry — only SUSPENDABLE providers act (E10 §6).
+    pub fn suspend_all_idle_heavy(&mut self) {
+        for e in self.entries.iter_mut() { e.provider.suspend(); }
+    }
 }
 
 /// Thin reduce/prompts delegation (spec §2). `clock` is needed for the Restarted re-arm.
@@ -151,6 +161,7 @@ pub(crate) enum ProviderCall {
     NotifyClose(BufferId),
     ReloadDictionary,
     Shutdown,
+    Suspend,
 }
 
 // `ProviderConfig` needs `PartialEq` only for the recorded-call assertions above; derived here
@@ -161,6 +172,7 @@ impl PartialEq for ProviderConfig {
         self.grammar == other.grammar
             && self.dictionary == other.dictionary
             && self.max_file_length == other.max_file_length
+            && self.language == other.language
     }
 }
 
@@ -218,6 +230,7 @@ impl DiagnosticsProvider for RecordingProvider {
     fn notify_close(&mut self, buffer_id: BufferId) { self.push(ProviderCall::NotifyClose(buffer_id)); }
     fn reload_dictionary(&mut self) { self.push(ProviderCall::ReloadDictionary); }
     fn shutdown(&mut self) { self.push(ProviderCall::Shutdown); }
+    fn suspend(&mut self) { self.push(ProviderCall::Suspend); }
 }
 
 #[cfg(test)]
@@ -234,7 +247,7 @@ mod tests {
     fn recording_provider_records_every_call_in_order() {
         let mut p = RecordingProvider::new();
         p.ensure_running();
-        p.configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9 });
+        p.configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9, language: None });
         let accepted = p.notify_change(BufferId(3), 7, Some("/f.md".into()), "text".into());
         assert_eq!(accepted, Accepted::Yes, "default recorder accepts");
         p.notify_close(BufferId(3));
@@ -243,7 +256,7 @@ mod tests {
 
         assert_eq!(p.calls(), vec![
             ProviderCall::EnsureRunning,
-            ProviderCall::Configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9 }),
+            ProviderCall::Configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9, language: None }),
             ProviderCall::NotifyChange { buffer_id: BufferId(3), version: 7, path: Some("/f.md".into()), text: "text".into() },
             ProviderCall::NotifyClose(BufferId(3)),
             ProviderCall::ReloadDictionary,
@@ -352,5 +365,16 @@ mod tests {
         assert_eq!(set.notify_change(DiagSource::Vale, BufferId(1), 3, None, "t".into()), Accepted::No,
             "unknown source never latches");
         assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::EnsureRunning)));
+    }
+
+    #[test]
+    fn recording_provider_records_suspend_and_set_delegates() {
+        let rec = RecordingProvider::new().with_source(DiagSource::LTeX);
+        let calls = rec.calls_handle();
+        let mut set = ProviderSet::default();
+        set.install(Box::new(rec), true);
+        set.suspend_all_idle_heavy();
+        assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::Suspend)),
+            "suspend_all_idle_heavy reaches every entry; the recorder observes it");
     }
 }

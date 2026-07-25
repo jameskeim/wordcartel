@@ -66,8 +66,12 @@ pub struct DynamicSection {
 
 /// The Documents dynamic section (Task 4.2): one row per open buffer, data, not
 /// registered commands — exempt from the palette/registry command surface.
-pub const DYNAMIC_SECTIONS: &[DynamicSection] =
-    &[DynamicSection { category: MenuCategory::Documents, rows: crate::workspace::documents_menu_rows }];
+pub const DYNAMIC_SECTIONS: &[DynamicSection] = &[
+    DynamicSection { category: MenuCategory::Documents, rows: crate::workspace::documents_menu_rows },
+    // E10 §11: engine management ships with engines — a builtin fn-pointer row, zero
+    // coupling to the deferred plugin-dynamic-menu machinery (that widening is E12's).
+    DynamicSection { category: MenuCategory::View, rows: crate::diagnostics_run::engine_menu_rows },
+];
 
 fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Editor)
     -> Vec<(MenuCategory, Vec<(String, MenuRowAction)>)> {
@@ -646,5 +650,25 @@ mod tests {
         let _ = intercept(crate::app::Msg::Input(enter_key()), &mut ed, &ctx);
         assert_eq!(ed.active().id, b_id, "selecting the Documents row switches to that buffer");
         assert!(ed.menu.is_none(), "menu closes after activation");
+    }
+
+    /// Task 9 (E10 §11): the View dynamic section carries the engine-management rows,
+    /// wired through the same `DYNAMIC_SECTIONS` seam `grouped_commands` consumes — test the
+    /// REAL wiring seam directly (the `group_items` test helper ignores its argument and
+    /// rebuilds from a providerless `throwaway_editor()`, so the label/action matrix itself
+    /// is covered by the direct `engine_menu_rows` unit test in `diagnostics_run.rs`).
+    #[test]
+    fn dynamic_sections_carries_the_view_engine_section() {
+        // Fully-qualified: menu.rs::tests has only `use super::*;` (no Editor import) — the
+        // neighbors (throwaway_editor etc.) all write crate::editor::Editor::new_from_text.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        crate::test_support::install_enabled_harper(&mut e);
+        let section = DYNAMIC_SECTIONS.iter()
+            .find(|s| s.category == MenuCategory::View)
+            .expect("E10 §11: the engine section is registered under View");
+        let rows = (section.rows)(&e);
+        assert!(rows.iter().any(|(label, action)| label.starts_with("Harper — ")
+                && *action == MenuRowAction::Command(CommandId("toggle_engine_harper"))),
+            "the View dynamic section yields engine rows from the PASSED editor");
     }
 }

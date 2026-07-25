@@ -623,6 +623,10 @@ pub struct Editor {
     /// latch, cleared in set_render_mode on entering Review). One hint per source per entry —
     /// informative, not naggy. Spec §9.
     pub diag_hint_shown: std::collections::BTreeSet<wordcartel_core::diagnostics::DiagSource>,
+    /// E10 §6: the armed idle-suspend deadline for the heavy (ltex) engine — `Some(due_ms)`
+    /// after a leaving-Review transition, cleared on re-entry or fire. Read by the
+    /// `timers.rs` "diag_idle" row; never persisted.
+    pub diag_idle_due: Option<u64>,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
     /// Theme picker overlay state. XOR with all other overlays.
@@ -754,6 +758,7 @@ impl Editor {
             diag_providers: crate::diag_provider::ProviderSet::default(),
             active_analysis_source: wordcartel_core::diagnostics::DiagSource::Harper,
             diag_hint_shown: std::collections::BTreeSet::new(),
+            diag_idle_due: None,
             outline: None,
             theme_picker: None,
             file_browser: None,

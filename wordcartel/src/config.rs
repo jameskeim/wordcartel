@@ -81,13 +81,22 @@ pub struct DiagnosticsConfig {
     /// re-read it, never to append. `None` → harper falls back to its own default path.
     pub dictionary: Option<std::path::PathBuf>,
     pub linters: Option<Vec<String>>,
+    /// `[diagnostics] default_engine` — the lens the Review view seeds to at startup when the
+    /// named engine is installed+enabled (E10 §13). Config-only: no command surface.
+    pub default_engine: Option<wordcartel_core::diagnostics::DiagSource>,
+    /// `[diagnostics.ltex] language` — the LanguageTool language code sent to ltex-ls-plus.
+    pub ltex_language: String,
+    /// `[diagnostics.ltex] idle_shutdown_min` — minutes of no-Review before the ltex JVM is
+    /// suspended (E10 §6). `0` = keep warm forever.
+    pub ltex_idle_shutdown_min: u64,
 }
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         // Fix A7: resolve a sensible default dictionary path (<config_dir>/wordcartel/dictionary.txt)
         // so add-to-dictionary works out of the box without explicit configuration.
         let dictionary = default_dictionary_path(dirs::config_dir().as_deref());
-        DiagnosticsConfig { enabled: true, grammar: true, debounce_ms: 400, dictionary, linters: None }
+        DiagnosticsConfig { enabled: true, grammar: true, debounce_ms: 400, dictionary, linters: None,
+            default_engine: None, ltex_language: "en-US".into(), ltex_idle_shutdown_min: 15 }
     }
 }
 
@@ -346,7 +355,9 @@ struct RawDiagnostics {
     debounce_ms: Option<u64>,
     dictionary: Option<String>,
     linters: Option<Vec<String>>,
+    default_engine: Option<String>,
     harper: RawHarperEngine,
+    ltex: RawLtexEngine,
 }
 /// `[diagnostics.harper]` — the per-engine table for the harper linter (SPINE Task 8, spec §9.1).
 /// `grammar` here is a config-file *spelling* of the already-global `diagnostics.grammar` option
@@ -356,6 +367,14 @@ struct RawDiagnostics {
 #[serde(default)]
 struct RawHarperEngine {
     grammar: Option<bool>,
+}
+/// `[diagnostics.ltex]` — the per-engine table for the ltex linter (E10 §9): the
+/// LanguageTool language code and the JVM idle-suspend timeout (minutes; 0 = never).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawLtexEngine {
+    language: Option<String>,
+    idle_shutdown_min: Option<u64>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -676,6 +695,20 @@ pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf],
         // unknown linter names are validated against the core catalog in
         // `diagnostics_run::install_core_providers` — warned there (SPINE Task 8), once the
         // engine catalog itself exists to validate against.
+        if let Some(name) = raw.diagnostics.default_engine {
+            use wordcartel_core::diagnostics::DiagSource;
+            match name.as_str() {
+                "harper" => cfg.diagnostics.default_engine = Some(DiagSource::Harper),
+                "ltex" => cfg.diagnostics.default_engine = Some(DiagSource::LTeX),
+                "vale" => cfg.diagnostics.default_engine = Some(DiagSource::Vale),
+                other => warns.push(format!(
+                    "config: diagnostics.default_engine — unknown engine \"{other}\" (known: harper, ltex, vale)")),
+            }
+        }
+        if let Some(v) = raw.diagnostics.ltex.language { cfg.diagnostics.ltex_language = v; }
+        if let Some(v) = raw.diagnostics.ltex.idle_shutdown_min {
+            cfg.diagnostics.ltex_idle_shutdown_min = v;
+        }
 
         // ---- [theme] (discriminated source; file resolved vs the declaring config) ----
         let rt = raw.theme;
@@ -1445,6 +1478,46 @@ mod tests {
     // -----------------------------------------------------------------------
     // Task 6: config-class reads acquire a cap
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // E10 Task 4: [diagnostics] default_engine + [diagnostics.ltex] language/idle_shutdown_min
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diagnostics_default_engine_folds_known_and_warns_unknown() {
+        let (cfg, warns) = load_cfg("de_known.toml", r#"
+[diagnostics]
+default_engine = "ltex"
+"#);
+        assert_eq!(cfg.diagnostics.default_engine,
+            Some(wordcartel_core::diagnostics::DiagSource::LTeX));
+        assert!(warns.is_empty());
+
+        let (cfg2, warns2) = load_cfg("de_unknown.toml", r#"
+[diagnostics]
+default_engine = "grammarly"
+"#);
+        assert_eq!(cfg2.diagnostics.default_engine, None, "unknown name → not set");
+        assert!(warns2.iter().any(|w| w.contains("default_engine") && w.contains("grammarly")),
+            "unknown default_engine warns with the known set");
+    }
+
+    #[test]
+    fn diagnostics_ltex_table_folds_language_and_idle_with_defaults() {
+        let (cfg, warns) = load_cfg("ltex_keys.toml", r#"
+[diagnostics.ltex]
+language = "de-DE"
+idle_shutdown_min = 0
+"#);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.diagnostics.ltex_language, "de-DE");
+        assert_eq!(cfg.diagnostics.ltex_idle_shutdown_min, 0, "0 = never suspend");
+
+        let (dflt, _) = load_cfg("ltex_defaults.toml", "");
+        assert_eq!(dflt.diagnostics.ltex_language, "en-US", "spec §9 default");
+        assert_eq!(dflt.diagnostics.ltex_idle_shutdown_min, 15, "spec ruling 3 default");
+        assert_eq!(dflt.diagnostics.default_engine, None);
+    }
 
     #[test]
     fn config_over_cap_degrades_like_an_unreadable_file() {
