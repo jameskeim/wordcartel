@@ -3,7 +3,7 @@
 
 # Backlog
 
-**33 open · 81 shipped · 2 dropped**
+**31 open · 83 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -34,8 +34,6 @@ Blocking Effort P: **0**
 | H28 | Un-pumped picker tests assert unreachable states | triage | feature | TBD |  | Un-pumped picker tests assert unreachable states |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | H30 | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes | triage | bug | TBD |  | subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes |
-| H32 | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam | triage | feature | TBD |  | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam |
-| H33 | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle | triage | feature | TBD |  | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle |
 | H34 | cursor_style restore_caret_if_written_gated_by_latch flake — 1/30, then 0/470 | watch | bug | TBD |  | Seen once (1/30) on a deliberately-broken tree; 0/470 on clean main at two concurrencies — rate bounded <0.64% |
 | H35 | Position-space newtypes to tag confusable byte spaces | triage | feature | TBD |  | Position-space newtypes to tag confusable byte spaces |
 | H36 | Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam | triage | feature | TBD |  | Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam |
@@ -47,10 +45,12 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>81 shipped</summary>
+<details><summary>83 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| H32 | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam | 2026-07-25 | 636f036 |
+| H33 | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle | 2026-07-25 | 636f036 |
 | B12 | Lone block-begin marker renders nothing (^KB before ^KK is invisible) | 2026-07-24 | 2f1bb56 |
 | B13 | Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs) | 2026-07-24 | f5a8b82 |
 | B18 | Landmark visibility toggle — hide marks/block markers in-text while editing | 2026-07-24 | c1e2456 |

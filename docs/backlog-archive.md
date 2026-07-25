@@ -2647,3 +2647,50 @@ correctly failed; a `DeadFs` → the fs tests correctly failed). Both final gate
 Codex GO). Origin: deferred out of C5 Task 5 (2026-07-18); the "surprise on size" the effort-①
 measurement flagged (2026-07-19) is exactly what R1/(d′) absorb. See also [[H1]] — the god-object
 split this anti-regrowth lint exists to prevent recurring.
+
+### H32 — Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam
+<!-- item: H32 -->
+
+**SHIPPED 2026-07-25 (merge `636f036`)** as the H32 half of the combined "tests get their
+environment from a seam, not the process" effort (with [[H33]]). Grounding corrected the filed
+"13" to **15** helpers (the census table's 14 rows + `config.rs::scratch_cfg_path`, itself H31's
+own fix). Delivered as one `test_support` seam — `scratch_path(label)` (unique path, not created)
+and `scratch_dir(label)` (unique dir, created + empty by construction), sharing ONE
+`SCRATCH_SEQ: AtomicU64`, format `wc-scratch-{pid}-{seq}-{label}` — backed by a ≥32-thread
+uniqueness-invariant test (mutation-proven: pinning the counter makes it fail). All 15 legacy
+helpers plus 11 inline `SEQ` co-users (in `file.rs`/`app.rs`/`swap.rs`) now delegate to it; every
+legacy `static SEQ` deleted (survivors: 3 production — `editor::DocumentId::mint`, `fsx::TEMP_SEQ`,
+`clipboard::PASTE_SEQ` — plus the seam's own `SCRATCH_SEQ`). `nix_privileged`'s latent
+fixed-name path folded onto the seam too. The ~105 loose inline `temp_dir()` constructions and 2
+integration-test sites were declared out of scope and filed as **[[H36]]** (`depends_on H32`). NOT
+solved with a textual scanner (rejected at H31 fork 3 / effort ① D5 — a second scanner leaves most
+evasion routes uncaught; the structural answer is one seam).
+
+Original filing (idiom-correct duplication, not a bug; the H31 flake was this idiom
+*available-and-not-used*; scoped out of H31 fork 3 as too broad for that small effort): the 13-site
+census was `file.rs`, `settings.rs`, `save.rs`, `config.rs` (×2), `file_browser_commit.rs`,
+`fsx.rs` (×2), `state.rs`, `swap.rs`, `app.rs`, `jobs_apply.rs`, `session_restore.rs`,
+`plugin/load.rs`. See [[H31]] (the flake that motivated it) and [[H33]] (the HOME/env half).
+
+### H33 — Test set_var(HOME) mutates process-wide state read by three config tests as an oracle
+<!-- item: H33 -->
+
+**SHIPPED 2026-07-25 (merge `636f036`)** as the H33 half of the combined "tests get their
+environment from a seam" effort (with [[H32]]). The one `std::env::set_var("HOME")` in
+`file_browser_commit.rs::absolute_and_home_relative_fields_are_honoured` — the **only** env
+mutation in the workspace — is **deleted**, resolving the mechanism fork toward *narrow explicit
+injection* (the house pattern already used by `app.rs`'s xdg boundary + `swap::state_dir`), NOT a
+broad `Fs`-trait change. Delivered as a pure `pathx::expand_tilde(text, home: Option<&Path>)` +a
+`PlatformDirs { home, config_dir }` carrier (`pathx::from_env()` at production boundaries), threaded
+through `load_with_fs` and `resolve_field` so home is injected, never read from the process env in
+tests. The four duplicated tilde-expansion sites collapse onto the one pure fn (a DRY win taken in
+the same move); bare-`~` nonuniformity preserved verbatim (only `~/` delegates at
+`resolve_field`/`expand_path`). The three config oracle tests now assert **unconditionally** against
+injected dirs (two were vacuous-skips when `HOME`/config-dir was unset — a "verification step that
+cannot fail" removed); `default_dictionary_path(config_dir)` extracted as a pure fn with a new
+`None`-case test. Clears the workspace's only **edition-2024** `unsafe`-env blocker.
+
+Original filing: never observed to fire (same *genus* as [[H31]] — a test observing process state
+another test mutates — different *species*); scoped out of H31 fork 1 for its own mechanism fork;
+edition-2024 `set_var`-becomes-`unsafe` was the forcing function. See [[H32]] (the scratch-path
+half) and [[H31]].
