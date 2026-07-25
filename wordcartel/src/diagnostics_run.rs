@@ -366,8 +366,8 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
 /// site the config fold's `linters` comment points at (SPINE Task 8, spec §9).
 pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
-    // The core catalog in cycle order. T6 appends Vale here.
-    let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX];
+    // The complete core catalog in cycle order (E10 T6).
+    let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale];
     // Which engines are enabled: None → all core; Some(list) → exactly the named (config_name).
     let enabled_of = |src: DiagSource| -> bool {
         match &cfg.diagnostics.linters {
@@ -402,8 +402,16 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
                     max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for ltex (spec §9)
                     language: Some(cfg.diagnostics.ltex_language.clone()),
                 })),
-            // Exhaustive — future core engines add arms; Vale/Plugin are not in the catalog yet.
-            DiagSource::Vale | DiagSource::Plugin(_) => continue,
+            DiagSource::Vale => Box::new(crate::lsp_client::LspProvider::<crate::vale_ls::ValeEngine>::new(
+                msg_tx.clone(),
+                crate::diag_provider::ProviderConfig {
+                    grammar: cfg.diagnostics.grammar,
+                    dictionary: None,
+                    max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for vale (spec §9)
+                    language: None,
+                })),
+            // Exhaustive — every core engine has an arm; Plugin engines are not in this catalog.
+            DiagSource::Plugin(_) => continue,
         };
         editor.diag_providers.install(provider, enabled_of(src));
     }
@@ -1195,8 +1203,8 @@ mod tests {
         let mut warns = Vec::new();
         install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
         let sources: Vec<DiagSource> = e.diag_providers.sources().collect();
-        assert!(sources.starts_with(&[DiagSource::Harper, DiagSource::LTeX]),
-            "cycle order: harper first, ltex second (spec §13 catalog)");
+        assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale],
+            "the complete E10 catalog in cycle order");
         assert!(warns.is_empty());
     }
 }
