@@ -453,6 +453,19 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     if let Some(first) = editor.diag_providers.enabled_sources().next() {
         editor.active_analysis_source = first;
     }
+    // E10 §13: the config-only default-engine override — applied ONLY when the named engine
+    // is enabled; known-but-disabled falls back loudly. (Unknown NAMES were already rejected
+    // at the config fold.) Direct field write, matching the seed above — construction, not
+    // set_analysis_source (which would status-message).
+    if let Some(want) = cfg.diagnostics.default_engine {
+        if editor.diag_providers.is_enabled(want) {
+            editor.active_analysis_source = want;
+        } else {
+            warns.push(format!(
+                "config: diagnostics.default_engine — \"{}\" is not enabled; using {}",
+                want.config_name(), editor.active_analysis_source.label()));
+        }
+    }
 }
 
 /// The engine-management dynamic menu rows (E10 §11): one row per registered engine,
@@ -1264,6 +1277,37 @@ mod tests {
         assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale],
             "the complete E10 catalog in cycle order");
         assert!(warns.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Task 10 (E10 §13): the config-only default-engine seed override.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_engine_overrides_the_seed_when_enabled() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.default_engine = Some(DiagSource::LTeX);
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert_eq!(e.active_analysis_source, DiagSource::LTeX, "spec §13 override");
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn default_engine_disabled_falls_back_with_a_warning() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.default_engine = Some(DiagSource::Vale);
+        cfg.diagnostics.linters = Some(vec!["harper".into(), "ltex".into()]); // vale NOT enabled
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper,
+            "known-but-disabled → harper-first fallback (spec §13)");
+        assert!(warns.iter().any(|w| w.contains("default_engine")),
+            "the fallback is loud (config warning), never silent");
     }
 
     // ------------------------------------------------------------------
