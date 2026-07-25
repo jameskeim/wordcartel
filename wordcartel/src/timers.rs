@@ -129,6 +129,10 @@ fn diag_deadline(e: &Editor, _now: u64) -> Option<u64> {
     } else { None }
 }
 
+/// E10 §6: the idle-suspend deadline — armed by the leaving-Review transition, cleared on
+/// re-entry/fire; `None` at rest (idle-free). The pos_sweep row's gated-Option shape.
+fn diag_idle_deadline(e: &Editor, _now: u64) -> Option<u64> { e.diag_idle_due }
+
 /// Block-tree reconcile deadline — same A3 shape as diagnostics: excluded while a
 /// reparse is in flight (`due_at` may be past-due, armed before the reparse), so
 /// the `in_flight_version.is_none()` gate prevents a recv_timeout(0) spin.
@@ -165,7 +169,8 @@ fn plugin_timer_deadline(e: &Editor, _now: u64) -> Option<u64> {
 
 /// The timed-subsystem table. Order = the run loop's historical fold order
 /// (documented fire order): swap, save-quit, scrollbar-fade, menu-dwell,
-/// scrollbar-dwell, status-dwell, diagnostics, reconcile, pos_sweep, on_change, plugin_timer.
+/// scrollbar-dwell, status-dwell, diagnostics, diag_idle, reconcile, pos_sweep, on_change,
+/// plugin_timer.
 pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "swap",         deadline: swap_deadline },
     TimedSubsystem { name: "save_quit",    deadline: sq_deadline },
@@ -174,6 +179,7 @@ pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "sb_dwell",     deadline: sb_dwell_deadline },
     TimedSubsystem { name: "status_dwell", deadline: status_dwell_deadline },
     TimedSubsystem { name: "diagnostics",  deadline: diag_deadline },
+    TimedSubsystem { name: "diag_idle",    deadline: diag_idle_deadline },
     TimedSubsystem { name: "reconcile",    deadline: reconcile_deadline },
     TimedSubsystem { name: "pos_sweep",    deadline: pos_sweep_deadline },
     TimedSubsystem { name: "on_change",    deadline: on_change_deadline },
@@ -215,6 +221,8 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     {
         crate::diagnostics_run::dispatch_diagnostics(editor, now);
     }
+    // E10 §6: suspend the heavy engine when the idle deadline is reached.
+    crate::diagnostics_run::diag_idle_fire(editor, now);
     // Dispatch a block-tree reconcile if due.
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
         crate::reconcile::dispatch_reconcile(editor, ex);
@@ -469,5 +477,22 @@ mod tests {
         // Mark both pending — no armed (non-pending) timer remains ⇒ None (idle-free).
         e.pending_plugin_timers[0].pending = true;
         assert_eq!((plugin_timer())(&e, 10_000), None, "all timers pending ⇒ None (nothing armed)");
+    }
+
+    // -----------------------------------------------------------------------
+    // E10 T8: the diag_idle row's idle-free guardrail (pos_sweep precedent).
+    // -----------------------------------------------------------------------
+
+    /// Unarmed `diag_idle_due` (`None`, the baseline) must not wake the loop; arming it makes
+    /// the row's deadline live. Selects the row by name (not whole-loop `next_wake`) so other
+    /// armed subsystems on a fresh `Editor` cannot mask a regression here.
+    #[test]
+    fn diag_idle_row_wakes_only_when_armed() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        assert_eq!(e.diag_idle_due, None);
+        let diag_idle = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "diag_idle").unwrap().deadline;
+        assert_eq!((diag_idle())(&e, 0), None, "unarmed ⇒ the row contributes nothing (idle-free)");
+        e.diag_idle_due = Some(5_000);
+        assert_eq!((diag_idle())(&e, 0), Some(5_000), "armed ⇒ the loop wakes at the due");
     }
 }

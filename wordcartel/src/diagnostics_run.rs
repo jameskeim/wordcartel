@@ -123,6 +123,37 @@ pub fn arm_if_edited(editor: &mut Editor, before_id: BufferId, before_version: u
     }
 }
 
+/// E10 §6: observe the summon-predicate TRANSITION at the reduce-exit seam (the
+/// arm_if_edited chokepoint — every normal reduce exit; the sole bypass is the debug-only
+/// WCARTEL_SMOKE_PANIC branch, a panic path). Arm the idle-suspend deadline on leaving
+/// Review (mode change OR buffer switch), clear it on re-entry. Edge-triggered, never
+/// level-triggered (the resource law). The arm gate is ENABLEMENT only — started-ness is
+/// guarded provider-side (spec §6: no accessor; LspProvider::suspend no-ops unless
+/// SUSPENDABLE && started).
+pub fn idle_shutdown_track(editor: &mut Editor, summoned_before: bool,
+    clock: &dyn wordcartel_core::history::Clock) {
+    let summoned_now = should_run_diagnostics(editor);
+    if summoned_before && !summoned_now {
+        if editor.diag_providers.is_enabled(DiagSource::LTeX)
+            && editor.diag_cfg.ltex_idle_shutdown_min > 0
+        {
+            editor.diag_idle_due = Some(clock.now_ms()
+                .saturating_add(editor.diag_cfg.ltex_idle_shutdown_min.saturating_mul(60_000)));
+        }
+    } else if !summoned_before && summoned_now {
+        editor.diag_idle_due = None;
+    }
+}
+
+/// E10 §6: the one-shot fire — reached the due ⇒ clear it and suspend the heavy engines
+/// (only SUSPENDABLE providers act). No re-arm until the next leaving-Review transition.
+pub fn diag_idle_fire(editor: &mut Editor, now: u64) {
+    if matches!(editor.diag_idle_due, Some(due) if now >= due) {
+        editor.diag_idle_due = None;
+        editor.diag_providers.suspend_all_idle_heavy();
+    }
+}
+
 /// Fan out to every ENABLED source whose re-check is due at `now` (spec §7): snapshot the active
 /// buffer ONCE, apply the whole-document `DIAG_MAX_SEND_BYTES` cap once, then hand the snapshot to
 /// `dispatch_one` per due source — each source consumes its own slot's deadline and latches
@@ -1206,5 +1237,89 @@ mod tests {
         assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale],
             "the complete E10 catalog in cycle order");
         assert!(warns.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Task 8 (E10 §6): idle_shutdown_track / diag_idle_fire — the leaving-Review
+    // transition seam that arms the heavy (ltex) engine's suspend deadline.
+    // ------------------------------------------------------------------
+
+    fn ltex_enabled_editor() -> crate::editor::Editor {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        e.diag_cfg.enabled = true;
+        e
+    }
+
+    #[test]
+    fn leaving_review_arms_the_idle_due_and_reentry_clears_it() {
+        use crate::test_support::TestClock;
+        let mut e = ltex_enabled_editor();
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        // true → false (mode change out of Review).
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        idle_shutdown_track(&mut e, before, &TestClock::new(1_000));
+        assert_eq!(e.diag_idle_due, Some(1_000 + 15 * 60_000), "default 15 min (spec §6)");
+        // false → true (re-entry) clears.
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        idle_shutdown_track(&mut e, before, &TestClock::new(2_000));
+        assert_eq!(e.diag_idle_due, None, "the grace: re-entry cancels");
+    }
+
+    #[test]
+    fn buffer_switch_out_of_review_also_arms() {
+        use crate::test_support::TestClock;
+        let mut e = ltex_enabled_editor();
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        e.install_scratch(); // a second, non-Review buffer
+        let before = should_run_diagnostics(&e); // true (active is the Review buffer)
+        e.switch_to_index(1); // scratch — Draft mode
+        idle_shutdown_track(&mut e, before, &TestClock::new(500));
+        assert!(e.diag_idle_due.is_some(),
+            "the predicate transition fires on buffer switches, not only set_render_mode (spec §6)");
+    }
+
+    #[test]
+    fn no_arm_when_ltex_disabled_or_zero_config_or_no_transition() {
+        use crate::test_support::TestClock;
+        // Disabled ltex: never arms.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        idle_shutdown_track(&mut e, before, &TestClock::new(0));
+        assert_eq!(e.diag_idle_due, None, "no ltex entry → no arm");
+        // Zero config: never arms.
+        let mut e = ltex_enabled_editor();
+        e.diag_cfg.ltex_idle_shutdown_min = 0;
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        let before = should_run_diagnostics(&e);
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        idle_shutdown_track(&mut e, before, &TestClock::new(0));
+        assert_eq!(e.diag_idle_due, None, "0 = keep warm forever (ruling 3)");
+        // No transition: staying out of Review is a no-op (edge-triggered, not level).
+        let mut e = ltex_enabled_editor();
+        idle_shutdown_track(&mut e, false, &TestClock::new(0));
+        assert_eq!(e.diag_idle_due, None);
+    }
+
+    #[test]
+    fn diag_idle_fire_suspends_and_clears_once() {
+        let mut e = ltex_enabled_editor();
+        let rec = crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper);
+        let calls = rec.calls_handle();
+        e.diag_providers.install(Box::new(rec), true);
+        e.diag_idle_due = Some(1_000);
+        diag_idle_fire(&mut e, 999);
+        assert!(e.diag_idle_due.is_some(), "not yet due");
+        diag_idle_fire(&mut e, 1_000);
+        assert_eq!(e.diag_idle_due, None, "one-shot: cleared on fire");
+        assert!(calls.lock().unwrap().iter().any(|c|
+            matches!(c, crate::diag_provider::ProviderCall::Suspend)),
+            "fire delegates to suspend_all_idle_heavy (every entry; SUSPENDABLE gating is provider-side)");
     }
 }
