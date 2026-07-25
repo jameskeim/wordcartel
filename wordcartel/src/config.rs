@@ -1282,6 +1282,7 @@ mod tests {
             view_focus:      false,
             view_measure:    false,
             view_wrap_guide: false,
+            view_landmarks_visible: true,
             view_word_count: false,
             view_wrap_column: 100,
             view_scrollbar:  crate::config::TransientMode::Auto,

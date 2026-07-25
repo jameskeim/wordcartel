@@ -41,6 +41,9 @@ pub struct SettingsSnapshot {
     pub view_focus: bool,
     pub view_measure: bool,
     pub view_wrap_guide: bool,
+    /// In-text landmark paint (`view.landmarks_visible`). Flipped inline by
+    /// `toggle_landmarks` (B18); OFF hides paint only — status segments survive.
+    pub view_landmarks_visible: bool,
     pub view_word_count: bool,
     pub view_wrap_column: u16,
     pub view_scrollbar: crate::config::TransientMode,
@@ -129,6 +132,7 @@ pub struct OView {
     #[serde(skip_serializing_if = "Option::is_none")] pub focus:       Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub measure:     Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub wrap_guide:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub landmarks_visible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub word_count:  Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub wrap_column: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")] pub scrollbar:   Option<String>,
@@ -193,6 +197,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_focus:      cfg.view.focus,
         view_measure:    cfg.view.measure,
         view_wrap_guide: cfg.view.wrap_guide,
+        view_landmarks_visible: cfg.view.landmarks_visible,
         view_word_count: cfg.view.word_count,
         view_wrap_column: cfg.view.wrap_column,
         view_scrollbar:  cfg.view.scrollbar,
@@ -220,6 +225,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_focus:      editor.view_opts.focus,
         view_measure:    editor.view_opts.measure,
         view_wrap_guide: editor.view_opts.wrap_guide,
+        view_landmarks_visible: editor.view_opts.landmarks_visible,
         view_word_count: editor.view_opts.word_count,
         view_wrap_column: editor.view_opts.wrap_column,
         view_scrollbar:  editor.scrollbar_mode,
@@ -426,6 +432,11 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.wrap_guide.as_ref()),
         mk_view.and_then(|v| v.wrap_guide).is_some(),
     );
+    let landmarks_visible = diff_key(
+        &runtime.view_landmarks_visible, &baseline.view_landmarks_visible,
+        ex_view.and_then(|v| v.landmarks_visible.as_ref()),
+        mk_view.and_then(|v| v.landmarks_visible).is_some(),
+    );
     let word_count = diff_key(
         &runtime.view_word_count, &baseline.view_word_count,
         ex_view.and_then(|v| v.word_count.as_ref()),
@@ -471,10 +482,10 @@ pub fn compute_overrides(
         mk_view.and_then(|v| v.messages_min_kind.as_ref()).is_some(),
     );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
-        || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some()
+        || wrap_guide.is_some() || landmarks_visible.is_some() || word_count.is_some() || wrap_column.is_some()
         || scrollbar.is_some() || status_line.is_some() || splash.is_some()
         || caret_shape.is_some() || caret_blink.is_some() || messages_min_kind.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink, messages_min_kind }, any_view);
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, landmarks_visible, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink, messages_min_kind }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -641,7 +652,8 @@ mod tests {
     fn snap(preset: &str, theme: ThemeIdentity, tw: bool) -> SettingsSnapshot {
         SettingsSnapshot { keymap_preset: preset.into(), theme_identity: theme,
             view_typewriter: tw, view_focus: false, view_measure: false,
-            view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
+            view_wrap_guide: false, view_landmarks_visible: true,
+            view_word_count: false, view_wrap_column: 72,
             view_scrollbar: crate::config::TransientMode::Auto,
             view_status_line: crate::config::TransientMode::On,
             view_splash: true,
@@ -1187,7 +1199,8 @@ mod tests {
         fn field_guard(s: &SettingsSnapshot) {
             let SettingsSnapshot {
                 keymap_preset: _, theme_identity: _, view_typewriter: _, view_focus: _,
-                view_measure: _, view_wrap_guide: _, view_word_count: _, view_wrap_column: _,
+                view_measure: _, view_wrap_guide: _, view_landmarks_visible: _,
+                view_word_count: _, view_wrap_column: _,
                 view_scrollbar: _, view_status_line: _, view_splash: _,
                 view_caret_shape: _, view_caret_blink: _,
                 menu_bar: _, mouse_capture: _,
@@ -1208,6 +1221,7 @@ mod tests {
         assert!(has("toggle_focus"), "view_focus");
         assert!(has("toggle_measure"), "view_measure");
         assert!(has("toggle_wrap_guide"), "view_wrap_guide");
+        assert!(has("toggle_landmarks"), "view_landmarks_visible");
         assert!(has("toggle_word_count"), "view_word_count");
         assert!(has("set_wrap_column"), "view_wrap_column");
         assert!(has("cycle_scrollbar") && has("scrollbar_auto"), "view_scrollbar");
@@ -1251,5 +1265,30 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         e.set_splash(false);
         assert!(!runtime_snapshot(&e).view_splash);
+    }
+
+    #[test]
+    fn landmarks_visible_round_trips_through_snapshot_diff_and_parse() {
+        // snapshot_of reads the config default (on); runtime diverges to off.
+        let baseline = snapshot_of(&crate::config::Config::default(), "tokyo-night");
+        assert!(baseline.view_landmarks_visible, "config default is on");
+        let mut runtime = baseline.clone();
+        runtime.view_landmarks_visible = false;
+        let of = compute_overrides(&runtime, &baseline,
+            &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.view.as_ref().and_then(|v| v.landmarks_visible), Some(false),
+            "divergence writes the key");
+        // …and the written key deserializes back through parse_overrides.
+        let text = toml::to_string(&of).expect("serialize overrides");
+        let re = parse_overrides(&text);
+        assert_eq!(re.view.and_then(|v| v.landmarks_visible), Some(false));
+        // No divergence → the key (and the empty section) stays absent (rule 4).
+        let of2 = compute_overrides(&baseline, &baseline,
+            &OverridesFile::default(), &OverridesFile::default());
+        assert!(of2.view.is_none(), "unchanged toggle writes no view key");
+        // runtime_snapshot reads the live editor field (the inline-flip path).
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.view_opts.landmarks_visible = false;
+        assert!(!runtime_snapshot(&e).view_landmarks_visible);
     }
 }
