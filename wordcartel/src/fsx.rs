@@ -478,22 +478,11 @@ fn write_and_sync(mut handle: Box<dyn WriteSync>, bytes: &[u8], mode: u32) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     // A private per-test dir under the system temp dir, so a glob for ".tmp" is
     // not polluted by other processes' files.
     fn private_dir(label: &str) -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!(
-            "wcartel-fsx-{}-{}-{}",
-            std::process::id(),
-            n,
-            label
-        ));
-        fs::create_dir_all(&d).expect("create private dir");
-        d
+        crate::test_support::scratch_dir(&format!("fsx-{label}"))
     }
 
     fn tmp_litter(dir: &Path) -> Vec<PathBuf> {

@@ -592,15 +592,9 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn scratch() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "wc-scratch-{}-{}.md",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ))
+        crate::test_support::scratch_path("swap.md")
     }
 
     #[test]
@@ -865,12 +859,7 @@ mod tests {
         // Use a UNIQUE temp dir, not this test process's (redirected, shared) state dir: the
         // finder returns the newest orphan across the whole dir, and that dir accumulates
         // scratch-*.swp litter from this file's OTHER tests that would outrank our planted file.
-        let dir = std::env::temp_dir().join(format!(
-            "wc-orphan-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("orphan");
         let fake_pid: u32 = 999_999;
         // On Linux, verify the fake pid is indeed not live before depending on it.
         #[cfg(target_os = "linux")]
@@ -943,11 +932,7 @@ mod tests {
         use wordcartel_core::history::Clock;
         struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 123 } }
 
-        let doc_path = std::env::temp_dir().join(format!(
-            "wc-dispatch-swap-{}-{}.md",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
+        let doc_path = crate::test_support::scratch_path("dispatch-swap.md");
         let mut e = Editor::new_from_text("swap me\n", Some(doc_path.clone()), (80, 24));
         e.active_mut().document.version = 3;
         let ex = InlineExecutor::default();
@@ -982,11 +967,7 @@ mod tests {
         use wordcartel_core::history::Clock;
         struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 456 } }
 
-        let doc_path = std::env::temp_dir().join(format!(
-            "wc-dispatch-swap-fault-{}-{}.md",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
+        let doc_path = crate::test_support::scratch_path("dispatch-swap-fault.md");
         let mut e = Editor::new_from_text("swap me\n", Some(doc_path.clone()), (80, 24));
         e.active_mut().document.version = 3;
         let ex = InlineExecutor::default();
@@ -1018,9 +999,8 @@ mod tests {
         use wordcartel_core::history::Clock;
         struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 77 } }
 
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let old_path = std::env::temp_dir().join(format!("wc-rekey-old-{}-{}.md", std::process::id(), seq));
-        let new_path = std::env::temp_dir().join(format!("wc-rekey-new-{}-{}.md", std::process::id(), seq));
+        let old_path = crate::test_support::scratch_path("rekey-old.md");
+        let new_path = crate::test_support::scratch_path("rekey-new.md");
         let mut e = Editor::new_from_text("unsaved body\n", Some(old_path.clone()), (80, 24));
         e.active_mut().document.version = 5; // dirty, edited
         let ex = InlineExecutor::default();
@@ -1085,10 +1065,7 @@ mod tests {
     }
 
     fn unique_dir(label: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "wc-h5-{}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed), label));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::test_support::scratch_dir(&format!("h5-{label}"))
     }
 
     /// The oracle's include verdict: a swap is cleanable ONLY when its body matches the saved
