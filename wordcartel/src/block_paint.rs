@@ -110,7 +110,6 @@ impl BlockPaint {
 }
 
 /// Directional off-screen hint for the (non-hidden) block — line-granular (spec §3.4).
-#[allow(dead_code)] // wired into the status line later; this module's tests exercise it directly
 pub(crate) fn blk_direction(editor: &Editor, b: MarkedBlock) -> &'static str {
     let buf = &editor.active().document.buffer;
     let view = &editor.active().view;
@@ -125,7 +124,6 @@ pub(crate) fn blk_direction(editor: &Editor, b: MarkedBlock) -> &'static str {
 /// `MK <ids>` for marks on the caret's line (identity segment, spec §3.4). Stale
 /// (post-undo) positions are CLAMPED before `byte_to_line` — a drifted mark past EOF
 /// must never panic the status path (accepted undo drift, spec §4.2).
-#[allow(dead_code)] // wired into the status line later; this module's tests exercise it directly
 pub(crate) fn marks_on_caret_line(editor: &Editor) -> Option<String> {
     let b = editor.active();
     if b.marks.is_empty() { return None; }
