@@ -3,7 +3,7 @@
 
 # Backlog
 
-**34 open · 78 shipped · 2 dropped**
+**32 open · 80 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -11,8 +11,6 @@ Blocking Effort P: **0**
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
-| B12 | Lone block-begin marker renders nothing (^KB before ^KK is invisible) | needs-design | bug | S |  | Found in the cursor-system review. Effort-9A shipped the marked-block system WITHOUT rendering a LONE begin marker: after ^KB (block-begin) with no ^KK (block-end) yet, there is NO visual indication a start is set — only a complete begin+end region paints (SE::MarkedBlock). The writer can't see they set a mark. Fix: render the pending_block_begin position. Superseded by B13 (styled boundaries) which does this properly for all markers; filed separately as the acute defect. ~S. |
-| B13 | Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs) | needs-design | feature | S |  | C2 of the cursor-system review (docs/design/cursor-system-concept-review.md). Render marked-block BEGIN/END (and the lone-begin, closing B12) as STYLED BOUNDARY CELLS — a reverse/underline/theme treatment on the boundary column — NOT injected bracket glyphs. Decision 2026-07-13: the WordStar [ ]-bracket model was predicated on hardware-terminal capabilities; styled boundary cells are the modern, cheaper choice (~15% of the B-full injected-marker cost) with the IDENTICAL data model. Explicitly NOT B-full (Fork B: injected display-only marker columns via layout()/ColMap — reuses the ventilate/ColMap regime but Medium + highest correctness stakes; deferred unless a real need appears). No byte injection, no ColMap change -> no data-safety surface. Must honor the terminal-plain/no-color fallback (reverse/underline, not color alone). ~S. |
 | H25 | compose::face_to_ratatui is add-only — can't express modifier subtraction | triage | debt | S |  | compose only ADDS modifiers (no sub_modifier path), so a face's dim can't clear a DIM an underlay wrote; B7 worked around it at the ChromeStyles cache seam |
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | A18 | Snippet / abbreviation expansion (trigger to text; dynamic placeholders; cursor stop) | needs-design | feature | SM |  | Type an abbreviation -> canned text (sign-offs, boilerplate, dynamic date/time/clipboard). Our OWN proto-demo already exists: insert_date.lua (P1 command demo — inserts dynamic text), which is why a plugin is the natural home. External prior art: helowrite/src/snippets.py — flat trigger=replacement config, non-word-char boundary guard, longest-first, %PLACEHOLDER. AVOID their mechanism: find_trigger scans the WHOLE prefix per trigger = O(document) (violates theme-R / O(edited)) and can match a non-caret occurrence; silent except:pass; no cursor stop. OUR design: bounded-suffix detection ending AT the caret (O(edited)); word boundary via our UAX-29 machinery; expansion via submit_transaction (undo-atomic, M2); dynamic placeholders (%DATE/%TIME/%CLIPBOARD, reuse C3); ADD a final-cursor stop ($0) they skip; typed errors -> status line. HOME: an Effort-P plugin (P2 on-edit hook + command; insert_date.lua shows the shape) or a small core command. ~SM. |
@@ -48,10 +46,12 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>78 shipped</summary>
+<details><summary>80 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| B12 | Lone block-begin marker renders nothing (^KB before ^KK is invisible) | 2026-07-24 | 2f1bb56 |
+| B13 | Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs) | 2026-07-24 | f5a8b82 |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | 2026-07-24 | 72928e3 |
 | H23 | palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom) | 2026-07-24 | a8063e3 |
 | H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | 2026-07-24 | 48105e0 |

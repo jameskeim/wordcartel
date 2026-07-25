@@ -384,6 +384,8 @@ impl Registry {
         // Named marks (Task 8 / Effort 5c).
         r.register("set_mark",     "Set Mark\u{2026}",     None, |c| { crate::marks::set_mark(c.editor); CommandResult::Handled });
         r.register("jump_to_mark", "Jump to Mark\u{2026}", None, |c| { crate::marks::jump_to_mark(c.editor); CommandResult::Handled });
+        r.register("clear_mark",  "Clear Mark\u{2026}",  None, |c| { crate::marks::clear_mark(c.editor);  CommandResult::Handled });
+        r.register("clear_marks", "Clear All Marks",     None, |c| { crate::marks::clear_marks(c.editor); CommandResult::Handled });
 
         // Numbered bookmarks ^K0-9/^Q0-9 (Task 4 / Effort 9b).
         // Handler is a fn pointer — runtime loop can't capture `ch`, so use a macro with literal digits.
@@ -1524,6 +1526,20 @@ mod tests {
         for id in ["next_buffer", "prev_buffer"] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("{id} must be registered"));
             assert_eq!(m.menu, None, "{id} is palette-only — Documents supersedes it on the menu");
+        }
+    }
+
+    /// ④ C2 (contract laws 1/3/4): the two clear commands are registered, palette-
+    /// reachable (the palette enumerates the registry — presence IS reachability),
+    /// menu-absent like every mark command, and read-only-safe (not `mutates`).
+    #[test]
+    fn clear_mark_commands_are_registered_palette_reachable() {
+        let r = Registry::builtins();
+        for (id, label) in [("clear_mark", "Clear Mark\u{2026}"), ("clear_marks", "Clear All Marks")] {
+            let m = r.meta(CommandId(id)).unwrap_or_else(|| panic!("{id} must be registered"));
+            assert_eq!(m.label, label);
+            assert!(m.menu.is_none(), "{id}: palette-only, like every existing mark command");
+            assert!(!m.mutates, "{id}: marks are buffer metadata — usable on read-only buffers");
         }
     }
 

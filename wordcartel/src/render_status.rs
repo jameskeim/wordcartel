@@ -35,11 +35,24 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
     } else {
         format!("{head} [{mode_text}] {}", editor.status_text())
     };
-    // BLK indicator: `· BLK` when a block is marked; `· BLK·hidden` when hidden.
+    // BLK indicator (④ extends): `· BLK` gains a direction when fully off-screen
+    // (`↑`/`↓`, line-granular); `· BLK·hidden` keeps its exact legacy form (no arrow
+    // for an unpainted landmark); a pending ^KB shows `· BLK…` independently.
     match editor.active().marked_block {
         Some(b) if b.hidden => text.push_str(" · BLK·hidden"),
-        Some(_) => text.push_str(" · BLK"),
+        Some(b) => {
+            text.push_str(" · BLK");
+            text.push_str(crate::block_paint::blk_direction(editor, b));
+        }
         None => {}
+    }
+    if editor.active().pending_block_begin.is_some() {
+        text.push_str(" · BLK…");
+    }
+    // Mark identity (④ sub-fork A): the caret line's mark names, BTreeMap order.
+    if let Some(mk) = crate::block_paint::marks_on_caret_line(editor) {
+        text.push_str(" · ");
+        text.push_str(&mk);
     }
     text
 }
@@ -184,6 +197,55 @@ mod tests {
             "Starting → plain REVIEW");
         assert!(!crate::render_status::status_left_text(&e2).contains("·"),
             "no attribution dot when not Ready");
+    }
+
+    #[test]
+    fn status_shows_pending_blk_ellipsis_and_direction() {
+        let text = (0..50).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut e = Editor::new_from_text(&text, None, (40, 10));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().pending_block_begin = Some(0);
+        assert!(crate::render_status::status_left_text(&e).contains("BLK…"),
+            "pending ^KB shows the mid-mark segment");
+        e.active_mut().pending_block_begin = None;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 6, hidden: false });
+        assert!(crate::render_status::status_left_text(&e).ends_with("· BLK"),
+            "in view: plain BLK, no arrow");
+        e.active_mut().view.scroll = 30;
+        crate::derive::rebuild(&mut e);
+        assert!(crate::render_status::status_left_text(&e).contains("BLK↑"),
+            "scrolled below the block: BLK↑");
+    }
+
+    /// PIN, not red (Codex plan-gate round 1, finding 5): this asserts the EXACT
+    /// legacy segment shape and is GREEN at introduction — its job is to stay green
+    /// through the GREEN phase below, proving the ④ segments never leak onto a hidden
+    /// block (no arrow, no pending, no MK — the status line ENDS at the legacy text).
+    #[test]
+    fn status_hidden_block_keeps_exact_legacy_segment() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 10));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: true });
+        let s = crate::render_status::status_left_text(&e);
+        assert!(s.ends_with(" · BLK·hidden"),
+            "hidden keeps the exact legacy tail — no arrow/pending/MK segment after it: {s}");
+        assert!(!s.contains('↑') && !s.contains('↓') && !s.contains("BLK…") && !s.contains("MK "),
+            "no ④ segment leaks onto a hidden block: {s}");
+    }
+
+    #[test]
+    fn status_lists_marks_on_caret_line() {
+        let mut e = Editor::new_from_text("one\ntwo\n", None, (40, 10));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().marks.insert('a', 5);
+        e.active_mut().marks.insert('3', 4);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(6);
+        assert!(crate::render_status::status_left_text(&e).contains("· MK 3,a"));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        assert!(!crate::render_status::status_left_text(&e).contains("MK "),
+            "no segment when the caret's line has no marks");
     }
 
     /// Task 6 (SPINE §8.3): the Review label follows the switchable lens, not always Harper.

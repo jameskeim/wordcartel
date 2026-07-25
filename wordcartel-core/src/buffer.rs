@@ -146,6 +146,25 @@ impl TextBuffer {
         self.rope.line_to_byte(line)
     }
 
+    /// Returns the raw byte at offset `i` (`0 <= i < self.len()`). Byte-level accessor
+    /// for single-byte sentinels (`\n`) — safe at ANY offset including mid-codepoint,
+    /// unlike [`TextBuffer::slice`], which asserts char boundaries.
+    ///
+    /// # Panics
+    /// Panics if `i >= self.len()` (ropey bounds check).
+    ///
+    /// # Examples
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    ///
+    /// let buf = TextBuffer::from_str("é\n");
+    /// assert_eq!(buf.byte(1), 0xA9); // mid-codepoint — slice(1..2) would panic
+    /// assert_eq!(buf.byte(2), b'\n');
+    /// ```
+    pub fn byte(&self, i: BytePos) -> u8 {
+        self.rope.byte(i)
+    }
+
     /// 1-based logical line + 1-based **source grapheme column** of `caret`.
     /// The column counts grapheme clusters from the start of the caret's line
     /// (`line_to_byte(line)`) to `caret` — source position, NOT visual; so it is
@@ -207,6 +226,16 @@ mod tests {
         assert_eq!(b.byte_to_line(5), 2);
         assert_eq!(b.line_to_byte(1), 2);
         assert_eq!(b.line_to_byte(2), 5);
+    }
+
+    /// ④: byte-level accessor — safe at ANY offset including mid-codepoint (the
+    /// motivating read: `slice(1..2)` on "é" trips the char-boundary assert).
+    #[test]
+    fn byte_reads_raw_bytes_including_mid_codepoint() {
+        let buf = TextBuffer::from_str("é\n");
+        assert_eq!(buf.byte(0), 0xC3);
+        assert_eq!(buf.byte(1), 0xA9); // continuation byte of U+00E9
+        assert_eq!(buf.byte(2), b'\n');
     }
 
     #[test]
