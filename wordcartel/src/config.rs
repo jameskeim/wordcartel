@@ -86,9 +86,15 @@ impl Default for DiagnosticsConfig {
     fn default() -> Self {
         // Fix A7: resolve a sensible default dictionary path (<config_dir>/wordcartel/dictionary.txt)
         // so add-to-dictionary works out of the box without explicit configuration.
-        let dictionary = dirs::config_dir().map(|d| d.join("wordcartel").join("dictionary.txt"));
+        let dictionary = default_dictionary_path(dirs::config_dir().as_deref());
         DiagnosticsConfig { enabled: true, grammar: true, debounce_ms: 400, dictionary, linters: None }
     }
+}
+
+/// `<config_dir>/wordcartel/dictionary.txt`, or `None` when the platform has no config
+/// dir — the pure rule behind `DiagnosticsConfig::default()`'s dictionary field.
+pub fn default_dictionary_path(config_dir: Option<&Path>) -> Option<PathBuf> {
+    config_dir.map(|d| d.join("wordcartel").join("dictionary.txt"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -970,22 +976,29 @@ mod tests {
     // Fix A7: default dictionary path + tilde expansion
     // -----------------------------------------------------------------------
 
+    /// The pure default-dictionary rule, asserted UNCONDITIONALLY against an injected
+    /// config dir — no process-env oracle, no vacuous skip on exotic platforms.
+    #[test]
+    fn default_dictionary_path_joins_the_injected_config_dir() {
+        let d = std::path::Path::new("/inj/cfg");
+        assert_eq!(default_dictionary_path(Some(d)),
+            Some(std::path::PathBuf::from("/inj/cfg/wordcartel/dictionary.txt")));
+        assert_eq!(default_dictionary_path(None), None,
+            "no config dir → no default dictionary");
+    }
+
     /// `DiagnosticsConfig::default().dictionary` must resolve to
     /// `<config_dir>/wordcartel/dictionary.txt` (not None).
     #[test]
     fn diagnostics_default_dictionary_is_not_none() {
+        // The RULE is pinned unconditionally by `default_dictionary_path_joins_the_
+        // injected_config_dir`; this test pins only the Default WIRING — that the field
+        // actually routes through that rule. Conditional by necessity: `Default` has no
+        // injection point, so on a platform with no config dir there is nothing to wire.
         let cfg = DiagnosticsConfig::default();
-        // If dirs::config_dir() is available (it always is on Linux/macOS/Windows),
-        // the default must be Some(<config_dir>/wordcartel/dictionary.txt).
-        // We do NOT require the file to exist — just that the path is set.
-        if let Some(config_dir) = dirs::config_dir() {
-            let expected = config_dir.join("wordcartel").join("dictionary.txt");
-            assert_eq!(cfg.dictionary, Some(expected),
-                "default dictionary must point to <config_dir>/wordcartel/dictionary.txt");
-        } else {
-            // On exotic platforms where config_dir() returns None, None is acceptable.
-            // (We can't assert Some in that case.)
-        }
+        assert_eq!(cfg.dictionary,
+            default_dictionary_path(dirs::config_dir().as_deref()),
+            "Default::default must delegate its dictionary to default_dictionary_path");
     }
 
     /// A `~/` prefix in the configured dictionary path must be expanded to the
@@ -993,37 +1006,38 @@ mod tests {
     #[test]
     fn dictionary_tilde_is_expanded() {
         let dir = tempdir();
+        let home = crate::test_support::scratch_dir("cfg-home");
         let p = dir.join("c.toml");
-        // Use a temp-dir-based path that doesn't touch the real home directory.
-        // We test the expansion logic by checking whether a configured "~/foo/dict.txt"
-        // expands to <home>/foo/dict.txt.
         std::fs::write(&p, "[diagnostics]\ndictionary = \"~/foo/dict.txt\"\n").unwrap();
-        let (cfg, warns) = load(&[p]);
+        let pdirs = crate::pathx::PlatformDirs { home: Some(home.clone()), config_dir: None };
+        let (cfg, warns) = load_with_fs(&crate::fsx::RealFs, &[p], &pdirs);
         assert!(warns.is_empty(), "tilde path must not produce warnings");
-        if let Some(home) = dirs::home_dir() {
-            let expected = home.join("foo").join("dict.txt");
-            assert_eq!(cfg.diagnostics.dictionary, Some(expected),
-                "~/foo/dict.txt must expand to <home>/foo/dict.txt, not a literal ~");
-        }
-        // Regardless of home detection: the path must NOT start with a literal tilde byte.
-        if let Some(dict_path) = &cfg.diagnostics.dictionary {
-            let first = dict_path.to_string_lossy();
-            assert!(!first.starts_with('~'),
-                "expanded dictionary path must not start with a literal tilde, got: {first}");
-        }
+        // Asserted UNCONDITIONALLY against the INJECTED home — the test owns the answer;
+        // no process-env oracle, no vacuous skip on a homeless container.
+        assert_eq!(cfg.diagnostics.dictionary, Some(home.join("foo").join("dict.txt")),
+            "~/foo/dict.txt must expand to <home>/foo/dict.txt, not a literal ~");
+        // Belt: the stored path never begins with a literal tilde byte.
+        let first = cfg.diagnostics.dictionary.as_ref().expect("asserted Some above")
+            .to_string_lossy();
+        assert!(!first.starts_with('~'),
+            "expanded dictionary path must not start with a literal tilde, got: {first}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A bare `~` expands to home_dir (not a literal tilde directory).
     #[test]
     fn dictionary_bare_tilde_expands_to_home() {
         let dir = tempdir();
+        let home = crate::test_support::scratch_dir("cfg-bare-home");
         let p = dir.join("c.toml");
         std::fs::write(&p, "[diagnostics]\ndictionary = \"~\"\n").unwrap();
-        let (cfg, _warns) = load(&[p]);
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(cfg.diagnostics.dictionary, Some(home),
-                "bare ~ must expand to home_dir");
-        }
+        let pdirs = crate::pathx::PlatformDirs { home: Some(home.clone()), config_dir: None };
+        let (cfg, _warns) = load_with_fs(&crate::fsx::RealFs, &[p], &pdirs);
+        assert_eq!(cfg.diagnostics.dictionary, Some(home.clone()),
+            "bare ~ must expand to the injected home, unconditionally asserted");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
