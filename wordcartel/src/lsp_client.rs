@@ -36,7 +36,6 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     const FIRST_CHECK_TIMEOUT_MS: Option<u64>;
     const CODEACTION_TIMEOUT_MS: u64;
     /// Idle suspend-the-child eligibility (consumed by T3; ltex-only).
-    #[allow(dead_code)] // T1 declares the full trait surface; T3's suspend/resume reads this.
     const SUSPENDABLE: bool;
     fn spawn_command() -> Command;
     /// The `initialize` request `params` object (capabilities + initializationOptions).
@@ -63,6 +62,8 @@ pub(crate) enum Cmd {
     Close { buffer_id: BufferId },
     ReloadDict,
     Shutdown,
+    /// E10 §5: ask a heavy engine to release its child process until next summoned.
+    Suspend,
 }
 
 /// Everything the pump receives: app commands, one parsed server frame, or reader end-of-stream.
@@ -80,10 +81,14 @@ pub(crate) enum Action {
     SetAvailability(Availability),
     Respawn,
     Exit,
+    /// E10 §5: kill the child, keep the client thread parked (a blocked thread is free).
+    Park,
+    /// E10 §5: resume via the ordinary respawn path — WITHOUT consuming the crash-respawn budget.
+    Unpark,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Phase { Initializing, Running, ShuttingDown }
+pub(crate) enum Phase { Initializing, Running, ShuttingDown, Suspended }
 
 /// Per-document server-sync bookkeeping. `text` is the exact string last sent for this generation —
 /// LSP positions are converted against it, never the live buffer (spec §5, §6).
@@ -179,6 +184,17 @@ impl<E: LspEngine> ClientState<E> {
     pub(crate) fn on_inbound(&mut self, inb: Inbound, now: u64) -> Vec<Action> {
         match inb {
             Inbound::Cmd(c) => {
+                // E10 §5: a suspend outside Running is DROPPED, never queued — a stale
+                // suspend replayed after a resume handshake would re-kill the fresh child.
+                if matches!(c, Cmd::Suspend) && self.phase != Phase::Running {
+                    return Vec::new();
+                }
+                // Parked: a Change is the one cmd that warrants a new child — queue it and
+                // wake the pump; everything else follows the ordinary pre-Running queueing.
+                if self.phase == Phase::Suspended && matches!(c, Cmd::Change { .. }) {
+                    self.queued.push(c);
+                    return vec![Action::Unpark];
+                }
                 if self.phase != Phase::Running && !matches!(c, Cmd::Shutdown) {
                     // Pre-handshake: queue for replay. Configure only updates cfg (the handshake's
                     // didChangeConfiguration carries it) so it never double-applies.
@@ -192,7 +208,10 @@ impl<E: LspEngine> ClientState<E> {
                 }
             }
             Inbound::Server(v) => self.on_server(v, now),
-            Inbound::ServerEof => self.on_server_gone(now),
+            // E10 §5 (C7): a deliberate suspend kills the child; the reader's EOF is
+            // EXPECTED — drained, never routed to the crash/respawn path.
+            Inbound::ServerEof => if self.phase == Phase::Suspended { Vec::new() }
+                else { self.on_server_gone(now) },
         }
     }
 
@@ -203,7 +222,22 @@ impl<E: LspEngine> ClientState<E> {
             Cmd::Close { buffer_id } => self.on_close(buffer_id),
             Cmd::ReloadDict => self.settings_push_action().into_iter().collect(),
             Cmd::Configure(cfg) => { self.cfg = cfg; self.settings_push_action().into_iter().collect() }
+            Cmd::Suspend => {
+                // Running only (on_inbound drops it otherwise). Flush-first makes the
+                // terminal guarantee unconditional; then best-effort polite teardown —
+                // fire-and-forget: NO PendingKind, a late response hits the unknown-id arm.
+                let mut out = self.flush_outstanding();
+                let id = self.alloc_id();
+                out.push(Action::Send(json!({"jsonrpc":"2.0","id":id,"method":"shutdown"})));
+                out.push(Action::Send(json!({"jsonrpc":"2.0","method":"exit"})));
+                out.push(Action::Park);
+                self.phase = Phase::Suspended;
+                out
+            }
             Cmd::Shutdown => {
+                // E10 §5 (C8): parked ⇒ no child — nothing to hand a shutdown request to;
+                // outstanding work was flushed at suspend time. Straight to Exit.
+                if self.phase == Phase::Suspended { return vec![Action::Exit]; }
                 self.phase = Phase::ShuttingDown;
                 let id = self.alloc_id();
                 self.pending_requests.insert(id, PendingKind::Shutdown);
@@ -637,6 +671,10 @@ impl<E: LspEngine> DiagnosticsProvider for LspProvider<E> {
     fn reload_dictionary(&mut self) { let _ = self.cmd_tx.send(Inbound::Cmd(Cmd::ReloadDict)); }
 
     fn shutdown(&mut self) { let _ = self.cmd_tx.send(Inbound::Cmd(Cmd::Shutdown)); }
+
+    fn suspend(&mut self) {
+        if E::SUSPENDABLE && self.started { let _ = self.cmd_tx.send(Inbound::Cmd(Cmd::Suspend)); }
+    }
 }
 
 /// Owns `cmd_rx` and runs the two-part flush on `Drop` — the last leg of the latch invariant
@@ -700,7 +738,7 @@ fn spawn_reader<E: LspEngine>(stdout: ChildStdout, inbound_tx: Sender<Inbound>) 
 }
 
 /// What the pump does after running one batch of actions.
-enum Control { Continue, Exit, Respawn }
+enum Control { Continue, Exit, Respawn, Park, Unpark }
 
 /// The pump: spawn the child, feed the handshake, then `recv_timeout(next deadline)` over the single
 /// `Inbound` channel — feeding `ClientState` and executing the actions it returns. Blocks on `recv`
@@ -708,7 +746,7 @@ enum Control { Continue, Exit, Respawn }
 fn pump<E: LspEngine>(guard: &mut FlushGuard<E>, inbound_tx: &Sender<Inbound>, shared: &Arc<Shared>) {
     let start = Instant::now();
     let now = |s: &Instant| s.elapsed().as_millis() as u64;
-    let (mut child, mut stdin) = match spawn_session::<E>(inbound_tx) {
+    let (child, stdin) = match spawn_session::<E>(inbound_tx) {
         Ok(s) => s,
         Err(_) => {
             // NotFound (or any initial spawn failure) IS the runtime PATH detection (§3.2).
@@ -718,8 +756,9 @@ fn pump<E: LspEngine>(guard: &mut FlushGuard<E>, inbound_tx: &Sender<Inbound>, s
             return;
         }
     };
+    let mut session: Option<(Child, ChildStdin)> = Some((child, stdin));
     let acts = guard.state.on_spawned(now(&start));
-    let _ = run_actions(acts, &mut stdin, &guard.msg_tx, shared);
+    let _ = run_actions(acts, &mut session, &guard.msg_tx, shared);
     set_availability(shared, Availability::Starting);
 
     let mut shutdown_at: Option<u64> = None;
@@ -729,24 +768,54 @@ fn pump<E: LspEngine>(guard: &mut FlushGuard<E>, inbound_tx: &Sender<Inbound>, s
             Wait::Closed => break, // app dropped the handle — end the thread (guard flushes).
             Wait::Timeout => {
                 if let Some(sd) = shutdown_at {
-                    if now(&start) >= sd { let _ = write_frame_to(&mut stdin, &exit_notification()); break; }
+                    if now(&start) >= sd {
+                        if let Some((_, stdin)) = &mut session {
+                            let _ = write_frame_to(stdin, &exit_notification());
+                        }
+                        break;
+                    }
                 }
                 guard.state.on_deadline(now(&start))
             }
             Wait::Got(inb) => guard.state.on_inbound(inb, now(&start)),
         };
-        match run_actions(acts, &mut stdin, &guard.msg_tx, shared) {
+        match run_actions(acts, &mut session, &guard.msg_tx, shared) {
             Control::Continue => {}
             Control::Exit => break,
             Control::Respawn => {
-                let _ = child.kill(); let _ = child.wait();
+                if let Some((mut c, s)) = session.take() { drop(s); let _ = c.kill(); let _ = c.wait(); }
                 match spawn_session::<E>(inbound_tx) {
                     Ok((c, s)) => {
-                        child = c; stdin = s;
+                        session = Some((c, s));
                         let acts = guard.state.on_spawned(now(&start));
-                        let _ = run_actions(acts, &mut stdin, &guard.msg_tx, shared);
+                        let _ = run_actions(acts, &mut session, &guard.msg_tx, shared);
                     }
                     Err(_) => { let _ = inbound_tx.send(Inbound::ServerEof); } // consume the next budget step
+                }
+            }
+            Control::Park => {
+                // E10 §5: kill the child, keep the thread — a blocked thread is free;
+                // the JVM was the cost. Availability Idle = "at rest, will lazy-resume".
+                if let Some((mut c, s)) = session.take() { drop(s); let _ = c.kill(); let _ = c.wait(); }
+                set_availability(shared, Availability::Idle);
+            }
+            Control::Unpark => {
+                match spawn_session::<E>(inbound_tx) {
+                    Ok(cs) => {
+                        session = Some(cs);
+                        let acts = guard.state.on_spawned(now(&start));
+                        let _ = run_actions(acts, &mut session, &guard.msg_tx, shared);
+                    }
+                    Err(_) => {
+                        // Resume-spawn failure = the spawn-failure path: degrade + flush
+                        // the queued change so its accepted latch cannot wedge (spec §5).
+                        set_availability(shared, Availability::Unavailable);
+                        let _ = guard.msg_tx.send(Msg::DiagProviderEvent { source: E::SOURCE,
+                            event: ProviderEvent::Degraded(E::INSTALL_HINT.into()) });
+                        for a in guard.state.flush_outstanding() {
+                            if let Action::Emit(m) = a { let _ = guard.msg_tx.send(m); }
+                        }
+                    }
                 }
             }
         }
@@ -754,8 +823,7 @@ fn pump<E: LspEngine>(guard: &mut FlushGuard<E>, inbound_tx: &Sender<Inbound>, s
             shutdown_at = Some(now(&start) + SHUTDOWN_GRACE_MS);
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Some((mut c, _s)) = session.take() { let _ = c.kill(); let _ = c.wait(); }
 }
 
 fn exit_notification() -> Value { json!({"jsonrpc":"2.0","method":"exit"}) }
@@ -768,16 +836,23 @@ fn write_frame_to(stdin: &mut ChildStdin, v: &Value) -> std::io::Result<()> {
     crate::lsp_rpc::write_frame(stdin, v)
 }
 
-/// Execute one batch of actions in order; return the first control-flow action (Respawn/Exit) hit.
-fn run_actions(acts: Vec<Action>, stdin: &mut ChildStdin, msg_tx: &Sender<Msg>, shared: &Arc<Shared>)
-    -> Control {
+/// Execute one batch of actions in order; return the first control-flow action
+/// (Respawn/Exit/Park/Unpark) hit.
+fn run_actions(acts: Vec<Action>, session: &mut Option<(Child, ChildStdin)>,
+    msg_tx: &Sender<Msg>, shared: &Arc<Shared>) -> Control {
     for a in acts {
         match a {
-            Action::Send(v) => { let _ = write_frame_to(stdin, &v); }
+            Action::Send(v) => match session {
+                Some((_, stdin)) => { let _ = write_frame_to(stdin, &v); }
+                None => debug_assert!(false,
+                    "Action::Send while parked (spec §5 rules make this unreachable)"),
+            },
             Action::Emit(m) => { let _ = msg_tx.send(m); }
             Action::SetAvailability(av) => set_availability(shared, av),
             Action::Respawn => return Control::Respawn,
             Action::Exit => return Control::Exit,
+            Action::Park => return Control::Park,
+            Action::Unpark => return Control::Unpark,
         }
     }
     Control::Continue
@@ -924,5 +999,87 @@ mod tests {
             path: None, text: "x".into() }), 0);
         let out = st.on_deadline(crate::harper_ls::HarperEngine::PUBLISH_TIMEOUT_MS);
         assert_eq!(diag_dones(&out), vec![(BufferId(0), 1)]);
+    }
+
+    // ── T3: suspend/resume ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn suspend_in_running_flushes_sends_shutdown_exit_then_parks() {
+        let mut st = running();
+        change(&mut st, 0, 5, 0); // an outstanding latch to flush
+        let out = st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        assert_eq!(diag_dones(&out), vec![(BufferId(0), 5)], "flush-first (spec §5)");
+        let methods: Vec<&str> = sends(&out).iter()
+            .map(|v| v["method"].as_str().unwrap_or("")).collect();
+        assert_eq!(methods, ["shutdown", "exit"], "best-effort polite teardown");
+        assert!(out.iter().any(|a| matches!(a, Action::Park)), "then park");
+        // Flush precedes the sends (terminal-guarantee ordering).
+        let flush_idx = out.iter().position(|a| matches!(a, Action::Emit(_))).unwrap();
+        let send_idx = out.iter().position(|a| matches!(a, Action::Send(_))).unwrap();
+        assert!(flush_idx < send_idx);
+    }
+
+    #[test]
+    fn suspend_shutdown_response_is_ignored_no_pending_registered() {
+        let mut st = running();
+        let out = st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        let shutdown_id = sends(&out)[0]["id"].as_u64().expect("shutdown id");
+        // The fire-and-forget response routes to the unknown-id arm → nothing.
+        let late = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":shutdown_id,
+            "result":Value::Null})), 0);
+        assert!(late.is_empty(), "no PendingKind was registered for the suspend shutdown");
+    }
+
+    #[test]
+    fn server_eof_while_suspended_is_drained() {
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        let out = st.on_inbound(Inbound::ServerEof, 0);
+        assert!(out.is_empty(),
+            "a deliberate kill's EOF: no flush, no respawn, no Restarted, no budget use");
+        assert_eq!(st.spawn_attempts, 1, "budget untouched by the expected EOF");
+    }
+
+    #[test]
+    fn shutdown_while_suspended_exits_directly_no_send() {
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        st.on_inbound(Inbound::ServerEof, 0); // the expected EOF, drained
+        let out = st.on_inbound(Inbound::Cmd(Cmd::Shutdown), 0);
+        assert!(sends(&out).is_empty(), "no child — nothing to Send (spec §5, C8)");
+        assert!(out.iter().any(|a| matches!(a, Action::Exit)));
+    }
+
+    #[test]
+    fn suspend_outside_running_is_dropped_not_queued() {
+        let mut st = ClientState::<TestEngine>::new(cfg());
+        let spawn = st.on_spawned(0); // Initializing
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        assert!(st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0).is_empty(),
+            "suspend while Initializing: dropped, not queued");
+        // Complete the handshake: the queue replay must NOT contain a Park.
+        let out = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 0);
+        assert!(!out.iter().any(|a| matches!(a, Action::Park)),
+            "a stale suspend must never replay against the fresh child");
+    }
+
+    #[test]
+    fn change_while_suspended_queues_and_unparks_then_replays() {
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        st.on_inbound(Inbound::ServerEof, 0);
+        let out = st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 9,
+            path: None, text: "back".into() }), 0);
+        assert!(out.iter().any(|a| matches!(a, Action::Unpark)), "a Change warrants a child");
+        assert!(sends(&out).is_empty(), "nothing sent while parked");
+        // Resume = the respawn path verbatim: on_spawned → handshake → queue replay.
+        let spawn = st.on_spawned(0);
+        assert_eq!(st.spawn_attempts, 1, "deliberate resume never consumes the budget (spec §5)");
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        let replay = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 0);
+        assert!(sends(&replay).iter().any(|v| v["method"] == "textDocument/didOpen"),
+            "the queued change replays as a didOpen after the resume handshake");
     }
 }
