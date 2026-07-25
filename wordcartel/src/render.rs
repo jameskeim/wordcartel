@@ -520,7 +520,7 @@ struct RowCtx<'a> {
     sel_from: usize,
     sel_to: usize,
     has_sel: bool,
-    marked_block: Option<crate::editor::MarkedBlock>,
+    block_paint: crate::block_paint::BlockPaint,
     use_placed: bool,
     plain_source: bool,
     prose_lens: &'a [crate::lenses::PosMatch],
@@ -614,9 +614,8 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     let (sel_from, sel_to) = (sel_range.from(), sel_range.to());
     let has_sel = !sel_range.is_empty();
 
-    // Snapshot the persistent marked block (Effort 9A). A visible (non-hidden)
-    // block is painted on the placed path; a hidden block is never painted.
-    let marked_block = editor.active().marked_block;
+    // Landmark snapshot (④): block + pending + marks, gathered once (block_paint seam).
+    let block_paint = crate::block_paint::gather(editor);
 
     // Active prose lens (S8 Task 5): the active category's slice iff a lens is on AND the
     // store is current for this version; `active_pos_matches` is the single source of truth
@@ -635,7 +634,7 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     // closes the B12 gap where a lone pending anchor or bare marks (no completed,
     // visible block) failed to force the placed path.
     let use_placed = !hl_window.is_empty() || diag_active || has_sel
-        || crate::block_paint::gather(editor).wants_placed() || prose_lens_active;
+        || block_paint.wants_placed() || prose_lens_active;
 
     // SourcePlain is the only mode with no semantic colour; LivePreview and
     // SourceHighlighted both paint role + inline styles (SH's raw markers carry
@@ -644,7 +643,7 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
 
     RowCtx {
         scroll, focus_region, sorted_lines, hl_current, hl_window, diag_all,
-        sel_from, sel_to, has_sel, marked_block, use_placed, plain_source, prose_lens,
+        sel_from, sel_to, has_sel, block_paint, use_placed, plain_source, prose_lens,
     }
 }
 
@@ -720,8 +719,10 @@ fn row_spans_segs(editor: &Editor, ctx: &RowCtx, vr: &VisualRow, map: &ColMap,
 /// Placed path: build spans from map.placed, per-glyph search highlight and/or
 /// diagnostic underline. Fires when search is active OR valid diagnostics are
 /// present OR a selection / visible marked block must be painted.
+// ④ T4's `last_row` is the 8th distinct per-row input the placed builder reads.
+#[allow(clippy::too_many_arguments)]
 fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
-                    vr: &VisualRow, map: &ColMap, row_dim: bool) -> Vec<Span<'static>> {
+                    vr: &VisualRow, map: &ColMap, row_dim: bool, last_row: bool) -> Vec<Span<'static>> {
     let buf = &editor.active().document.buffer;
     // ORIGIN from the window resolver: `ps` for a ventilated anchor key, else the logical line start.
     let line_off = crate::ventilate::origin_of(&editor.active().view, buf, l);
@@ -756,15 +757,9 @@ fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
 
         let mut style = ladder_style(&editor.theme, editor.depth, vr.role, p.style, row_dim, ctx.plain_source);
 
-        // MarkedBlock composes BELOW Selection/Search/Diag (base → MarkedBlock →
-        // Selection → …). Only visible placed cells are touched; hidden lines are
-        // never in `map.placed`, so the block paint is inherently fold-safe.
-        if let Some(b) = ctx.marked_block {
-            if !b.hidden && overlaps(g_from, g_to, b.start, b.end) {
-                let mb_face = editor.theme.face(SE::MarkedBlock);
-                style = style.patch(crate::compose::face_to_ratatui(&mb_face, editor.depth));
-            }
-        }
+        // Landmarks (④): ONE exclusive face per cell — boundary > pending > mark >
+        // interior — composed BELOW Selection/Search/Lens/Diag, fold-safe as before.
+        style = ctx.block_paint.patch_glyph(style, g_from, g_to, &editor.theme, editor.depth);
 
         // FIX-2: Selection layers first; a current search match patches over it so
         // it stands out; diagnostics last. (Spec §3.4: Selection → Search → Diag.)
@@ -825,6 +820,9 @@ fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
     if !run.is_empty() {
         spans.push(Span::styled(run, run_style.unwrap()));
     }
+    if last_row {
+        if let Some(sp) = ctx.block_paint.trailing_marker(editor, l) { spans.push(sp); }
+    }
     spans
 }
 
@@ -861,7 +859,7 @@ fn paint_rows(frame: &mut Frame, editor: &Editor, area: Rect,
             let mut spans = if !ctx.use_placed {
                 row_spans_segs(editor, &ctx, vr, map, row_dim)
             } else {
-                row_spans_placed(editor, &ctx, l, row_index, vr, map, row_dim)
+                row_spans_placed(editor, &ctx, l, row_index, vr, map, row_dim, row_index + 1 == visual_rows.len())
             };
 
             // Ventilated PROSE rows carry a VentBlock gutter (count/│); OVERWRITE the reserved
@@ -2029,6 +2027,72 @@ mod tests {
         let tint = crate::compose::face_to_ratatui(&e.theme.face(SE::MarkedBlock), e.depth).bg;
         assert!((0..buf.area.width).all(|x| buf[(x, 0u16)].style().bg != tint),
             "hidden block paints no interior tint");
+    }
+
+    /// ④ B12: a lone ^KB anchor paints a boundary-faced cell (RED against the pre-④
+    /// tree: pending_block_begin had zero render-side uses).
+    #[test]
+    fn pending_block_begin_paints_a_boundary_cell() {
+        use ratatui::style::Modifier;
+        let mut e = Editor::new_from_text("hello\n", None, (60, 6));
+        e.active_mut().pending_block_begin = Some(2);
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 60, 6);
+        let st = buf[(2u16, 0u16)].style();
+        assert!(st.add_modifier.contains(Modifier::REVERSED | Modifier::BOLD),
+            "anchor cell carries the boundary face");
+        assert!(!buf[(0u16, 0u16)].style().add_modifier.contains(Modifier::REVERSED),
+            "non-anchor cells untouched");
+    }
+
+    /// ④ B13: quiet interior, strong boundaries (the deliberate look change, spec §4.1).
+    #[test]
+    fn block_interior_is_quiet_and_boundaries_are_strong() {
+        use ratatui::style::Modifier;
+        let mut e = Editor::new_from_text("hello world\n", None, (60, 6));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 60, 6);
+        for x in [0u16, 4u16] {
+            assert!(buf[(x, 0u16)].style().add_modifier.contains(Modifier::REVERSED | Modifier::BOLD),
+                "col {x}: boundary cell (start / end-1)");
+        }
+        for x in 1u16..4 {
+            let st = buf[(x, 0u16)].style();
+            assert!(!st.add_modifier.contains(Modifier::REVERSED),
+                "col {x}: interior is a tint, NOT reversed (pre-④ it was)");
+            assert!(st.bg.is_some(), "col {x}: interior carries the tint bg");
+        }
+    }
+
+    /// ④: mark presence cell + concealed-byte mark paints nothing anywhere (spec §3.3).
+    #[test]
+    fn landmark_cell_paints_and_concealed_mark_stays_invisible() {
+        use ratatui::style::Modifier;
+        let mut e = Editor::new_from_text("hello\n", None, (60, 6));
+        e.active_mut().marks.insert('a', 1);
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 60, 6);
+        let st = buf[(1u16, 0u16)].style();
+        assert!(st.add_modifier.contains(Modifier::REVERSED | Modifier::ITALIC | Modifier::UNDERLINED),
+            "mark cell carries the LandmarkGlyph face");
+
+        // Concealed: LivePreview hides the `**` runs; a mark on the trailing `*` (byte 3)
+        // paints NO cell — not in place (no glyph), not trailing (3 != cend 5).
+        // Caret parked on the phantom line past the trailing newline (byte 6, NOT 0 —
+        // Editor::new_from_text's default caret) so line 0 is INACTIVE and concealed;
+        // a caret left on line 0 would render it RawPlain (raw, unconcealed) and this
+        // assertion would trivially fail on the visible marker byte (`set_caret` is the
+        // established pattern for this, e.g. `renders_concealed_heading_and_cursor_on_active_line`).
+        let mut e2 = Editor::new_from_text("**a**\n", None, (60, 6));
+        set_caret(&mut e2, 6);
+        e2.active_mut().marks.insert('x', 3);
+        crate::derive::rebuild(&mut e2);
+        let buf2 = render_to_buffer(&mut e2, 60, 6);
+        for x in 0..10u16 {
+            assert!(!buf2[(x, 0u16)].style().add_modifier.contains(Modifier::ITALIC),
+                "col {x}: concealed-byte mark must paint nothing");
+        }
     }
 
     #[test]

@@ -23,7 +23,6 @@ pub(crate) struct BlockPaint {
 }
 
 /// Exclusive cell classification (locked decision 8). Exactly ONE face patches per cell.
-#[allow(dead_code)] // wired in Task 4 (render.rs); this module's tests exercise it directly
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CellKind { Boundary, Pending, Landmark, Interior }
 
@@ -39,7 +38,6 @@ pub(crate) fn gather(editor: &Editor) -> BlockPaint {
 /// The logical content end of `line`: the newline byte's own offset, or `buf.len()` on
 /// a final line without one. BYTE-level newline test — `slice` asserts char boundaries
 /// and would panic on a multibyte final char (spec §3.3, Codex round 2).
-#[allow(dead_code)] // wired in Task 4 via trailing_marker; this module's tests exercise it directly
 pub(crate) fn logical_content_end(buf: &TextBuffer, line: usize) -> usize {
     let start = crate::derive::line_start(buf, line);
     let next = crate::derive::line_start(buf, line + 1); // clamps to buf.len() past the last line
@@ -54,7 +52,6 @@ impl BlockPaint {
     }
 
     /// First-match-wins exclusive classification for the glyph `[g_from, g_to)`.
-    #[allow(dead_code)] // wired in Task 4 via patch_glyph; this module's tests exercise it directly
     fn classify(&self, g_from: usize, g_to: usize) -> Option<CellKind> {
         if let Some(b) = self.block {
             // b.start < b.end is a model invariant (`set_block` rejects empty;
@@ -77,7 +74,6 @@ impl BlockPaint {
 
     /// The per-glyph patch — replaces render.rs's inline MarkedBlock arm. ONE face,
     /// chosen by exclusive classification; add-only compose stays sound.
-    #[allow(dead_code)] // wired in Task 4 (render.rs); this module's tests exercise it directly
     pub(crate) fn patch_glyph(&self, style: RStyle, g_from: usize, g_to: usize,
                               theme: &Theme, depth: Depth) -> RStyle {
         let el = match self.classify(g_from, g_to) {
@@ -93,7 +89,6 @@ impl BlockPaint {
     /// a marker byte equals the entry's final logical line's content end — a position
     /// never covered by a placed glyph. Priority Boundary > Pending > Landmark; a
     /// one-glyph-at-EOL block resolves end-first (`]`).
-    #[allow(dead_code)] // wired in Task 4 (render.rs); this module's tests exercise it directly
     pub(crate) fn trailing_marker(&self, editor: &Editor, l: usize) -> Option<Span<'static>> {
         let b = editor.active();
         let buf = &b.document.buffer;
