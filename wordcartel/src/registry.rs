@@ -565,6 +565,26 @@ impl Registry {
                 wordcartel_core::diagnostics::DiagSource::Harper, on, c.clock);
             CommandResult::Handled
         });
+        r.register("analysis_engine_ltex", "Analysis Engine: LTeX", None, |c| {
+            c.editor.set_analysis_source(wordcartel_core::diagnostics::DiagSource::LTeX);
+            CommandResult::Handled
+        });
+        r.register("analysis_engine_vale", "Analysis Engine: vale", None, |c| {
+            c.editor.set_analysis_source(wordcartel_core::diagnostics::DiagSource::Vale);
+            CommandResult::Handled
+        });
+        r.register("toggle_engine_ltex", "Toggle LTeX Engine", None, |c| {
+            let on = !c.editor.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::LTeX);
+            crate::diagnostics_run::set_engine_enabled(c.editor,
+                wordcartel_core::diagnostics::DiagSource::LTeX, on, c.clock);
+            CommandResult::Handled
+        });
+        r.register("toggle_engine_vale", "Toggle vale Engine", None, |c| {
+            let on = !c.editor.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Vale);
+            crate::diagnostics_run::set_engine_enabled(c.editor,
+                wordcartel_core::diagnostics::DiagSource::Vale, on, c.clock);
+            CommandResult::Handled
+        });
 
         // Prose lenses (S8) — Rule 8: 5 palette-only set primitives + one stateful cycle rep; the
         // shared setter is lenses::set_prose_lens (Law 6). Per-buffer state on View. A14: no
@@ -2050,6 +2070,48 @@ mod tests {
         assert!(ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
         dispatch_id(&mut ed, "toggle_engine_harper");
         assert!(!ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
+    }
+
+    // Helper: build an Editor with Harper/LTeX/Vale RecordingProviders installed, all enabled —
+    // the shared arrange for the ltex/vale command-sibling tests below.
+    fn editor_with_all_engines_enabled() -> Editor {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 8));
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), true);
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::LTeX)), true);
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Vale)), true);
+        ed
+    }
+
+    #[test]
+    fn ltex_vale_command_siblings_are_registered_palette_only() {
+        let reg = Registry::builtins(); // the constructor the neighboring tests use
+        for id in ["analysis_engine_ltex", "analysis_engine_vale",
+                   "toggle_engine_ltex", "toggle_engine_vale"] {
+            let meta = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("{id} registered"));
+            assert_eq!(meta.menu, None, "{id} is palette-only (contract rule 8 set primitives)");
+        }
+    }
+
+    #[test]
+    fn analysis_engine_ltex_dispatches_the_shared_setter() {
+        let mut ed = editor_with_all_engines_enabled();
+        dispatch_id(&mut ed, "analysis_engine_ltex");
+        assert_eq!(ed.active_analysis_source, wordcartel_core::diagnostics::DiagSource::LTeX);
+    }
+
+    #[test]
+    fn toggle_engine_vale_flips_enablement_via_set_engine_enabled() {
+        let mut ed = editor_with_all_engines_enabled();
+        dispatch_id(&mut ed, "toggle_engine_vale");
+        assert!(!ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Vale));
+        dispatch_id(&mut ed, "toggle_engine_vale");
+        assert!(ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Vale));
     }
 
     // Helper: build a Ctx and dispatch a command id against the given Editor.
