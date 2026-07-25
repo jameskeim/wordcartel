@@ -498,7 +498,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let anchor = cli.path.as_ref()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-    let xdg = dirs::config_dir();
+    let xdg = crate::pathx::PlatformDirs::from_env().config_dir;
     let hand_paths = config::config_layer_paths_with_fs(&*fs, &cli, xdg.as_deref(), &anchor);
     // The overrides layer: ABOVE the hand chain, BELOW --config (spec D3). --no-config
     // empties hand_paths and skips the overrides too (config_layer_paths returned early).
@@ -934,8 +934,6 @@ mod tests {
     use crate::editor::Editor;
     use crate::app::Msg;
     use crate::test_support::{TestClock, key_char, press};
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn cua_keymap() -> crate::keymap::KeyTrie {
         let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
@@ -1862,11 +1860,7 @@ mod tests {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
-        let doc_path = std::env::temp_dir().join(format!(
-            "wc-tick-swap-{}-{}.md",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
+        let doc_path = crate::test_support::scratch_path("tick-swap.md");
         let mut e = Editor::new_from_text("\n", Some(doc_path.clone()), (80, 24));
         e.active_mut().document.version = 1;            // dirty (saved_version=Some(0))
         e.active_mut().last_edit_at = Some(0);
@@ -1919,9 +1913,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn quit_tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "wc-quit8-{}-{}-{}.md",
-            tag, std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+        crate::test_support::scratch_path(&format!("quit-{tag}.md"))
     }
 
     #[test]
@@ -2290,12 +2282,7 @@ mod tests {
         use crate::registry::Registry;
 
         // Create a temp directory and source file path.
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "wc-exportdone-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let tmp_dir = crate::test_support::scratch_dir("exportdone");
         let source = tmp_dir.join("notes.md");
         std::fs::write(&source, "# Hello\n").expect("write source");
 
@@ -2341,12 +2328,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
 
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "wc-export-toctou-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let tmp_dir = crate::test_support::scratch_dir("export-toctou");
         let source = tmp_dir.join("notes.md");
         std::fs::write(&source, "# Hello\n").expect("write source");
         let output_path = tmp_dir.join("notes.html");
@@ -2388,12 +2370,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
 
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "wc-export-confirmed-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let tmp_dir = crate::test_support::scratch_dir("export-confirmed");
         let source = tmp_dir.join("notes.md");
         std::fs::write(&source, "# Hello\n").expect("write source");
         let output_path = tmp_dir.join("notes.html");
@@ -2431,12 +2408,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
 
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "wc-exportdone-prompt-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let tmp_dir = crate::test_support::scratch_dir("exportdone-prompt");
         let source = tmp_dir.join("doc.md");
         std::fs::write(&source, "x\n").expect("write source");
         let output_path = tmp_dir.join("doc.html");

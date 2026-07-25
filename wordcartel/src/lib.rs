@@ -17,6 +17,7 @@ pub mod chrome_geom;
 pub mod block_paint;
 pub mod term;
 pub mod panicx;
+pub mod pathx;
 pub mod prompt;
 pub mod prompts;
 pub mod file;

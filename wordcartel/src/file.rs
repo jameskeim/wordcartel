@@ -232,18 +232,9 @@ mod tests {
     // production import.
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    // Unique scratch path: pid + monotonic counter + a label.
-    static SEQ: AtomicU32 = AtomicU32::new(0);
     fn scratch_path(label: &str) -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "wcartel-test-{}-{}-{}.txt",
-            std::process::id(),
-            n,
-            label
-        ))
+        crate::test_support::scratch_path(&format!("file-{label}.txt"))
     }
 
     // -------------------------------------------------------------------------
@@ -456,12 +447,7 @@ mod tests {
     /// save_atomic_bytes: roundtrip with a non-UTF-8 byte (0xFF), no temp litter.
     #[test]
     fn save_atomic_bytes_roundtrip_no_litter() {
-        let private_dir = std::env::temp_dir().join(format!(
-            "wcartel-bytes-litter-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&private_dir).expect("create private temp subdir");
+        let private_dir = crate::test_support::scratch_dir("bytes-litter");
 
         let p = private_dir.join("export-test.bin");
         let content: Vec<u8> = vec![0x48, 0x65, 0xFF, 0x6C, 0x6F]; // He<0xFF>Lo
@@ -529,12 +515,7 @@ mod tests {
         // Create a unique private subdir for this test run so we only see our
         // own temp files, not those of other concurrent saves in the shared
         // system temp dir.
-        let private_dir = std::env::temp_dir().join(format!(
-            "wcartel-littertest-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&private_dir).expect("create private temp subdir");
+        let private_dir = crate::test_support::scratch_dir("littertest");
 
         let p = private_dir.join("litter-target.txt");
         save_atomic(&p, "clean\n").expect("save");

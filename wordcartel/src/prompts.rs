@@ -132,10 +132,11 @@ fn raise_clean_recovery(editor: &mut crate::editor::Editor, files: Vec<std::path
 }
 
 /// Expand a user-typed path: `~/` prefix → home dir; relative → joined onto cwd.
-/// Mirrors the `~` handling used by the dictionary/config path loaders.
+/// The `~` arm routes through `pathx::expand_tilde` (H33) — home is resolved HERE, at
+/// the production boundary; a bare `~` deliberately keeps its legacy fall-through.
 pub fn expand_path(text: &str) -> std::path::PathBuf {
-    let expanded = if let Some(rest) = text.strip_prefix("~/") {
-        dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(text))
+    let expanded = if text.starts_with("~/") {
+        crate::pathx::expand_tilde(text, dirs::home_dir().as_deref())
     } else { std::path::PathBuf::from(text) };
     if expanded.is_absolute() { expanded }
     else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }

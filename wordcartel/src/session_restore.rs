@@ -226,16 +226,13 @@ mod tests {
     use crate::test_support::TestClock;
     use crate::jobs::{Executor, InlineExecutor};
     use crate::registry::Ctx;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    static SEQ: AtomicU32 = AtomicU32::new(0);
     struct Z; impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
     fn tx() -> std::sync::mpsc::Sender<crate::app::Msg> {
         std::sync::mpsc::channel().0
     }
     fn scratch() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("wcartel-sessmig-{}-{}.md",
-            std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+        crate::test_support::scratch_path("sessmig.md")
     }
 
     #[test]

@@ -225,9 +225,7 @@ pub(crate) fn press_enter_fb(e: &mut crate::editor::Editor,
 /// voids the premise of any chmod-based unreadability test. Tests that would otherwise
 /// assert a false negative skip loudly on this rather than passing vacuously.
 pub(crate) fn nix_privileged() -> bool {
-    let d = std::env::temp_dir().join(format!("wc-priv-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    if std::fs::create_dir_all(&d).is_err() { return false; }
+    let d = scratch_dir("priv");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -275,4 +273,94 @@ pub(crate) fn open_and_pump(e: &mut crate::editor::Editor, dir: std::path::PathB
     e.open_file_browser(&fs, &tx, dir);
     pump_listing(e, &rx);
     rx
+}
+
+// ---------------------------------------------------------------------------
+// H32: the scratch-path seam — the ONE answer to "get a scratch path" for every
+// test module in this crate. Uniqueness = process id + a single crate-global
+// counter; the invariant test below is the durable guardrail (H31's class).
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Crate-global scratch counter — the ONE source of path uniqueness for both seam fns.
+/// One static, shared, deliberately: split or per-module counters are the aliasing
+/// fragility the H32 census flagged (swap.rs / fsx.rs history).
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn scratch_name(label: &str) -> PathBuf {
+    let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("wc-scratch-{}-{seq}-{label}", std::process::id()))
+}
+
+/// A unique scratch PATH under the system temp dir — NOT created. The label is a short
+/// test tag and carries any extension: `scratch_path("bgsave.md")`.
+///
+/// # Examples
+/// ```ignore
+/// let p = crate::test_support::scratch_path("save.md");
+/// assert!(!p.exists());
+/// ```
+pub(crate) fn scratch_path(label: &str) -> PathBuf { scratch_name(label) }
+
+/// A unique scratch DIRECTORY under the system temp dir — created, and empty by
+/// construction: the pid+seq pair has never been issued before, so no prior content
+/// can exist (this subsumes every legacy remove-then-create dance).
+///
+/// # Examples
+/// ```ignore
+/// let d = crate::test_support::scratch_dir("browser");
+/// assert!(d.is_dir());
+/// ```
+pub(crate) fn scratch_dir(label: &str) -> PathBuf {
+    let d = scratch_name(label);
+    std::fs::create_dir_all(&d).expect("scratch_dir: create");
+    d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam's uniqueness contract under the concurrency that surfaced H31:
+    /// ≥32 threads interleaving both fns yield pairwise-distinct paths; every
+    /// `scratch_dir` result exists and is empty at return; every `scratch_path`
+    /// result does not exist at return.
+    #[test]
+    fn scratch_seam_is_collision_free_under_contention() {
+        const THREADS: usize = 32;
+        const PER: usize = 8;
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            handles.push(std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(PER);
+                for i in 0..PER {
+                    if (t + i) % 2 == 0 {
+                        let p = scratch_path("inv.md");
+                        assert!(!p.exists(),
+                            "scratch_path must not create: {}", p.display());
+                        got.push(p);
+                    } else {
+                        let d = scratch_dir("inv");
+                        assert!(std::fs::read_dir(&d).expect("scratch_dir exists")
+                            .next().is_none(),
+                            "scratch_dir must be empty at birth: {}", d.display());
+                        got.push(d);
+                    }
+                }
+                got
+            }));
+        }
+        let mut all = std::collections::HashSet::new();
+        let mut created = Vec::new();
+        for h in handles {
+            for p in h.join().expect("seam thread must not panic") {
+                if p.is_dir() { created.push(p.clone()); }
+                assert!(all.insert(p), "seam returned a duplicate path");
+            }
+        }
+        assert_eq!(all.len(), THREADS * PER, "one distinct path per call");
+        for d in created { let _ = std::fs::remove_dir_all(&d); }
+    }
 }
