@@ -129,21 +129,26 @@ fn harper_settings(cfg: &ProviderConfig) -> Value {
 }
 
 /// The pure harper protocol machine — the pre-T1 name, preserved for the pin.
-// T1 has no production consumer of this alias (only the pinned tests do); later tasks
-// (warm-phase, suspend/resume) are expected to use it directly, per the T1 interfaces contract.
+// The pinned test module (here + lsp_client's harper-alias probe) is the SOLE consumer;
+// production names `ClientState<E>` generically. Test-only referent ⇒ the non-test build
+// sees an unused alias, so the allow is REQUIRED (warning-free-build gate).
 #[allow(dead_code)]
 pub(crate) type HarperState = crate::lsp_client::ClientState<HarperEngine>;
 /// The app-side harper provider handle — the pre-T1 name (external callers + tests).
 pub type HarperLs = crate::lsp_client::LspProvider<HarperEngine>;
 /// The harper flush guard — the pre-T1 name (test struct literals).
-// Only the pinned tests construct this alias in T1; production use arrives with later tasks.
+// The pinned test module's struct literals are the SOLE consumer; production constructs the
+// generic guard inside `lsp_client::run_client`. Test-only referent ⇒ the allow is REQUIRED
+// (warning-free-build gate).
 #[allow(dead_code)]
 pub(crate) type FlushGuard = crate::lsp_client::FlushGuard<HarperEngine>;
 
 impl crate::lsp_client::ClientState<HarperEngine> {
     /// Test-visible harper settings for the CURRENT cfg — the pre-T1 method, preserved for
     /// the pin (a concrete inherent impl on the monomorphized type; spec §3.1).
-    // Only the pinned tests call this in T1; kept for the pin + future production use.
+    // The pinned test module is the SOLE caller; production reaches `harper_settings` via
+    // the `HarperEngine` hooks. Test-only referent ⇒ the allow is REQUIRED (verified: its
+    // removal warns `never used` in the non-test build — the warning-free-build gate).
     #[allow(dead_code)]
     pub(crate) fn settings_object(&self) -> Value { harper_settings(&self.cfg) }
 }

@@ -147,6 +147,16 @@ pub(crate) struct ClientState<E: LspEngine> {
     /// which watchdog deadline `on_change` stamps. Reset in `on_spawned` so a respawned child
     /// re-enters the warm phase.
     pub(crate) first_publish_seen: bool,
+    /// EOFs we have PRE-DECLARED by deliberately killing a live child (the `Cmd::Suspend`
+    /// handler's `Action::Park` — the sole increment site): each such child's reader will
+    /// deliver exactly one `ServerEof`, which must be DRAINED even if it arrives after a
+    /// resume has already moved the phase past `Suspended` (the change-before-EOF race — an
+    /// edit landing on the FIFO channel ahead of the old reader's EOF). A counter, not a
+    /// bool: rapid suspend→resume→suspend cycles can leave TWO deliberate-kill EOFs
+    /// logically outstanding (each reader thread delivers on its own schedule). Crash EOFs
+    /// and the synthetic respawn-fail EOF never touch this — they must keep consuming the
+    /// respawn budget in `on_server_gone`.
+    pub(crate) expected_eofs: u32,
     pub(crate) _engine: std::marker::PhantomData<E>,
 }
 
@@ -157,7 +167,7 @@ impl<E: LspEngine> ClientState<E> {
             phase: Phase::Initializing, cfg, docs: HashMap::new(), uri_owner: HashMap::new(),
             next_generation: 1, queued: Vec::new(), next_id: 1, pending_requests: HashMap::new(),
             awaiting_publish: HashMap::new(), assembling: HashMap::new(), spawn_attempts: 1,
-            first_publish_seen: false,
+            first_publish_seen: false, expected_eofs: 0,
             _engine: std::marker::PhantomData,
         }
     }
@@ -229,9 +239,18 @@ impl<E: LspEngine> ClientState<E> {
             }
             Inbound::Server(v) => self.on_server(v, now),
             // E10 §5 (C7): a deliberate suspend kills the child; the reader's EOF is
-            // EXPECTED — drained, never routed to the crash/respawn path.
-            Inbound::ServerEof => if self.phase == Phase::Suspended { Vec::new() }
-                else { self.on_server_gone(now) },
+            // EXPECTED — drained, never routed to the crash/respawn path. The COUNTER is
+            // what closes the resume race: the stale EOF may arrive only after an Unpark
+            // has already moved the phase to Initializing (change-before-EOF on the FIFO
+            // channel), where a phase-only check would mis-route it to `on_server_gone`
+            // (budget burned + the queued post-resume check falsely flushed). The phase
+            // check stays as a parked-window backstop: while Suspended no child exists, so
+            // no EOF there can be a live-child crash.
+            Inbound::ServerEof => {
+                if self.expected_eofs > 0 { self.expected_eofs -= 1; Vec::new() }
+                else if self.phase == Phase::Suspended { Vec::new() }
+                else { self.on_server_gone(now) }
+            }
         }
     }
 
@@ -251,6 +270,10 @@ impl<E: LspEngine> ClientState<E> {
                 out.push(Action::Send(json!({"jsonrpc":"2.0","id":id,"method":"shutdown"})));
                 out.push(Action::Send(json!({"jsonrpc":"2.0","method":"exit"})));
                 out.push(Action::Park);
+                // Pre-declare the killed child's EOF (SOLE increment site): Running ⟺ a live
+                // child, and Park kills it — its reader will deliver exactly one ServerEof,
+                // possibly only after a resume has already left `Suspended` (the race).
+                self.expected_eofs += 1;
                 self.phase = Phase::Suspended;
                 out
             }
@@ -1082,6 +1105,40 @@ mod tests {
             "result":{"capabilities":{}}})), 0);
         assert!(!out.iter().any(|a| matches!(a, Action::Park)),
             "a stale suspend must never replay against the fresh child");
+    }
+
+    /// THE RESUME RACE (pre-merge gate finding): an edit arrives right as idle-suspend kills
+    /// the JVM — `Cmd::Change` lands on the FIFO channel BEFORE the killed child's reader
+    /// delivers its `ServerEof`. The pump unparks and `on_spawned` moves the phase to
+    /// `Initializing`, so a phase-only drain would route the STALE EOF to `on_server_gone`:
+    /// budget consumed, the queued post-resume check flushed as a false-empty terminal, and
+    /// the fresh child killed. The deliberate-kill EOF must drain ACROSS the resume
+    /// transition — and a real crash EOF afterward must still consume the budget.
+    #[test]
+    fn stale_suspend_eof_after_resume_spawn_is_drained() {
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        // Change BEFORE the old child's EOF (the race interleaving): queued + Unpark.
+        let resume = st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 9,
+            path: None, text: "back".into() }), 10);
+        assert!(resume.iter().any(|a| matches!(a, Action::Unpark)));
+        // The pump spawns the fresh child: phase leaves Suspended.
+        let spawn = st.on_spawned(20);
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        // NOW the old deliberately-killed child's EOF arrives — it must be DRAINED.
+        let stale = st.on_inbound(Inbound::ServerEof, 30);
+        assert!(stale.is_empty(), "stale suspend-EOF after the resume spawn is drained");
+        assert_eq!(st.spawn_attempts, 1, "no budget consumed by the stale EOF");
+        // The queued post-resume check survived: the handshake still replays it.
+        let replay = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 40);
+        assert!(sends(&replay).iter().any(|v| v["method"] == "textDocument/didOpen"),
+            "the queued change was NOT flushed by the stale EOF — it replays");
+        // A REAL crash EOF after Running still routes to on_server_gone (the counter did
+        // not leak): budget consumed, respawn requested.
+        let crash = st.on_inbound(Inbound::ServerEof, 50);
+        assert!(crash.iter().any(|a| matches!(a, Action::Respawn)), "real crash still respawns");
+        assert_eq!(st.spawn_attempts, 2, "real crash consumes the budget");
     }
 
     #[test]
