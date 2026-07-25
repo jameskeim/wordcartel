@@ -3352,3 +3352,52 @@ fn journey_landmarks_visible_and_clearable() {
     h.render();
     assert!(!h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "mark gone after clear_marks");
 }
+
+/// B18 regression gate: toggling landmarks OFF suppresses ALL in-text landmark paint
+/// (pending anchor cell, block boundaries, mark cells) while the status segments
+/// survive (`BLK…` mid-mark — Fork 5; `· BLK` + `MK <ids>` — Fork 1); toggling back
+/// ON repaints. Real commands throughout.
+#[test]
+fn journey_toggle_landmarks_hides_paint_keeps_status() {
+    use crate::registry::{Ctx, CommandId};
+    use ratatui::style::Modifier;
+    let text = "alpha beta gamma\n";
+    let mut h = Harness::new(text, None, (80, 24));
+    let dispatch = |h: &mut Harness, id: &'static str| {
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex,
+                            msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        h.reg.dispatch(CommandId(id), &mut ctx);
+    };
+    // Landmarks ON (default): a bookmark at 'b' of beta + a pending ^KB at 0 both paint.
+    h.editor.borrow_mut().active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(6);
+    dispatch(&mut h, "set_bookmark_1");
+    h.editor.borrow_mut().active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(0);
+    dispatch(&mut h, "block_begin");
+    h.render();
+    assert!(h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "ON: bookmark cell italic");
+    assert!(h.cell_modifiers(0, 0).contains(Modifier::BOLD), "ON: pending anchor bold");
+    // OFF: the cells vanish; the status keeps narrating.
+    dispatch(&mut h, "toggle_landmarks");
+    h.render();
+    assert!(!h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "OFF: mark cell unpainted");
+    assert!(!h.cell_modifiers(0, 0).contains(Modifier::BOLD), "OFF: pending cell unpainted");
+    assert!(h.screen_contains("BLK…"), "OFF: pending status survives (Fork 5)");
+    // Complete the block while OFF: the model is untouched; still nothing paints.
+    h.editor.borrow_mut().active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(5);
+    dispatch(&mut h, "block_end");
+    h.render();
+    assert!(!h.cell_modifiers(0, 0).contains(Modifier::REVERSED), "OFF: no begin boundary");
+    assert!(!h.cell_modifiers(4, 0).contains(Modifier::REVERSED), "OFF: no end boundary");
+    assert!(h.screen_contains("· BLK"), "OFF: block status survives (Fork 1)");
+    assert!(h.screen_contains("MK 1"), "OFF: caret-line mark identity survives");
+    // Back ON: the completed block and the mark repaint.
+    dispatch(&mut h, "toggle_landmarks");
+    h.render();
+    assert!(h.cell_modifiers(0, 0).contains(Modifier::REVERSED), "ON again: begin boundary");
+    assert!(h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "ON again: mark repainted");
+}
