@@ -921,3 +921,10 @@ Critical false-green defects were found and fixed *inside* it across four review
 Position-space newtypes to tag confusable byte spaces
 
 *(Captured 2026-07-20 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### B18 — Landmark visibility toggle — hide marks/block markers in-text while editing
+<!-- item: B18 -->
+
+Landmark visibility toggle — hide marks/block markers in-text while editing
+
+*(Captured 2026-07-24 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
