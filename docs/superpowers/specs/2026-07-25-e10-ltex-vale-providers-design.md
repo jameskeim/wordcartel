@@ -550,8 +550,11 @@ model state — the B18 "status reads the model directly" precedent), therefore 
 self-clearing on the Starting→Ready flip, and incapable of animating (no timer, no repaint
 loop — the idle-free law; the steady-warming ruling holds). `dispatch_one`'s existing one-shot
 `"starting {label}…"` Info message stays as the transient acknowledgment; the segment is the
-steady truth. (The existing `status_line_shows_review_label` test asserts the Ready case and
-survives unmodified; T9 adds the Starting-case test.)
+steady truth. (The existing `status_line_shows_review_label` test covers the empty-`ProviderSet`
+case and survives unmodified; the pre-E10 `status_line_attributes_review_only_when_provider_ready`
+test — which asserts the Ready case AND that Starting renders plain `REVIEW` — is REPLACED by T9's
+`status_line_review_attribution_matrix` covering the new Ready / Starting-warming / plain-`REVIEW`
+matrix.)
 
 ---
 
