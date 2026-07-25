@@ -357,6 +357,14 @@ impl Harness {
         self.term.backend().buffer()[(x, y)].style().bg
     }
 
+    /// The full modifier set painted at cell `(x, y)` — the ④ landmark journey's idiom for
+    /// pinning REVERSED/BOLD/ITALIC/UNDERLINED cues (boundary/pending/landmark faces), which
+    /// `cell_bg` alone cannot distinguish (several ④ faces share no bg but differ only in
+    /// modifiers).
+    fn cell_modifiers(&self, x: u16, y: u16) -> ratatui::style::Modifier {
+        self.term.backend().buffer()[(x, y)].style().add_modifier
+    }
+
     /// Drive the REAL search Msg sequence through `step` (Ctrl+F opens, typing `needle` inserts and
     /// recomputes live — `search_ui::intercept`'s text-insert arm calls `search_sync` after every
     /// keystroke, so the match set and `current()` are already live once typing finishes; there is
@@ -3298,4 +3306,48 @@ fn e2e_shrink_into_fold_reveals_selected_text_on_screen() {
     let sel_row = (0..12u16).find(|&y| h.row(y).contains("Alpha one.")).expect("revealed row");
     let (_cx, cy) = h.cursor_pos();
     assert_eq!(cy, sel_row, "caret cell sits on the revealed row");
+}
+
+/// ④ FINAL REGRESSION GATE (expected green once T1-T6 land): mark → see it; ^KB →
+/// pending cell + BLK…; ^KK → quiet interior, strong boundaries + BLK; clear_marks
+/// removes the painted mark. Real commands throughout.
+#[test]
+fn journey_landmarks_visible_and_clearable() {
+    use crate::registry::{Ctx, CommandId};
+    use ratatui::style::Modifier;
+    let text = "alpha beta gamma\n";
+    let mut h = Harness::new(text, None, (80, 24));
+    let dispatch = |h: &mut Harness, id: &'static str| {
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex,
+                            msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        h.reg.dispatch(CommandId(id), &mut ctx);
+    };
+    // 1) a bookmark paints at its cell
+    h.editor.borrow_mut().active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(6); // 'b' of beta
+    dispatch(&mut h, "set_bookmark_1");
+    h.render();
+    assert!(h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "bookmark cell italic (LandmarkGlyph)");
+    // 2) ^KB pending: cell + status
+    h.editor.borrow_mut().active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(0);
+    dispatch(&mut h, "block_begin");
+    h.render();
+    assert!(h.cell_modifiers(0, 0).contains(Modifier::BOLD), "pending anchor cell bold (boundary face)");
+    assert!(h.screen_contains("BLK…"), "mid-mark status segment");
+    // 3) ^KK completes: boundaries strong, interior quiet, BLK segment
+    h.editor.borrow_mut().active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(5);
+    dispatch(&mut h, "block_end");
+    h.render();
+    assert!(h.cell_modifiers(0, 0).contains(Modifier::REVERSED), "begin boundary");
+    assert!(h.cell_modifiers(4, 0).contains(Modifier::REVERSED), "end boundary (b.end-1)");
+    assert!(!h.cell_modifiers(2, 0).contains(Modifier::REVERSED), "interior quiet");
+    assert!(h.screen_contains("· BLK"), "block status segment");
+    // 4) clear_marks removes the painted bookmark
+    dispatch(&mut h, "clear_marks");
+    h.render();
+    assert!(!h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "mark gone after clear_marks");
 }

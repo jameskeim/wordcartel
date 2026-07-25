@@ -656,6 +656,16 @@ gutter follow-on via `scripts/backlog add` if the human wants it tracked.
    flag was RESOLVED at the Codex round-1 fold — the corrected §3.3 predicate tests the
    logical content end, not the visible `src_span` end, with the `**a**` vector pinned
    in unit tests; only the clipping/B17 axis remains for the execute-time probe.)
+   **OUTCOME (T7 probe, `render.rs::trailing_marker_exact_width_and_flush_row_probe`):**
+   confirmed clipping on the exact-width row (a 10-col row of 10 visible chars leaves the
+   appended marker span one cell past `row_area`'s right edge; ratatui's `Paragraph`
+   truncates at the buffer boundary — no corruption, no panic, no stray styling on the
+   row, the marker simply doesn't render). ACCEPTED per this section — status (`MK …`)
+   and jump navigation remain the mark's discovery path on that row. B17 interaction is
+   the opposite of a hazard: a hung trailing space wraps its line to a flush continuation
+   row (B17), and that flush row — otherwise empty — becomes the trailing marker's
+   `last_row`; the glyph paints cleanly at its column 0 with the full `LandmarkGlyph`
+   face, no clipping. Both branches are now locked test pins, not open questions.
 2. **Live-terminal legibility of the chosen faces** (A21 lesson: synthetic buffers prove
    composition, not readability). A tui-interact eyeball pass during execute on
    tokyo-night, one phosphor, terminal-plain, and no-color: interior tint vs canvas,

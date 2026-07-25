@@ -4358,4 +4358,54 @@ mod tests {
         let buf = render_to_buffer(&mut e, 21846, 4);
         assert_eq!((buf.area.width, buf.area.height), (21846, 4));
     }
+
+    /// ④ residual probe (spec §10.1): trailing marker on an exact-width row, and on a
+    /// B17 phantom flush row (trailing space at the wrap margin). Pins REAL behavior.
+    /// DISCOVERY (recorded here + spec §10.1 outcome note): on a visual row that fills
+    /// `text_width` exactly with visible content, the appended trailing-marker cell is
+    /// clipped by the row `Rect` in `paint_rows` — the `Paragraph`'s content is one cell
+    /// wider than `row_area` and ratatui truncates at the buffer boundary. No cell is
+    /// corrupted and nothing panics; the mark is simply invisible on that row (accepted
+    /// per spec §10.1 — status (`MK`) and jump navigation remain the discovery path). On
+    /// a B17 phantom flush row, by contrast, the marker rides cleanly: the flush row is
+    /// the entry's LAST visual row (empty of real content), so `trailing_marker` paints
+    /// at its column 0 with room to spare — visible, correctly faced, no clipping.
+    #[test]
+    fn trailing_marker_exact_width_and_flush_row_probe() {
+        // width 10 viewport; "0123456789" fills row 0 exactly; mark at EOL (byte 10).
+        let mut e = Editor::new_from_text("0123456789\nnext\n", None, (10, 6));
+        e.active_mut().marks.insert('a', 10);
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 10, 6);
+        // PINNED: clipped. The exact-width row has exactly one visual row (no wrap —
+        // 10 visible chars fit width 10 with nothing left over), so the trailing marker
+        // is the ONLY thing that could show it; it doesn't, on any row.
+        let painted = (0..2u16).any(|r| row_string(&buf, r).contains('·'));
+        assert!(!painted, "exact-width row: the trailing marker clips (accepted, spec §10.1); \
+            status (MK) and jump remain the discovery path — not a data-loss or corruption bug");
+        // And no cell on the full-width row was corrupted by the (dropped) marker span —
+        // the row still reads back as the plain, unstyled source text.
+        assert_eq!(row_string(&buf, 0), "0123456789", "row content is untouched by the clipped marker");
+        for x in 0..10u16 {
+            assert_eq!(buf[(x, 0u16)].style().add_modifier, ratatui::style::Modifier::empty(),
+                "col {x}: no stray landmark styling leaks onto the clipped row");
+        }
+
+        // B17 phantom flush row: trailing space at the margin wraps the caret to a
+        // flush continuation row — a mark at the line end rides the flush row.
+        let mut e2 = Editor::new_from_text("0123 5678 \nx\n", None, (10, 6));
+        let eol = "0123 5678 ".len(); // byte 10, the newline
+        e2.active_mut().marks.insert('b', eol);
+        crate::derive::rebuild(&mut e2);
+        let buf2 = render_to_buffer(&mut e2, 10, 6);
+        // PINNED: visible, on the flush row (visual row 1 of line 0), column 0 — B17's
+        // hung-space wrap gives the trailing marker an otherwise-empty row to land on.
+        let (rows2, _map2) = &e2.active().view.line_layouts[&0];
+        assert_eq!(rows2.len(), 2, "the hung trailing space wraps a flush continuation row (B17)");
+        assert_eq!(row_string(&buf2, 0), "0123 5678 ", "row 0 carries the visible content, untouched");
+        assert_eq!(buf2[(0u16, 1u16)].symbol(), "\u{b7}", "the flush row's col 0 carries the landmark glyph");
+        let st = buf2[(0u16, 1u16)].style();
+        assert!(st.add_modifier.contains(Modifier::REVERSED | Modifier::ITALIC | Modifier::UNDERLINED),
+            "flush-row marker carries the full LandmarkGlyph face, not a truncated one");
+    }
 }
