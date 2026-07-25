@@ -503,12 +503,64 @@ tellable only if there is one seam to register into. (`DiagSource::Plugin` antic
   lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
 - Config namespace and persistence; interaction with the density presets (E1).
 
-### E10 — Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle
+### E10 — Multi-engine linting (b) — ltex-ls-plus + vale-ls providers (LSP) + JVM lifecycle + engine menu
 <!-- item: E10 -->
 
-Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle
+**Two LSP providers, one effort** (scope set 2026-07-25 from the Fable holistic analysis,
+`scratchpad/lens-linting-arc/fable-analysis.md`): **ltex-ls-plus / LanguageTool** AND **vale-ls**
+(Vale via its LSP wrapper). Both clone the `harper_ls.rs` template over the engine-agnostic
+`lsp_rpc.rs` — this is the **first live N=3 exercise of the shipped `ProviderSet`**. Also ships the
+**builtin engine-management dynamic-menu section** (Ready / warming / off / not-installed, from
+`ProviderSet::sources` + `availability`) — engine management ships with engines, so it belongs here,
+NOT in [[E12]] (which owns only *plugin-contributed* rows).
 
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+**Vale = vale-ls, not vale-CLI (decided 2026-07-25).** Vale ships both a one-shot Go CLI and a Rust
+LSP wrapper (`vale-ls`). We take **vale-ls**: it rides the exact shipped seam as a third catalog arm
+(same template, same commands, same config shape), matches the design doc §2 recommendation
+("LSP-everywhere for the first-class bundled/core providers — harper-ls, ltex-ls-plus, vale-ls"), and
+its `installVale: true` self-install is the best absent-binary UX of any engine. The alternative
+(vale-CLI as a `wc.async`/[[PD]] driver, design ⚠OPEN 1) was rejected FOR THIS GROUP — it would push
+Vale out to PD's orbit. Knock-on: PD loses vale-CLI as its proof-case but keeps formatters
+(prettier/fmt), so it is not stranded.
+
+**The spine is DONE — E10 is provider-impl + lifecycle, NOT a seam generalization.** Fable verified
+at HEAD (post-`a2f9062`): `ProviderSet { entries: Vec<ProviderEntry> }` with source-keyed delegation,
+a source-partitioned `DiagStore` (`BTreeMap<DiagSource, SourceSlot>`, per-source
+`computed_version`/`recheck_due_at`/`in_flight_version`), per-source fan-out + independent latch
+(`dispatch_one`), the generic `Starting` → `"starting {label}…"` no-silent-UI surface, the
+`DiagnosticsConfig.linters` fold (`install_core_providers`), and the command-sibling slots all
+**already exist** — the catalog is `&[DiagSource::Harper]` commented literally *"Effort b appends
+ltex/vale here"*, and the provider-construction `match` is exhaustive (the compiler forces the new
+arms). `DiagSource::{LTeX, Vale}` are reserved vocabulary already in core. **The "may need to finish
+the Vec/registry generalization" clause from the original filing is FALSE and struck.**
+
+**The genuinely-new work is the JVM lifecycle (ltex only):**
+- **`PUBLISH_TIMEOUT_MS = 10_000` landmine** (`harper_ls.rs:36`, `on_deadline`): the template emits an
+  empty terminal `DiagnosticsDone` 10 s after a check is accepted with no publish. ltex's first check
+  takes **30 s – 2 min** (JVM warm). Cloned unchanged it would fire a false-empty "no issues,"
+  clear the latch, and re-dispatch into a still-warming server. E10 needs a **Starting-aware
+  acceptance/deadline policy** (don't accept until initialized, or a warm-phase deadline), reconciled
+  with the latch invariant (`Accepted::Yes ⟹ guaranteed terminal`, so a 2-min warm holds
+  `in_flight_version` that long and the worker must coalesce mid-warm edits).
+- **Idle-shutdown has NO existing substrate** — `shutdown_all` runs only at app exit. The seam is
+  `timers.rs::SUBSYSTEMS` (the registration-seam table; "diagnostics" is already a row); edge-trigger
+  a shutdown deadline on *leaving Review*, never wall-clock polling (resource conventions).
+- **Vale has no warm-up landmine** — near-free third arm alongside ltex.
+- **Per-engine config:** `ProviderConfig` is harper-shaped and `[diagnostics.<engine>]` tables don't
+  exist yet (only the flat `DiagnosticsConfig` + `linters`). Add ltex's keys (language, min) and
+  vale's (`.vale.ini`/StylesPath is read by vale itself; wordcartel just points at it).
+
+**Decouple from E8:** E10 adds no new toggle SHAPES — `analysis_engine_ltex`/`_vale` are more *values*
+of the exclusive engine-selector E8 already models, and `cycle_analysis_source` iterates
+`enabled_sources()` generically. Key the lifecycle triggers on the existing predicates
+(`should_run_diagnostics`, `set_render_mode`'s arm-on-Review), NOT on literal `RenderMode::Review`, so
+if [[E8]] later redefines "what summons analysis," the lazy-spawn/idle-shutdown moves with it.
+
+**Sequencing:** E10 is the most execution-ready E-theme item and unblocks [[E11]]'s value (E11's
+`href`/`code` UX is inert until a non-harper engine sends those fields — harper never does). See the
+Fable analysis for the full grouping; the linting sub-arc is **E10 → E11 → E8-impl → E12-if-ever**.
+Open human forks remaining (from the analysis): JVM idle-shutdown policy (strict free-at-rest vs
+keep-warm-in-session), ltex install/support posture, and default engine when several are enabled.
 
 ### E11 — Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
 <!-- item: E11 -->
