@@ -1066,13 +1066,15 @@ shipped_date = "2026-07-14"
 [[item]]
 id = "E10"
 title = "Multi-engine linting (b) — ltex-ls-plus + vale-ls providers (LSP) + JVM lifecycle + engine menu"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "E"
 hook = "Multi-engine linting effort (b): TWO LSP providers folded into one effort — ltex-ls-plus/LanguageTool AND vale-ls (Vale via its LSP wrapper, decided 2026-07-25: LSP-everywhere per design §2, self-install best absent-binary UX; NOT vale-CLI, which would need wc.async/PD). Both clone the harper_ls.rs template over the engine-agnostic lsp_rpc.rs — the first live N=3 exercise of the shipped ProviderSet. Ships the builtin engine-management dynamic-menu section too (Ready/warming/off/not-installed from ProviderSet::sources+availability — belongs with engines, NOT E12). The SPINE IS DONE (Fable grounding 2026-07-25): ProviderSet/source-partitioned DiagStore/per-source fan-out+latch/generic Starting-'warming' status/config-fold/command-sibling slots all exist — the 'finish the Vec/registry generalization' doubt is FALSE; catalog+registry are literally commented 'Effort b appends ltex/vale here'. The genuinely-new work = JVM lifecycle: idle-shutdown (NO substrate — timers.rs::SUBSYSTEMS is the seam) + the PUBLISH_TIMEOUT_MS=10000 watchdog landmine (would fire false-empty terminals during ltex's 30s-2min warm — needs a Starting-aware deadline). Vale has no warm-up landmine, so it's a near-free third arm. Design: docs/design/prose-linters-design-space.md §2/§6."
-doc = "ux-backlog.md#e10"
+doc = "backlog-archive.md#e10"
 created = "2026-07-13"
+shipped_date = "2026-07-25"
+shipped_commit = "9c2d9e4"
 
 [[item]]
 id = "E11"

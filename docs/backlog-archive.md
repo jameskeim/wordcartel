@@ -2694,3 +2694,34 @@ Original filing: never observed to fire (same *genus* as [[H31]] — a test obse
 another test mutates — different *species*); scoped out of H31 fork 1 for its own mechanism fork;
 edition-2024 `set_var`-becomes-`unsafe` was the forcing function. See [[H32]] (the scratch-path
 half) and [[H31]].
+
+### E10 — Multi-engine linting (b): ltex-ls-plus + vale-ls providers (LSP) + shared core + JVM lifecycle + engine menu
+<!-- item: E10 -->
+
+**SHIPPED 2026-07-25 (merge `9c2d9e4`).** Two LSP diagnostic providers — **ltex-ls-plus**
+(LanguageTool grammar) and **vale-ls** (prose style) — join harper behind the shipped multi-provider
+spine, via ONE shared `lsp_client.rs` core (generic `ClientState<E>`/`LspProvider<E>` over an
+`LspEngine` trait) instead of three drifting clones. First live **N=3** exercise of `ProviderSet`.
+The eight human-ruled forks (2026-07-25): warm-up = first-check-special ~180s deadline + STEADY
+`warming LTeX…` status (no animation — idle-free law); shared-core architecture (harper refactored
+onto it FIRST, its 29 inline tests byte-for-byte the pin); idle-shutdown = keep-warm ~15min
+configurable, ltex-only, suspend-the-child; vale auto-install NOT wired (user-installed like the
+others); default_engine config-only override on harper-first; documented optdepends + Java-21+ hint;
+engine menu under View; minimal per-engine config. Vale via **vale-ls** (LSP path, design §2), NOT
+vale-CLI (which would need [[PD]]/wc.async).
+
+**Process record.** Codex-gated spec (READY, 1 fold round — T1 pin symbol census, per-engine
+CRASHED_HINT hook, two suspend-mechanism holes) + plan (GO, 2 rounds — both peripheral T9/T10).
+11 tasks, each per-task-reviewed clean. **The two final gates DISAGREED** (the H21 pattern): Codex
+NO-GO caught a real **suspend→resume→stale-EOF race** (a deliberately-killed child's untagged EOF on
+the shared `cmd_tx` FIFO, arriving after `Unpark → on_spawned` moved phase past `Suspended`, routed to
+`on_server_gone` — consuming crash budget + flushing the first post-resume check); Fable's GO probe
+tested EOF-before-Change and change-while-parked separately but never the change-BEFORE-EOF
+interleaving. Adjudicated to the finding; fixed with an `expected_eofs` counter that drains the
+deliberate-kill EOF across the resume transition (counter over bool: rapid suspend/resume can leave 2
+outstanding), regression-tested, Codex re-gate GO. **T11 live probe: 7/8 PASS** against real
+ltex-ls-plus 18.7.0 (steady warming ~5–6s, live idle-suspend→JVM-gone→respawn, both absent-binary
+hints; SKIP vale-ls absent; finding: the custom `ltex/workspaceSpecificConfiguration` method was not
+exercised — handled defensively). Render zero-touch; command-surface conformant. Sub-arc:
+E10 → [[E11]] → E8-impl → E12-if-ever. Grounding/forks: `scratchpad/lens-linting-arc/`; memory
+[[wordcartel-lens-linting-arc]].
