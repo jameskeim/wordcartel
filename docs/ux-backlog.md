@@ -921,3 +921,28 @@ Critical false-green defects were found and fixed *inside* it across four review
 Position-space newtypes to tag confusable byte spaces
 
 *(Captured 2026-07-20 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### H36 — Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam
+<!-- item: H36 -->
+
+The explicit follow-on to H32. H32 consolidates the **15 named** test scratch-path *helpers* onto a
+single `test_support` seam (`scratch_path`/`scratch_dir`). It deliberately leaves the larger, looser
+population untouched: the H32 grounding (Fable, 2026-07-25) found **~105 inline `temp_dir()`
+scratch-path constructions across ~30 files** that build a path directly at the call site without
+even a local helper (heaviest: `file_browser.rs` ~17, `app.rs` ~15, `prompts.rs` ~14, `jobs_apply.rs`
+~10, `swap.rs` ~10, `render_overlays.rs` ~7). This item is a tracked home for sweeping those onto the
+H32 seam so "get a scratch path" truly has exactly one answer everywhere.
+
+**Deferred out of H32 deliberately** (2026-07-25): the ~105 sites are individually correct today
+(pid-unique, one label per test — not the H31 collision class), so they have no decay; sweeping them
+is ~30 files of mechanical churn whose review blast radius dwarfs the value on a no-decay item. H32
+declared them out of scope on the record and filed this item so the decision is tracked rather than
+forgotten. Two integration-test sites (`tests/harper_ls_probe.rs`, `tests/harper_ls_integration.rs`)
+are a separate crate and cannot reach a `#[cfg(test)] pub(crate)` seam at all — out of scope here too.
+
+**Do NOT answer this with a textual scanner** banning raw `temp_dir().join(...)` — same reasoning as
+H32 (H31 fork 3 / effort ① D5): the `fs_chokepoint` scanner was measured to leave 5 of 6 evasion
+routes uncaught; a second scanner is self-defeating. The work is mechanical delegation onto the H32
+seam, not a new gate. Prerequisite: H32 shipped (the seam must exist first).
+
+*(Captured 2026-07-25 via `scripts/backlog add`, as the H32 grounding's out-of-scope follow-up.)*

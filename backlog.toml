@@ -1483,3 +1483,15 @@ doc = "backlog-archive.md#b18"
 created = "2026-07-24"
 shipped_commit = "c1e2456"
 shipped_date = "2026-07-24"
+
+[[item]]
+id = "H36"
+title = "Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam"
+status = "triage"
+kind = "feature"
+size = "TBD"
+theme = "H"
+hook = "Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam"
+doc = "ux-backlog.md#h36"
+depends_on = ["H32"]
+created = "2026-07-25"
