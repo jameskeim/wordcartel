@@ -407,9 +407,13 @@ Review first summons ltex, exactly the E7 cost-lands-in-the-summoned-view princi
   `didchangeconfiguration_push` pattern).
 - `answer_request`: `"workspace/configuration"` AND `"ltex/workspaceSpecificConfiguration"` both
   → a result array of **bare, unwrapped** `{"language": …}` settings objects, one per
-  `params.items` entry (harper's `answer_configuration` MUST-FIX shape, reused; the custom
-  method is ltex-plus's documented merge extension — **empirical shape check in the live
-  probe**).
+  `params.items` entry (harper's `answer_configuration` MUST-FIX shape, reused). **T11 live-probe
+  update (ltex-ls-plus 18.7.0, single-doc config):** the standard `workspace/configuration` PULL is
+  what the real server sends, and our bare per-item response was accepted with diagnostics flowing
+  (`MORFOLOGIK_RULE_EN_US`). The custom `ltex/workspaceSpecificConfiguration` extension was NOT
+  observed being exercised under the tested configuration — the arm is **handled defensively**
+  (served identically to the standard method), not a proven-exercised path. Kept for robustness
+  against ltex versions/configs that do send it.
 - `classify(d)`: `code` starting with/containing `MORFOLOGIK`, `HUNSPELL`, or `SPELLER` →
   `Spelling`; else fall through to the shared harper heuristic (substring "spell" across
   code/source/message) → else `Grammar`. (LanguageTool spelling rule ids are
