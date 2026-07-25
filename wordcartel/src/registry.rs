@@ -599,6 +599,9 @@ impl Registry {
         r.register_stateful("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.wrap_guide),
             |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
+        r.register_stateful("toggle_landmarks", "Toggle Landmarks", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.view_opts.landmarks_visible),
+            |c| { c.editor.view_opts.landmarks_visible = !c.editor.view_opts.landmarks_visible; CommandResult::Handled });
         r.register_stateful("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.word_count),
             |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
@@ -2357,6 +2360,25 @@ mod tests {
         assert_eq!(reg.dispatch(CommandId("toggle_ventilate"), &mut ctx), CommandResult::Handled);
         assert!(ed.active().view.ventilate, "dispatch turned the lens on");
         assert!(matches!(f(&ed), MenuMark::OnOff(true)));
+    }
+
+    /// B18: `toggle_landmarks` is the stateful View-menu representative for the global
+    /// `view_opts.landmarks_visible` paint toggle (command-surface Laws 2/6/8) — an
+    /// INLINE flip (single mutation path; no setter, matching the wrap_guide class).
+    #[test]
+    fn toggle_landmarks_is_stateful_onoff_and_flips_the_field() {
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        let m = reg.meta(CommandId("toggle_landmarks")).expect("toggle_landmarks registered");
+        assert_eq!(m.menu, Some(MenuCategory::View), "toggle_landmarks is a View row");
+        let f = m.state.expect("toggle_landmarks is stateful");
+        assert!(matches!(f(&ed), MenuMark::OnOff(true)), "defaults ON (④ always-on)");
+        let ex = InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut ed, clock: &Z, executor: &ex, msg_tx: tx, fs: crate::test_support::test_fs() };
+        assert_eq!(reg.dispatch(CommandId("toggle_landmarks"), &mut ctx), CommandResult::Handled);
+        assert!(!ed.view_opts.landmarks_visible, "dispatch turned paint off");
+        assert!(matches!(f(&ed), MenuMark::OnOff(false)));
     }
 
     // -----------------------------------------------------------------------
