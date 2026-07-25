@@ -559,8 +559,44 @@ if [[E8]] later redefines "what summons analysis," the lazy-spawn/idle-shutdown 
 **Sequencing:** E10 is the most execution-ready E-theme item and unblocks [[E11]]'s value (E11's
 `href`/`code` UX is inert until a non-harper engine sends those fields — harper never does). See the
 Fable analysis for the full grouping; the linting sub-arc is **E10 → E11 → E8-impl → E12-if-ever**.
-Open human forks remaining (from the analysis): JVM idle-shutdown policy (strict free-at-rest vs
-keep-warm-in-session), ltex install/support posture, and default engine when several are enabled.
+
+**DECISIONS RULED (human, 2026-07-25 — grounding + forks in `scratchpad/lens-linting-arc/`):**
+1. **Warm-up:** first-check-special deadline — a `FIRST_CHECK_TIMEOUT` (~180 s) until ltex's first
+   publish ever arrives, then the normal watchdog; keep accepting during warm (shipped init-queue
+   semantics). Status = a single steady `warming ltex…` (no blink, no progress bar, no self-driven
+   animation — the idle-free law forbids a wall-clock repaint loop).
+2. **Architecture:** extract a **shared LSP-client core** — refactor harper onto it FIRST as its own
+   intermediate-green task (harper's tests pass unmodified), THEN add ltex + vale as thin engine
+   specs. One copy of the terminal-guarantee/watchdog/warm logic. (NOT clone-×3.)
+3. **Idle-shutdown:** keep-warm with a **~15-min idle timeout** (configurable
+   `[diagnostics.ltex] idle_shutdown_min`), **ltex-only** (vale is cheap — never shut down).
+   Mechanism = suspend-the-child (reuse the crash-respawn path); arm on the leaving-Review
+   *predicate transition* (handle buffer-switch, grace window), clear on re-entry; deadline lives in
+   editor state (beside `diag_hint_shown`), not the provider.
+4. **vale auto-install: NOT wired at all.** vale treated identically to harper/ltex — available only
+   when the user has installed it; graceful "not installed" + hint on absence. No `installVale`, no
+   install config key (avoids the app's first silent network+disk side effect; consistent posture).
+5. **Default engine:** harper-first catalog order is the FALLBACK, plus a **config-file-only
+   `[diagnostics] default_engine`** key that overrides the seed when set AND the named engine is
+   installed+enabled (else harper-first). Config-only like `language` — NO command, no
+   command-surface tax. (Revised from the earlier defer: the active engine is NOT persisted across
+   sessions — `settings.rs` has no snapshot field — so without this a primarily-ltex user re-switches
+   every session; and the seed site + config layer are already being edited here.)
+6. **ltex support posture:** documented optdepends + a per-engine `INSTALL_HINT` naming
+   "requires Java 21+".
+7. **Engine menu section:** lives under **View** (rows = `Command(toggle_engine_<e>)` with
+   state-in-label, a builtin `fn(&Editor)` over `ProviderSet::sources`+`availability`; menu ⊆ palette
+   by construction — no `MenuRowAction::Plugin`/dynamic-menu machinery). A top-level "Analysis" menu
+   is deferred to [[E8]]'s menu question.
+8. **Per-engine config (blessed minimal):** `[diagnostics.ltex]` = `language` + `idle_shutdown_min`;
+   `[diagnostics.vale]` = none (vale self-discovers `.vale.ini`); plus `[diagnostics] default_engine`
+   (config-only, #5). NOT: ltex java_path/heap, vale config-path override, any install flag.
+
+**Grounded invariants carried to spec:** the render layer is ZERO-TOUCH (two providers change nothing
+in `RowCtx`/derive/ventilate/lenses — S6 ventilate × Review already compose, diag byte-spans map
+through ventilated rows by construction); the dispatch/store/timers spine needs zero change for N=3
+(insertion points are the catalog append + registry siblings + two provider specs); decouple-from-E8
+= key lifecycle on `should_run_diagnostics`, never `RenderMode::Review` literals.
 
 ### E11 — Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
 <!-- item: E11 -->
