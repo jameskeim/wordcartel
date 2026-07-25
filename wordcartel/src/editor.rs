@@ -467,7 +467,7 @@ pub struct MouseState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarkPending { Set, Jump }
+pub enum MarkPending { Set, Jump, Clear }
 
 /// One pending session-entry rename, recorded by a Save-As merge and applied where the
 /// session store is actually reachable (`app::run`).

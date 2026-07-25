@@ -29,6 +29,15 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
 
 pub fn set_mark(editor: &mut Editor)  { editor.pending_mark = Some(MarkPending::Set); editor.set_status(crate::status::StatusKind::Info, "set mark:"); }
 pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.set_status(crate::status::StatusKind::Info, "jump to mark:"); }
+pub fn clear_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Clear); editor.set_status(crate::status::StatusKind::Info, "clear mark:"); }
+
+/// Clear every mark in the active buffer (C2 — visible marks need a lifecycle).
+pub fn clear_marks(editor: &mut Editor) {
+    let n = editor.active().marks.len();
+    editor.active_mut().marks.clear();
+    editor.set_status(crate::status::StatusKind::Info,
+        if n == 0 { "no marks".to_string() } else { format!("{n} marks cleared") });
+}
 
 /// Push `pre` onto the ring as a deliberate jump origin.
 pub fn record_jump(buf: &mut Buffer, pre: usize) {
@@ -120,6 +129,13 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
         Some(MarkPending::Jump) => {
             if jump_char_mark(editor, ch) {
                 editor.set_status(crate::status::StatusKind::Info, format!("jumped to mark {ch}"));
+            } else {
+                editor.set_status(crate::status::StatusKind::Info, format!("no mark {ch}"));
+            }
+        }
+        Some(MarkPending::Clear) => {
+            if editor.active_mut().marks.remove(&ch).is_some() {
+                editor.set_status(crate::status::StatusKind::Info, format!("mark {ch} cleared"));
             } else {
                 editor.set_status(crate::status::StatusKind::Info, format!("no mark {ch}"));
             }
@@ -217,6 +233,35 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
         assert!(super::jump_char_mark(&mut e, '5'), "bookmark 5 == char-mark '5'");
         assert_eq!(e.active().document.selection.primary().head, 5);
+    }
+
+    #[test]
+    fn clear_mark_interactive_round_trip() {
+        let mut e = Editor::new_from_text("0123456789\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        super::set_char_mark(&mut e, 'a');
+        super::clear_mark(&mut e);
+        assert_eq!(e.pending_mark, Some(MarkPending::Clear));
+        super::resolve_pending(&mut e, 'a');
+        assert!(!e.active().marks.contains_key(&'a'), "mark removed");
+        assert_eq!(e.status_text(), "mark a cleared");
+        assert!(!super::jump_char_mark(&mut e, 'a'), "jump now fails");
+        // clearing an absent name reports, mutates nothing
+        super::clear_mark(&mut e);
+        super::resolve_pending(&mut e, 'q');
+        assert_eq!(e.status_text(), "no mark q");
+    }
+
+    #[test]
+    fn clear_marks_clears_all_and_counts() {
+        let mut e = Editor::new_from_text("abcdef\n", None, (80, 24));
+        super::set_char_mark(&mut e, '1');
+        super::set_char_mark(&mut e, 'z');
+        super::clear_marks(&mut e);
+        assert!(e.active().marks.is_empty());
+        assert_eq!(e.status_text(), "2 marks cleared");
+        super::clear_marks(&mut e);
+        assert_eq!(e.status_text(), "no marks");
     }
 
     #[test]
