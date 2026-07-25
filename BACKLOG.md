@@ -3,7 +3,7 @@
 
 # Backlog
 
-**33 open · 80 shipped · 2 dropped**
+**32 open · 81 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -28,7 +28,6 @@ Blocking Effort P: **0**
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A22 | Write-Block Redirect exports the whole document, not the marked block | triage | feature | TBD |  | Write-Block Redirect exports the whole document, not the marked block |
-| B18 | Landmark visibility toggle — hide marks/block markers in-text while editing | triage | feature | TBD |  | Landmark visibility toggle — hide marks/block markers in-text while editing |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
 | H26 | fs-chokepoint guard: use-tree parsing for full soundness | triage | feature | TBD |  | fs-chokepoint guard: use-tree parsing for full soundness |
@@ -47,12 +46,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>80 shipped</summary>
+<details><summary>81 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | B12 | Lone block-begin marker renders nothing (^KB before ^KK is invisible) | 2026-07-24 | 2f1bb56 |
 | B13 | Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs) | 2026-07-24 | f5a8b82 |
+| B18 | Landmark visibility toggle — hide marks/block markers in-text while editing | 2026-07-24 | c1e2456 |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | 2026-07-24 | 72928e3 |
 | H23 | palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom) | 2026-07-24 | a8063e3 |
 | H27 | dispatch signatures: pass DispatchCtx instead of 8 loose args | 2026-07-24 | 48105e0 |
