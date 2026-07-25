@@ -33,7 +33,6 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     const PUBLISH_TIMEOUT_MS: u64;
     /// `Some(ms)` = warm-phase deadline until the first publish of each child process
     /// (consumed by T2; declared here so the trait is complete from day one).
-    #[allow(dead_code)] // T1 declares the full trait surface; T2's warm phase reads this.
     const FIRST_CHECK_TIMEOUT_MS: Option<u64>;
     const CODEACTION_TIMEOUT_MS: u64;
     /// Idle suspend-the-child eligibility (consumed by T3; ltex-only).
@@ -119,6 +118,10 @@ pub(crate) struct ClientState<E: LspEngine> {
     pub(crate) awaiting_publish: HashMap<BufferId, AwaitPublish>,
     pub(crate) assembling: HashMap<BufferId, Assembly>,
     pub(crate) spawn_attempts: u32,
+    /// True once this child process has produced its first owned-URI publish (E10 §4) — gates
+    /// which watchdog deadline `on_change` stamps. Reset in `on_spawned` so a respawned child
+    /// re-enters the warm phase.
+    pub(crate) first_publish_seen: bool,
     pub(crate) _engine: std::marker::PhantomData<E>,
 }
 
@@ -129,6 +132,7 @@ impl<E: LspEngine> ClientState<E> {
             phase: Phase::Initializing, cfg, docs: HashMap::new(), uri_owner: HashMap::new(),
             next_generation: 1, queued: Vec::new(), next_id: 1, pending_requests: HashMap::new(),
             awaiting_publish: HashMap::new(), assembling: HashMap::new(), spawn_attempts: 1,
+            first_publish_seen: false,
             _engine: std::marker::PhantomData,
         }
     }
@@ -162,6 +166,7 @@ impl<E: LspEngine> ClientState<E> {
     /// (Re)spawn handshake step: reset to `Initializing`, mark every doc closed, clear pending, and
     /// send `initialize`. The pump must read its RESPONSE before `initialized` (deadlock guard).
     pub(crate) fn on_spawned(&mut self, _now: u64) -> Vec<Action> {
+        self.first_publish_seen = false;
         self.phase = Phase::Initializing;
         for d in self.docs.values_mut() { d.open = false; }
         self.pending_requests.clear();
@@ -211,6 +216,10 @@ impl<E: LspEngine> ClientState<E> {
     /// guard, spec §3.2/§5.1) — before any `Send` — so a mid-send death still flushes a terminal.
     fn on_change(&mut self, buffer_id: BufferId, version: u64,
         _path: Option<std::path::PathBuf>, text: String, now: u64) -> Vec<Action> {
+        // E10 §4: until this child's first publish, the watchdog runs at the engine's
+        // warm-phase deadline (JVM boot + model load land in first-CHECK latency).
+        let publish_timeout = if self.first_publish_seen { E::PUBLISH_TIMEOUT_MS }
+            else { E::FIRST_CHECK_TIMEOUT_MS.unwrap_or(E::PUBLISH_TIMEOUT_MS) };
         let reopen = !self.docs.get(&buffer_id).map(|d| d.open).unwrap_or(false);
         let mut out = Vec::new();
         if reopen {
@@ -220,7 +229,7 @@ impl<E: LspEngine> ClientState<E> {
             let lsp_version = 1;
             // Record awaiting BEFORE the Send action (non-IO first step; flush covers a mid-send death).
             self.awaiting_publish.insert(buffer_id,
-                AwaitPublish { our_version: version, generation, deadline: now + E::PUBLISH_TIMEOUT_MS });
+                AwaitPublish { our_version: version, generation, deadline: now + publish_timeout });
             out.push(Action::Send(json!({
                 "jsonrpc":"2.0","method":"textDocument/didOpen",
                 "params":{"textDocument":{"uri":uri,"languageId": E::LANGUAGE_ID,"version":lsp_version,"text":text}}})));
@@ -235,7 +244,7 @@ impl<E: LspEngine> ClientState<E> {
                 (d.uri.clone(), d.generation, d.lsp_version)
             };
             self.awaiting_publish.insert(buffer_id,
-                AwaitPublish { our_version: version, generation, deadline: now + E::PUBLISH_TIMEOUT_MS });
+                AwaitPublish { our_version: version, generation, deadline: now + publish_timeout });
             out.push(Action::Send(json!({
                 "jsonrpc":"2.0","method":"textDocument/didChange",
                 "params":{"textDocument":{"uri":uri,"version":lsp_version},
@@ -338,6 +347,9 @@ impl<E: LspEngine> ClientState<E> {
                 (d.our_version, d.text.clone(), d.lsp_version),
             _ => return Vec::new(),
         };
+        // An attributed publish proves the engine warm even when the version-echo mismatches
+        // below (E10 §4) — the watchdog only needs proof the child is alive and talking.
+        self.first_publish_seen = true;
         // Secondary in-generation guard: drop a stale snapshot when the echo IS present (harper 2.1.0
         // omits it — generation is the load-bearing tag; this never blocks the omitted case).
         if let Some(ver) = params.get("version").and_then(|x| x.as_i64()) {
@@ -789,5 +801,128 @@ fn wait_inbound(rx: &Receiver<Inbound>, deadline_ms: Option<u64>, now_ms: u64) -
                 Err(RecvTimeoutError::Disconnected) => Wait::Closed,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spec-configurable engine for exercising the generic machine (the RecordingProvider
+    /// precedent at the state level). Warm phase ON (30 s), suspendable (T3).
+    #[derive(Debug)]
+    struct TestEngine;
+    impl LspEngine for TestEngine {
+        const SOURCE: DiagSource = DiagSource::Plugin("test-engine");
+        const INSTALL_HINT: &'static str = "test engine unavailable";
+        const CRASHED_HINT: &'static str = "test engine crashed";
+        const LANGUAGE_ID: &'static str = "markdown";
+        const CLIENT_THREAD: &'static str = "wcartel-test-client";
+        const READER_THREAD: &'static str = "wcartel-test-read";
+        const PUBLISH_TIMEOUT_MS: u64 = 1_000;
+        const FIRST_CHECK_TIMEOUT_MS: Option<u64> = Some(30_000);
+        const CODEACTION_TIMEOUT_MS: u64 = 500;
+        const SUSPENDABLE: bool = true;
+        fn spawn_command() -> Command { Command::new("wcartel-no-such-test-engine") }
+        fn initialize_params(_cfg: &ProviderConfig) -> Value {
+            json!({"processId": Value::Null, "capabilities": {}})
+        }
+        fn settings_push(_cfg: &ProviderConfig) -> Option<Value> { None }
+        fn answer_request(_method: &str, _req: &Value, _cfg: &ProviderConfig) -> Option<Value> { None }
+        fn classify(_d: &Value) -> DiagnosticKind { DiagnosticKind::Grammar }
+    }
+
+    fn cfg() -> ProviderConfig {
+        ProviderConfig { grammar: true, dictionary: None, max_file_length: 10_000 }
+    }
+
+    fn sends(acts: &[Action]) -> Vec<&Value> {
+        acts.iter().filter_map(|a| if let Action::Send(v) = a { Some(v) } else { None }).collect()
+    }
+    fn diag_dones(acts: &[Action]) -> Vec<(BufferId, u64)> {
+        acts.iter().filter_map(|a| match a {
+            Action::Emit(Msg::DiagnosticsDone { buffer_id, version, .. }) =>
+                Some((*buffer_id, *version)),
+            _ => None,
+        }).collect()
+    }
+
+    /// Drive `new → on_spawned → initialize response` to a Running machine.
+    fn running() -> ClientState<TestEngine> {
+        let mut st = ClientState::<TestEngine>::new(cfg());
+        let spawn = st.on_spawned(0);
+        let id = sends(&spawn)[0]["id"].as_u64().expect("initialize id");
+        let out = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 0);
+        assert!(!out.is_empty());
+        st
+    }
+
+    fn change(st: &mut ClientState<TestEngine>, buffer: u64, version: u64, at: u64) {
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(buffer),
+            version, path: None, text: "x".into() }), at);
+    }
+    // (`BufferId` is a `pub u64` newtype — editor.rs — so the literal forms below match the
+    // harper tests' `BufferId(0)` exactly.)
+
+    // ── T2: warm-phase deadline ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn first_check_uses_the_long_deadline() {
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        assert!(st.on_deadline(TestEngine::PUBLISH_TIMEOUT_MS).is_empty(),
+            "normal watchdog must NOT fire during the warm phase");
+        let out = st.on_deadline(TestEngine::FIRST_CHECK_TIMEOUT_MS.unwrap());
+        assert_eq!(diag_dones(&out), vec![(BufferId(0), 1)],
+            "the warm deadline eventually fires an empty terminal");
+    }
+
+    #[test]
+    fn after_first_publish_the_normal_deadline_applies() {
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        // First publish for the owned uri (generation 1) proves the engine warm.
+        let out = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{"uri":"untitled:wcartel-0-1","diagnostics":[]}})), 0);
+        assert_eq!(diag_dones(&out), vec![(BufferId(0), 1)]);
+        // The next check is watchdogged at the NORMAL timeout.
+        change(&mut st, 0, 2, 100);
+        let fired = st.on_deadline(100 + TestEngine::PUBLISH_TIMEOUT_MS);
+        assert_eq!(diag_dones(&fired), vec![(BufferId(0), 2)],
+            "post-warm checks use PUBLISH_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn respawn_re_enters_the_warm_phase() {
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{"uri":"untitled:wcartel-0-1","diagnostics":[]}})), 0); // warm proven
+        st.on_inbound(Inbound::ServerEof, 0); // crash → respawn path
+        let spawn = st.on_spawned(0);
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 0);
+        change(&mut st, 0, 3, 0);
+        assert!(st.on_deadline(TestEngine::PUBLISH_TIMEOUT_MS).is_empty(),
+            "on_spawned reset first_publish_seen — the fresh child re-warms (spec §4)");
+    }
+
+    #[test]
+    fn engine_without_warm_phase_uses_the_normal_deadline_from_the_start() {
+        // HarperEngine has FIRST_CHECK_TIMEOUT_MS = None — its own pinned test
+        // `publish_watchdog_emits_empty_after_deadline` (harper_ls.rs) covers this; this
+        // test guards the unwrap_or fallback generically via the harper alias.
+        let mut st = crate::harper_ls::HarperState::new(cfg());
+        let spawn = st.on_spawned(0);
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,"result":{}})), 0);
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1,
+            path: None, text: "x".into() }), 0);
+        let out = st.on_deadline(crate::harper_ls::HarperEngine::PUBLISH_TIMEOUT_MS);
+        assert_eq!(diag_dones(&out), vec![(BufferId(0), 1)]);
     }
 }
