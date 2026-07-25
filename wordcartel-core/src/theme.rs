@@ -115,6 +115,10 @@ pub enum SemanticElement {
     Selection,
     /// A user-marked block, distinct from `Selection` (§13.2 marked-block faces).
     MarkedBlock,
+    /// The begin/end boundary cells of a marked block (and the pending ^KB anchor cell).
+    MarkedBlockBoundary,
+    /// A char-mark / numbered-bookmark presence cell (landmark visibility, Effort ④).
+    LandmarkGlyph,
     /// A non-current search match.
     SearchMatch,
     /// The current (cursor-focused) search match.
@@ -249,6 +253,7 @@ struct ThemeFaces {
     text: Face, emphasis: Face, strong: Face, strong_emphasis: Face, code: Face, strikethrough: Face, link: Face,
     heading: [Face; 6], block_quote: Face, code_block: Face, list_marker: Face, thematic_break: Face,
     front_matter: Face, comment: Face, selection: Face, marked_block: Face,
+    marked_block_boundary: Face, landmark_glyph: Face,
     search_match: Face, search_current: Face, diag_spelling: Face, diag_grammar: Face,
     prose_lens_match: Face,
     focus_dim: Face, fold_marker: Face, wrap_guide: Face,
@@ -288,6 +293,8 @@ impl Theme {
             ListMarker => self.faces.list_marker, ThematicBreak => self.faces.thematic_break,
             FrontMatter => self.faces.front_matter, Comment => self.faces.comment, Selection => self.faces.selection,
             MarkedBlock => self.faces.marked_block,
+            MarkedBlockBoundary => self.faces.marked_block_boundary,
+            LandmarkGlyph => self.faces.landmark_glyph,
             SearchMatch => self.faces.search_match, SearchCurrent => self.faces.search_current,
             DiagSpelling => self.faces.diag_spelling, DiagGrammar => self.faces.diag_grammar,
             ProseLensMatch => self.faces.prose_lens_match,
@@ -507,6 +514,8 @@ impl Theme {
             FrontMatter => &mut self.faces.front_matter, Comment => &mut self.faces.comment,
             Selection => &mut self.faces.selection,
             MarkedBlock => &mut self.faces.marked_block,
+            MarkedBlockBoundary => &mut self.faces.marked_block_boundary,
+            LandmarkGlyph => &mut self.faces.landmark_glyph,
             SearchMatch => &mut self.faces.search_match, SearchCurrent => &mut self.faces.search_current,
             DiagSpelling => &mut self.faces.diag_spelling, DiagGrammar => &mut self.faces.diag_grammar,
             ProseLensMatch => &mut self.faces.prose_lens_match,
@@ -622,8 +631,10 @@ pub fn default() -> Theme {
             list_marker: Face { fg: Some(Color::DarkGray), ..Face::default() }, // prefix glyph normal
             thematic_break: Face::default(), front_matter: Face::default(), comment: Face::default(),
             selection: Face { reverse: Some(true), ..Face::default() },
-            // §13.2 marked block: tinted bg + reverse+bold+underline (distinct from selection=reverse).
-            marked_block: Face { bg: Some(Color::DarkGray), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            // ④ landmark visibility: quiet interior tint — strong cues live on the boundary face.
+            marked_block: Face { bg: Some(Color::DarkGray), ..Face::default() },
+            marked_block_boundary: Face { reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            landmark_glyph: Face { reverse: Some(true), italic: Some(true), underline: Some(true), ..Face::default() },
             // search: today match = yellow bg + black fg; current = reverse.
             search_match: Face { bg: Some(Color::Yellow), fg: Some(Color::Black), ..Face::default() },
             search_current: modface(None, false, false, false, false, true),
@@ -696,8 +707,10 @@ pub fn tokyo_night() -> Theme {
             front_matter: Face { fg: Some(ORANGE), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(COMMENT), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { bg: Some(SEL_BG), ..Face::default() },
-            // §13.2 marked block: lighter-than-selection bg + reverse+bold+underline.
-            marked_block: Face { bg: Some(DARK3), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            // ④ landmark visibility: quiet interior tint — strong cues live on the boundary face.
+            marked_block: Face { bg: Some(DARK3), ..Face::default() },
+            marked_block_boundary: Face { reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            landmark_glyph: Face { reverse: Some(true), italic: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(YELLOW), fg: Some(BG), ..Face::default() },
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(RED), ..Face::default() },
@@ -760,7 +773,10 @@ pub fn terminal_ansi() -> Theme {
             front_matter: Face { fg: Some(Color::Magenta), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(Color::DarkGray), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { reverse: Some(true), ..Face::default() },
-            marked_block: Face { bg: Some(Color::DarkGray), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            // ④ landmark visibility: quiet interior tint — strong cues live on the boundary face.
+            marked_block: Face { bg: Some(Color::DarkGray), ..Face::default() },
+            marked_block_boundary: Face { reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            landmark_glyph: Face { reverse: Some(true), italic: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(Color::Yellow), fg: Some(Color::Black), ..Face::default() },
             search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(Color::Red), ..Face::default() },
@@ -934,8 +950,10 @@ fn blue_jeans(name: &str, r: BjRoles) -> Theme {
             front_matter: Face { fg: Some(r.front_matter), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(r.comment), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { bg: Some(r.selection_bg), ..Face::default() },
-            // §13.2 marked block: warm mark-bg + reverse+bold+underline (distinct from selection).
-            marked_block: Face { bg: Some(r.mark_bg), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            // ④ landmark visibility: quiet interior tint — strong cues live on the boundary face.
+            marked_block: Face { bg: Some(r.mark_bg), ..Face::default() },
+            marked_block_boundary: Face { reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            landmark_glyph: Face { reverse: Some(true), italic: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(r.search_bg), fg: Some(r.bg), ..Face::default() },
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(r.diag_spell), ..Face::default() },
@@ -1051,8 +1069,10 @@ pub fn from_base16(name: &str, p: BasePalette) -> Theme {
             front_matter: Face { fg: Some(b[0xF]), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(b[0x3]), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { bg: Some(b[0x2]), ..Face::default() },
-            // §13.2 marked block: distinct (comment-slot) bg + reverse+bold+underline.
-            marked_block: Face { bg: Some(b[0x3]), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            // ④ landmark visibility: quiet interior tint — strong cues live on the boundary face.
+            marked_block: Face { bg: Some(b[0x3]), ..Face::default() },
+            marked_block_boundary: Face { reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            landmark_glyph: Face { reverse: Some(true), italic: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(b[0xA]), fg: Some(b[0x0]), ..Face::default() },
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(b[0x8]), ..Face::default() },
@@ -1088,6 +1108,7 @@ pub fn element_from_key(key: &str) -> Option<SemanticElement> {
         "block_quote" => BlockQuote, "code_block" => CodeBlock, "list_marker" => ListMarker,
         "thematic_break" => ThematicBreak, "front_matter" => FrontMatter, "comment" => Comment,
         "selection" => Selection, "marked_block" => MarkedBlock,
+        "marked_block_boundary" => MarkedBlockBoundary, "landmark_glyph" => LandmarkGlyph,
         "search_match" => SearchMatch, "search_current" => SearchCurrent,
         "diag_spelling" => DiagSpelling, "diag_grammar" => DiagGrammar,
         "prose_lens_match" => ProseLensMatch, "focus_dim" => FocusDim,
@@ -1172,7 +1193,9 @@ fn mono_faces() -> ThemeFaces {
         front_matter: m(false, true, false, false, true),         // reverse+italic
         comment: Face { italic: Some(true), dim: Some(true), ..Face::default() }, // italic+dim
         selection: m(false, false, true, false, true),            // reverse+underline
-        marked_block: m(true, false, true, false, true),          // reverse+bold+underline (§13.2 distinct)
+        marked_block: Face { reverse: Some(true), dim: Some(true), ..Face::default() }, // ④ quiet interior (r+d)
+        marked_block_boundary: m(true, false, true, false, true),  // reverse+bold+underline (the retired interior combo)
+        landmark_glyph: m(false, true, true, false, true),         // reverse+italic+underline
         search_match: m(false, false, false, false, true),
         search_current: m(true, false, false, false, true),
         diag_spelling: m(true, false, true, false, false),        // bold+underline
@@ -1212,7 +1235,10 @@ pub fn phosphor(name: &str, hue: Color) -> Theme {
         front_matter: Face { fg: Some(shade(hue, 2)), italic: Some(true), ..Face::default() },
         comment: Face { fg: Some(shade(hue, 1)), italic: Some(true), ..Face::default() },
         selection: Face { fg: Some(shade(hue, 5)), reverse: Some(true), underline: Some(true), ..Face::default() },
-        marked_block: Face { bg: Some(shade(hue, 2)), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+        // ④ landmark visibility: quiet interior tint — strong cues live on the boundary face.
+        marked_block: Face { bg: Some(shade(hue, 2)), ..Face::default() },
+        marked_block_boundary: Face { reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+        landmark_glyph: Face { reverse: Some(true), italic: Some(true), underline: Some(true), ..Face::default() },
         search_match: Face { bg: Some(shade(hue, 2)), fg: Some(shade(hue, 0)), ..Face::default() },
         search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
         diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
@@ -1355,29 +1381,46 @@ mod tests {
         assert_ne!(t.face(SemanticElement::FrontMatter), t.face(SemanticElement::Code));
     }
 
-    // a11y: MarkedBlock has a distinct mono modifier (reverse+bold+underline) and is in ALL_ELEMENTS.
+    // a11y (④): the landmark trio is mono-distinct — quiet interior (reverse+dim),
+    // strong boundary (reverse+bold+underline: the pre-④ interior combo, reassigned),
+    // landmark glyph (reverse+italic+underline). Pairwise distinct from each other and
+    // from every co-occurring highlight/cue face in the near-full mono space.
     #[test]
-    fn marked_block_mono_modifier_is_distinct() {
+    fn landmark_mono_modifiers_are_distinct() {
         let t = no_color();
-        let mb = t.face(SemanticElement::MarkedBlock);
-        assert_eq!((mb.reverse, mb.bold, mb.underline), (Some(true), Some(true), Some(true)));
-        // distinct from selection (reverse+underline), search_current (bold+reverse), diag_spelling (bold+underline)
-        assert_ne!(mb, t.face(SemanticElement::Selection));
-        assert_ne!(mb, t.face(SemanticElement::SearchCurrent));
-        assert_ne!(mb, t.face(SemanticElement::DiagSpelling));
-        // present in the totality set
-        assert!(ALL_ELEMENTS.contains(&SemanticElement::MarkedBlock));
+        let interior = t.face(SemanticElement::MarkedBlock);
+        assert_eq!((interior.reverse, interior.dim), (Some(true), Some(true)));
+        assert_eq!((interior.bold, interior.underline), (None, None), "interior is QUIET");
+        let boundary = t.face(SemanticElement::MarkedBlockBoundary);
+        assert_eq!((boundary.reverse, boundary.bold, boundary.underline),
+                   (Some(true), Some(true), Some(true)));
+        let landmark = t.face(SemanticElement::LandmarkGlyph);
+        assert_eq!((landmark.reverse, landmark.italic, landmark.underline),
+                   (Some(true), Some(true), Some(true)));
+        let peers = [SemanticElement::Selection, SemanticElement::SearchMatch,
+                     SemanticElement::SearchCurrent, SemanticElement::DiagSpelling,
+                     SemanticElement::DiagGrammar, SemanticElement::ProseLensMatch,
+                     SemanticElement::FrontMatter, SemanticElement::Comment];
+        for f in [interior, boundary, landmark] {
+            for p in peers { assert_ne!(f, t.face(p), "{p:?} must stay distinct"); }
+        }
+        assert_ne!(interior, boundary);
+        assert_ne!(boundary, landmark);
+        assert_ne!(interior, landmark);
+        assert!(ALL_ELEMENTS.contains(&SemanticElement::MarkedBlockBoundary));
+        assert!(ALL_ELEMENTS.contains(&SemanticElement::LandmarkGlyph));
     }
 
-    const ALL_ELEMENTS: [SemanticElement; 35] = {
+    const ALL_ELEMENTS: [SemanticElement; 37] = {
         use SemanticElement::*;
         [Text, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
          Heading(1), Heading(2), Heading(3), Heading(4), Heading(5), Heading(6),
          BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection, MarkedBlock,
+         MarkedBlockBoundary, LandmarkGlyph,
          SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, ProseLensMatch, FocusDim, FoldMarker, WrapGuide,
          Chrome, ChromeReverse, ChromeSelected, ChromeMuted, ChromeOverlay, ChromeAccent]
     };
-    // 35 = Text + 6 inline + 6 heading + 4 block + 4 (fm/comment/sel/marked-block) + 7 overlay + 6 chrome + 1 prose-lens.
+    // 37 = Text + 6 inline + 6 heading + 4 block + 6 (fm/comment/sel/marked-block/boundary/landmark) + 7 overlay + 6 chrome + 1 prose-lens.
     // This is the totality proof — the count must equal the SemanticElement variant count
     // (Heading collapsed to its 6 levels). The `face_is_total` loop visits every one.
     #[test]
@@ -1501,6 +1544,7 @@ mod tests {
             DiagSpelling | DiagGrammar                                        => UnderlineColorRequired,
             Selection | MarkedBlock | SearchMatch | ProseLensMatch            => Highlight,
             SearchCurrent                                                     => Modifier,
+            MarkedBlockBoundary | LandmarkGlyph                               => Modifier,
             Chrome | ChromeReverse | ChromeSelected | ChromeMuted | ChromeOverlay
             | ChromeAccent                                                     => Exempt,
         }
@@ -1808,6 +1852,8 @@ mod tests {
         assert_eq!(element_from_key("heading1"), Some(Heading(1)));
         assert_eq!(element_from_key("heading6"), Some(Heading(6)));
         assert_eq!(element_from_key("selection"), Some(Selection));
+        assert_eq!(element_from_key("marked_block_boundary"), Some(MarkedBlockBoundary));
+        assert_eq!(element_from_key("landmark_glyph"), Some(LandmarkGlyph));
         assert_eq!(element_from_key("strong_emphasis"), Some(StrongEmphasis));
         assert_eq!(element_from_key("chrome_selected"), Some(ChromeSelected));
         assert_eq!(element_from_key("chrome_overlay"), Some(ChromeOverlay));
@@ -2257,6 +2303,7 @@ mod tests {
                 block_quote: Face::default(), code_block: Face::default(), list_marker: Face::default(),
                 thematic_break: Face::default(), front_matter: Face::default(), comment: Face::default(),
                 selection: Face::default(), marked_block: Face::default(),
+                marked_block_boundary: Face::default(), landmark_glyph: Face::default(),
                 search_match: Face::default(), search_current: Face::default(),
                 diag_spelling: Face::default(), diag_grammar: Face::default(),
                 prose_lens_match: Face::default(),

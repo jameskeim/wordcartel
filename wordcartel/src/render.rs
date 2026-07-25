@@ -2002,8 +2002,14 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 60, 6);
-        // the block cells carry a non-default style distinct from unselected cells (reverse modifier)
-        assert!(row_has_highlight(&buf, 0), "block cells painted with a modifier");
+        // ④ quiet interior: a strictly-interior cell (col 2 — stable through the T4
+        // boundary split) carries the theme's MarkedBlock tint bg and is NOT reversed.
+        let want_bg = crate::compose::face_to_ratatui(&e.theme.face(SE::MarkedBlock), e.depth).bg;
+        assert!(want_bg.is_some(), "default theme's interior tint has a bg");
+        assert_eq!(buf[(2u16, 0u16)].style().bg, want_bg, "interior cell carries the tint");
+        assert!(!buf[(2u16, 0u16)].style().add_modifier.contains(Modifier::REVERSED),
+            "④: the interior is QUIET — the pre-④ reversed look is retired");
+        assert_ne!(buf[(7u16, 0u16)].style().bg, want_bg, "outside the block: no tint");
         // and the status row contains "BLK"
         assert!(row_string(&buf, 5).contains("BLK"), "status shows BLK indicator");
     }
@@ -2016,8 +2022,12 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 60, 6);
         assert!(row_string(&buf, 5).contains("BLK·hidden"));
-        // a hidden block is not painted into the text rows
-        assert!(!row_has_highlight(&buf, 0), "hidden block not painted");
+        // ④: "not painted" pinned against the ACTUAL interior form — a leaked hidden
+        // block would tint row 0 with the MarkedBlock bg (`row_has_highlight` cannot
+        // see the quiet interior, so assert the face directly — no vacuous pass).
+        let tint = crate::compose::face_to_ratatui(&e.theme.face(SE::MarkedBlock), e.depth).bg;
+        assert!((0..buf.area.width).all(|x| buf[(x, 0u16)].style().bg != tint),
+            "hidden block paints no interior tint");
     }
 
     #[test]
