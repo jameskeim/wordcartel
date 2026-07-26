@@ -1055,3 +1055,29 @@ the archive.
 
 Prior art / context: E10 (shipped the vale-ls provider), E11 (shipped the mapping + disabled it by
 default), [[E15]] (dropped — superseded by this). ~M.
+
+### H38 — classify_spell_heuristic's spell-substring branch is pinned by no test
+<!-- item: H38 -->
+
+**A pre-existing coverage hole, surfaced 2026-07-26 by the review of the vale-ls removal** — it
+predates that branch and is not caused by it.
+
+`lsp_client`'s shared `classify_spell_heuristic` decides whether a diagnostic is a spelling issue
+when the engine's own naming does not settle it; one of its branches tests the rule code for a
+`spell` substring. **Mutating that branch reddens no test — and did not before the removal either.**
+The reason it looked covered: the deleted `vale_ls.rs` test `classify_spelling_checks_by_name_else_heuristic`
+appeared to exercise it, but `ValeEngine::classify` short-circuited on its own `"Spelling"` check and
+so never reached the shared heuristic's substring branch at all. The test passed for a reason
+unrelated to what its name claimed.
+
+This is the effort's recurring defect class in its purest form: **the asserted outcome was also the
+outcome of a path that never ran.** It survived because the engine-specific short-circuit and the
+shared fallback produce the same answer for vale's inputs, so no fixture ever distinguished them.
+
+**Fix shape:** a fixture whose rule code reaches the shared heuristic — i.e. an engine (or a
+`TestEngine`) whose own `classify` returns "undecided" for a code containing `spell` — asserted to
+classify as Spelling, with the kill condition stated: deleting the substring branch must redden it.
+Cheap; the value is closing a branch that currently has no pin at all.
+
+Anchors: `lsp_client::classify_spell_heuristic`, `LspEngine::classify`. Related: the removal that
+surfaced it (`chore-drop-vale-ls-provider`), [[E16]]. ~S.
