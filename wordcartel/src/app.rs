@@ -63,6 +63,16 @@ pub enum Msg {
         source: wordcartel_core::diagnostics::DiagSource,
         diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
     },
+    /// E11 §3.4: on-demand fix results for ONE overlay request. `token` is the delivery key
+    /// (minted per request); the identity fields ride for debug asserts, never correlation.
+    DiagFixesReady {
+        token: u64,
+        buffer_id: crate::editor::BufferId,
+        version: u64,
+        source: wordcartel_core::diagnostics::DiagSource,
+        range: std::ops::Range<usize>,
+        suggestions: Vec<wordcartel_core::diagnostics::Suggestion>,
+    },
     /// A `DiagnosticsProvider` lifecycle event (Effort A) — restart re-arm / degradation hint.
     DiagProviderEvent {
         source: wordcartel_core::diagnostics::DiagSource,
@@ -132,6 +142,14 @@ impl std::fmt::Debug for Msg {
                 .field("version", version)
                 .field("source", source)
                 .field("count", &diagnostics.len())
+                .finish(),
+            Msg::DiagFixesReady { token, buffer_id, version, source, suggestions, .. } => f
+                .debug_struct("DiagFixesReady")
+                .field("token", token)
+                .field("buffer_id", buffer_id)
+                .field("version", version)
+                .field("source", source)
+                .field("count", &suggestions.len())
                 .finish(),
             Msg::DiagProviderEvent { source, event } => f
                 .debug_struct("DiagProviderEvent")
@@ -344,6 +362,8 @@ fn reduce_dispatch(msg: Msg, editor: &mut Editor, ctx: &crate::overlays::Dispatc
         Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
+        // E11 T4 placeholder — T5 installs the delivery arm (token-keyed consumption).
+        Msg::DiagFixesReady { .. } => {}
         Msg::DiagProviderEvent { source, event } =>
             crate::diag_provider::apply_provider_event(editor, source, event, ctx.clock),
         Msg::Tick => crate::timers::on_tick(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),

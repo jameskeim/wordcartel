@@ -31,6 +31,11 @@ impl LspEngine for LtexEngine {
     /// The JVM + model warm lands in first-CHECK latency: 2-min worst case + margin (spec §4).
     const FIRST_CHECK_TIMEOUT_MS: Option<u64> = Some(180_000);
     const SUSPENDABLE: bool = true;
+    /// T1's live probe returned OUTCOME A: ltex's response tracks the requested RANGE, not the
+    /// contents of `context.diagnostics` — a single-diagnostic request elicits the same
+    /// `acceptSuggestions` actions as the batch. Set explicitly (not defaulted) because it is a
+    /// recorded empirical ruling, not an omission.
+    const FIX_CONTEXT_ALL_RAWS: bool = false;
 
     // T11-probe flag: the bare invocation is the documented stdio default; verify live.
     fn spawn_command() -> std::process::Command {

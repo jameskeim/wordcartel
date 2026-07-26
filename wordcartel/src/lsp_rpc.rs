@@ -107,7 +107,6 @@ pub fn lsp_range_to_bytes(text: &str, start: (u32, u32), end: (u32, u32))
 /// `edit.documentChanges[]` (ltex, probe-verified exclusive). The action's edit range is a
 /// MATCHING KEY against `anchor` and is then discarded — `Suggestion` carries text only
 /// (the apply-safety invariant, spec §3.3).
-#[allow(dead_code)] // E11 T2 scaffold — consumed by T4's on_fix_response; allow removed there
 pub(crate) fn action_fix_suggestion(
     action: &serde_json::Value, our_uri: &str, doc_text: &str,
     anchor: &std::ops::Range<usize>, accept_kind: impl Fn(&str) -> bool,
@@ -159,7 +158,6 @@ fn edits_to_suggestion(edits: &[serde_json::Value], doc_text: &str,
 /// E11 §4: ALL matching actions for `anchor`, response order, deduped (the shipped `break`
 /// capped attachment at one suggestion per diagnostic — multi-candidate is real on both new
 /// engines: vale 5-for-one, ltex 2-for-`recieve`, both probe-verified).
-#[allow(dead_code)] // E11 T2 scaffold — consumed by T4's on_fix_response; allow removed there
 pub(crate) fn collect_fix_suggestions(
     actions: &[serde_json::Value], our_uri: &str, doc_text: &str,
     anchor: &std::ops::Range<usize>, accept_kind: impl Fn(&str) -> bool,

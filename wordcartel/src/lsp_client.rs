@@ -36,6 +36,11 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     const FIRST_CHECK_TIMEOUT_MS: Option<u64>;
     /// Idle suspend-the-child eligibility (consumed by T3; ltex-only).
     const SUSPENDABLE: bool;
+    /// E11 §2.3/T1: what a per-diagnostic fix request carries in `context.diagnostics` —
+    /// `false` (default): the triple-matched raw alone; `true`: EVERY retained raw from the
+    /// same publish (the shape ltex demonstrably answers in batch; range stays the matched
+    /// raw's own). Flipped per engine by T1's probe outcome.
+    const FIX_CONTEXT_ALL_RAWS: bool = false;
     fn spawn_command() -> Command;
     /// The `initialize` request `params` object (capabilities + initializationOptions).
     fn initialize_params(cfg: &ProviderConfig) -> Value;
@@ -48,7 +53,6 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     fn classify(d: &Value) -> DiagnosticKind;
     /// E11 §4: is this CodeAction `kind` a FIX this engine delivers as an edit?
     /// Probe-grounded per engine — command-only kinds are excluded by knowledge, not luck.
-    #[allow(dead_code)] // E11 T2 scaffold — consumed by T4's on_fix_response; allow removed there
     fn is_fix_kind(kind: &str) -> bool;
 }
 
@@ -76,6 +80,11 @@ pub(crate) fn classify_spell_heuristic(d: &Value) -> DiagnosticKind {
 const SHUTDOWN_GRACE_MS: u64 = 1_000;
 /// Respawn budget per session — the initial spawn counts as the first (spec §3.4; anti-crash-loop).
 const MAX_SPAWN_ATTEMPTS: u32 = 3;
+/// E11 §3.3: the flat leash on ONE on-demand fix request, covering HELD + sent time. Live from
+/// the moment the slot is materialized, in every phase — during a long JVM warm the writer gets
+/// an honest "no fixes available" within 10 s and can reopen to retry, rather than watching
+/// "fetching…" for minutes (a warm-aware deadline was considered and rejected for that reason).
+const FIX_REQUEST_TIMEOUT_MS: u64 = 10_000;
 
 /// A command from the app-side handle, delivered over the `Inbound` channel.
 #[derive(Debug, Clone)]
@@ -87,6 +96,15 @@ pub(crate) enum Cmd {
     Shutdown,
     /// E10 §5: ask a heavy engine to release its child process until next summoned.
     Suspend,
+    /// E11 §3.2: fetch fix candidates for ONE diagnostic, on demand (quick-fix overlay open).
+    /// `token` is the correlation identity; `code`/`message` ride because a byte range alone
+    /// cannot deterministically pick the raw diagnostic to echo (overlapping anchors exist).
+    // T4 builds the CONSUMER (the whole `pending_fix` machine); the sole producer is T5's
+    // `LspProvider::request_fixes`, so the non-test build sees no construction site until then.
+    // Allow removed in T5 (the warning-free-build gate is per commit).
+    #[allow(dead_code)]
+    RequestFixes { token: u64, buffer_id: BufferId, version: u64,
+        range: std::ops::Range<usize>, code: Option<String>, message: String },
 }
 
 /// Everything the pump receives: app commands, one parsed server frame, or reader end-of-stream.
@@ -118,18 +136,36 @@ pub(crate) enum Phase { Initializing, Running, ShuttingDown, Suspended }
 pub(crate) struct DocState {
     pub(crate) uri: String, pub(crate) lsp_version: i32, pub(crate) our_version: u64,
     pub(crate) generation: u64, pub(crate) text: String, pub(crate) open: bool,
-    /// The raw LSP diagnostics array from the most recent publish for this doc, version-tagged
-    /// (`our_version`) — the on-demand quick-fix fetch's source (E11 §3). NEVER STORED by this
-    /// task (spec round-4 Minor 5): T3 adds the field + clearing sites only; ALL storage is
-    /// T4's await-attribution.
-    #[allow(dead_code)] // E11 T3 bridge — first read lands with T4's attribution; allow removed there
+    /// The raw LSP diagnostics array from the most recent publish for this doc — the on-demand
+    /// quick-fix fetch's source (E11 §3.3). STORED ONLY BY AWAIT-ATTRIBUTION: a publish that
+    /// answers a live `awaiting_publish` entry, tagged with THAT await's `our_version` — never
+    /// the ambient `d.our_version`, which an unsolicited republish would silently mis-tag.
     pub(crate) last_raw: Option<(u64, Vec<Value>)>,
 }
 /// A didOpen/didChange awaiting its `publishDiagnostics` (or the publish watchdog).
 pub(crate) struct AwaitPublish { pub(crate) our_version: u64, pub(crate) generation: u64, pub(crate) deadline: u64 }
+/// The ONE live on-demand fix request (E11 §3.3) — the overlay is XOR-single, so at most one can
+/// exist. The slot IS this command's queue: it is materialized in `on_inbound` in every phase and
+/// never enters `queued`, so its `deadline` is visible to `next_deadline()` from acceptance.
+pub(crate) struct PendingFix {
+    pub(crate) token: u64,
+    pub(crate) buffer_id: BufferId,
+    pub(crate) version: u64,
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) code: Option<String>,
+    pub(crate) message: String,
+    pub(crate) deadline: u64,
+    /// `Some` once the wire request went out — the `pending_requests` key to de-register when
+    /// any empty-terminal leg resolves the slot (a late response then hits the unknown-id arm).
+    pub(crate) sent_id: Option<u64>,
+}
 /// What an outstanding JSON-RPC request id means when its response lands.
 pub(crate) enum PendingKind {
     Initialize, Shutdown,
+    /// E11 §3.3: the per-diagnostic `textDocument/codeAction` in flight. The token is IN the
+    /// variant — correlation must never route back through mutable state.
+    FixRequest { token: u64, buffer_id: BufferId, generation: u64, version: u64,
+        range: std::ops::Range<usize> },
 }
 
 /// The pure protocol state machine (spec §3.3), parameterized over the engine `E`. No IO — feed it
@@ -145,6 +181,8 @@ pub(crate) struct ClientState<E: LspEngine> {
     pub(crate) next_id: u64,
     pub(crate) pending_requests: HashMap<u64, PendingKind>,
     pub(crate) awaiting_publish: HashMap<BufferId, AwaitPublish>,
+    /// E11 §3.3: the single on-demand fix request slot (see [`PendingFix`]).
+    pub(crate) pending_fix: Option<PendingFix>,
     pub(crate) spawn_attempts: u32,
     /// True once this child process has produced its first owned-URI publish (E10 §4) — gates
     /// which watchdog deadline `on_change` stamps. Reset in `on_spawned` so a respawned child
@@ -169,7 +207,7 @@ impl<E: LspEngine> ClientState<E> {
         ClientState {
             phase: Phase::Initializing, cfg, docs: HashMap::new(), uri_owner: HashMap::new(),
             next_generation: 1, queued: Vec::new(), next_id: 1, pending_requests: HashMap::new(),
-            awaiting_publish: HashMap::new(), spawn_attempts: 1,
+            awaiting_publish: HashMap::new(), pending_fix: None, spawn_attempts: 1,
             first_publish_seen: false, expected_eofs: 0,
             _engine: std::marker::PhantomData,
         }
@@ -181,8 +219,11 @@ impl<E: LspEngine> ClientState<E> {
     pub(crate) fn is_shutting_down(&self) -> bool { self.phase == Phase::ShuttingDown }
 
     /// The soonest watchdog deadline, if any — the pump's `recv_timeout` bound (idle = `None`).
+    /// Chains the `pending_fix` leash so a HELD slot (any phase, including mid-JVM-warm) is
+    /// visible to the pump from the moment it was accepted (E11 §3.3).
     pub(crate) fn next_deadline(&self) -> Option<u64> {
-        self.awaiting_publish.values().map(|a| a.deadline).min()
+        merge_deadline(self.awaiting_publish.values().map(|a| a.deadline).min(),
+            self.pending_fix.as_ref().map(|p| p.deadline))
     }
 
     /// The `initialize` request — engine params under the shared envelope.
@@ -215,6 +256,18 @@ impl<E: LspEngine> ClientState<E> {
     pub(crate) fn on_inbound(&mut self, inb: Inbound, now: u64) -> Vec<Action> {
         match inb {
             Inbound::Cmd(c) => {
+                // E11 §3.3: `RequestFixes` gets FIRST-CLASS routing ahead of the generic queue
+                // arm (the `Cmd::Suspend` precedent) and is NEVER pushed onto `queued` — the
+                // queue holds bare `Cmd`s that `next_deadline()` cannot see, so a queue-side
+                // request during a JVM warm would get its leash only after initialization
+                // (minutes of visible "fetching"). The slot IS this command's queue.
+                let c = match c {
+                    Cmd::RequestFixes { token, buffer_id, version, range, code, message } =>
+                        return self.on_request_fixes(PendingFix { token, buffer_id, version,
+                            range, code, message, deadline: now + FIX_REQUEST_TIMEOUT_MS,
+                            sent_id: None }),
+                    other => other,
+                };
                 // E10 §5: a suspend outside Running is DROPPED, never queued — a stale
                 // suspend replayed after a resume handshake would re-kill the fresh child.
                 if matches!(c, Cmd::Suspend) && self.phase != Phase::Running {
@@ -257,6 +310,12 @@ impl<E: LspEngine> ClientState<E> {
 
     fn apply_cmd(&mut self, c: Cmd, now: u64) -> Vec<Action> {
         match c {
+            // E11 §3.3: intercepted in `on_inbound` in every phase, so it never reaches the
+            // apply/replay path — and it is never in `queued` for the replay to hand back.
+            Cmd::RequestFixes { .. } => {
+                debug_assert!(false, "RequestFixes is routed in on_inbound, never applied/queued");
+                Vec::new()
+            }
             Cmd::Change { buffer_id, version, path, text } =>
                 self.on_change(buffer_id, version, path, text, now),
             Cmd::Close { buffer_id } => self.on_close(buffer_id),
@@ -299,7 +358,15 @@ impl<E: LspEngine> ClientState<E> {
         let publish_timeout = if self.first_publish_seen { E::PUBLISH_TIMEOUT_MS }
             else { E::FIRST_CHECK_TIMEOUT_MS.unwrap_or(E::PUBLISH_TIMEOUT_MS) };
         let reopen = !self.docs.get(&buffer_id).map(|d| d.open).unwrap_or(false);
-        let mut out = Vec::new();
+        // E11 §3.3 change-invalidation: an edit PAST a pending slot's snapshot retires it now —
+        // the fix target belongs to a superseded version, and the overlay's own `opened_version`
+        // guard would refuse the apply anyway. Killing it here (rather than leaning on the
+        // downstream guard) means any surviving slot satisfies `our_version == version`.
+        let stale_slot = self.pending_fix.as_ref()
+            .is_some_and(|p| p.buffer_id == buffer_id && p.version < version);
+        let mut out: Vec<Action> = if stale_slot {
+            self.resolve_pending_fix_empty().into_iter().collect()
+        } else { Vec::new() };
         if reopen {
             let generation = self.next_generation; self.next_generation += 1;
             let uri = crate::lsp_rpc::doc_uri(buffer_id, generation);
@@ -341,10 +408,22 @@ impl<E: LspEngine> ClientState<E> {
             out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id, version,
                 source: E::SOURCE, diagnostics: Vec::new() }));
         }
+        // E11 §3.3 document-close leg: resolve a matching slot BEFORE state removal (the
+        // terminal-first house pattern). Without it, a response landing after the close would
+        // consume its `PendingKind`, be dropped as stale, and leave the accepted request with
+        // NO terminal — the one leg the round-2 exactly-once matrix missed.
+        if self.pending_fix.as_ref().is_some_and(|p| p.buffer_id == buffer_id) {
+            out.extend(self.resolve_pending_fix_empty());
+        }
         if let Some(d) = self.docs.remove(&buffer_id) {
             self.uri_owner.remove(&d.uri);
-            out.push(Action::Send(json!({"jsonrpc":"2.0","method":"textDocument/didClose",
-                "params":{"textDocument":{"uri":d.uri}}})));
+            // The wire frame ONLY when the doc is actually open: a §3.3 timeout-RETIRED doc is
+            // still present with `open = false`, its URI already didClosed at retirement, and an
+            // unconditional send here would didClose that retired URI a second time.
+            if d.open {
+                out.push(Action::Send(json!({"jsonrpc":"2.0","method":"textDocument/didClose",
+                    "params":{"textDocument":{"uri":d.uri}}})));
+            }
         }
         out
     }
@@ -387,6 +466,8 @@ impl<E: LspEngine> ClientState<E> {
             Some(PendingKind::Initialize) => self.on_initialized(now),
             Some(PendingKind::Shutdown) =>
                 vec![Action::Send(json!({"jsonrpc":"2.0","method":"exit"})), Action::Exit],
+            Some(PendingKind::FixRequest { token, buffer_id, generation, version, range }) =>
+                self.on_fix_response(token, buffer_id, generation, version, range, &v),
             None => Vec::new(),
         }
     }
@@ -406,6 +487,9 @@ impl<E: LspEngine> ClientState<E> {
         out.push(Action::SetAvailability(Availability::Ready));
         self.phase = Phase::Running;
         for c in std::mem::take(&mut self.queued) { out.extend(self.apply_cmd(c, now)); }
+        // E11 §3.3 attempt site (b): a slot held across the handshake may have become sendable
+        // now that the queue replayed and the machine is Running.
+        out.extend(self.try_send_fix());
         out
     }
 
@@ -438,9 +522,19 @@ impl<E: LspEngine> ClientState<E> {
         // one (both are stamped from the same reopen) — a soundness cross-check on the tag.
         if let Some(a) = self.awaiting_publish.remove(&buffer_id) {
             debug_assert_eq!(a.generation, generation, "awaiting generation matches attributed publish");
+            // E11 §3.3 await-attribution: retain the raws ONLY for a publish that ANSWERS a live
+            // await, tagged with THAT await's version. Unsolicited republishes (ltex's
+            // config-triggered ones, probe-observed) leave `last_raw` untouched.
+            if let Some(d) = self.docs.get_mut(&buffer_id) {
+                d.last_raw = Some((a.our_version, raw));
+            }
         }
-        vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
-            source: E::SOURCE, diagnostics: converted })]
+        let mut out = vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
+            source: E::SOURCE, diagnostics: converted })];
+        // E11 §3.3 attempt site (c): a fresh tagged `last_raw` is the moment a held slot's send
+        // condition can newly become true.
+        out.extend(self.try_send_fix());
+        out
     }
 
     /// Convert an LSP diagnostics array to our byte-ranged set against `text` (spec §6/§7). Drops
@@ -448,21 +542,11 @@ impl<E: LspEngine> ClientState<E> {
     fn convert_diagnostics(&self, raw: &[Value], text: &str) -> Vec<Diagnostic> {
         let mut out = Vec::new();
         for d in raw {
-            let r = match d.get("range") { Some(r) => r, None => continue };
-            let (s, e) = match (r.get("start").and_then(pos), r.get("end").and_then(pos)) {
-                (Some(s), Some(e)) => (s, e), _ => continue,
-            };
-            let range = match crate::lsp_rpc::lsp_range_to_bytes(text, s, e) {
-                Some(r) => r, None => continue,
-            };
+            let range = match raw_byte_range(d, text) { Some(r) => r, None => continue };
             let kind = E::classify(d);
             if !self.cfg.grammar && kind == DiagnosticKind::Grammar { continue; }
-            let message = d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
-            let code = match d.get("code") {
-                Some(Value::String(s)) => Some(s.clone()),
-                Some(other) => Some(other.to_string()),
-                None => None,
-            };
+            let message = raw_message(d).to_string();
+            let code = raw_code(d);
             let href = d.get("codeDescription").and_then(|c| c.get("href"))
                 .and_then(|h| h.as_str()).map(str::to_string);
             out.push(Diagnostic { range, kind, source: E::SOURCE, code, href, message,
@@ -484,8 +568,31 @@ impl<E: LspEngine> ClientState<E> {
                 out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
                     source: E::SOURCE, diagnostics: Vec::new() }));
             }
+            out.extend(self.retire_generation(b));
+        }
+        // E11 §3.3: the slot's own leash. A slot that never became sendable expires here into an
+        // honest empty terminal — no infinite hold.
+        if self.pending_fix.as_ref().is_some_and(|p| now >= p.deadline) {
+            out.extend(self.resolve_pending_fix_empty());
         }
         out
+    }
+
+    /// E11 §3.3 rule 1 — RETIRE a timed-out document generation without leaking it. A publish
+    /// timeout is not a crash: the child is alive, so the obsolete document is closed on the wire
+    /// too. Removing the `uri_owner` mapping is what makes a late publish for the timed-out change
+    /// drop WHOLE at the attribution lookup — never converted, never stored, never tagged; and it
+    /// is what keeps `uri_owner`/the server's open-document set from growing one entry per timeout
+    /// (the shipped reopen branch only INSERTS, because its only prior caller was a respawn where
+    /// `on_server_gone` clears the map wholesale and the dead server needs no didClose).
+    fn retire_generation(&mut self, buffer_id: BufferId) -> Vec<Action> {
+        let uri = match self.docs.get_mut(&buffer_id) {
+            Some(d) if d.open => { d.open = false; d.last_raw = None; d.uri.clone() }
+            _ => return Vec::new(),
+        };
+        self.uri_owner.remove(&uri);
+        vec![Action::Send(json!({"jsonrpc":"2.0","method":"textDocument/didClose",
+            "params":{"textDocument":{"uri":uri}}}))]
     }
 
     /// The server is gone (EOF / write error / corrupt frame). **Flush all outstanding FIRST** — the
@@ -526,13 +633,168 @@ impl<E: LspEngine> ClientState<E> {
                     source: E::SOURCE, diagnostics: Vec::new() }));
             }
         }
+        // E11 §3.4: the slot is the third flush track — thread death or a server EOF between
+        // accept and apply must not strand a Fetching overlay.
+        out.extend(self.resolve_pending_fix_empty());
         out
     }
+
+    /// Resolve the live slot with its EMPTY terminal: take it, de-register any in-flight id (a
+    /// late response then falls to the existing unknown-id arm — no double emission), and emit
+    /// the token's `DiagFixesReady`. THE single funnel for every empty leg of exactly-once —
+    /// replacement, change-invalidation, no-triple-match, deadline, close, and both flushes.
+    fn resolve_pending_fix_empty(&mut self) -> Option<Action> {
+        let p = self.pending_fix.take()?;
+        if let Some(id) = p.sent_id { self.pending_requests.remove(&id); }
+        Some(Action::Emit(Msg::DiagFixesReady { token: p.token, buffer_id: p.buffer_id,
+            version: p.version, source: E::SOURCE, range: p.range, suggestions: Vec::new() }))
+    }
+
+    /// `Cmd::RequestFixes` (E11 §3.3): materialize the slot NOW, in whatever phase, then attempt
+    /// the send. Replacing a live slot terminates the DISPLACED request first — exactly-once holds
+    /// universally, not just for the survivor; the displaced terminal is dropped harmlessly by the
+    /// reduce-side token guard (its overlay is gone).
+    fn on_request_fixes(&mut self, slot: PendingFix) -> Vec<Action> {
+        let mut out: Vec<Action> = self.resolve_pending_fix_empty().into_iter().collect();
+        self.pending_fix = Some(slot);
+        out.extend(self.try_send_fix()); // attempt site (a): the conditions may already hold
+        out
+    }
+
+    /// Evaluate the §3.3 send condition against the CURRENT state — read-only, so the decision
+    /// and the mutation stay separable (`try_send_fix` performs whichever it returns).
+    fn evaluate_fix_send(&self) -> FixAttempt {
+        let p = match &self.pending_fix {
+            // Already on the wire: the attempt sites re-fire on every publish/replay, and a
+            // second send would orphan the first id's `PendingKind` entry.
+            Some(p) if p.sent_id.is_none() => p,
+            _ => return FixAttempt::Hold,
+        };
+        if self.phase != Phase::Running { return FixAttempt::Hold; }
+        let d = match self.docs.get(&p.buffer_id) {
+            Some(d) if d.open => d, _ => return FixAttempt::Hold,
+        };
+        // ONE snapshot: the text we converted against, the raws we echo, and the request's own
+        // version must all name `PendingFix.version` — otherwise the three artifacts disagree.
+        let raws = match &d.last_raw {
+            Some((tag, raws)) if *tag == p.version && d.our_version == p.version => raws,
+            _ => return FixAttempt::Hold,
+        };
+        match raws.iter().find(|r| raw_matches(r, &d.text, &p.range, &p.code, &p.message)) {
+            // The wire request is materialized HERE, at send time — never at slot creation, whose
+            // URI would name a generation retired by an intervening retirement or resume. `range`
+            // is the matched raw's own verbatim wire range: the exact positions the server itself
+            // published, which sidesteps a byte→UTF-16 inverse conversion entirely.
+            Some(m) => FixAttempt::Send {
+                uri: d.uri.clone(), generation: d.generation, wire_range: m["range"].clone(),
+                context: if E::FIX_CONTEXT_ALL_RAWS { raws.clone() } else { vec![m.clone()] },
+            },
+            // Version-matched raws present but nothing carries this identity: the fix target no
+            // longer exists server-side, so the slot resolves NOW rather than waiting out
+            // its leash.
+            None => FixAttempt::ResolveEmpty,
+        }
+    }
+
+    /// Attempt the held slot's send (E11 §3.3). Called at the three moments the send condition can
+    /// newly become true: slot creation (a), the `on_initialized` queue replay (b), and a publish
+    /// that stores a fresh tagged `last_raw` (c).
+    fn try_send_fix(&mut self) -> Vec<Action> {
+        match self.evaluate_fix_send() {
+            FixAttempt::Hold => Vec::new(),
+            FixAttempt::ResolveEmpty => self.resolve_pending_fix_empty().into_iter().collect(),
+            FixAttempt::Send { uri, generation, wire_range, context } => {
+                let id = self.alloc_id();
+                let (token, buffer_id, version, range) = {
+                    let p = self.pending_fix.as_mut()
+                        .expect("slot present — evaluate_fix_send just read it");
+                    p.sent_id = Some(id);
+                    (p.token, p.buffer_id, p.version, p.range.clone())
+                };
+                self.pending_requests.insert(id,
+                    PendingKind::FixRequest { token, buffer_id, generation, version, range });
+                vec![Action::Send(json!({"jsonrpc":"2.0","id":id,"method":"textDocument/codeAction",
+                    "params":{"textDocument":{"uri":uri},"range":wire_range,
+                        "context":{"diagnostics":context}}}))]
+            }
+        }
+    }
+
+    /// The per-diagnostic `codeAction` RESPONSE (E11 §3.4). Emits `DiagFixesReady` with EVERY
+    /// matched suggestion (possibly empty) and clears the slot.
+    ///
+    /// A slot that is gone or now belongs to a different token was ALREADY terminated
+    /// (replacement/close/deadline each de-register the sent id, so this is belt-and-braces).
+    /// A STALE GENERATION is dropped without emitting and WITHOUT clearing the slot — that
+    /// request's terminal is then owed by its still-live deadline; clearing here would lose it.
+    fn on_fix_response(&mut self, token: u64, buffer_id: BufferId, generation: u64,
+        version: u64, range: std::ops::Range<usize>, v: &Value) -> Vec<Action> {
+        match &self.pending_fix {
+            Some(p) if p.token == token => {
+                debug_assert_eq!(p.version, version, "response identity matches the live slot");
+                debug_assert_eq!(p.range, range, "response anchor matches the live slot");
+            }
+            _ => return Vec::new(),
+        }
+        let (uri, text) = match self.docs.get(&buffer_id) {
+            Some(d) if d.generation == generation => (d.uri.clone(), d.text.clone()),
+            _ => return Vec::new(),
+        };
+        let empty: Vec<Value> = Vec::new();
+        let actions = v.get("result").and_then(|r| r.as_array()).unwrap_or(&empty);
+        let suggestions = crate::lsp_rpc::collect_fix_suggestions(actions, &uri, &text, &range,
+            E::is_fix_kind);
+        let p = self.pending_fix.take().expect("slot present — matched just above");
+        vec![Action::Emit(Msg::DiagFixesReady { token: p.token, buffer_id: p.buffer_id,
+            version: p.version, source: E::SOURCE, range: p.range, suggestions })]
+    }
+}
+
+/// What `evaluate_fix_send` decided (E11 §3.3): hold for a later attempt site, resolve the slot
+/// empty, or send this fully materialized request.
+enum FixAttempt {
+    Hold,
+    ResolveEmpty,
+    Send { uri: String, generation: u64, wire_range: Value, context: Vec<Value> },
 }
 
 /// An LSP position value → `(line, utf16-character)`.
 fn pos(v: &Value) -> Option<(u32, u32)> {
     Some((v.get("line")?.as_u64()? as u32, v.get("character")?.as_u64()? as u32))
+}
+
+/// One raw LSP diagnostic's range as a byte range into `text`. `None` when the range is absent
+/// or unmappable — the same rule `convert_diagnostics` drops on, so a converted diagnostic's
+/// range and its raw's always agree.
+fn raw_byte_range(d: &Value, text: &str) -> Option<std::ops::Range<usize>> {
+    let r = d.get("range")?;
+    let (s, e) = (r.get("start").and_then(pos)?, r.get("end").and_then(pos)?);
+    crate::lsp_rpc::lsp_range_to_bytes(text, s, e)
+}
+
+/// One raw LSP diagnostic's `code` in the exact form `convert_diagnostics` preserves (a string
+/// verbatim; any other JSON value stringified; absent → `None`).
+fn raw_code(d: &Value) -> Option<String> {
+    match d.get("code") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+        None => None,
+    }
+}
+
+/// One raw LSP diagnostic's `message`, in the form `convert_diagnostics` preserves.
+fn raw_message(d: &Value) -> &str { d.get("message").and_then(|m| m.as_str()).unwrap_or("") }
+
+/// The deterministic TRIPLE match (E11 §3.3): a raw diagnostic identifies a request's anchor iff
+/// its converted byte range, its `code`, AND its `message` all agree. Range alone is ambiguous
+/// (overlapping/identical anchors exist); `code` and `message` ride the request because
+/// `convert_diagnostics` preserves both verbatim, so the triple picks out the raw object exactly.
+/// Fully identical raws are mutually indistinguishable and any one serves.
+fn raw_matches(d: &Value, text: &str, range: &std::ops::Range<usize>,
+    code: &Option<String>, message: &str) -> bool {
+    raw_byte_range(d, text).as_ref() == Some(range)
+        && raw_code(d) == *code
+        && raw_message(d) == message
 }
 
 // ── The imperative shell: app-side handle + client thread + FlushGuard ──────────────────────────
@@ -647,9 +909,18 @@ impl<E: LspEngine> Drop for FlushGuard<E> {
             if let Action::Emit(m) = a { let _ = self.msg_tx.send(m); }
         }
         while let Ok(inb) = self.cmd_rx.try_recv() {
-            if let Inbound::Cmd(Cmd::Change { buffer_id, version, .. }) = inb {
-                let _ = self.msg_tx.send(Msg::DiagnosticsDone { buffer_id, version,
-                    source: E::SOURCE, diagnostics: Vec::new() });
+            match inb {
+                Inbound::Cmd(Cmd::Change { buffer_id, version, .. }) => {
+                    let _ = self.msg_tx.send(Msg::DiagnosticsDone { buffer_id, version,
+                        source: E::SOURCE, diagnostics: Vec::new() });
+                }
+                // E11 §3.2: an ACCEPTED-but-unread fix request owes its terminal too — thread
+                // death between accept and apply must not strand a Fetching overlay.
+                Inbound::Cmd(Cmd::RequestFixes { token, buffer_id, version, range, .. }) => {
+                    let _ = self.msg_tx.send(Msg::DiagFixesReady { token, buffer_id, version,
+                        source: E::SOURCE, range, suggestions: Vec::new() });
+                }
+                _ => {}
             }
         }
     }
@@ -1050,6 +1321,338 @@ mod tests {
         let crash = st.on_inbound(Inbound::ServerEof, 50);
         assert!(crash.iter().any(|a| matches!(a, Action::Respawn)), "real crash still respawns");
         assert_eq!(st.spawn_attempts, 2, "real crash consumes the budget");
+    }
+
+    // ── T4: the on-demand `pending_fix` slot (E11 §3.3/§3.4) ────────────────────────────────
+
+    fn fix_readies(acts: &[Action]) -> Vec<(u64, Vec<wordcartel_core::diagnostics::Suggestion>)> {
+        acts.iter().filter_map(|a| match a {
+            Action::Emit(Msg::DiagFixesReady { token, suggestions, .. }) =>
+                Some((*token, suggestions.clone())),
+            _ => None,
+        }).collect()
+    }
+
+    fn publish_one(st: &mut ClientState<TestEngine>, uri: &str, at: u64) -> Vec<Action> {
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{"uri":uri,"diagnostics":[
+                {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                 "message":"m","code":"C1"}]}})), at)
+    }
+
+    fn req(st: &mut ClientState<TestEngine>, token: u64, version: u64, at: u64) -> Vec<Action> {
+        st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token, buffer_id: BufferId(0),
+            version, range: 0..1, code: Some("C1".into()), message: "m".into() }), at)
+    }
+
+    #[test]
+    fn fix_request_sends_when_running_open_and_raw_attributed() {
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // answers the await → last_raw tagged v1
+        let out = req(&mut st, 7, 1, 10);
+        let ca = sends(&out).into_iter().find(|v| v["method"] == "textDocument/codeAction")
+            .expect("per-diagnostic codeAction sent");
+        assert_eq!(ca["params"]["context"]["diagnostics"].as_array().unwrap().len(), 1,
+            "the triple-matched RAW diagnostic is echoed verbatim (T1 outcome A shape)");
+    }
+
+    #[test]
+    fn fix_response_attaches_all_and_clears_slot() {
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5);
+        let out = req(&mut st, 7, 1, 10);
+        let id = sends(&out).iter().find(|v| v["method"] == "textDocument/codeAction")
+            .and_then(|v| v["id"].as_u64()).unwrap();
+        let resp = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,"result":[
+            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
+                {"newText":"X","range":{"start":{"line":0,"character":0},
+                                        "end":{"line":0,"character":1}}}]}}},
+            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
+                {"newText":"Y","range":{"start":{"line":0,"character":0},
+                                        "end":{"line":0,"character":1}}}]}}}]})), 20);
+        assert_eq!(fix_readies(&resp), vec![(7, vec![
+            wordcartel_core::diagnostics::Suggestion::ReplaceWith("X".into()),
+            wordcartel_core::diagnostics::Suggestion::ReplaceWith("Y".into())])],
+            "attach-all through collect_fix_suggestions; token rides through");
+        assert!(st.pending_fix.is_none());
+    }
+
+    #[test]
+    fn fix_deadline_fires_even_while_initializing() {
+        // Round-1 finding-2 regression: the slot + deadline are live in EVERY phase.
+        let mut st = ClientState::<TestEngine>::new(cfg());
+        st.on_spawned(0); // Initializing
+        let out = req(&mut st, 9, 1, 0);
+        assert!(out.is_empty(), "slot materialized, nothing sent, nothing queued");
+        assert_eq!(st.next_deadline(), Some(FIX_REQUEST_TIMEOUT_MS),
+            "the 10s leash is visible to the pump during warm");
+        let expired = st.on_deadline(FIX_REQUEST_TIMEOUT_MS);
+        assert_eq!(fix_readies(&expired), vec![(9, vec![])], "honest empty terminal at 10s");
+    }
+
+    #[test]
+    fn stale_raw_after_didchange_never_sends_and_change_invalidates() {
+        // Round-2 finding-2 + round-3: one-snapshot condition + change-invalidation.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // last_raw tagged v1
+        change(&mut st, 0, 2, 10); // didChange advances text/our_version to v2
+        let out = req(&mut st, 3, 2, 15); // request against v2; raws are v1
+        assert!(sends(&out).iter().all(|v| v["method"] != "textDocument/codeAction"),
+            "no send against mismatched snapshots");
+        // A further change PAST a pending slot resolves it empty immediately.
+        let inv = st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 3,
+            path: None, text: "zz".into() }), 20);
+        assert_eq!(fix_readies(&inv), vec![(3u64, vec![])],
+            "change-invalidation emits the token terminal at once");
+    }
+
+    #[test]
+    fn replacement_terminates_displaced_request_and_deregisters_its_id() {
+        // Round-2 finding-3: exactly-once holds for the DISPLACED request too.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5);
+        let a = req(&mut st, 1, 1, 10);
+        let id_a = sends(&a).iter().find(|v| v["method"] == "textDocument/codeAction")
+            .and_then(|v| v["id"].as_u64()).unwrap();
+        let b = req(&mut st, 2, 1, 11);
+        assert_eq!(fix_readies(&b), vec![(1, vec![])], "displaced token 1 terminated at replacement");
+        assert!(!st.pending_requests.contains_key(&id_a),
+            "the displaced request's id is DE-REGISTERED — otherwise every unanswered fix \
+             request leaks a pending_requests entry until the next respawn clears the map");
+        let late = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id_a,
+            "result":[]})), 12);
+        assert!(fix_readies(&late).is_empty(), "late response to the displaced id → unknown-id arm");
+    }
+
+    #[test]
+    fn a_request_for_a_stale_version_holds_even_when_its_raws_are_tagged() {
+        // The OTHER half of §3.3's one-snapshot condition, which the version-mismatch test above
+        // cannot reach: raws tagged v1 AND a request naming v1 is still not enough — the DOCUMENT
+        // must be at v1 too. A slot minted after the buffer already advanced (no `on_change`
+        // follows, so change-invalidation never runs) would otherwise send v1's raws matched
+        // against v2's text, under v2's uri — three artifacts, two snapshots.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // last_raw tagged v1
+        change(&mut st, 0, 2, 10);                       // the doc moves to v2; the raws stay v1
+        let out = req(&mut st, 12, 1, 15);               // …and NOW a request against the stale v1
+        assert!(sends(&out).iter().all(|v| v["method"] != "textDocument/codeAction"),
+            "the tag matches the request, but the document has moved past both");
+        assert!(fix_readies(&out).is_empty(), "held for its leash — not a no-triple-match resolve");
+        assert_eq!(st.pending_fix.as_ref().map(|p| p.deadline), Some(15 + FIX_REQUEST_TIMEOUT_MS),
+            "and the held slot still owes exactly one terminal, at its own deadline");
+    }
+
+    #[test]
+    fn timeout_retirement_cycles_do_not_leak_and_late_publishes_drop() {
+        // Round-3 Critical-1 + round-4 Important-2, pinned over N CYCLES with per-cycle
+        // mapping/count assertions (plan-gate finding 5: one cycle without uri_owner
+        // assertions cannot catch the leak).
+        let mut st = running();
+        let mut base = 0u64;
+        for cycle in 1..=3u64 {
+            let version = cycle;
+            st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version,
+                path: None, text: "x".into() }), base);
+            let expired = st.on_deadline(base + TestEngine::FIRST_CHECK_TIMEOUT_MS.unwrap());
+            assert!(!diag_dones(&expired).is_empty(), "cycle {cycle}: check terminal emitted");
+            let closes = sends(&expired).iter()
+                .filter(|v| v["method"] == "textDocument/didClose").count();
+            assert_eq!(closes, 1, "cycle {cycle}: exactly one didClose per retirement");
+            assert!(st.uri_owner.is_empty(),
+                "cycle {cycle}: the retired mapping is REMOVED — uri_owner holds only live URIs");
+            let late = publish_one(&mut st,
+                &format!("untitled:wcartel-0-{cycle}"), base + 999);
+            assert!(late.is_empty(), "cycle {cycle}: late publish to the retired uri drops whole");
+            base += 1_000_000;
+        }
+        // The next check reopens under generation 4 (three retirements consumed 1..=3).
+        let reopen = st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 9,
+            path: None, text: "b".into() }), base);
+        assert!(sends(&reopen).iter().any(|v| v["method"] == "textDocument/didOpen"
+            && v["params"]["textDocument"]["uri"] == "untitled:wcartel-0-4"));
+        assert_eq!(st.uri_owner.len(), 1, "exactly the one live URI after N cycles");
+    }
+
+    #[test]
+    fn retirement_then_buffer_close_sends_exactly_one_didclose() {
+        // Round-5 Important-2: the wire frame is gated on d.open.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        let retired = st.on_deadline(TestEngine::FIRST_CHECK_TIMEOUT_MS.unwrap());
+        let n1 = sends(&retired).iter().filter(|v| v["method"] == "textDocument/didClose").count();
+        let closed = st.on_inbound(Inbound::Cmd(Cmd::Close { buffer_id: BufferId(0) }), 10);
+        let n2 = sends(&closed).iter().filter(|v| v["method"] == "textDocument/didClose").count();
+        assert_eq!(n1 + n2, 1, "exactly ONE didClose across retirement + close");
+    }
+
+    #[test]
+    fn close_resolves_pending_fix_and_a_late_response_is_silent() {
+        // Round-3 Important-2: the document-close leg of exactly-once.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5);
+        let out = req(&mut st, 4, 1, 10);
+        let id = sends(&out).iter().find(|v| v["method"] == "textDocument/codeAction")
+            .and_then(|v| v["id"].as_u64()).unwrap();
+        let closed = st.on_inbound(Inbound::Cmd(Cmd::Close { buffer_id: BufferId(0) }), 20);
+        assert!(fix_readies(&closed).contains(&(4, vec![])), "close emits the token terminal");
+        let late = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,"result":[]})), 30);
+        assert!(fix_readies(&late).is_empty(), "de-registered id → silence, no double terminal");
+    }
+
+    #[test]
+    fn suspend_resume_holds_the_slot_and_sends_after_replay_and_fresh_publish() {
+        // Spec §3.5's full ordering: suspend → change → unpark → slot persists → replay →
+        // publish re-tags → send. (TestEngine::SUSPENDABLE = true.)
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::Suspend), 0);
+        st.on_inbound(Inbound::ServerEof, 1); // expected-EOF drain (E10)
+        let resume = st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1,
+            path: None, text: "x".into() }), 2);
+        assert!(resume.iter().any(|a| matches!(a, Action::Unpark)));
+        let held = req(&mut st, 6, 1, 3);
+        assert!(held.is_empty(), "slot held — no send, no emissions yet");
+        assert!(st.queued.iter().all(|c| !matches!(c, Cmd::RequestFixes { .. })),
+            "RequestFixes is NEVER in `queued` — the slot IS its queue (finding-2 class)");
+        let spawn = st.on_spawned(4);
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        let replay = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 5);
+        // The publish that ANSWERS the replayed didOpen re-tags last_raw → the slot sends.
+        // Take the URI from that didOpen: the reopen mints whatever generation is next, and
+        // this interleaving never opened the doc before the suspend, so it is generation 1 —
+        // the plan text's literal "-0-2" presumed a pre-suspend open this ordering omits.
+        let uri = sends(&replay).iter().find(|v| v["method"] == "textDocument/didOpen")
+            .and_then(|v| v["params"]["textDocument"]["uri"].as_str())
+            .expect("the replayed change reopens the document").to_string();
+        let pubd = publish_one(&mut st, &uri, 6);
+        assert!(sends(&pubd).iter().any(|v| v["method"] == "textDocument/codeAction"),
+            "attempt site (c): send fires after the awaited publish re-tags last_raw");
+    }
+
+    #[test]
+    fn unsolicited_publish_does_not_update_last_raw() {
+        // §3.3 await-attribution, pinned with DISTINGUISHABLE arrays (plan-gate finding 5):
+        // the solicited publish carries code C1; the unsolicited republish carries ONLY a
+        // different diagnostic (code C9). If the unsolicited publish replaced last_raw, a
+        // C1 request could no longer triple-match (empty terminal) and a C9 request COULD —
+        // assert the exact opposite on both.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // solicited: code C1 (answers await)
+        let _ = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{"uri":"untitled:wcartel-0-1","diagnostics":[
+                {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                 "message":"other","code":"C9"}]}})), 6); // unsolicited: NO await live
+        let c1 = req(&mut st, 8, 1, 10);
+        assert!(sends(&c1).iter().any(|v| v["method"] == "textDocument/codeAction"),
+            "C1 still triple-matches — the SOLICITED raws were retained");
+        let c9 = st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 9,
+            buffer_id: BufferId(0), version: 1, range: 0..1,
+            code: Some("C9".into()), message: "other".into() }), 11);
+        // Token 8's slot is still live, so this request DISPLACES it — the §3.3 replacement
+        // rule emits 8's empty terminal first (exactly-once for the displaced request too).
+        assert_eq!(fix_readies(&c9), vec![(8, vec![]), (9, vec![])],
+            "C9 does NOT match (empty terminal) — the unsolicited raws were never stored");
+    }
+
+    #[test]
+    fn no_triple_match_resolves_empty_immediately() {
+        // §3.3: version-matched raws present but nothing matches the request identity.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // raws hold C1 only
+        let out = st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 4,
+            buffer_id: BufferId(0), version: 1, range: 0..1,
+            code: Some("NOPE".into()), message: "m".into() }), 10);
+        assert_eq!(fix_readies(&out), vec![(4, vec![])], "no-match leg emits the empty terminal");
+        assert!(sends(&out).iter().all(|v| v["method"] != "textDocument/codeAction"));
+    }
+
+    #[test]
+    fn server_gone_flushes_a_pending_fix() {
+        // §3.4 exactly-once, server-gone leg: the slot joins flush_outstanding's coverage.
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 5, buffer_id: BufferId(0),
+            version: 1, range: 0..1, code: None, message: "m".into() }), 0); // held (no raws)
+        let gone = st.on_inbound(Inbound::ServerEof, 1);
+        assert!(fix_readies(&gone).contains(&(5, vec![])),
+            "on_server_gone's flush emits the held slot's token terminal");
+        assert!(st.pending_fix.is_none());
+    }
+
+    #[test]
+    fn flush_guard_drains_unread_request_fixes_from_the_channel() {
+        // §3.2 FlushGuard extension — mirror the shipped flush_guard_drop channel pattern.
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Inbound>();
+        let state = ClientState::<TestEngine>::new(cfg());
+        cmd_tx.send(Inbound::Cmd(Cmd::RequestFixes { token: 6, buffer_id: BufferId(0),
+            version: 1, range: 0..1, code: None, message: "m".into() })).unwrap();
+        drop(FlushGuard { state, cmd_rx, msg_tx });
+        let got: Vec<u64> = std::iter::from_fn(|| msg_rx.try_recv().ok())
+            .filter_map(|m| if let Msg::DiagFixesReady { token, suggestions, .. } = m {
+                assert!(suggestions.is_empty()); Some(token) } else { None }).collect();
+        assert_eq!(got, vec![6], "an UNREAD RequestFixes still gets its empty terminal on drop");
+    }
+
+    /// The Outcome-B seam engine: `TestEngine`'s impl verbatim with the single const flipped,
+    /// so BOTH `context.diagnostics` shapes stay under test whatever T1 ruled for ltex.
+    #[derive(Debug)]
+    struct TestEngineAllRaws;
+    impl LspEngine for TestEngineAllRaws {
+        const SOURCE: DiagSource = DiagSource::Plugin("test-engine");
+        const INSTALL_HINT: &'static str = "test engine unavailable";
+        const CRASHED_HINT: &'static str = "test engine crashed";
+        const LANGUAGE_ID: &'static str = "markdown";
+        const CLIENT_THREAD: &'static str = "wcartel-test-client";
+        const READER_THREAD: &'static str = "wcartel-test-read";
+        const PUBLISH_TIMEOUT_MS: u64 = 1_000;
+        const FIRST_CHECK_TIMEOUT_MS: Option<u64> = Some(30_000);
+        const SUSPENDABLE: bool = true;
+        const FIX_CONTEXT_ALL_RAWS: bool = true;
+        fn spawn_command() -> Command { Command::new("wcartel-no-such-test-engine") }
+        fn initialize_params(_cfg: &ProviderConfig) -> Value {
+            json!({"processId": Value::Null, "capabilities": {}})
+        }
+        fn settings_push(_cfg: &ProviderConfig) -> Option<Value> { None }
+        fn answer_request(_method: &str, _req: &Value, _cfg: &ProviderConfig) -> Option<Value> { None }
+        fn classify(_d: &Value) -> DiagnosticKind { DiagnosticKind::Grammar }
+        fn is_fix_kind(kind: &str) -> bool { kind == "quickfix" }
+    }
+
+    #[test]
+    fn all_raws_engine_echoes_the_full_retained_array_with_the_matched_range() {
+        let mut st = ClientState::<TestEngineAllRaws>::new(cfg());
+        // running() equivalent inline (the helper is TestEngine-typed): spawn + init response.
+        let spawn = st.on_spawned(0);
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":{"capabilities":{}}})), 0);
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1,
+            path: None, text: "ab".into() }), 0);
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{"uri":"untitled:wcartel-0-1","diagnostics":[
+                {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                 "message":"m","code":"C1"},
+                {"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}},
+                 "message":"n","code":"C2"}]}})), 5);
+        let out = st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 7,
+            buffer_id: BufferId(0), version: 1, range: 0..1,
+            code: Some("C1".into()), message: "m".into() }), 10);
+        let ca = sends(&out).into_iter().find(|v| v["method"] == "textDocument/codeAction").unwrap();
+        assert_eq!(ca["params"]["context"]["diagnostics"].as_array().unwrap().len(), 2,
+            "ALL retained raws echoed under the all-raws shape");
+        assert_eq!(ca["params"]["range"], json!({"start":{"line":0,"character":0},
+            "end":{"line":0,"character":1}}), "range stays the MATCHED raw's verbatim range");
     }
 
     #[test]

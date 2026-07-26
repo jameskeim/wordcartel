@@ -445,21 +445,29 @@ mod tests {
         assert_eq!(diag_dones(&out), vec![(BufferId(0), 3, vec![])]);
     }
 
-    // ── flush_outstanding covers awaiting + queued ─────────────────────────────────────────────
+    // ── flush_outstanding covers awaiting + queued + the E11 pending_fix slot ──────────────────
 
     #[test]
-    fn flush_outstanding_covers_awaiting_and_queued_and_is_idempotent() {
+    fn flush_outstanding_covers_all_three_tracks_and_is_idempotent() {
         let mut st = running(true);
-        // awaiting (buffer 0)
+        // Track 1 — awaiting (buffer 0).
         st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1, path: None,
             text: "a".into() }), 0);
-        // queued (buffer 2): drop back to Initializing so a change queues instead of applying.
+        // Track 2 — queued (buffer 2): drop back to Initializing so a change queues.
         st.phase = Phase::Initializing;
         st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(2), version: 3, path: None,
             text: "q".into() }), 0);
-        let mut done = diag_dones(&st.flush_outstanding());
-        done.sort_by_key(|(b, _, _)| b.0);
-        assert_eq!(done, vec![(BufferId(0), 1, vec![]), (BufferId(2), 3, vec![])]);
+        // Track 3 — the E11 pending_fix slot (held: Initializing, no raws).
+        st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 11, buffer_id: BufferId(0),
+            version: 1, range: 0..1, code: None, message: "m".into() }), 0);
+        let acts = st.flush_outstanding();
+        let mut done: Vec<(BufferId, u64)> = acts.iter().filter_map(|a| match a {
+            Action::Emit(Msg::DiagnosticsDone { buffer_id, version, .. }) =>
+                Some((*buffer_id, *version)), _ => None }).collect();
+        done.sort_by_key(|(b, _)| b.0);
+        assert_eq!(done, vec![(BufferId(0), 1), (BufferId(2), 3)], "checks flushed");
+        assert!(acts.iter().any(|a| matches!(a,
+            Action::Emit(Msg::DiagFixesReady { token: 11, .. }))), "the slot's token terminal");
         assert!(st.flush_outstanding().is_empty(), "idempotent — a second flush emits nothing");
     }
 
