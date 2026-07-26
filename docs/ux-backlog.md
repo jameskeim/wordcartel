@@ -881,3 +881,72 @@ routes uncaught; a second scanner is self-defeating. The work is mechanical dele
 seam, not a new gate. Prerequisite: H32 shipped (the seam must exist first).
 
 *(Captured 2026-07-25 via `scripts/backlog add`, as the H32 grounding's out-of-scope follow-up.)*
+
+### E13 — Push the personal dictionary into ltex's settings channel (server-side spelling suppression)
+<!-- item: E13 -->
+
+**Deferred out of E11 (2026-07-25, deliberate human scope call — not an oversight.)** Adding a word
+to the personal dictionary already suppresses it across ALL engines, client-side: `retain_unignored`
+refilters every source's slot against the dictionary ∪ session ignores, and ltex/vale spelling
+diagnostics classify as `DiagnosticKind::Spelling`, so they are dropped before paint. The writer
+cannot tell the difference — no underline appears, counts and navigation are correct.
+
+**What this item would add:** suppression at the SOURCE for ltex. A live probe against
+ltex-ls-plus 18.7.0 (`scratchpad/e11/probe/ltex-probe-results.md`, 2026-07-25) confirmed the
+mechanism works and needs NO new file writers: delivering `{"dictionary": {"en-US": ["floopmuffin"]}}`
+through the existing settings channel (`didChangeConfiguration` → the server re-pulls
+`workspace/configuration` → republishes without the word) took ~1s and required no forced edit. The
+same probe confirmed `disabledRules` works identically. So the seam is `ltex_settings` + the shipped
+`reload_dictionary_enabled` → `settings_push` nudge.
+
+**Why it was NOT taken in E11, and the consequences to weigh when it is picked up:**
+- **Zero user-visible change.** The client-side filter already delivers the whole UX; this buys
+  correctness-at-the-source and stops invisible wasted work on the engine side.
+- **Unbounded payload growth.** It ships the writer's ENTIRE personal dictionary inside every
+  settings response, forever, growing as the feature is used over years. Needs a size posture
+  (cap? only push words the engine has actually flagged? per-language partition?).
+- **A second source of truth for suppression** that must stay in sync with the client-side filter —
+  including on word REMOVAL, not just addition.
+- **Per-language keying.** ltex's dictionary is keyed by language (`en-US`); the personal dictionary
+  is not. That mapping needs a decision.
+- **vale gets nothing.** Its settings channel is inert — the same probe showed
+  `didChangeConfiguration` produces only a `window/logMessage` and the server never sends
+  `workspace/configuration`. Any vale-side equivalent would mean editing engine-native vocab files,
+  a class of writer this app has never had.
+
+Prior art / context: E10 (the ltex + vale providers), E11 (the viewing/action layer). Decision
+record: `scratchpad/e11/decisions.md` D6. ~S.
+
+### E14 — Rule-level disable — persist a per-engine disabled-rule list and deliver it to all three engines
+<!-- item: E14 -->
+
+**Deferred out of E11 (2026-07-25, deliberate human scope call.)** E11 ships a **session dismiss**
+(client-side, keyed on engine source + rule `code` + occurrence) so a false positive can be killed
+for the working session. THIS item is the persistent form: *"stop flagging PASSIVE_VOICE at all,
+ever."*
+
+**Why it has a stronger story than [[E13]]** (the other E11 deferral): it is USER-VISIBLE and
+recurring. A writer who uses the passive deliberately is told about it forever, and a session
+dismiss must be re-performed every session. This is the most plausible next ask after E11 ships.
+
+**Mechanism per engine (all live-probe-confirmed 2026-07-25 —
+`scratchpad/e11/probe/ltex-probe-results.md`, `scratchpad/e11/probe/vale/vale-probe-results.md`):**
+- **ltex** — `{"disabledRules": {"en-US": ["MORFOLOGIK_RULE_EN_US"]}}` through the existing settings
+  channel. Probe-confirmed: both matching diagnostics disappeared, automatically, no forced edit.
+- **harper** — the per-rule boolean `linters` map already pushed from `harper_settings`.
+- **vale** — client-side filter on `code` ONLY. Its settings channel is inert (`didChangeConfiguration`
+  yields a `window/logMessage` and nothing else; the server never sends `workspace/configuration`).
+
+**The real fork, and why it wants its own effort: WHERE DOES IT PERSIST?** The app has never
+written its config back out; the only user-state files that exist are `dictionary.txt`,
+`settings-overrides.toml`, and `session.toml`. So this needs either a new user-state file or an
+extension of settings-overrides — a call with consequences well beyond diagnostics, which is exactly
+why it should not be answered in a hurry inside another effort.
+
+**Also owed:** a command surface. Command-surface-contract law 2 (every user-settable option IS a
+command) means rule management needs palette entries — and a decision about menu presence — not just
+an overlay row. Rejected direction: editing engine-native config (`.vale.ini`, ltex external files)
+would make this the app's first foreign-config writer.
+
+Prior art / context: E10 (the providers), E11 (the viewing/action layer + the session dismiss this
+would upgrade), [[E13]] (the sibling deferral). Decision record: `scratchpad/e11/decisions.md` D7. ~M.
