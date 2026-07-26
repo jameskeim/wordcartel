@@ -507,10 +507,16 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
     // The complete core catalog in cycle order (E10 T6).
     let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale];
-    // Which engines are enabled: None → all core; Some(list) → exactly the named (config_name).
+    // Which engines are enabled: None → the on-by-default core; Some(list) → exactly the named
+    // (config_name). `vale` is OFF by default (E11 T10 / backlog E15): `lsp_rpc::doc_uri` mints
+    // `untitled:` URIs and vale-ls publishes nothing at all for a URI that does not name a file
+    // on disk, so an enabled-by-default vale presents a permanently empty `[REVIEW · vale]` lens
+    // that reads as "vale found no problems" — the silent-UI failure this project forbids. Off by
+    // default makes the dormancy honest (the menu says "off"; the lens command refuses) until E15
+    // gives vale a URI it can lint. An explicit `linters` entry still turns it on.
     let enabled_of = |src: DiagSource| -> bool {
         match &cfg.diagnostics.linters {
-            None => true,
+            None => src != DiagSource::Vale,
             Some(list) => list.iter().any(|n| n == src.config_name()),
         }
     };
@@ -1384,6 +1390,49 @@ mod tests {
         let sources: Vec<DiagSource> = e.diag_providers.sources().collect();
         assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale],
             "the complete E10 catalog in cycle order");
+        assert!(warns.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // E11 T10 / E15: vale ships dormant (it cannot lint an `untitled:` URI).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vale_is_disabled_by_default_and_its_surfaces_say_so() {
+        // Shipping vale ON would present a permanently empty `[REVIEW · vale]` lens that reads
+        // as "vale found no problems". Pin BOTH halves: the default itself, and that the two
+        // surfaces a writer meets vale through report the dormancy honestly.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
+        assert!(!e.diag_providers.is_enabled(DiagSource::Vale), "vale ships dormant");
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper), "…and ONLY vale is dormant");
+        assert!(e.diag_providers.is_enabled(DiagSource::LTeX));
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens seed skips it too");
+        assert!(warns.is_empty());
+        // Surface 1 — the engine menu row reads "off".
+        let labels: Vec<String> = engine_menu_rows(&e).into_iter().map(|(l, _)| l).collect();
+        assert!(labels.iter().any(|l| l == "vale — off"),
+            "the engine menu says vale is off; rows = {labels:?}");
+        // Surface 2 — `analysis_engine_vale`'s setter refuses through the shipped disabled path
+        // rather than opening the empty lens.
+        e.set_analysis_source(DiagSource::Vale);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens did not switch");
+        assert!(e.status_text().contains("not enabled"));
+    }
+
+    #[test]
+    fn an_explicit_linters_entry_still_enables_vale() {
+        // Only the DEFAULT changed — a writer who asks for vale still gets it.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.linters = Some(vec!["vale".into()]);
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(e.diag_providers.is_enabled(DiagSource::Vale), "opting in still works");
+        assert_eq!(e.active_analysis_source, DiagSource::Vale, "and it seeds the lens");
         assert!(warns.is_empty());
     }
 

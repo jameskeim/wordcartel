@@ -134,9 +134,10 @@ pub(crate) struct DocState {
     pub(crate) uri: String, pub(crate) lsp_version: i32, pub(crate) our_version: u64,
     pub(crate) generation: u64, pub(crate) text: String, pub(crate) open: bool,
     /// The raw LSP diagnostics array from the most recent publish for this doc — the on-demand
-    /// quick-fix fetch's source (E11 §3.3). STORED ONLY BY AWAIT-ATTRIBUTION: a publish that
-    /// answers a live `awaiting_publish` entry, tagged with THAT await's `our_version` — never
-    /// the ambient `d.our_version`, which an unsolicited republish would silently mis-tag.
+    /// quick-fix fetch's source (E11 §3.3). STORED IN LOCKSTEP WITH THE DIAGNOSTICS STORE: every
+    /// attributed publish writes it, tagged with the SAME version that publish's
+    /// `DiagnosticsDone` carries. What the writer sees underlined and what the fix fetch echoes
+    /// are therefore the same publish, by construction (E11 T10 — see `on_publish`).
     pub(crate) last_raw: Option<(u64, Vec<Value>)>,
 }
 /// A didOpen/didChange awaiting its `publishDiagnostics` (or the publish watchdog).
@@ -521,16 +522,21 @@ impl<E: LspEngine> ClientState<E> {
         }
         let raw: Vec<Value> = params["diagnostics"].as_array().cloned().unwrap_or_default();
         let converted = self.convert_diagnostics(&raw, &text);
+        // E11 §3.3 LOCKSTEP ATTRIBUTION (T10 live fix, replacing the await-attribution rule): the
+        // raws are stored on EVERY attributed publish, tagged with `tagged` — the very version
+        // this publish's `DiagnosticsDone` carries just below. The store and the echo source thus
+        // move together by construction. The retired rule tagged from the ANSWERED AWAIT instead,
+        // which is equivalent only while publishes and awaits stay 1:1: harper emits exactly one
+        // publish per didChange, ltex does NOT. A straggler from the previous check landing inside
+        // the next check's await window made the store take one publish and `last_raw` take
+        // another — permanently disagreeing at the same version tag, so `raw_matches` found no
+        // triple match and the fetch resolved empty for precisely the diagnostic the writer had
+        // just edited (probe F1: apply a fix → undo → `(no fixes available)` forever).
+        if let Some(d) = self.docs.get_mut(&buffer_id) { d.last_raw = Some((tagged, raw)); }
         // The publish arrived; retire the await slot. Its generation must match the URI-attributed
-        // one (both are stamped from the same reopen) — a soundness cross-check on the tag.
+        // one (both are stamped from the same reopen) — a soundness cross-check on attribution.
         if let Some(a) = self.awaiting_publish.remove(&buffer_id) {
             debug_assert_eq!(a.generation, generation, "awaiting generation matches attributed publish");
-            // E11 §3.3 await-attribution: retain the raws ONLY for a publish that ANSWERS a live
-            // await, tagged with THAT await's version. Unsolicited republishes (ltex's
-            // config-triggered ones, probe-observed) leave `last_raw` untouched.
-            if let Some(d) = self.docs.get_mut(&buffer_id) {
-                d.last_raw = Some((a.our_version, raw));
-            }
         }
         let mut out = vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
             source: E::SOURCE, diagnostics: converted })];
@@ -1367,6 +1373,17 @@ mod tests {
                  "message":"m","code":"C1"}]}})), at)
     }
 
+    /// `publish_one` with a caller-chosen `code`, so two publishes for the same document can be
+    /// told apart by the triple-match identity a `RequestFixes` names.
+    fn publish_code(st: &mut ClientState<TestEngine>, uri: &str, code: &str,
+        at: u64) -> Vec<Action> {
+        st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
+            "method":"textDocument/publishDiagnostics",
+            "params":{"uri":uri,"diagnostics":[
+                {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                 "message":"m","code":code}]}})), at)
+    }
+
     fn req(st: &mut ClientState<TestEngine>, token: u64, version: u64, at: u64) -> Vec<Action> {
         st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token, buffer_id: BufferId(0),
             version, range: 0..1, code: Some("C1".into()), message: "m".into() }), at)
@@ -1615,30 +1632,60 @@ mod tests {
     }
 
     #[test]
-    fn unsolicited_publish_does_not_update_last_raw() {
-        // §3.3 await-attribution, pinned with DISTINGUISHABLE arrays (plan-gate finding 5):
-        // the solicited publish carries code C1; the unsolicited republish carries ONLY a
-        // different diagnostic (code C9). If the unsolicited publish replaced last_raw, a
-        // C1 request could no longer triple-match (empty terminal) and a C9 request COULD —
-        // assert the exact opposite on both.
+    fn every_attributed_publish_updates_last_raw_in_lockstep_with_the_store() {
+        // E11 T10 — the INVERSE of the retired §3.3 await-attribution rule (this test formerly
+        // read `unsolicited_publish_does_not_update_last_raw`). Pinned with DISTINGUISHABLE
+        // arrays: the first publish answers the await and carries code C1; the second (NO await
+        // live — ltex's config-triggered republish shape) carries ONLY C9. That republish is
+        // attributed, so it updates the diagnostics STORE — the writer now sees C9 and nothing
+        // else. `last_raw` must follow it: C9 becomes the fixable identity and C1 stops being
+        // one. Retaining C1's raws instead is exactly the desync that made a visible diagnostic
+        // unfixable in the live probe.
         let mut st = running();
         change(&mut st, 0, 1, 0);
-        publish_one(&mut st, "untitled:wcartel-0-1", 5); // solicited: code C1 (answers await)
-        let _ = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
-            "method":"textDocument/publishDiagnostics",
-            "params":{"uri":"untitled:wcartel-0-1","diagnostics":[
-                {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
-                 "message":"other","code":"C9"}]}})), 6); // unsolicited: NO await live
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // answers the await: code C1
+        let republish = publish_code(&mut st, "untitled:wcartel-0-1", "C9", 6); // NO await live
+        assert_eq!(diag_dones(&republish), vec![(BufferId(0), 1)],
+            "the republish DOES update the store — which is why it must update last_raw too");
         let c1 = req(&mut st, 8, 1, 10);
-        assert!(sends(&c1).iter().any(|v| v["method"] == "textDocument/codeAction"),
-            "C1 still triple-matches — the SOLICITED raws were retained");
+        assert_eq!(fix_readies(&c1), vec![(8, vec![])],
+            "C1 left the store, so it is no longer fixable — no stale echo survives it");
         let c9 = st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 9,
             buffer_id: BufferId(0), version: 1, range: 0..1,
-            code: Some("C9".into()), message: "other".into() }), 11);
-        // Token 8's slot is still live, so this request DISPLACES it — the §3.3 replacement
-        // rule emits 8's empty terminal first (exactly-once for the displaced request too).
-        assert_eq!(fix_readies(&c9), vec![(8, vec![]), (9, vec![])],
-            "C9 does NOT match (empty terminal) — the unsolicited raws were never stored");
+            code: Some("C9".into()), message: "m".into() }), 11);
+        assert!(sends(&c9).iter().any(|v| v["method"] == "textDocument/codeAction"),
+            "C9 — what the writer actually sees — triple-matches and reaches the wire");
+    }
+
+    #[test]
+    fn straggler_publish_between_checks_does_not_desync_anchor_from_echo() {
+        // THE live-probe F1 regression: apply an ltex quick-fix, undo it, and that diagnostic
+        // could never be fixed again. ltex emits more than one publish per didChange, so a
+        // straggler from the PREVIOUS check lands inside the NEXT check's await window. Under
+        // await-attribution the store took one publish and `last_raw` took the other, both
+        // tagged the same version and naming different content — a permanent desync that killed
+        // fixes for precisely the diagnostic under repair. Lockstep attribution makes the pairing
+        // structural, so no publish interleaving can separate them.
+        let mut st = running();
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1,
+            path: None, text: "ab".into() }), 0);
+        publish_code(&mut st, "untitled:wcartel-0-1", "OLD", 5); // answers await(v1)
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 2,
+            path: None, text: "cd".into() }), 10);               // await(v2) now live
+        // The straggler — the PREVIOUS check's content, arriving inside v2's await window and so
+        // ANSWERING await(v2). This is the publish the retired rule tagged v2's raws from.
+        publish_code(&mut st, "untitled:wcartel-0-1", "OLD", 11);
+        // …and now v2's real publish, with no await left for it to answer.
+        let real = publish_code(&mut st, "untitled:wcartel-0-1", "NEW", 12);
+        assert_eq!(diag_dones(&real), vec![(BufferId(0), 2)],
+            "the store shows v2's content at v2 — this is what the writer sees underlined");
+        let out = st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 21,
+            buffer_id: BufferId(0), version: 2, range: 0..1,
+            code: Some("NEW".into()), message: "m".into() }), 15);
+        assert!(sends(&out).iter().any(|v| v["method"] == "textDocument/codeAction"),
+            "the diagnostic the writer can SEE is fixable — the echo tracks the store");
+        assert!(fix_readies(&out).is_empty(),
+            "…and it is NOT resolved empty, which is what the desync produced live");
     }
 
     #[test]
