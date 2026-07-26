@@ -101,32 +101,74 @@ pub fn lsp_range_to_bytes(text: &str, start: (u32, u32), end: (u32, u32))
     if e < s { None } else { Some(s..e) }
 }
 
-/// Extract a `Suggestion::ReplaceWith` from a harper quickfix `CodeAction` value, matched to a
-/// diagnostic whose byte range is `d`. Returns `None` for command-only actions (`kind != "quickfix"`
-/// or no `edit`), for edits on a different uri, or for an edit that does not correspond to `d`.
-/// (harper 2.1.0 verified: `edit.changes[uri] = [{newText, range}]` with clean `newText`.)
-pub fn quickfix_suggestion(
-    action: &serde_json::Value, our_uri: &str, doc_text: &str, d: &std::ops::Range<usize>,
+/// E11 §4: map ONE CodeAction to a `Suggestion` targeting `anchor`, accepting fix kinds via
+/// the ENGINE's table (`accept_kind` — a fn so this stays engine-agnostic plumbing) and BOTH
+/// edit shapes: `edit.changes[uri]` (harper/vale, probe-verified) and
+/// `edit.documentChanges[]` (ltex, probe-verified exclusive). The action's edit range is a
+/// MATCHING KEY against `anchor` and is then discarded — `Suggestion` carries text only
+/// (the apply-safety invariant, spec §3.3).
+pub(crate) fn action_fix_suggestion(
+    action: &serde_json::Value, our_uri: &str, doc_text: &str,
+    anchor: &std::ops::Range<usize>, accept_kind: impl Fn(&str) -> bool,
 ) -> Option<Suggestion> {
-    if action.get("kind").and_then(|k| k.as_str()) != Some("quickfix") { return None; }
-    let changes = action.get("edit")?.get("changes")?.as_object()?;
-    let edits = changes.get(our_uri)?.as_array()?;
+    let kind = action.get("kind").and_then(|k| k.as_str())?;
+    if !accept_kind(kind) { return None; }
+    let edit = action.get("edit")?;
+    // Shape 1: edit.changes[uri] = [TextEdit].
+    if let Some(edits) = edit.get("changes").and_then(|c| c.as_object())
+        .and_then(|c| c.get(our_uri)).and_then(|e| e.as_array())
+    {
+        return edits_to_suggestion(edits, doc_text, anchor);
+    }
+    // Shape 2: edit.documentChanges[] = [{textDocument{uri}, edits: [TextEdit]}].
+    if let Some(dcs) = edit.get("documentChanges").and_then(|d| d.as_array()) {
+        for dc in dcs {
+            if dc.get("textDocument").and_then(|t| t.get("uri")).and_then(|u| u.as_str())
+                != Some(our_uri) { continue; }
+            if let Some(edits) = dc.get("edits").and_then(|e| e.as_array()) {
+                if let Some(s) = edits_to_suggestion(edits, doc_text, anchor) { return Some(s); }
+            }
+        }
+    }
+    None
+}
+
+/// The shared TextEdit→Suggestion rules (extracted verbatim from `quickfix_suggestion`'s
+/// loop): an edit range equal to `anchor` ⇒ ReplaceWith/Remove; an empty range at
+/// `anchor.end` ⇒ InsertAfter; anything else ⇒ no match.
+fn edits_to_suggestion(edits: &[serde_json::Value], doc_text: &str,
+    anchor: &std::ops::Range<usize>) -> Option<Suggestion> {
     for te in edits {
         let new_text = te.get("newText")?.as_str()?.to_string();
         let r = te.get("range")?;
         let s = (r["start"]["line"].as_u64()? as u32, r["start"]["character"].as_u64()? as u32);
         let e = (r["end"]["line"].as_u64()? as u32, r["end"]["character"].as_u64()? as u32);
         let er = lsp_range_to_bytes(doc_text, s, e)?;
-        // Map to our three-variant Suggestion the exact inverse of build_range_replace (spec §6.2).
-        if er == *d {
+        if er == *anchor {
             return Some(if new_text.is_empty() { Suggestion::Remove }
                         else { Suggestion::ReplaceWith(new_text) });
         }
-        if er.is_empty() && er.start == d.end {
+        if er.is_empty() && er.start == anchor.end {
             return Some(Suggestion::InsertAfter(new_text));
         }
     }
     None
+}
+
+/// E11 §4: ALL matching actions for `anchor`, response order, deduped (the shipped `break`
+/// capped attachment at one suggestion per diagnostic — multi-candidate is real on both new
+/// engines: vale 5-for-one, ltex 2-for-`recieve`, both probe-verified).
+pub(crate) fn collect_fix_suggestions(
+    actions: &[serde_json::Value], our_uri: &str, doc_text: &str,
+    anchor: &std::ops::Range<usize>, accept_kind: impl Fn(&str) -> bool,
+) -> Vec<Suggestion> {
+    let mut out: Vec<Suggestion> = Vec::new();
+    for a in actions {
+        if let Some(s) = action_fix_suggestion(a, our_uri, doc_text, anchor, &accept_kind) {
+            if !out.contains(&s) { out.push(s); }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -304,103 +346,159 @@ mod tests {
         assert_eq!(lsp_range_to_bytes(text, (0, 8), (0, 5)), None);
     }
 
-    // ---- quickfix_suggestion ------------------------------------------------------------------
+    // ── VERBATIM probe captures (wire-regression tier; do not simplify) ─────────────────────
 
     #[test]
-    fn quickfix_matching_range_yields_replace_with() {
-        let uri = "untitled:wcartel-1-0";
-        let text = "I has a cat.";
-        let d = 2..5; // "has"
-        let action = json!({
-            "kind": "quickfix",
-            "edit": {
-                "changes": {
-                    uri: [{"newText": "the", "range": {
-                        "start": {"line": 0, "character": 2},
-                        "end": {"line": 0, "character": 5}
-                    }}]
-                }
-            }
+    fn verbatim_ltex_recieve_accept_action_maps() {
+        // ltex-probe-results.md Q2, the `recieve` → `receive` accept-suggestion action,
+        // fields as captured (documentChanges shape; diagnostics echo included).
+        let doc = "# Probe Document\n\nThis is a probe document for ltex-ls-plus. It was written by us to test the checker.\n\nThe the cake was eaten by the dog.\n\nI recieve many emails every day due to the fact that people email me constantly.\n";
+        let action = serde_json::json!({
+            "title": "Use 'receive'",
+            "kind": "quickfix.ltex.acceptSuggestions",
+            "diagnostics": [{
+                "range": {"start": {"line": 6, "character": 2}, "end": {"line": 6, "character": 9}},
+                "severity": 3, "code": "MORFOLOGIK_RULE_EN_US",
+                "codeDescription": {"href": "https://community.languagetool.org/rule/show/MORFOLOGIK_RULE_EN_US?lang=en-US"},
+                "source": "LTeX", "message": "'recieve': Possible spelling mistake found."
+            }],
+            "edit": {"documentChanges": [{
+                "textDocument": {"version": 1, "uri": "file:///probe/doc.md"},
+                "edits": [{"range": {"start": {"line": 6, "character": 2},
+                                     "end": {"line": 6, "character": 9}},
+                           "newText": "receive"}]}]}
         });
-        let got = quickfix_suggestion(&action, uri, text, &d);
-        assert_eq!(got, Some(Suggestion::ReplaceWith("the".to_string())));
+        let anchor = lsp_range_to_bytes(doc, (6, 2), (6, 9)).expect("anchor range");
+        assert_eq!(action_fix_suggestion(&action, "file:///probe/doc.md", doc, &anchor,
+            |k| k == "quickfix.ltex.acceptSuggestions"),
+            Some(Suggestion::ReplaceWith("receive".into())));
     }
 
     #[test]
-    fn quickfix_empty_new_text_at_d_yields_remove() {
-        let uri = "untitled:wcartel-1-0";
-        let text = "a  b";
-        let d = 1..2; // one of the double spaces
-        let action = json!({
+    fn verbatim_vale_misspelling_action_maps() {
+        // vale-probe-results.md §1+§2 verbatim: the first of the 5 spelling quickfixes, with
+        // the captured diagnostic echoed IN FULL — including the native `data` object and the
+        // TYPOGRAPHIC-quote title (multibyte, deliberate — the capture's exact bytes). The
+        // doc string places `mispeling` at line 2, chars 20..29 (the captured positions);
+        // fix the DOC string, never the captured JSON.
+        let doc = "# Probe\n\nThe word here has a mispeling in it.\n";
+        let uri = "file:///home/jkeim/projects/groundwords/scratchpad/e11/probe/vale/test.md";
+        let action = serde_json::json!({
+            "diagnostics": [{
+                "code": "Vale.Spelling",
+                "data": {
+                    "Action": { "Name": "suggest", "Params": ["spellings"] },
+                    "Check": "Vale.Spelling",
+                    "Description": "",
+                    "Line": 3,
+                    "Link": "",
+                    "Match": "mispeling",
+                    "Message": "Did you really mean 'mispeling'?",
+                    "Severity": "error",
+                    "Span": [21, 29]
+                },
+                "message": "Did you really mean 'mispeling'?",
+                "range": {"end": {"character": 29, "line": 2}, "start": {"character": 20, "line": 2}},
+                "severity": 1,
+                "source": "vale-ls"
+            }],
+            "edit": {"changes": { uri: [{
+                "newText": "misspelling",
+                "range": {"end": {"character": 29, "line": 2}, "start": {"character": 20, "line": 2}}}]}},
             "kind": "quickfix",
-            "edit": {
-                "changes": {
-                    uri: [{"newText": "", "range": {
-                        "start": {"line": 0, "character": 1},
-                        "end": {"line": 0, "character": 2}
-                    }}]
-                }
-            }
+            "title": "Replace with \u{2018}misspelling\u{2019}"
         });
-        let got = quickfix_suggestion(&action, uri, text, &d);
-        assert_eq!(got, Some(Suggestion::Remove));
+        let anchor = lsp_range_to_bytes(doc, (2, 20), (2, 29)).expect("anchor range");
+        assert_eq!(&doc[anchor.clone()], "mispeling", "the captured range targets the word");
+        assert_eq!(action_fix_suggestion(&action, uri, doc, &anchor, |k| k == "quickfix"),
+            Some(Suggestion::ReplaceWith("misspelling".into())));
+    }
+
+    // ── E11 T2: the engine-parameterized fix mapping ────────────────────────────────────────
+
+    /// ltex accept-suggestion action (probe Q2 verbatim shape): namespaced kind +
+    /// edit.documentChanges[].
+    fn ltex_accept_action(uri: &str, new_text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "title": format!("Use '{new_text}'"),
+            "kind": "quickfix.ltex.acceptSuggestions",
+            "edit": {"documentChanges": [{
+                "textDocument": {"version": 1, "uri": uri},
+                "edits": [{"range": {"start": {"line": 0, "character": 2},
+                                     "end": {"line": 0, "character": 9}},
+                           "newText": new_text}]}]}
+        })
     }
 
     #[test]
-    fn quickfix_empty_range_at_d_end_yields_insert_after() {
-        let uri = "untitled:wcartel-1-0";
-        let text = "cat sat";
-        let d = 0..3; // "cat"
-        let action = json!({
+    fn ltex_documentchanges_accept_action_maps_to_replace_with() {
+        let text = "a recieve b";
+        let anchor = 2..9usize;
+        let a = ltex_accept_action("untitled:wcartel-0-1", "receive");
+        assert_eq!(
+            action_fix_suggestion(&a, "untitled:wcartel-0-1", text, &anchor,
+                |k| k == "quickfix.ltex.acceptSuggestions"),
+            Some(Suggestion::ReplaceWith("receive".into())));
+    }
+
+    #[test]
+    fn ltex_command_only_kinds_are_excluded_by_engine_knowledge() {
+        // Probe Q2: addToDictionary / hideFalsePositives / disableRules are command-only.
+        let a = serde_json::json!({"title": "Add 'x' to dictionary",
+            "kind": "quickfix.ltex.addToDictionary",
+            "command": {"title": "Add", "command": "_ltex.addToDictionary", "arguments": []}});
+        assert_eq!(action_fix_suggestion(&a, "u", "abc", &(0..1),
+            |k| k == "quickfix.ltex.acceptSuggestions"), None);
+    }
+
+    #[test]
+    fn vale_changes_shape_still_maps_and_collect_attaches_all_candidates() {
+        // Probe §2: bare "quickfix" + edit.changes[uri]; 5 candidates for one diagnostic.
+        let text = "abc mispeling xyz";
+        let anchor = 4..13usize;
+        let mk = |t: &str| serde_json::json!({"title": format!("Replace with '{t}'"),
             "kind": "quickfix",
-            "edit": {
-                "changes": {
-                    uri: [{"newText": ",", "range": {
-                        "start": {"line": 0, "character": 3},
-                        "end": {"line": 0, "character": 3}
-                    }}]
-                }
-            }
-        });
-        let got = quickfix_suggestion(&action, uri, text, &d);
-        assert_eq!(got, Some(Suggestion::InsertAfter(",".to_string())));
+            "edit": {"changes": {"file:///t.md": [{"newText": t,
+                "range": {"start": {"line": 0, "character": 4},
+                          "end": {"line": 0, "character": 13}}}]}}});
+        let actions: Vec<serde_json::Value> =
+            ["misspelling", "dispelling", "misdealing"].iter().map(|t| mk(t)).collect();
+        let got = collect_fix_suggestions(&actions, "file:///t.md", text, &anchor,
+            |k| k == "quickfix");
+        assert_eq!(got, vec![
+            Suggestion::ReplaceWith("misspelling".into()),
+            Suggestion::ReplaceWith("dispelling".into()),
+            Suggestion::ReplaceWith("misdealing".into()),
+        ], "ALL matching actions attach, response order kept — the `break` is gone");
     }
 
     #[test]
-    fn quickfix_command_only_action_is_none() {
-        let uri = "untitled:wcartel-1-0";
-        let text = "cat sat";
-        let d = 0..3;
-        let action = json!({"kind": null, "command": {"title": "Add to dictionary"}});
-        assert_eq!(quickfix_suggestion(&action, uri, text, &d), None);
+    fn collect_dedupes_identical_suggestions_and_keeps_range_equality_gate() {
+        let text = "abc mispeling xyz";
+        let anchor = 4..13usize;
+        let same = serde_json::json!({"kind": "quickfix",
+            "edit": {"changes": {"u": [{"newText": "misspelling",
+                "range": {"start": {"line": 0, "character": 4},
+                          "end": {"line": 0, "character": 13}}}]}}});
+        let elsewhere = serde_json::json!({"kind": "quickfix",
+            "edit": {"changes": {"u": [{"newText": "zzz",
+                "range": {"start": {"line": 0, "character": 0},
+                          "end": {"line": 0, "character": 3}}}]}}});
+        let got = collect_fix_suggestions(
+            &[same.clone(), same, elsewhere], "u", text, &anchor, |k| k == "quickfix");
+        assert_eq!(got, vec![Suggestion::ReplaceWith("misspelling".into())],
+            "duplicates collapse; an edit not targeting the ANCHOR range never attaches \
+             (the apply-safety invariant: server ranges are a matching key only)");
     }
 
     #[test]
-    fn quickfix_no_edit_key_on_quickfix_kind_is_none() {
-        let uri = "untitled:wcartel-1-0";
-        let text = "cat sat";
-        let d = 0..3;
-        let action = json!({"kind": "quickfix", "command": {"title": "Add to dictionary"}});
-        assert_eq!(quickfix_suggestion(&action, uri, text, &d), None);
-    }
-
-    #[test]
-    fn quickfix_foreign_uri_is_none() {
-        let uri = "untitled:wcartel-1-0";
-        let foreign = "untitled:wcartel-2-0";
-        let text = "cat sat";
-        let d = 0..3;
-        let action = json!({
-            "kind": "quickfix",
-            "edit": {
-                "changes": {
-                    foreign: [{"newText": "dog", "range": {
-                        "start": {"line": 0, "character": 0},
-                        "end": {"line": 0, "character": 3}
-                    }}]
-                }
-            }
-        });
-        assert_eq!(quickfix_suggestion(&action, uri, text, &d), None);
+    fn engine_is_fix_kind_tables_match_the_probes() {
+        use crate::lsp_client::LspEngine;
+        assert!(crate::harper_ls::HarperEngine::is_fix_kind("quickfix"));
+        assert!(!crate::harper_ls::HarperEngine::is_fix_kind("quickfix.ltex.acceptSuggestions"));
+        assert!(crate::ltex_ls::LtexEngine::is_fix_kind("quickfix.ltex.acceptSuggestions"));
+        assert!(!crate::ltex_ls::LtexEngine::is_fix_kind("quickfix.ltex.addToDictionary"));
+        assert!(!crate::ltex_ls::LtexEngine::is_fix_kind("quickfix"));
+        assert!(crate::vale_ls::ValeEngine::is_fix_kind("quickfix"));
     }
 }

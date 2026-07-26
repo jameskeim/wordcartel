@@ -1501,3 +1501,58 @@ hook = "Sweep the ~105 inline temp_dir() scratch-path constructions onto the tes
 doc = "ux-backlog.md#h36"
 depends_on = ["H32"]
 created = "2026-07-25"
+
+[[item]]
+id = "E13"
+title = "Push the personal dictionary into ltex's settings channel (server-side spelling suppression)"
+status = "triage"
+kind = "feature"
+size = "S"
+theme = "E"
+hook = "Deferred out of E11 (2026-07-25 human scope call). Adding a word ALREADY suppresses it across all engines client-side (retain_unignored refilters every source before paint) — this buys suppression at the SOURCE for ltex only, with ZERO user-visible change. Live-probe-confirmed viable with no new file writers: {\"dictionary\":{\"en-US\":[...]}} via the existing settings channel, ~1s, no forced edit. Consequences to weigh: unbounded payload growth (the whole personal dictionary in every settings response, forever); a second source of truth that must stay in sync on REMOVAL too; ltex's per-language dictionary keying vs our unkeyed one; vale gets nothing (its settings channel is inert — logMessage only, never sends workspace/configuration). Decision record: scratchpad/e11/decisions.md D6."
+doc = "ux-backlog.md#e13"
+created = "2026-07-25"
+
+[[item]]
+id = "E14"
+title = "Rule-level disable — persist a per-engine disabled-rule list and deliver it to all three engines"
+status = "triage"
+kind = "feature"
+size = "M"
+theme = "E"
+hook = "Deferred out of E11 (2026-07-25 human scope call) — the PERSISTENT form of the session dismiss E11 ships. Stronger story than E13: user-visible and recurring (a writer who uses the passive deliberately is told forever; a session dismiss must be redone every session). Mechanisms all live-probe-confirmed: ltex disabledRules via the settings channel; harper the linters bool map it already pushes; vale client-side filter on code ONLY (its settings channel is inert). THE FORK that wants its own effort: where it PERSISTS — the app has never written config back, and the only user-state files are dictionary.txt / settings-overrides.toml / session.toml, so this needs a new user-state file or a settings-overrides extension, a call reaching well beyond diagnostics. Also owed: a command surface (contract law 2), not just an overlay row. Decision record: scratchpad/e11/decisions.md D7."
+doc = "ux-backlog.md#e14"
+created = "2026-07-25"
+
+[[item]]
+id = "H37"
+title = "Accepted-send/drop race in LSP client teardown — a send in the FlushGuard drain window reports Accepted::Yes for a message nothing will drain"
+status = "triage"
+kind = "bug"
+size = "M"
+theme = "H"
+hook = "PRE-EXISTING (Effort-A era), surfaced by E11 T5 — deliberately NOT folded into E11. FlushGuard::drop drains try_recv() until Empty, then the Receiver deallocates when the guard fields drop; a cmd_tx.send landing in that window returns Ok (std mpsc sends succeed while the Receiver object exists), so the caller reports Accepted::Yes for a message nothing will ever drain — violating exactly-once at the seam. Window is instruction-scale and gated on CLIENT-THREAD DEATH, not send timing. The SHIPPED class is the worse one: an accepted-in-window Cmd::Change latches in_flight_version permanently (dispatch_one) and that engine silently never rechecks that buffer again until close/restart, with no affordance; E11 Cmd::RequestFixes only strands a VISIBLE fetching row that Esc clears and a reopen resolves honestly. Not closable at the provider layer (any post-send re-check is itself racy). Real fix = a Shared.closing AtomicBool set before the final drain + senders downgrading a successful send, which creates a double-terminal case that is benign for fixes but would blank painted underlines for changes — so it needs a companion apply-side guard and MUST cover both message classes. ~40-80 lines in the crate most delicate seam. Anchors: lsp_client.rs::{FlushGuard, LspProvider::notify_change, LspProvider::request_fixes}, diagnostics_run.rs::dispatch_one."
+doc = "ux-backlog.md#h37"
+created = "2026-07-26"
+
+[[item]]
+id = "E15"
+title = "vale is unreachable — doc_uri mints untitled: unconditionally and vale-ls publishes nothing for it"
+status = "triage"
+kind = "bug"
+size = "M"
+theme = "E"
+hook = "VALE HAS NEVER PRODUCED A DIAGNOSTIC, for any document, since E10 shipped — found by E11 T10 live probe (2026-07-26), established at the wire with wordcartel's exact init params differing only in the URI. lsp_rpc::doc_uri mints untitled:wcartel-{buffer}-{generation} unconditionally (on_change ignores its path arg); vale-ls publishes NOTHING for an untitled: URI — it needs a URI naming a file that exists on disk. E10 missed it because its T11 probe recorded vale as SKIP (binary not installed) and its wire probe used a file:// URI directly, masking it exactly. Symptom is a SILENT [REVIEW · vale] empty view that reads as \"found no problems\" — a no-silent-UI violation, so E11 folded in a loudness mitigation ONLY: vale ships DISABLED by default. THIS ITEM IS THE REAL FIX and restores the default. Not a fold-in because it needs a per-engine URI policy hook, rework of generation semantics for stable URIs (the staleness discriminator keys on generation-tagged URIs via uri_owner; a stable file:// URI collapses it and reopens the late-publish attribution class E11 spent six gate rounds closing), an honest degrade for unsaved buffers, and ONE OPEN WIRE QUESTION the probe did not settle: does vale-ls lint the didChange-synced text or the disk file? Probe that before designing. Anchors: lsp_rpc::doc_uri, lsp_client::ClientState::{on_change,on_publish}, uri_owner, diagnostics_run::install_core_providers."
+doc = "ux-backlog.md#e15"
+created = "2026-07-26"
+
+[[item]]
+id = "B19"
+title = "Display-column-aware text fitting — wrap_prose and its sibling fitters count chars, not columns"
+status = "triage"
+kind = "feature"
+size = "SM"
+theme = "B"
+hook = "Filed out of E11 whole-branch review (2026-07-26), which ruled it does NOT block merge. render_overlays::wrap_prose wraps on a chars() count, not display columns — a CJK message wrapped to a 28-column interior yields 28-CHARACTER lines that ratatui clips at 28 COLUMNS, so ~half of every line never reaches the screen and the elision count does not account for it (probed 40x14: silent truncation, no panic). Filed MODULE-WIDE because every sibling fitter counts chars too (elide_path_left, paint_prompt_detail, overlay row truncation) — fixing wrap_prose alone would make the detail box column-correct while the title above and prompt box beside it stay char-counted, so the same message fits differently in adjacent boxes. Display-fidelity only: no data loss, no panic, no wrong edit. The editor proper is already column-correct; this is a chrome/overlay gap. Anchors: render_overlays::{wrap_prose, paint_prompt_detail, elide_path_left}."
+doc = "ux-backlog.md#b19"
+created = "2026-07-26"

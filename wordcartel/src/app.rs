@@ -63,6 +63,16 @@ pub enum Msg {
         source: wordcartel_core::diagnostics::DiagSource,
         diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
     },
+    /// E11 §3.4: on-demand fix results for ONE overlay request. `token` is the delivery key
+    /// (minted per request); the identity fields ride for debug asserts, never correlation.
+    DiagFixesReady {
+        token: u64,
+        buffer_id: crate::editor::BufferId,
+        version: u64,
+        source: wordcartel_core::diagnostics::DiagSource,
+        range: std::ops::Range<usize>,
+        suggestions: Vec<wordcartel_core::diagnostics::Suggestion>,
+    },
     /// A `DiagnosticsProvider` lifecycle event (Effort A) — restart re-arm / degradation hint.
     DiagProviderEvent {
         source: wordcartel_core::diagnostics::DiagSource,
@@ -132,6 +142,14 @@ impl std::fmt::Debug for Msg {
                 .field("version", version)
                 .field("source", source)
                 .field("count", &diagnostics.len())
+                .finish(),
+            Msg::DiagFixesReady { token, buffer_id, version, source, suggestions, .. } => f
+                .debug_struct("DiagFixesReady")
+                .field("token", token)
+                .field("buffer_id", buffer_id)
+                .field("version", version)
+                .field("source", source)
+                .field("count", &suggestions.len())
                 .finish(),
             Msg::DiagProviderEvent { source, event } => f
                 .debug_struct("DiagProviderEvent")
@@ -344,6 +362,8 @@ fn reduce_dispatch(msg: Msg, editor: &mut Editor, ctx: &crate::overlays::Dispatc
         Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
+        Msg::DiagFixesReady { token, buffer_id, version, suggestions, .. } =>
+            crate::search_ui::apply_diag_fixes_ready(editor, buffer_id, token, version, suggestions),
         Msg::DiagProviderEvent { source, event } =>
             crate::diag_provider::apply_provider_event(editor, source, event, ctx.clock),
         Msg::Tick => crate::timers::on_tick(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),
@@ -1770,6 +1790,126 @@ mod tests {
             "sanity: the suggestion was applied via the click");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(7_000 + e.diag_cfg.debounce_ms),
             "click-apply arms exactly once, from the single seam call");
+    }
+
+    // ── E11 T5: the Msg::DiagFixesReady delivery arm (§3.4) ─────────────────────────────────
+    // Driven through the REAL `reduce` — a test that pokes overlay state directly could not
+    // pin a DELIVERY defect (a missing arm, or a stage that swallows the terminal), which is
+    // exactly what these guard.
+
+    /// Open the overlay for a fixed diagnostic and put it in the post-request Fetching state
+    /// under `token` — the state `quick_fix` leaves behind on `Accepted::Yes`.
+    fn fetching_overlay_via(e: &mut Editor, token: u64) {
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX,
+            code: Some("C1".into()), href: None, message: "m".into(), suggestions: vec![] };
+        e.open_diag(d);
+        let ov = e.diag.as_mut().unwrap();
+        ov.fix_token = Some(token);
+        ov.fix_state = crate::diag_overlay::FixState::Fetching;
+    }
+
+    fn fixes_ready(e: &Editor, token: u64) -> Msg {
+        Msg::DiagFixesReady { token, buffer_id: e.active().id,
+            version: e.active().document.version,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX, range: 0..1,
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("x".into())] }
+    }
+
+    #[test]
+    fn fixes_ready_delivers_on_token_match_and_same_version_via_reduce() {
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        fetching_overlay_via(&mut e, 7);
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let msg = fixes_ready(&e, 7);
+        crate::app::reduce(msg, &mut e, &reg, &km, &crate::jobs::InlineExecutor::default(),
+            &crate::test_support::TestClock::new(0), &tx, &crate::test_support::test_fs());
+        let ov = e.diag.as_ref().expect("overlay stays open");
+        assert_eq!(ov.anchor.suggestions.len(), 1, "suggestions delivered");
+        assert_eq!(ov.fix_state, crate::diag_overlay::FixState::Done);
+    }
+
+    #[test]
+    fn displaced_terminal_does_not_clear_a_reopened_overlays_fetching_state_via_reduce() {
+        // Spec round-2 Critical-1: reopen mints the SAME buffer/version/range — only the
+        // token discriminates. Token 1's (displaced) terminal must not touch token 2's overlay.
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        fetching_overlay_via(&mut e, 1);
+        e.diag = None;                    // close…
+        fetching_overlay_via(&mut e, 2);  // …and reopen the same diagnostic, new token
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let stale = Msg::DiagFixesReady { token: 1, buffer_id: e.active().id,
+            version: e.active().document.version,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX, range: 0..1,
+            suggestions: vec![] };
+        crate::app::reduce(stale, &mut e, &reg, &km, &crate::jobs::InlineExecutor::default(),
+            &crate::test_support::TestClock::new(0), &tx, &crate::test_support::test_fs());
+        let ov = e.diag.as_ref().expect("overlay untouched");
+        assert_eq!(ov.fix_state, crate::diag_overlay::FixState::Fetching,
+            "token-1 terminal dropped silently; token-2 fetch still live");
+    }
+
+    #[test]
+    fn version_mismatched_terminal_is_consumed_and_closes_the_overlay_via_reduce() {
+        // Spec round-5 Important-1: a BACKGROUND (non-key) mutation bumps the version while
+        // Fetching; the change-invalidation terminal (token-matched, version-mismatched)
+        // must CLOSE the overlay with the shipped sticky status — consumed, never dropped.
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        fetching_overlay_via(&mut e, 7);
+        let opened = e.diag.as_ref().unwrap().opened_version;
+        // Background mutation through the edit funnel (no key input; the modal only eats keys).
+        let (cs, edit) = crate::commands::build_range_replace(0, 0, "z",
+            e.active().document.buffer.len());
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other,
+            &crate::test_support::TestClock::new(0));
+        assert!(e.active().document.version > opened, "background edit bumped the version");
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let terminal = Msg::DiagFixesReady { token: 7, buffer_id: e.active().id,
+            version: opened, // the terminal names the REQUEST's version
+            source: wordcartel_core::diagnostics::DiagSource::LTeX, range: 0..1,
+            suggestions: vec![] };
+        crate::app::reduce(terminal, &mut e, &reg, &km, &crate::jobs::InlineExecutor::default(),
+            &crate::test_support::TestClock::new(0), &tx, &crate::test_support::test_fs());
+        assert!(e.diag.is_none(), "consumed AND closed — no eternal Fetching");
+        let st = e.status().expect("status set");
+        assert_eq!(e.status_text(), "document changed; re-open");
+        assert_eq!(st.lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    #[test]
+    fn prompt_intercept_delivers_fixes_ready_under_a_modal() {
+        // Plan-gate finding 4: prompts::intercept consumes ALL messages while a prompt is
+        // open (`_ => {}`), with explicit forwarding arms for background results — the
+        // shipped `intercept_delivers_diag_provider_event_under_a_modal` precedent. Without
+        // a DiagFixesReady arm, a prompt raised while a fetch is live would eat the sole
+        // terminal (eternal Fetching, the spec rounds-4/5 defect class).
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        fetching_overlay_via(&mut e, 7);
+        e.open_prompt(crate::prompt::Prompt::close_confirm("f.md", e.active().id));
+        // NOTE open_prompt closes overlays (XOR) — re-arm the diag state after, as the race
+        // being modeled is a prompt raised by a BACKGROUND route (which does not close_all):
+        fetching_overlay_via(&mut e, 7);
+        e.prompt = Some(crate::prompt::Prompt::close_confirm("f.md", e.active().id));
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::reduce(fixes_ready(&e, 7), &mut e, &reg, &km,
+            &crate::jobs::InlineExecutor::default(), &crate::test_support::TestClock::new(0),
+            &tx, &crate::test_support::test_fs());
+        assert_eq!(e.diag.as_ref().unwrap().fix_state, crate::diag_overlay::FixState::Done,
+            "the prompt-intercept arm delivered the terminal; nothing was swallowed");
     }
 
     #[test]

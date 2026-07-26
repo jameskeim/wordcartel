@@ -609,6 +609,12 @@ pub struct Editor {
     pub dictionary: std::collections::HashSet<String>,
     /// Session-level words to ignore (added via ignore-word command).
     pub session_ignores: std::collections::HashSet<String>,
+    /// E11 §5.3: session dismissals of INDIVIDUAL non-spelling flags, keyed by
+    /// `(source, code-or-empty, pair key)`. The pair key (enclosing sentence + enclosing line) is
+    /// what scopes a dismissal to one occurrence; `session_ignores` above cannot do this job
+    /// because it matches on the surface word and only suppresses `Spelling`. Ephemeral by
+    /// design — never persisted, so a dismissal outlives no session.
+    pub session_dismissals: crate::diagnostics_run::DismissSet,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
     /// Registered diagnostics providers (Effort A/SPINE). Empty `ProviderSet` by default →
@@ -623,6 +629,14 @@ pub struct Editor {
     /// latch, cleared in set_render_mode on entering Review). One hint per source per entry —
     /// informative, not naggy. Spec §9.
     pub diag_hint_shown: std::collections::BTreeSet<wordcartel_core::diagnostics::DiagSource>,
+    /// E11 §3.2: the monotonic mint for on-demand fix-request correlation tokens. Each
+    /// `quick_fix` takes the current value and increments. MONOTONIC AND NEVER REUSED is the
+    /// whole guarantee: reopening the same diagnostic unedited reproduces every identity field
+    /// (buffer, version, range), so the token is the ONLY thing that distinguishes a live
+    /// request from a displaced one — a wrapped or reset counter would let a stale terminal
+    /// silently clear a live fetch. Starts at 1 so `Some(0)` can never be a default-shaped
+    /// accident.
+    pub next_fix_token: u64,
     /// E10 §6: the armed idle-suspend deadline for the heavy (ltex) engine — `Some(due_ms)`
     /// after a leaving-Review transition, cleared on re-entry or fire. Read by the
     /// `timers.rs` "diag_idle" row; never persisted.
@@ -754,10 +768,12 @@ impl Editor {
             export_cfg: crate::config::ExportConfig::default(),
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
+            session_dismissals: std::collections::HashSet::new(),
             diag: None,
             diag_providers: crate::diag_provider::ProviderSet::default(),
             active_analysis_source: wordcartel_core::diagnostics::DiagSource::Harper,
             diag_hint_shown: std::collections::BTreeSet::new(),
+            next_fix_token: 1,
             diag_idle_due: None,
             outline: None,
             theme_picker: None,

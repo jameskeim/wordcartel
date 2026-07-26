@@ -31,8 +31,6 @@ pub const INSTALL_HINT: &str =
 /// Publish watchdog: if the server never publishes for a sent version, emit an empty terminal
 /// after this so the single-in-flight latch never wedges (spec §3.4).
 const PUBLISH_TIMEOUT_MS: u64 = 10_000;
-/// codeAction watchdog: emit the converted diagnostics suggestionless if the fix fetch stalls.
-const CODEACTION_TIMEOUT_MS: u64 = 5_000;
 /// Degrade hint shown once the respawn budget is exhausted (distinct from the not-installed hint).
 const CRASHED_HINT: &str = "grammar checker stopped after repeated restarts";
 
@@ -64,7 +62,6 @@ impl crate::lsp_client::LspEngine for HarperEngine {
     const READER_THREAD: &'static str = "wcartel-harper-read";
     const PUBLISH_TIMEOUT_MS: u64 = PUBLISH_TIMEOUT_MS;
     const FIRST_CHECK_TIMEOUT_MS: Option<u64> = None; // resident + fast — no warm phase
-    const CODEACTION_TIMEOUT_MS: u64 = CODEACTION_TIMEOUT_MS;
     const SUSPENDABLE: bool = false;
 
     fn spawn_command() -> std::process::Command {
@@ -108,6 +105,9 @@ impl crate::lsp_client::LspEngine for HarperEngine {
     }
 
     fn classify(d: &Value) -> DiagnosticKind { classify_lsp(d) }
+
+    // probe-verified bare kind + edit.changes:
+    fn is_fix_kind(kind: &str) -> bool { kind == "quickfix" }
 }
 
 /// The BARE, unwrapped harper settings object (spec §8) — the pre-T1 `settings_object` body,
@@ -174,7 +174,6 @@ fn classify_lsp(d: &Value) -> DiagnosticKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wordcartel_core::diagnostics::Suggestion;
 
     fn cfg(grammar: bool) -> ProviderConfig {
         ProviderConfig { grammar, dictionary: None, max_file_length: 10_000, language: None }
@@ -412,97 +411,25 @@ mod tests {
         assert!(stale.is_empty(), "old-generation publish dropped, no emission for the retired uri");
     }
 
-    // ── codeAction: shape, attach, command-only dropped ─────────────────────────────────────────
+    // ── publish emits immediately, no codeAction round trip (E11 §3) ────────────────────────────
 
-    /// Publish a single spelling diagnostic over "teh" (bytes 0..3), returning the codeAction id
-    /// the machine allocated.
-    fn publish_teh(st: &mut HarperState, buffer: BufferId, uri: &str) -> u64 {
+    #[test]
+    fn nonempty_publish_emits_converted_immediately_no_codeaction_roundtrip() {
+        // E11 §3.1: the parking is GONE — paint no longer waits on a fix round trip.
+        let mut st = running(true);
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 5, path: None,
+            text: "teh".into() }), 0);
         let out = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
             "method":"textDocument/publishDiagnostics",
-            "params":{"uri":uri,"diagnostics":[
+            "params":{"uri":"untitled:wcartel-0-1","diagnostics":[
                 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
                  "message":"spelling","code":"SpellCheck"}]}})), 0);
-        let ca = sends(&out).into_iter().find(|v| method_of(v) == "textDocument/codeAction")
-            .expect("a codeAction request was sent for the non-empty publish");
-        let _ = buffer;
-        ca["id"].as_u64().expect("codeAction id")
-    }
-
-    #[test]
-    fn nonempty_publish_then_codeaction_attaches_replace_with_and_drops_command_only() {
-        let mut st = running(true);
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 5, path: None,
-            text: "teh".into() }), 0);
-        let id = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        let resp = json!({"jsonrpc":"2.0","id":id,"result":[
-            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
-                {"newText":"the","range":{"start":{"line":0,"character":0},
-                    "end":{"line":0,"character":3}}}]}}},
-            {"kind":Value::Null,"command":{"title":"Add to dictionary"}}
-        ]});
-        let out = st.on_inbound(Inbound::Server(resp), 0);
+        assert!(sends(&out).is_empty(), "no codeAction request is ever sent from a publish");
         let done = diag_dones(&out);
         assert_eq!(done.len(), 1);
-        let (b, v, diags) = &done[0];
-        assert_eq!((*b, *v), (BufferId(0), 5));
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].suggestions, vec![Suggestion::ReplaceWith("the".into())],
-            "quickfix attached; command-only action dropped");
-    }
-
-    #[test]
-    fn assembly_superseded_generation_is_discarded_not_emitted_with_new_ranges() {
-        let mut st = running(true);
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 5, path: None,
-            text: "teh".into() }), 0);
-        let id = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        // Force a generation bump on the doc while the codeAction is in flight.
-        st.docs.get_mut(&BufferId(0)).unwrap().generation = 99;
-        let resp = json!({"jsonrpc":"2.0","id":id,"result":[
-            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
-                {"newText":"the","range":{"start":{"line":0,"character":0},
-                    "end":{"line":0,"character":3}}}]}}}]});
-        let out = st.on_inbound(Inbound::Server(resp), 0);
-        // Discarded: no non-empty diagnostics emitted against the newer generation.
-        for (_, _, diags) in diag_dones(&out) {
-            assert!(diags.is_empty(), "superseded assembly must not paint against new text");
-        }
-    }
-
-    #[test]
-    fn stale_codeaction_response_does_not_consume_the_newer_assembly() {
-        let mut st = running(true);
-        // v1: publish parks assembly #1 (our_version=1) and issues codeAction id1.
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1, path: None,
-            text: "teh".into() }), 0);
-        let id1 = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        // codeAction #1 stalls past its watchdog: assembly #1 emits v1 suggestionless and is removed,
-        // but its pending request survives — a late response can still route to on_codeaction_response.
-        let w = st.on_deadline(CODEACTION_TIMEOUT_MS);
-        assert_eq!(diag_dones(&w)[0].1, 1, "watchdog terminated v1 suggestionless");
-        // v2 edit + publish parks a BRAND-NEW assembly #2 (same generation, our_version=2), id2.
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 2, path: None,
-            text: "teh".into() }), CODEACTION_TIMEOUT_MS);
-        let id2 = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        assert_ne!(id1, id2);
-        // The LATE response to request #1 lands now: its our_version (1) ≠ the parked assembly's (2),
-        // so it must be DISCARDED — no emit, and assembly #2 left intact for its own response.
-        let stale = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id1,"result":[
-            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
-                {"newText":"STALE","range":{"start":{"line":0,"character":0},
-                    "end":{"line":0,"character":3}}}]}}}]})), CODEACTION_TIMEOUT_MS);
-        assert!(diag_dones(&stale).is_empty(), "stale v1 response discarded — no emission");
-        assert!(st.assembling.contains_key(&BufferId(0)), "assembly #2 left intact for its own response");
-        // The real v2 response attaches its OWN fresh fix and emits for v2.
-        let fresh = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id2,"result":[
-            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
-                {"newText":"the","range":{"start":{"line":0,"character":0},
-                    "end":{"line":0,"character":3}}}]}}}]})), CODEACTION_TIMEOUT_MS);
-        let done = diag_dones(&fresh);
-        assert_eq!(done.len(), 1);
-        assert_eq!((done[0].0, done[0].1), (BufferId(0), 2), "emitted for v2");
-        assert_eq!(done[0].2[0].suggestions, vec![Suggestion::ReplaceWith("the".into())],
-            "v2 assembly attached its OWN fresh edits, not the stale v1 ones");
+        assert_eq!((done[0].0, done[0].1), (BufferId(0), 5));
+        assert_eq!(done[0].2.len(), 1, "converted diagnostic emitted immediately");
+        assert!(done[0].2[0].suggestions.is_empty(), "suggestions are on-demand (E11 §3)");
     }
 
     // ── watchdogs ───────────────────────────────────────────────────────────────────────────────
@@ -518,39 +445,29 @@ mod tests {
         assert_eq!(diag_dones(&out), vec![(BufferId(0), 3, vec![])]);
     }
 
-    #[test]
-    fn codeaction_watchdog_emits_converted_suggestionless() {
-        let mut st = running(true);
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 4, path: None,
-            text: "teh".into() }), 0);
-        publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        let out = st.on_deadline(CODEACTION_TIMEOUT_MS);
-        let done = diag_dones(&out);
-        assert_eq!(done.len(), 1);
-        assert_eq!((done[0].0, done[0].1), (BufferId(0), 4));
-        assert_eq!(done[0].2.len(), 1, "the converted diagnostic still paints");
-        assert!(done[0].2[0].suggestions.is_empty(), "no fixes on a codeAction timeout");
-    }
-
-    // ── flush_outstanding covers awaiting + assembling + queued ────────────────────────────────
+    // ── flush_outstanding covers awaiting + queued + the E11 pending_fix slot ──────────────────
 
     #[test]
     fn flush_outstanding_covers_all_three_tracks_and_is_idempotent() {
         let mut st = running(true);
-        // awaiting (buffer 0)
+        // Track 1 — awaiting (buffer 0).
         st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1, path: None,
             text: "a".into() }), 0);
-        // assembling (buffer 1)
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(1), version: 2, path: None,
-            text: "teh".into() }), 0);
-        publish_teh(&mut st, BufferId(1), "untitled:wcartel-1-2");
-        // queued (buffer 2): drop back to Initializing so a change queues instead of applying.
+        // Track 2 — queued (buffer 2): drop back to Initializing so a change queues.
         st.phase = Phase::Initializing;
         st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(2), version: 3, path: None,
             text: "q".into() }), 0);
-        let mut done = diag_dones(&st.flush_outstanding());
-        done.sort_by_key(|(b, _, _)| b.0);
-        assert_eq!(done, vec![(BufferId(0), 1, vec![]), (BufferId(1), 2, vec![]), (BufferId(2), 3, vec![])]);
+        // Track 3 — the E11 pending_fix slot (held: Initializing, no raws).
+        st.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 11, buffer_id: BufferId(0),
+            version: 1, range: 0..1, code: None, message: "m".into() }), 0);
+        let acts = st.flush_outstanding();
+        let mut done: Vec<(BufferId, u64)> = acts.iter().filter_map(|a| match a {
+            Action::Emit(Msg::DiagnosticsDone { buffer_id, version, .. }) =>
+                Some((*buffer_id, *version)), _ => None }).collect();
+        done.sort_by_key(|(b, _)| b.0);
+        assert_eq!(done, vec![(BufferId(0), 1), (BufferId(2), 3)], "checks flushed");
+        assert!(acts.iter().any(|a| matches!(a,
+            Action::Emit(Msg::DiagFixesReady { token: 11, .. }))), "the slot's token terminal");
         assert!(st.flush_outstanding().is_empty(), "idempotent — a second flush emits nothing");
     }
 
@@ -591,27 +508,7 @@ mod tests {
         assert!(out.iter().any(|a| matches!(a, Action::Exit)));
     }
 
-    // ── assembly-overwrite guard (round-2 IMPORTANT) + watchdog symmetry ───────────────────────
-
-    #[test]
-    fn assembly_result_then_eof_does_not_re_emit_empty_for_the_same_version() {
-        let mut st = running(true);
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 5, path: None,
-            text: "teh".into() }), 0);
-        let id = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        // codeAction response emits the NON-EMPTY terminal for v=5 and removes assembling[0].
-        let resp = json!({"jsonrpc":"2.0","id":id,"result":[
-            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
-                {"newText":"the","range":{"start":{"line":0,"character":0},
-                    "end":{"line":0,"character":3}}}]}}}]});
-        let landed = st.on_inbound(Inbound::Server(resp), 0);
-        assert_eq!(diag_dones(&landed)[0].2.len(), 1, "non-empty result landed for v=5");
-        // Now the server dies: the flush must find NO tracked entry for v=5 → no empty clobber.
-        let after = st.on_inbound(Inbound::ServerEof, 0);
-        assert!(!after.iter().any(|a| matches!(a,
-            Action::Emit(Msg::DiagnosticsDone { buffer_id: BufferId(0), version: 5, .. }))),
-            "no second (empty) terminal for a version whose non-empty result already landed");
-    }
+    // ── watchdog symmetry ────────────────────────────────────────────────────────────────────
 
     #[test]
     fn publish_watchdog_then_eof_no_duplicate_terminal() {
@@ -624,20 +521,6 @@ mod tests {
         assert!(!after.iter().any(|a| matches!(a,
             Action::Emit(Msg::DiagnosticsDone { buffer_id: BufferId(0), version: 6, .. }))),
             "watchdog already removed the awaiting entry; the flush finds nothing to re-emit");
-    }
-
-    #[test]
-    fn codeaction_watchdog_then_eof_no_duplicate_terminal() {
-        let mut st = running(true);
-        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 7, path: None,
-            text: "teh".into() }), 0);
-        publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
-        let w = st.on_deadline(CODEACTION_TIMEOUT_MS);
-        assert_eq!(diag_dones(&w)[0].1, 7);
-        let after = st.on_inbound(Inbound::ServerEof, 0);
-        assert!(!after.iter().any(|a| matches!(a,
-            Action::Emit(Msg::DiagnosticsDone { buffer_id: BufferId(0), version: 7, .. }))),
-            "assembly watchdog already removed the entry; no duplicate on EOF");
     }
 
     // ── classification / grammar gate ───────────────────────────────────────────────────────────
@@ -655,7 +538,6 @@ mod tests {
         let mut st = running(false); // grammar off
         st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1, path: None,
             text: "teh cat".into() }), 0);
-        // One spelling + one grammar diagnostic; only spelling survives → converted non-empty.
         let out = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0",
             "method":"textDocument/publishDiagnostics",
             "params":{"uri":"untitled:wcartel-0-1","diagnostics":[
@@ -663,10 +545,9 @@ mod tests {
                  "message":"spelling","code":"SpellCheck"},
                 {"range":{"start":{"line":0,"character":4},"end":{"line":0,"character":7}},
                  "message":"style","code":"LongSentences"}]}})), 0);
-        // Non-empty (spelling remains) → a codeAction went out; assembly holds exactly one diag.
-        assert!(sends(&out).iter().any(|v| method_of(v) == "textDocument/codeAction"));
-        assert_eq!(st.assembling.get(&BufferId(0)).unwrap().diags.len(), 1,
-            "grammar-classified diagnostic dropped by the client gate");
+        let done = diag_dones(&out);
+        assert_eq!(done[0].2.len(), 1, "grammar-classified diagnostic dropped by the client gate");
+        assert_eq!(done[0].2[0].kind, DiagnosticKind::Spelling);
     }
 
     // ── FlushGuard: drop emits terminals for tracked + queued (channel-drain) ──────────────────

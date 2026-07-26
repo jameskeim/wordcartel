@@ -48,6 +48,16 @@ pub trait DiagnosticsProvider: std::fmt::Debug {
     fn notify_change(&mut self, buffer_id: BufferId, version: u64,
         path: Option<std::path::PathBuf>, text: String) -> Accepted;
     fn notify_close(&mut self, buffer_id: BufferId);
+    /// E11 §3: fetch fix candidates for one diagnostic, on demand. `token` is the request's
+    /// correlation identity (§3.4 — minted per request; the ONLY value the reduce arm keys
+    /// delivery on). `Accepted::Yes` ⟹ exactly one terminal `Msg::DiagFixesReady` carrying
+    /// this token is guaranteed (§3.4); `Accepted::No` ⟹ nothing will be emitted — the
+    /// caller must resolve the overlay's fetch state itself. Default: `Accepted::No`
+    /// (non-LSP providers offer no fixes).
+    fn request_fixes(&mut self, token: u64, buffer_id: BufferId, version: u64,
+        range: std::ops::Range<usize>, code: Option<String>, message: String) -> Accepted {
+        let _ = (token, buffer_id, version, range, code, message); Accepted::No
+    }
     /// Best-effort: ask the server to re-read `userDictPath` (a config resend). NOT a writer.
     fn reload_dictionary(&mut self);
     fn shutdown(&mut self);
@@ -110,6 +120,18 @@ impl ProviderSet {
             None => Accepted::No,
         }
     }
+    /// E11 §3.2: route an on-demand fix request to ONE engine (the active lens). An
+    /// unregistered source can emit nothing, so it is never accepted — same never-latch
+    /// discipline as `notify_change`.
+    #[allow(clippy::too_many_arguments)] // the request's identity IS six fields (spec §3.2)
+    pub fn request_fixes(&mut self, source: DiagSource, token: u64, buffer_id: BufferId,
+        version: u64, range: std::ops::Range<usize>, code: Option<String>, message: String)
+        -> Accepted {
+        match self.get_mut(source) {
+            Some(e) => e.provider.request_fixes(token, buffer_id, version, range, code, message),
+            None => Accepted::No,
+        }
+    }
     pub fn configure(&mut self, source: DiagSource, cfg: ProviderConfig) {
         if let Some(e) = self.get_mut(source) { e.provider.configure(cfg); }
     }
@@ -159,6 +181,8 @@ pub(crate) enum ProviderCall {
     Configure(ProviderConfig),
     NotifyChange { buffer_id: BufferId, version: u64, path: Option<std::path::PathBuf>, text: String },
     NotifyClose(BufferId),
+    RequestFixes { token: u64, buffer_id: BufferId, version: u64,
+        range: std::ops::Range<usize>, code: Option<String>, message: String },
     ReloadDictionary,
     Shutdown,
     Suspend,
@@ -228,6 +252,11 @@ impl DiagnosticsProvider for RecordingProvider {
         self.accepted
     }
     fn notify_close(&mut self, buffer_id: BufferId) { self.push(ProviderCall::NotifyClose(buffer_id)); }
+    fn request_fixes(&mut self, token: u64, buffer_id: BufferId, version: u64,
+        range: std::ops::Range<usize>, code: Option<String>, message: String) -> Accepted {
+        self.push(ProviderCall::RequestFixes { token, buffer_id, version, range, code, message });
+        self.accepted
+    }
     fn reload_dictionary(&mut self) { self.push(ProviderCall::ReloadDictionary); }
     fn shutdown(&mut self) { self.push(ProviderCall::Shutdown); }
     fn suspend(&mut self) { self.push(ProviderCall::Suspend); }
@@ -365,6 +394,47 @@ mod tests {
         assert_eq!(set.notify_change(DiagSource::Vale, BufferId(1), 3, None, "t".into()), Accepted::No,
             "unknown source never latches");
         assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::EnsureRunning)));
+    }
+
+    /// E11 §3.2: the on-demand fix request is source-keyed like every other delegation, records
+    /// its TOKEN (the sole correlation identity), and reports the recorder's settable `Accepted`.
+    /// An unregistered source can emit nothing, so it must never be accepted.
+    #[test]
+    fn recording_provider_records_request_fixes_and_reports_settable_accepted() {
+        let rec = RecordingProvider::new().with_source(DiagSource::LTeX);
+        let calls = rec.calls_handle();
+        let mut set = ProviderSet::default();
+        set.install(Box::new(rec), true);
+        let a = set.request_fixes(DiagSource::LTeX, 7, BufferId(0), 1, 2..5,
+            Some("C".into()), "m".into());
+        assert_eq!(a, Accepted::Yes, "recorder default accepts");
+        assert!(calls.lock().unwrap().iter().any(|c| matches!(c,
+            ProviderCall::RequestFixes { token: 7, .. })));
+        assert_eq!(set.request_fixes(DiagSource::Vale, 8, BufferId(0), 1, 0..1, None, "".into()),
+            Accepted::No, "unregistered source → No");
+    }
+
+    /// The defaulted trait body: a provider that offers no fixes must REFUSE, so the caller
+    /// resolves the overlay itself rather than waiting for a message that will never come.
+    #[test]
+    fn request_fixes_defaults_to_not_accepted() {
+        #[derive(Debug)]
+        struct Minimal;
+        impl DiagnosticsProvider for Minimal {
+            fn source(&self) -> DiagSource { DiagSource::Plugin("minimal") }
+            fn install_hint(&self) -> &'static str { "" }
+            fn availability(&self) -> Availability { Availability::Ready }
+            fn ensure_running(&mut self) {}
+            fn configure(&mut self, _cfg: ProviderConfig) {}
+            fn notify_change(&mut self, _b: BufferId, _v: u64, _p: Option<std::path::PathBuf>,
+                _t: String) -> Accepted { Accepted::No }
+            fn notify_close(&mut self, _b: BufferId) {}
+            fn reload_dictionary(&mut self) {}
+            fn shutdown(&mut self) {}
+        }
+        let mut m = Minimal;
+        assert_eq!(m.request_fixes(1, BufferId(0), 1, 0..1, None, "m".into()), Accepted::No,
+            "the default body never promises a terminal");
     }
 
     #[test]

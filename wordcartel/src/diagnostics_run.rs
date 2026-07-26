@@ -225,12 +225,108 @@ fn ignore_union_lower(editor: &Editor) -> std::collections::HashSet<String> {
         .map(|w| w.to_lowercase()).collect()
 }
 
-/// Drop every `Spelling` diagnostic whose surface word (sliced from `text`) is in `union`;
-/// retain everything else (non-spelling diagnostics are never suppressed). Byte ranges index into
-/// `text`, which is the buffer content of the diagnostics' version.
-fn retain_over_union(diags: &mut Vec<Diagnostic>, text: &str,
-    union: &std::collections::HashSet<String>) {
+/// E11 §5.3: the two text units that together identify ONE dismissed occurrence — the enclosing
+/// sentence and the enclosing source line. Neither alone is enough: a sentence key alone silences
+/// the same wording wherever that sentence is repeated (and cannot separate a heading from prose
+/// that quotes it); a line key alone cannot separate two sentences sharing one long line. Both are
+/// required EQUAL, and both are derived parse-free, so the filter is safe on a buffer whose block
+/// tree is deliberately stale (the lazy-reparse law).
+///
+/// The pair carries no notion of Markdown role, by design: nothing classifies the CANDIDATE, so
+/// there is no classification step to disagree with the one taken at dismiss time. The residue is
+/// a named collision class — two occurrences whose sentence AND line units are byte-identical are
+/// indistinguishable and are suppressed together, whatever their roles.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct DismissKey {
+    /// The enclosing sentence, as `textobj::sentence_bounds` cuts it from the blank-line window.
+    pub sentence: String,
+    /// The enclosing source line, without its trailing newline.
+    pub line: String,
+}
+
+/// E11 §5.3: the session-dismissal set — `(source, code-or-empty, pair key)` triples. An absent
+/// `Diagnostic::code` keys as the empty string, so a code-less engine still gets per-occurrence
+/// dismissal rather than a wildcard.
+pub type DismissSet = std::collections::HashSet<(DiagSource, String, DismissKey)>;
+
+/// E11 §5.3: BOTH parse-free units at `pos` — the blank-line-window sentence + the source
+/// line. Rope + `textobj` only (no block tree — safe on any buffer; the lazy-reparse law).
+///
+/// Out-of-range `pos` is clamped to the document end; a slice that cannot be taken yields an
+/// empty unit rather than a panic (the units are compared, never indexed back into the text).
+///
+/// # Examples
+/// Crate-private, so rustdoc does not collect this as a doctest — the EXECUTED version is
+/// `dismissal_units_pair_sentence_and_line` below.
+/// ```ignore
+/// let buf = wordcartel_core::buffer::TextBuffer::from_str("One two. Three four.\n");
+/// let k = dismissal_units_at(&buf, 12);
+/// assert_eq!(k.sentence, "Three four.");
+/// assert_eq!(k.line, "One two. Three four.");
+/// ```
+pub(crate) fn dismissal_units_at(buf: &wordcartel_core::buffer::TextBuffer, pos: usize)
+    -> DismissKey {
+    let pos = pos.min(buf.len());
+    let line = buf.byte_to_line(pos);
+    // Expand to the nearest blank-line/document boundaries (source-level paragraph). "Blank" is
+    // TRIM-empty, not strict-empty: CommonMark treats a whitespace-only line as blank, and both
+    // shipped paragraph walkers (`nav.rs`, `ventilate.rs`) agree — a strict-empty test silently
+    // swallowed the preceding block into the key. One predicate, both directions, one function:
+    // the store and filter sides cannot disagree.
+    let blank = |n: usize| crate::lines::line_text(buf, n).trim().is_empty();
+    let mut first = line;
+    while first > 0 && !blank(first - 1) { first -= 1; }
+    let total = crate::lines::total_logical_lines(buf);
+    let mut last = line;
+    while last + 1 < total && !blank(last + 1) { last += 1; }
+    let win_start = crate::lines::line_start(buf, first);
+    let win_end = if last + 1 < total { crate::lines::line_start(buf, last + 1) }
+        else { buf.len() };
+    let window = buf.slice(win_start..win_end);
+    let rel = pos.saturating_sub(win_start).min(window.len());
+    let (from, to) = wordcartel_core::textobj::sentence_bounds(&window, rel);
+    DismissKey {
+        sentence: window.get(from..to).unwrap_or("").to_string(),
+        line: crate::lines::line_text(buf, line),
+    }
+}
+
+/// Whether `d` was dismissed for this session (E11 §5.3): the same engine, the same code
+/// (`None` keys as the empty string), and BOTH pair units byte-equal at the diagnostic's start.
+/// Equality, never containment — a dismissed sentence must not silence a longer sentence that
+/// merely contains it.
+///
+/// `buf` is the buffer the ranges were computed against, which is NOT necessarily the active one
+/// (a publish can land on a background buffer); the derivation is parse-free precisely so that is
+/// safe. Cost is `O(enclosing paragraph)` per diagnostic, and the caller only reaches it for a
+/// diagnostic whose `(source, code)` already matched a dismissal — see `retain_over_union`.
+fn is_dismissed(d: &Diagnostic, buf: &wordcartel_core::buffer::TextBuffer,
+    dismissals: &DismissSet) -> bool {
+    let key = dismissal_units_at(buf, d.range.start);
+    dismissals.contains(&(d.source, d.code.clone().unwrap_or_default(), key))
+}
+
+/// Drop every `Spelling` diagnostic whose surface word (sliced from `text`) is in `union`, and
+/// every diagnostic of any kind that matches a session dismissal; retain everything else. Byte
+/// ranges index into `text`/`buf`, which are the buffer content of the diagnostics' version — the
+/// two are one version by contract, checked below.
+fn retain_over_union(diags: &mut Vec<Diagnostic>, buf: &wordcartel_core::buffer::TextBuffer,
+    text: &str, union: &std::collections::HashSet<String>, dismissals: &DismissSet) {
+    // `text` IS `buf`'s content — the callers pass a `buf.to_string()` they already hold, so the
+    // spelling slice and the pair-key derivation see one and the same version. A stale `text`
+    // would filter spelling against one document and dismissals against another; not evaluated in
+    // release (the compare is `O(document)`).
+    debug_assert_eq!(text, buf.to_string(),
+        "retain_over_union: `text` must be `buf`'s own content");
+    // The cheap half of the dismissal rule, hoisted (spec §5.3 cost note): `(source, code)` is a
+    // hash lookup, the pair key costs `O(enclosing paragraph)` to derive. Prune by the prefix
+    // FIRST, so a diagnostic from an engine/rule the writer never dismissed derives no unit at
+    // all — the cost tracks the MATCHING-source diagnostics, not every diagnostic.
+    let prefixes: std::collections::HashSet<(DiagSource, &str)> =
+        dismissals.iter().map(|(s, c, _)| (*s, c.as_str())).collect();
     diags.retain(|d| {
+        if prefixes.contains(&(d.source, d.code.as_deref().unwrap_or("")))
+            && is_dismissed(d, buf, dismissals) { return false; }
         if d.kind != DiagnosticKind::Spelling { return true; }
         let surface = text.get(d.range.start..d.range.end).unwrap_or("");
         !union.contains(&surface.to_lowercase())
@@ -243,10 +339,18 @@ fn retain_over_union(diags: &mut Vec<Diagnostic>, text: &str,
 /// engine-agnostic, so a newly-ignored word must disappear from whichever engine flagged it.
 pub fn retain_unignored(editor: &mut Editor) {
     let union = ignore_union_lower(editor);
-    if union.is_empty() { return; } // nothing suppressed → no work, no snapshot
-    let text = editor.active().document.buffer.to_string();
-    for slot in editor.active_mut().diagnostics.slots_mut() {
-        retain_over_union(&mut slot.diagnostics, &text, &union);
+    // Nothing suppressed → no work, no snapshot. BOTH suppressors have to be empty: a session
+    // dismissal with an EMPTY spelling union is the ordinary non-spelling case, and a union-only
+    // guard here would silently apply none of them (E11 §5.3).
+    if union.is_empty() && editor.session_dismissals.is_empty() { return; }
+    let dismissals = editor.session_dismissals.clone();
+    let b = editor.active_mut();
+    // Disjoint field borrows of the same buffer: the store is refiltered against the document
+    // that produced the ranges.
+    let (doc, store) = (&b.document, &mut b.diagnostics);
+    let text = doc.buffer.to_string();
+    for slot in store.slots_mut() {
+        retain_over_union(&mut slot.diagnostics, &doc.buffer, &text, &union, &dismissals);
     }
 }
 
@@ -305,19 +409,23 @@ pub fn apply_diagnostics_done(
         if let Some(b) = editor.by_id_mut(buffer_id) { b.diagnostics.clear_source(source); }
         return;
     }
-    // Build the ignore union BEFORE borrowing the buffer mutably (dictionary/session_ignores live
-    // on `editor`, not the buffer). Empty in the common case → the filter below is skipped.
+    // Build the ignore union and snapshot the dismissals BEFORE borrowing the buffer mutably
+    // (dictionary/session_ignores/session_dismissals live on `editor`, not the buffer). Both
+    // empty in the common case → the filter below is skipped.
     let union = ignore_union_lower(editor);
+    let dismissals = editor.session_dismissals.clone();
     if let Some(b) = editor.by_id_mut(buffer_id) {
         if b.document.version == version {
             let mut diagnostics = diagnostics;
             debug_assert!(diagnostics.iter().all(|d| d.source == source),
                 "DiagnosticsDone payload sources match the message tag");
-            if !union.is_empty() {
-                // Apply-time ignore filter (spec §7.3): the text is this buffer at `version`, so the
-                // stored byte ranges slice the right surface words.
+            if !union.is_empty() || !dismissals.is_empty() {
+                // Apply-time ignore/dismissal filter (spec §7.3, §5.3): the text is this buffer at
+                // `version`, so the stored byte ranges slice the right surface words and the pair
+                // units derive from the very document the engine checked. A dismissal alone must
+                // reach here — hence the `||`, not a union-only guard.
                 let text = b.document.buffer.to_string();
-                retain_over_union(&mut diagnostics, &text, &union);
+                retain_over_union(&mut diagnostics, &b.document.buffer, &text, &union, &dismissals);
             }
             let slot = b.diagnostics.slot_mut(source);
             slot.diagnostics = diagnostics;
@@ -399,10 +507,16 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
     // The complete core catalog in cycle order (E10 T6).
     let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale];
-    // Which engines are enabled: None → all core; Some(list) → exactly the named (config_name).
+    // Which engines are enabled: None → the on-by-default core; Some(list) → exactly the named
+    // (config_name). `vale` is OFF by default (E11 T10 / backlog E15): `lsp_rpc::doc_uri` mints
+    // `untitled:` URIs and vale-ls publishes nothing at all for a URI that does not name a file
+    // on disk, so an enabled-by-default vale presents a permanently empty `[REVIEW · vale]` lens
+    // that reads as "vale found no problems" — the silent-UI failure this project forbids. Off by
+    // default makes the dormancy honest (the menu says "off"; the lens command refuses) until E15
+    // gives vale a URI it can lint. An explicit `linters` entry still turns it on.
     let enabled_of = |src: DiagSource| -> bool {
         match &cfg.diagnostics.linters {
-            None => true,
+            None => src != DiagSource::Vale,
             Some(list) => list.iter().any(|n| n == src.config_name()),
         }
     };
@@ -1280,6 +1394,49 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // E11 T10 / E15: vale ships dormant (it cannot lint an `untitled:` URI).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vale_is_disabled_by_default_and_its_surfaces_say_so() {
+        // Shipping vale ON would present a permanently empty `[REVIEW · vale]` lens that reads
+        // as "vale found no problems". Pin BOTH halves: the default itself, and that the two
+        // surfaces a writer meets vale through report the dormancy honestly.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
+        assert!(!e.diag_providers.is_enabled(DiagSource::Vale), "vale ships dormant");
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper), "…and ONLY vale is dormant");
+        assert!(e.diag_providers.is_enabled(DiagSource::LTeX));
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens seed skips it too");
+        assert!(warns.is_empty());
+        // Surface 1 — the engine menu row reads "off".
+        let labels: Vec<String> = engine_menu_rows(&e).into_iter().map(|(l, _)| l).collect();
+        assert!(labels.iter().any(|l| l == "vale — off"),
+            "the engine menu says vale is off; rows = {labels:?}");
+        // Surface 2 — `analysis_engine_vale`'s setter refuses through the shipped disabled path
+        // rather than opening the empty lens.
+        e.set_analysis_source(DiagSource::Vale);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens did not switch");
+        assert!(e.status_text().contains("not enabled"));
+    }
+
+    #[test]
+    fn an_explicit_linters_entry_still_enables_vale() {
+        // Only the DEFAULT changed — a writer who asks for vale still gets it.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.linters = Some(vec!["vale".into()]);
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(e.diag_providers.is_enabled(DiagSource::Vale), "opting in still works");
+        assert_eq!(e.active_analysis_source, DiagSource::Vale, "and it seeds the lens");
+        assert!(warns.is_empty());
+    }
+
+    // ------------------------------------------------------------------
     // Task 10 (E10 §13): the config-only default-engine seed override.
     // ------------------------------------------------------------------
 
@@ -1446,5 +1603,301 @@ mod tests {
         assert_eq!(rows2[0].0, "Harper — on", "enabled + Idle (not yet summoned) → on");
         assert_eq!(rows2[1].0, "LTeX — off", "disabled wins over Ready availability");
         assert_eq!(rows2[2].0, "vale — off", "disabled wins over Starting availability");
+    }
+
+    // ── T7: the session dismiss — pair key (sentence + line) + equality filter ────────────────
+
+    #[test]
+    fn dismissal_units_pair_sentence_and_line() {
+        let e = crate::editor::Editor::new_from_text(
+            "Para one here. Para two here.\n\nOther block.\n", None, (80, 24));
+        let k = dismissal_units_at(&e.active().document.buffer, 16); // inside "Para two"
+        assert_eq!(k.sentence, "Para two here.");
+        assert_eq!(k.line, "Para one here. Para two here.");
+    }
+
+    /// ADDED (review FIX 2) — "blank" is TRIM-empty, not strict-empty. `line_text` strips only the
+    /// trailing newline, so a whitespace-only separator used to count as paragraph CONTENT and the
+    /// window swallowed the neighbouring block: the key was then bound to text the writer never
+    /// selected. One fixture per walk direction: the two loops share ONE predicate, so both are
+    /// pinned against a future edit that re-splits it.
+    #[test]
+    fn a_whitespace_only_line_is_a_blank_boundary() {
+        // Backward walk: the heading above must NOT be pulled into the window.
+        let up = crate::editor::Editor::new_from_text("# Title\n   \nBeta two.\n", None, (80, 24));
+        let k = dismissal_units_at(&up.active().document.buffer, 12); // start of "Beta two."
+        assert_eq!(k.sentence, "Beta two.", "the whitespace-only line above stops the window");
+        assert_eq!(k.line, "Beta two.");
+        // Forward walk: an unterminated first sentence must not run on into the block below.
+        // (A terminated one would be cut by the segmenter anyway — no discrimination.)
+        let down = crate::editor::Editor::new_from_text("Alpha beta\n \t \nGamma three.\n",
+            None, (80, 24));
+        let k2 = dismissal_units_at(&down.active().document.buffer, 0);
+        assert_eq!(k2.sentence, "Alpha beta", "the whitespace-only line below stops the window");
+    }
+
+    // ── T7 harness (all bodies complete — plan-gate round-2 finding 4) ──────────────────────
+
+    fn gdiag(range: std::ops::Range<usize>, code: &str) -> Diagnostic {
+        Diagnostic { range, kind: DiagnosticKind::Grammar, source: DiagSource::LTeX,
+            code: Some(code.into()), href: None, message: "m".into(), suggestions: vec![] }
+    }
+    fn dismiss_at(e: &mut crate::editor::Editor, pos: usize, code: &str) {
+        let key = dismissal_units_at(&e.active().document.buffer, pos);
+        e.session_dismissals.insert((DiagSource::LTeX, code.into(), key));
+    }
+    fn seed_slot(e: &mut crate::editor::Editor, diags: Vec<Diagnostic>) {
+        let v = e.active().document.version;
+        let slot = e.active_mut().diagnostics.slot_mut(DiagSource::LTeX);
+        slot.diagnostics = diags;
+        slot.computed_version = v;
+    }
+    fn slot_ranges(e: &crate::editor::Editor) -> Vec<std::ops::Range<usize>> {
+        e.active().diagnostics.slot(DiagSource::LTeX)
+            .map(|s| s.diagnostics.iter().map(|d| d.range.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn dismissal_filters_with_an_empty_spelling_union() {
+        // The guard regression (round-1 finding 7): NO dictionary words, NO session ignores —
+        // a dismissal alone must still filter, in BOTH call paths.
+        let mut e = crate::editor::Editor::new_from_text("Alpha beta gamma. Delta eps.\n",
+            None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        assert!(e.dictionary.is_empty() && e.session_ignores.is_empty());
+        dismiss_at(&mut e, 18, "R"); // inside "Delta eps."
+        seed_slot(&mut e, vec![gdiag(18..23, "R")]);
+        retain_unignored(&mut e);
+        assert!(slot_ranges(&e).is_empty(), "retain_unignored path filters on dismissals alone");
+        let (id, v) = (e.active().id, e.active().document.version);
+        apply_diagnostics_done(&mut e, id, v, DiagSource::LTeX, vec![gdiag(18..23, "R")]);
+        assert!(slot_ranges(&e).is_empty(), "republish path filters on dismissals alone");
+    }
+
+    #[test]
+    fn dismiss_filters_by_pair_equality_and_reapplies_on_republish() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        dismiss_at(&mut e, 18, "R"); // "Delta epsilon zeta." starts at byte 18
+        seed_slot(&mut e, vec![gdiag(18..23, "R"), gdiag(0..5, "R")]); // + one in sentence 1
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![0..5], "only the dismissed sentence's flag dropped");
+        let (id, v) = (e.active().id, e.active().document.version);
+        apply_diagnostics_done(&mut e, id, v, DiagSource::LTeX,
+            vec![gdiag(18..23, "R"), gdiag(0..5, "R")]);
+        assert_eq!(slot_ranges(&e), vec![0..5], "the dismissal re-applies on every republish");
+    }
+
+    #[test]
+    fn identical_wording_in_a_different_sentence_survives() {
+        // D9 discriminator: same flagged wording, different enclosing sentence.
+        let mut e = crate::editor::Editor::new_from_text(
+            "Go now please. You should go now please today.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        dismiss_at(&mut e, 0, "R"); // sentence 1: "Go now please."
+        seed_slot(&mut e, vec![gdiag(26..28, "R")]); // "go" inside sentence 2
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![26..28], "different sentence-unit ⇒ survives");
+    }
+
+    #[test]
+    fn heading_dismissal_stays_scoped_to_that_line() {
+        // D10 discriminator + round-3 counterexample: "# Title" dismissed; body prose
+        // containing "Title" keeps its flag (line-units differ).
+        let mut e = crate::editor::Editor::new_from_text(
+            "# Title\n\nThe Title is tentative.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        dismiss_at(&mut e, 2, "R"); // inside the heading line
+        seed_slot(&mut e, vec![gdiag(13..18, "R")]); // "Title" inside the body sentence
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![13..18], "the body flag survives the heading dismissal");
+    }
+
+    #[test]
+    fn dismissed_sentence_does_not_suppress_a_longer_containing_sentence() {
+        // Round-3, AMENDED (review M1): what this actually pins is that a dismissal does not
+        // reach a flag in a DIFFERENT PARAGRAPH whose sentence merely contains the dismissed one —
+        // and here the two sentences also sit on different LINES, so the `line` conjunct alone
+        // already decides it. A containment implementation of `sentence` still passes. The test
+        // that isolates equality-vs-containment is the sibling
+        // `containment_on_the_same_line_does_not_suppress`, where ONE line holds both sentences.
+        // The segmenter keeps "Dr. Smith arrived." as ONE sentence (the shipped textobj doctest).
+        let mut e = crate::editor::Editor::new_from_text(
+            "Smith arrived. Yes.\n\nDr. Smith arrived. Indeed.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        dismiss_at(&mut e, 0, "R"); // key sentence: "Smith arrived."
+        seed_slot(&mut e, vec![gdiag(25..30, "R")]); // "Smith" inside "Dr. Smith arrived."
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![25..30], "superstring sentence ⇒ NOT equal ⇒ survives");
+    }
+
+    /// ADDED (not in the T7 brief) — the `line` half of the pair was otherwise UNPINNED: every
+    /// brief fixture whose sentence units differ also has differing line units, so a key that
+    /// compared `sentence` alone passed all nine. Here the two occurrences share ONE sentence
+    /// unit (the sentence spans a hard line break, so the blank-line window cuts the same span
+    /// for both) and differ only by line — which must be enough to keep the second flag.
+    #[test]
+    fn same_sentence_on_a_different_line_survives() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta\ngamma delta.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        let k0 = dismissal_units_at(&e.active().document.buffer, 0);
+        let k1 = dismissal_units_at(&e.active().document.buffer, 11);
+        assert_eq!(k0.sentence, k1.sentence, "precondition: ONE sentence unit spans both lines");
+        assert_ne!(k0.line, k1.line, "precondition: the line units differ");
+        dismiss_at(&mut e, 0, "R"); // line unit "Alpha beta"
+        seed_slot(&mut e, vec![gdiag(11..16, "R")]); // "gamma", line unit "gamma delta."
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![11..16], "different line-unit ⇒ survives");
+    }
+
+    /// ADDED (not in the T7 brief) — the equality-vs-containment discriminator the brief's
+    /// `dismissed_sentence_does_not_suppress_a_longer_containing_sentence` INTENDS but does not
+    /// isolate: in that fixture the two sentences sit on different LINES, so a containment rule
+    /// on `sentence` still leaves it green. Here both sentences share one line, and the dismissed
+    /// "Smith arrived." is a strict substring of the candidate's "Dr. Smith arrived." — so only
+    /// EQUALITY keeps the second flag.
+    #[test]
+    fn containment_on_the_same_line_does_not_suppress() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Smith arrived. Dr. Smith arrived.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        let k0 = dismissal_units_at(&e.active().document.buffer, 0);
+        let k1 = dismissal_units_at(&e.active().document.buffer, 19);
+        assert_eq!(k0.line, k1.line, "precondition: ONE line unit holds both sentences");
+        assert!(k1.sentence.contains(&k0.sentence) && k1.sentence != k0.sentence,
+            "precondition: the candidate sentence strictly CONTAINS the dismissed one");
+        dismiss_at(&mut e, 0, "R"); // "Smith arrived."
+        seed_slot(&mut e, vec![gdiag(19..24, "R")]); // "Smith" inside "Dr. Smith arrived."
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![19..24], "containment is NOT equality ⇒ survives");
+    }
+
+    /// ADDED (review FIX 1) — the `(source, code)` half of the triple was UNPINNED: every fixture
+    /// used ONE source (`LTeX`) and ONE code (`"R"`), so dropping either conjunct from the match
+    /// left the whole battery green. The three tests below each hold the pair key FIXED and vary
+    /// exactly ONE conjunct, so that conjunct alone decides the outcome.
+    ///
+    /// Here: another ENGINE's flag on the same sentence AND line. Without the `source` conjunct a
+    /// writer dismissing an ltex rule would also silence harper/vale on that very text.
+    #[test]
+    fn a_dismissal_does_not_cross_engines() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        dismiss_at(&mut e, 18, "R"); // LTeX / "R" / the "Delta epsilon zeta." pair
+        let mut d = gdiag(18..23, "R");
+        d.source = DiagSource::Harper; // SAME pair key, SAME code — only the engine differs
+        let v = e.active().document.version;
+        let slot = e.active_mut().diagnostics.slot_mut(DiagSource::Harper);
+        slot.diagnostics = vec![d];
+        slot.computed_version = v;
+        retain_unignored(&mut e);
+        let kept: Vec<std::ops::Range<usize>> = e.active().diagnostics.slot(DiagSource::Harper)
+            .map(|s| s.diagnostics.iter().map(|d| d.range.clone()).collect()).unwrap_or_default();
+        assert_eq!(kept, vec![18..23], "a different engine's flag on the same units survives");
+    }
+
+    /// The `code` conjunct in isolation: same engine, same pair key, a different RULE.
+    /// Without it, dismissing one ltex rule would silence every other rule on that sentence.
+    #[test]
+    fn a_dismissal_does_not_cross_codes() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        dismiss_at(&mut e, 18, "R");
+        seed_slot(&mut e, vec![gdiag(18..23, "S")]); // SAME source, SAME pair key, code "S"
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![18..23], "a different rule code survives");
+    }
+
+    /// The `None → ""` keying `DismissSet`'s doc specifies: a code-less engine still gets
+    /// per-occurrence dismissal, not a wildcard over the key. Both flags below share ONE pair key
+    /// and differ only in `code`, so the empty-string dismissal must take the code-less one and
+    /// leave the coded one — the `unwrap_or_default` on the FILTER side.
+    #[test]
+    fn an_absent_code_keys_as_the_empty_string() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        let key = dismissal_units_at(&e.active().document.buffer, 18);
+        e.session_dismissals.insert((DiagSource::LTeX, String::new(), key));
+        let mut no_code = gdiag(18..23, "R");
+        no_code.code = None;
+        // Both inside "Delta epsilon zeta." ⇒ identical pair key; only `code` separates them.
+        seed_slot(&mut e, vec![no_code, gdiag(24..31, "R")]);
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![24..31],
+            "the code-less flag is dismissed; a coded flag on the same key is not");
+    }
+
+    #[test]
+    fn identical_pair_across_roles_is_suppressed_documented_behavior() {
+        // Round-5 Minor-3, on a GENUINE cross-role fixture (plan-gate round-3 finding 1):
+        // Markdown lazy continuation makes the first `Title` blockquote CONTENT
+        // (role-non-prose — an unmarked line under `> Quote.` belongs to the quote), yet its
+        // pair derives sentence unit "Title" (`Quote.` terminates the preceding sentence in
+        // the blank-line window "> Quote.\nTitle") and line unit "Title" — byte-identical to
+        // the isolated one-line PARAGRAPH `Title` below. The pair rule is ROLE-BLIND: the
+        // dismissal suppresses both. Documented identical-text collision class, not
+        // separation (spec §5.3's context-sensitive-Markdown caveat, made concrete).
+        let mut e = crate::editor::Editor::new_from_text(
+            "> Quote.\nTitle\n\nTitle\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        dismiss_at(&mut e, 9, "R"); // the lazy-continuation "Title" (bytes 9..14, non-prose)
+        seed_slot(&mut e, vec![gdiag(16..21, "R")]); // the paragraph "Title" (bytes 16..21)
+        retain_unignored(&mut e);
+        assert!(slot_ranges(&e).is_empty(),
+            "byte-equal line AND sentence units across ROLES ⇒ suppressed, role never consulted");
+    }
+
+    #[test]
+    fn rewrap_of_the_containing_line_drops_the_dismissal_documented_behavior() {
+        // The named limit: rewrapping changes the line-unit; the pair no longer matches.
+        let mut a = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma delta.\n", None, (80, 24));
+        dismiss_at(&mut a, 0, "R");
+        let mut b = crate::editor::Editor::new_from_text(
+            "Alpha beta\ngamma delta.\n", None, (80, 24)); // same sentence, rewrapped
+        b.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        b.session_dismissals = a.session_dismissals.clone();
+        seed_slot(&mut b, vec![gdiag(0..5, "R")]);
+        retain_unignored(&mut b);
+        assert_eq!(slot_ranges(&b), vec![0..5], "line-unit changed ⇒ the flag honestly returns");
+    }
+
+    #[test]
+    fn filter_runs_on_non_active_buffer_apply_without_touching_any_tree() {
+        // Lazy-reparse invariant: the apply lands on a NON-active buffer; the filter must
+        // use rope+textobj against THAT buffer's text (never the lens/classifier).
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::LTeX)), true);
+        dismiss_at(&mut e, 18, "R");
+        let (target, v) = (e.active().id, e.active().document.version);
+        e.install_scratch();
+        crate::workspace::goto_scratch(&mut e);
+        assert_ne!(e.active().id, target, "the target buffer is NOT active");
+        // Review M3: pin the headline claim. The block tree of a non-active buffer is deliberately
+        // stale (the lazy-reparse law), so the filter must not touch it — a future edit reaching
+        // for the lens/classifier here bumps this generation and trips the assert.
+        let gen_before = e.by_id(target).unwrap().document.blocks_generation();
+        apply_diagnostics_done(&mut e, target, v, DiagSource::LTeX, vec![gdiag(18..23, "R")]);
+        assert_eq!(e.by_id(target).unwrap().document.blocks_generation(), gen_before,
+            "no reparse of the non-active buffer — no tree was touched");
+        // `unwrap_or(0)` would also yield 0 for a missing slot, so pin the slot's EXISTENCE first.
+        let slot = e.by_id(target).unwrap().diagnostics.slot(DiagSource::LTeX)
+            .expect("the apply created the LTeX slot on the target buffer");
+        assert!(slot.diagnostics.is_empty(),
+            "dismissal filtered on the non-active buffer's own text");
     }
 }

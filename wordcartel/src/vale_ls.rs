@@ -27,7 +27,6 @@ impl LspEngine for ValeEngine {
     const READER_THREAD: &'static str = "wcartel-vale-read";
     const PUBLISH_TIMEOUT_MS: u64 = 10_000;
     const FIRST_CHECK_TIMEOUT_MS: Option<u64> = None;
-    const CODEACTION_TIMEOUT_MS: u64 = 5_000;
     const SUSPENDABLE: bool = false;
 
     // T11-probe flag: bare stdio invocation; verify live.
@@ -67,6 +66,9 @@ impl LspEngine for ValeEngine {
         }
         crate::lsp_client::classify_spell_heuristic(d)
     }
+
+    // probe §2:
+    fn is_fix_kind(kind: &str) -> bool { kind == "quickfix" }
 }
 
 #[cfg(test)]

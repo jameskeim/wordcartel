@@ -13,7 +13,7 @@ use wordcartel_core::history::Clock;
 /// must still be processed — a JobDone arriving while a modal is up (e.g. an
 /// in-flight save completing during the quit-confirm prompt) must not be
 /// dropped, or save&quit would hang waiting for a result it already discarded.
-/// Consumes every message once admitted (Key + the five background-result arms + `_`) —
+/// Consumes every message once admitted (Key + the nine background-result arms + `_`) —
 /// never returns Pass (§8.1-J).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
     ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
@@ -64,6 +64,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         // beside reduce_dispatch's arm — the intercept's `_ => {}` would otherwise swallow it.
         Msg::DiagProviderEvent { source, event } =>
             crate::diag_provider::apply_provider_event(editor, source, event, ctx.clock),
+        // E11 §3.4: a fix terminal must reach its overlay even under an open modal — the
+        // token's exactly-once terminal is the only one that will ever come (second delivery
+        // site beside reduce_dispatch's arm; the `_ => {}` would otherwise swallow it).
+        Msg::DiagFixesReady { token, buffer_id, version, suggestions, .. } =>
+            crate::search_ui::apply_diag_fixes_ready(editor, buffer_id, token, version, suggestions),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, ctx.clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Resize/Tick/other input: ignored for the modal, but results still drain below.

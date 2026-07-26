@@ -432,14 +432,10 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
 
-    // A prompt carrying structured `detail` (C5 §11.3 — which recovery files are being kept,
-    // and how old they are) paints it as a bordered box ABOVE this row; the question and its
-    // choices stay on the row itself. `message` is truncated to one row, so a disclosure
-    // smuggled into it never reached the screen (review finding C1). Empty `detail` — every
-    // other prompt in the app — paints nothing, so this is inert for them.
-    if let Some(ref prompt) = editor.prompt {
-        crate::render_overlays::paint_prompt_detail(frame, prompt, area, status_row, cs);
-    }
+    // The disclosure boxes that belong to what is on this row — the prompt's `detail` (C5
+    // §11.3) and the quick-fix overlay's message (E11 §6). Both are painted FOR an overlay
+    // rather than being render sites of their own; the per-overlay guards live in the seam.
+    crate::render_overlays::paint_detail_boxes(frame, editor, area, status_row, cs);
 }
 
 /// Phase 12 — the hardware cursor: search-field / minibuffer / normal-caret arms,
@@ -1249,6 +1245,169 @@ mod tests {
             assert_eq!(buf.area.width, w, "{w}x{h}: the painter must not resize the frame");
             assert_eq!(buf.area.height, h);
         }
+    }
+
+    /// E11 §6 on the DRAWN SCREEN: the box carries the whole message on a tall terminal and
+    /// declines outright on a short one, while the overlay's actionable rows survive both.
+    ///
+    /// The obvious assertion — "the screen contains `passive voice was used`" — is VACUOUS
+    /// here, and was measured to be so: it passes with `paint_diag_detail` not written at all,
+    /// because `paint_diag`'s block TITLE already renders `anchor.message`, truncated to the
+    /// box interior (`┌ The passive voice was used here by this sente┐`). The title is also why
+    /// its negation cannot hold on the short screen: declining to paint the box does not
+    /// un-paint the title. So both directions are pinned on text ONLY this box produces —
+    /// the message's TAIL, which is precisely what the one-line title drops, and the
+    /// attribution line, which nothing else in the app renders.
+    ///
+    /// **The short screen is 80x8, and the 8 is load-bearing.** At 80x6 the box rect and the
+    /// overlay rect are the SAME rect (`x=16 w=48 y=0 h=5`), and the overlay paints last — so
+    /// a box that failed to decline would be clobbered off the grid and the negatives below
+    /// would hold anyway, documenting the decline instead of pinning it. 80x8 puts the
+    /// overlay's floor two rows above the status row: the cap still refuses (two rows cannot
+    /// hold two borders and a line), but an UNCAPPED box would reach row 5 with its last
+    /// composed line — the attribution — in the clear, where the negative can see it. Measured:
+    /// removing the cap reddens the attribution assertion here and not at 80x6.
+    #[test]
+    fn diag_detail_box_renders_message_on_tall_screens_and_declines_on_short() {
+        let mk = || {
+            let mut e = Editor::new_from_text("ab\n", None, (80, 30));
+            let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+                source: wordcartel_core::diagnostics::DiagSource::LTeX,
+                code: Some("PASSIVE_VOICE".into()), href: None,
+                message: "The passive voice was used here by this sentence.".into(),
+                suggestions: vec![] };
+            e.open_diag(d);
+            e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Done;
+            e
+        };
+        let tall = screen_text(&render_to_buffer(&mut mk(), 80, 30));
+        assert!(tall.contains("sentence."),
+            "the message's TAIL reaches the screen — the whole point, since the title cuts it \
+             at `…by this sente`:\n{tall}");
+        assert!(tall.contains("LTeX \u{b7} PASSIVE_VOICE"), "attribution line renders:\n{tall}");
+        // Precondition, stated in geometry rather than in prose: at 80x8 the overlay stops
+        // two rows above the status row, so an uncapped box WOULD have visible rows here.
+        let short_area = Rect::new(0, 0, 80, 8);
+        let short_ov = crate::chrome_geom::palette_overlay_rect(short_area, 2);
+        assert_eq!(7 - (short_ov.y + short_ov.height), 2,
+            "precondition: {short_ov:?} leaves two rows in the clear above the status row");
+        let short = screen_text(&render_to_buffer(&mut mk(), 80, 8));
+        assert!(short.contains("The passive voice was used"),
+            "precondition: the TITLE still renders at 80x8, which is why the naive negative \
+             assertion cannot be used to detect the box:\n{short}");
+        assert!(!short.contains("sentence."),
+            "the box DECLINED on a short screen — nothing load-bearing lived in it:\n{short}");
+        assert!(!short.contains("LTeX \u{b7} PASSIVE_VOICE"),
+            "and its attribution went with it:\n{short}");
+        assert!(short.contains("Dismiss for this session"),
+            "the overlay's own rows still render without the box:\n{short}");
+    }
+
+    /// The box is bottom-anchored AND capped from above, so every degenerate size is two
+    /// subtractions waiting to underflow — and the cap can raise the top edge past the bottom
+    /// one. A long unbroken word exercises the hard-wrap path at the same time. Nothing here
+    /// may panic, and nothing may paint past the frame.
+    #[test]
+    fn the_diag_detail_box_never_panics_or_overflows_a_tiny_terminal() {
+        let long = "https://example.test/rules/a-very-long-unbreakable-rule-identifier-here";
+        for (w, h) in [(1u16, 1u16), (2, 1), (3, 2), (4, 3), (10, 4), (20, 5), (80, 6), (200, 24)] {
+            let mut e = Editor::new_from_text("x\n", None, (w, h));
+            e.open_diag(wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+                source: wordcartel_core::diagnostics::DiagSource::Vale,
+                code: Some("Style.Rule".into()), href: Some(long.into()),
+                message: format!("{long} {long}"), suggestions: vec![] });
+            derive::rebuild(&mut e);
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render(f, &mut e)).unwrap(); // must not panic at any size
+            let buf = term.backend().buffer();
+            assert_eq!(buf.area.width, w, "{w}x{h}: the painter must not resize the frame");
+            assert_eq!(buf.area.height, h);
+        }
+    }
+
+    /// The disjointness the geometry helper promises, observed on the DRAWN GRID at a size
+    /// where the cap genuinely fires. The helper's own property sweep cannot see this: it is
+    /// handed an overlay rect, and the defect class here is the PAINTER handing it the wrong
+    /// one. Passing a fixed row count instead of the live `diag.row_count()` leaves every
+    /// geometry test green while a tall overlay — which paints last — clobbers the box.
+    #[test]
+    fn a_tall_overlay_pushes_the_detail_box_below_it_on_the_drawn_grid() {
+        let words: Vec<String> = (0..50).map(|i| format!("w{i:02}")).collect();
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: words.join(" "),
+            suggestions: (0..18).map(|i| wordcartel_core::diagnostics::Suggestion::ReplaceWith(
+                format!("fix-{i:02}"))).collect() });
+        let area = Rect::new(0, 0, 80, 24);
+        // Precondition: uncapped, the box would START inside the 20-row overlay — so the
+        // disjointness below is the cap's doing and not an accident of the two anchors.
+        let overlay = crate::chrome_geom::palette_overlay_rect(area, 20);
+        let uncapped = crate::chrome_geom::prompt_detail_rect(area, 23, 6).expect("six lines fit");
+        assert!(uncapped.y < overlay.y + overlay.height,
+            "precondition: {uncapped:?} overlaps {overlay:?} without the cap");
+
+        let buf = render_to_buffer(&mut e, 80, 24);
+        let rows: Vec<String> = (0..24).map(|y| row_string(&buf, y)).collect();
+        let with = |g: &str| -> Vec<usize> {
+            rows.iter().enumerate().filter(|(_, r)| r.contains(g)).map(|(y, _)| y).collect()
+        };
+        let (tops, bottoms) = (with("\u{250c}"), with("\u{2514}"));
+        assert_eq!((tops.len(), bottoms.len()), (2, 2),
+            "both boxes drew a complete border — neither was clobbered:\n{}", rows.join("\n"));
+        assert!(bottoms[0] < tops[1],
+            "the box opens strictly below where the overlay closes ({bottoms:?} / {tops:?})");
+        assert!(rows.iter().any(|r| r.contains("fix-00")), "the overlay's rows survived");
+        assert!(rows[tops[1] + 1].contains("w00"), "and the box's own first row painted");
+    }
+
+    /// A diagnostic whose provider reported no `code` must not be attributed with a dangling
+    /// separator, and the `href` rides along as the courtesy line §6 asks for. Both are read
+    /// off the screen, since both are one `format!` away from looking right in a unit test and
+    /// wrong in a cell.
+    #[test]
+    fn diag_detail_attribution_omits_a_missing_code_and_carries_the_href() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper,
+            code: None, href: Some("https://writewithharper.com/rules/spell".into()),
+            message: "Did you mean receive?".into(), suggestions: vec![] });
+        let screen = screen_text(&render_to_buffer(&mut e, 80, 24));
+
+        assert!(screen.contains("Harper"), "the engine still attributes itself:\n{screen}");
+        assert!(!screen.contains("Harper \u{b7}"),
+            "with NO separator — a trailing `\u{b7}` claims a code that does not exist:\n{screen}");
+        assert!(screen.contains("https://writewithharper.com/rules/spell"),
+            "and the documentation link rides along as the courtesy line:\n{screen}");
+    }
+
+    /// A message too long for the room left under the overlay must ANNOUNCE what it dropped —
+    /// the prompt box's `…and N more` precedent. Silently stopping mid-explanation reads as a
+    /// rendering fault, and the reader has no way to know an explanation continued.
+    #[test]
+    fn diag_detail_box_announces_the_lines_it_could_not_fit() {
+        // 60 three-character words wrap to 11 per 46-column row → 6 message rows + 1
+        // attribution row, against a box the overlay cap leaves only 4 content rows tall.
+        let words: Vec<String> = (0..60).map(|i| format!("w{i:02}")).collect();
+        let mut e = Editor::new_from_text("ab\n", None, (80, 14));
+        e.open_diag(wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX,
+            code: Some("LONG".into()), href: None,
+            message: words.join(" "), suggestions: vec![] });
+        let screen = screen_text(&render_to_buffer(&mut e, 80, 14));
+
+        assert!(screen.contains("w00"), "precondition: the box painted its first row:\n{screen}");
+        assert!(!screen.contains("w59"),
+            "precondition: it genuinely could not hold the whole message:\n{screen}");
+        assert!(screen.contains("\u{2026}and 4 more"),
+            "so the dropped rows are counted, not silently cut:\n{screen}");
+        assert!(!screen.contains("LTeX \u{b7} LONG"),
+            "and the count speaks for the elided attribution row too:\n{screen}");
     }
 
     /// B9 (spec §6b): the bar compresses through the §3.2 ladder instead of clipping. Widths

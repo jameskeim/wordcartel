@@ -881,3 +881,172 @@ routes uncaught; a second scanner is self-defeating. The work is mechanical dele
 seam, not a new gate. Prerequisite: H32 shipped (the seam must exist first).
 
 *(Captured 2026-07-25 via `scripts/backlog add`, as the H32 grounding's out-of-scope follow-up.)*
+
+### E13 — Push the personal dictionary into ltex's settings channel (server-side spelling suppression)
+<!-- item: E13 -->
+
+**Deferred out of E11 (2026-07-25, deliberate human scope call — not an oversight.)** Adding a word
+to the personal dictionary already suppresses it across ALL engines, client-side: `retain_unignored`
+refilters every source's slot against the dictionary ∪ session ignores, and ltex/vale spelling
+diagnostics classify as `DiagnosticKind::Spelling`, so they are dropped before paint. The writer
+cannot tell the difference — no underline appears, counts and navigation are correct.
+
+**What this item would add:** suppression at the SOURCE for ltex. A live probe against
+ltex-ls-plus 18.7.0 (`scratchpad/e11/probe/ltex-probe-results.md`, 2026-07-25) confirmed the
+mechanism works and needs NO new file writers: delivering `{"dictionary": {"en-US": ["floopmuffin"]}}`
+through the existing settings channel (`didChangeConfiguration` → the server re-pulls
+`workspace/configuration` → republishes without the word) took ~1s and required no forced edit. The
+same probe confirmed `disabledRules` works identically. So the seam is `ltex_settings` + the shipped
+`reload_dictionary_enabled` → `settings_push` nudge.
+
+**Why it was NOT taken in E11, and the consequences to weigh when it is picked up:**
+- **Zero user-visible change.** The client-side filter already delivers the whole UX; this buys
+  correctness-at-the-source and stops invisible wasted work on the engine side.
+- **Unbounded payload growth.** It ships the writer's ENTIRE personal dictionary inside every
+  settings response, forever, growing as the feature is used over years. Needs a size posture
+  (cap? only push words the engine has actually flagged? per-language partition?).
+- **A second source of truth for suppression** that must stay in sync with the client-side filter —
+  including on word REMOVAL, not just addition.
+- **Per-language keying.** ltex's dictionary is keyed by language (`en-US`); the personal dictionary
+  is not. That mapping needs a decision.
+- **vale gets nothing.** Its settings channel is inert — the same probe showed
+  `didChangeConfiguration` produces only a `window/logMessage` and the server never sends
+  `workspace/configuration`. Any vale-side equivalent would mean editing engine-native vocab files,
+  a class of writer this app has never had.
+
+Prior art / context: E10 (the ltex + vale providers), E11 (the viewing/action layer). Decision
+record: `scratchpad/e11/decisions.md` D6. ~S.
+
+### E14 — Rule-level disable — persist a per-engine disabled-rule list and deliver it to all three engines
+<!-- item: E14 -->
+
+**Deferred out of E11 (2026-07-25, deliberate human scope call.)** E11 ships a **session dismiss**
+(client-side, keyed on engine source + rule `code` + occurrence) so a false positive can be killed
+for the working session. THIS item is the persistent form: *"stop flagging PASSIVE_VOICE at all,
+ever."*
+
+**Why it has a stronger story than [[E13]]** (the other E11 deferral): it is USER-VISIBLE and
+recurring. A writer who uses the passive deliberately is told about it forever, and a session
+dismiss must be re-performed every session. This is the most plausible next ask after E11 ships.
+
+**Mechanism per engine (all live-probe-confirmed 2026-07-25 —
+`scratchpad/e11/probe/ltex-probe-results.md`, `scratchpad/e11/probe/vale/vale-probe-results.md`):**
+- **ltex** — `{"disabledRules": {"en-US": ["MORFOLOGIK_RULE_EN_US"]}}` through the existing settings
+  channel. Probe-confirmed: both matching diagnostics disappeared, automatically, no forced edit.
+- **harper** — the per-rule boolean `linters` map already pushed from `harper_settings`.
+- **vale** — client-side filter on `code` ONLY. Its settings channel is inert (`didChangeConfiguration`
+  yields a `window/logMessage` and nothing else; the server never sends `workspace/configuration`).
+
+**The real fork, and why it wants its own effort: WHERE DOES IT PERSIST?** The app has never
+written its config back out; the only user-state files that exist are `dictionary.txt`,
+`settings-overrides.toml`, and `session.toml`. So this needs either a new user-state file or an
+extension of settings-overrides — a call with consequences well beyond diagnostics, which is exactly
+why it should not be answered in a hurry inside another effort.
+
+**Also owed:** a command surface. Command-surface-contract law 2 (every user-settable option IS a
+command) means rule management needs palette entries — and a decision about menu presence — not just
+an overlay row. Rejected direction: editing engine-native config (`.vale.ini`, ltex external files)
+would make this the app's first foreign-config writer.
+
+Prior art / context: E10 (the providers), E11 (the viewing/action layer + the session dismiss this
+would upgrade), [[E13]] (the sibling deferral). Decision record: `scratchpad/e11/decisions.md` D7. ~M.
+
+### H37 — Accepted-send/drop race in LSP client teardown — a send in the FlushGuard drain window reports Accepted::Yes for a message nothing will drain
+<!-- item: H37 -->
+
+**Accepted-send/drop race in the LSP client teardown (pre-existing, Effort-A era; surfaced by E11 T5.)**
+`lsp_client.rs::FlushGuard::drop` drains unread commands via `try_recv()` until `Empty`, then the
+`Receiver` deallocates when the guard's fields drop. A `cmd_tx.send` landing in the window between the
+final `Empty` and the deallocation returns `Ok` (std mpsc sends succeed while the Receiver object
+exists), so the caller reports `Accepted::Yes` for a message nothing will ever drain — violating the
+exactly-once terminal guarantee at the seam. The window is instruction-scale and opens only during
+client-thread death (handle drop, budget-exhaustion `Exit`, shutdown, panic-unwind).
+
+**Two affected message classes, and the shipped one is the WORSE one:**
+- `Cmd::Change` (since Effort A) — an accepted-in-window change latches `in_flight_version`
+  permanently at `diagnostics_run.rs::dispatch_one`; `due_sources` excludes in-flight slots, so that
+  engine silently never dispatches again for that buffer until close/restart. No user affordance.
+- `Cmd::RequestFixes` (E11) — a VISIBLE stuck "fetching…" row. Esc closes it, and a reopen's send
+  then returns `Err` (receiver gone) → `Accepted::No` → an honest "no fixes available". Full recovery
+  in one gesture. E11 adds a rare, interactive, better-signposted, self-recovering instance of an
+  existing hole; it does not widen the window, which is gated on thread death rather than send timing.
+
+**Not closable at the provider layer** — any post-send re-check is itself racy against the drain.
+**A real fix** is a closing-flag protocol: `Shared.closing: AtomicBool`, set SeqCst by the guard
+BEFORE its final drain; senders check it AFTER a successful send and downgrade to `Accepted::No`.
+Note that std mpsc offers no atomic drain-then-drop (dropping the receiver first loses queued
+messages; draining first leaves the window). The flag introduces a double-terminal case needing
+per-class reasoning: benign for fix requests (no token stored, so the reduce guard drops the
+terminal), but NOT benign for `notify_change`, where an unlatched empty `DiagnosticsDone` at the
+current version would blank painted underlines until the next recheck — so the apply side needs a
+companion guard. Alternatively a heavier pump-ack per send. **Must cover BOTH message classes to be
+worth doing**, which makes it larger than any one linting effort. ~40–80 lines in the crate's most
+delicate seam, plus ordering proofs and race tests.
+
+Anchors: `lsp_client.rs::{FlushGuard, LspProvider::notify_change, LspProvider::request_fixes}`,
+`diagnostics_run.rs::dispatch_one` (the latch site). Grounding: Fable, 2026-07-26, during E11 T5.
+
+### E15 — vale is unreachable — doc_uri mints untitled: unconditionally and vale-ls publishes nothing for it
+<!-- item: E15 -->
+
+**Vale has never produced a diagnostic. For any document, since E10 shipped.** Found by E11's T10
+live probe (`scratchpad/e11/probe/t10-live-results.md`, 2026-07-26), established at the wire with
+wordcartel's exact initialization params differing only in the URI.
+
+**Mechanism.** `lsp_rpc::doc_uri` mints `untitled:wcartel-{buffer}-{generation}` unconditionally —
+there is no path-aware variant, and `on_change` ignores its `path` argument entirely. **vale-ls
+publishes nothing for an `untitled:` URI**; it requires a URI naming a file that exists on disk.
+E11 ships correct vale fix-mapping (probe-proven at the wire: 5 candidates for one spelling
+diagnostic, via `edit.changes[uri]` + a bare `"quickfix"` kind) that no user can currently reach.
+
+**Why E10 missed it.** E10's T11 probe recorded vale as SKIP — `vale-ls` was not installed on that
+machine, so only the absent-binary hint was exercised. E10's separate wire probe drove `vale-ls`
+with a `file://` URI directly, which masked the defect precisely.
+
+**The user-visible symptom is the worst kind:** a silent `[REVIEW · vale]` empty view with nothing
+flagged and no hint — it reads as "vale found no problems." That is a no-silent-UI violation, which
+is why **E11 folded in a loudness mitigation only: vale now ships DISABLED by default**, so the menu
+says "vale — off" and selecting it refuses through the shipped disabled-engine status. A user who
+explicitly enables it in config still gets it. **This item is the real fix, and it restores the
+default.**
+
+**Why the real fix is its own effort, not a fold-in.** It needs, at minimum:
+- a **per-engine URI policy** (an `LspEngine` hook) — harper and ltex are happy with `untitled:`;
+- **rework of generation semantics for stable URIs.** The whole staleness discriminator keys on
+  generation-tagged URIs through `uri_owner`; a stable `file://` URI collapses that and reopens the
+  late-publish attribution class E11's spec spent six gate rounds closing (and which E11's own T4/T10
+  work shows is easy to get subtly wrong);
+- an **honest degrade for unsaved/scratch buffers** — vale structurally cannot check a buffer with
+  no file on disk, so the lens must say so rather than show empty;
+- **one genuinely open wire question the probe did not settle: does vale-ls lint the didChange-synced
+  text, or the file on disk?** If the latter, unsaved edits are invisible to it and the semantic model
+  ("results reflect the saved file, not the buffer") is its own product decision. **Probe this before
+  designing.**
+
+Anchors: `lsp_rpc::doc_uri`, `lsp_client::ClientState::{on_change, on_publish}`, `uri_owner`,
+`diagnostics_run::install_core_providers`. Related: E10 (shipped the provider), E11 (shipped the
+mapping + the default-off mitigation). Grounding: Fable, 2026-07-26. ~M.
+
+### B19 — Display-column-aware text fitting — wrap_prose and its sibling fitters count chars, not columns
+<!-- item: B19 -->
+
+**Filed out of E11's whole-branch review (2026-07-26), which ruled it does NOT block merge.**
+`render_overlays::wrap_prose` wraps on a `chars()` count, not display columns. A CJK message wrapped
+to a 28-column interior therefore yields 28-CHARACTER lines that ratatui clips at 28 COLUMNS —
+roughly half of every line never reaches the screen, and the `…and N more` elision count does not
+account for the loss. Probed at 40×14: no panic, no frame resize; silent truncation only.
+
+**Why it is filed module-wide rather than fixed in place.** Every other fitter in that module
+behaves identically — `elide_path_left`, `paint_prompt_detail`, and the overlay row truncation all
+count chars. Fixing `wrap_prose` alone would leave the detail box column-correct while the overlay
+title above it and the prompt box beside it stay char-counted, which is worse than uniform: the
+same message would fit differently in two adjacent boxes. The fix is one pass over the module's
+fitting helpers, using the width machinery the layout engine already has (the editor proper is
+column-correct — this is a chrome/overlay gap, not a core one).
+
+**Consequence when it bites:** a writer using CJK (or any wide-glyph script) sees prose-linter
+explanations, prompt detail, and elided paths truncated well before the visible edge. No data loss,
+no panic, no wrong edit — a display-fidelity defect, which is why it rode.
+
+Anchors: `render_overlays::{wrap_prose, paint_prompt_detail, elide_path_left}`. The project already
+tests multibyte text (`é` / `中` / `🙂`) elsewhere, so fixtures exist to model on. ~S–M.

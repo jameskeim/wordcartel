@@ -189,6 +189,43 @@ pub(crate) fn prompt_detail_rect(area: Rect, status_row: u16, lines: usize) -> O
     Some(Rect::new(ov_x, status_row - ov_h, ov_w, ov_h))
 }
 
+/// Bounding rect for the diagnostic overlay's detail box (E11 §6), or `None` when it cannot
+/// legally paint. Everything `prompt_detail_rect` does — same width ladder, same centring,
+/// bottom-anchored so its lower border sits immediately above `status_row`, `None` under three
+/// free rows — **plus one rule the prompt helper does not have**: the box's top edge is capped
+/// strictly below `overlay`, and `None` is returned when no legal row remains beneath that cap.
+///
+/// The cap is not decoration. The two rects are **not** disjoint by nature: the quick-fix
+/// overlay sits at `palette_overlay_rect`'s top-quarter bias, but the inherited helper may
+/// otherwise consume every row above the status row — and paint order makes an overlap a
+/// CLOBBER, not a blend (`paint_status` paints this box, then the frame-overlay walk paints
+/// `paint_diag` last). Callers pass `palette_overlay_rect(area, diag.row_count())`, the same
+/// helper the overlay's own paint and hit-test share, so the cap tracks the live overlay
+/// geometry by construction rather than by a recomputed guess.
+///
+/// The box is RAISED to the first legal row, never slid downward: the bottom border stays
+/// pinned above `status_row`, so a capped box is shorter, not floating. Because the box can
+/// vanish outright, nothing load-bearing may live in it — the actionable rows all stay in the
+/// centered overlay.
+///
+/// (No `# Examples` block, matching `prompt_detail_rect` next door: a `pub(crate)` item's
+/// doctest is not compiled, so an example here would be prose that cannot fail. The executable
+/// statement of this contract is `diag_detail_rect_*` in this file's `tests` module, including
+/// the disjointness property sweep.)
+pub(crate) fn diag_detail_rect(area: Rect, status_row: u16, overlay: Rect, lines: usize)
+    -> Option<Rect>
+{
+    let base = prompt_detail_rect(area, status_row, lines)?;
+    // The first row the box may occupy: one past the overlay's last row. Saturating because a
+    // hostile Resize can hand us an overlay whose bottom edge is at u16::MAX.
+    let floor = overlay.y.saturating_add(overlay.height);
+    if base.y >= floor { return Some(base); }
+    let bottom = base.y + base.height; // == status_row; the anchor the cap must not move
+    let height = bottom.checked_sub(floor)?;
+    if height < 3 { return None; } // two borders plus at least one interior row
+    Some(Rect::new(base.x, floor, base.width, height))
+}
+
 /// Return the zero-based list row index that `(col, row)` hits, or `None`.
 /// The list starts at `ov_y + 2` and has at most `palette.rows.len()` entries.
 /// Returns an ABSOLUTE row index (accounting for `scroll_top`).
@@ -523,6 +560,122 @@ mod tests {
         // A status row above the area's own origin is nonsense geometry, not a reason to
         // pin the box to the top: refuse it.
         assert_eq!(prompt_detail_rect(Rect::new(0, 10, 80, 14), 4, 3), None);
+    }
+
+    // ---- diag_detail_rect (E11 §6) -----------------------------------------------
+
+    #[test]
+    fn diag_detail_rect_caps_below_the_overlay_and_declines_when_no_room() {
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay = palette_overlay_rect(area, 5);
+        let r = diag_detail_rect(area, 23, overlay, 3).expect("room on a 24-row screen");
+        assert!(r.y > overlay.y + overlay.height - 1, "top edge strictly below the overlay");
+        assert!(r.y + r.height <= 23, "sits above the status row");
+        // A short screen where the overlay eats the space → None, never overlap.
+        let small = Rect::new(0, 0, 80, 8);
+        let ov_small = palette_overlay_rect(small, 5);
+        assert!(diag_detail_rect(small, 7, ov_small, 3).is_none()
+            || diag_detail_rect(small, 7, ov_small, 3).unwrap().y
+                > ov_small.y + ov_small.height - 1);
+    }
+
+    #[test]
+    fn diag_detail_rect_disjointness_property_sweep() {
+        // Spec §6: rect ∩ overlay == ∅ or None — sweep sizes × row counts × line counts.
+        for h in 5..40u16 { for rows in 1..20usize { for lines in 1..12usize {
+            let area = Rect::new(0, 0, 60, h);
+            let ov = palette_overlay_rect(area, rows);
+            if let Some(r) = diag_detail_rect(area, h.saturating_sub(1), ov, lines) {
+                let disjoint = r.y >= ov.y + ov.height || r.y + r.height <= ov.y;
+                assert!(disjoint, "h={h} rows={rows} lines={lines}: {r:?} vs {ov:?}");
+            }
+        }}}
+    }
+
+    /// The helper declines for TWO independent reasons; each needs a fixture where that
+    /// reason ALONE decides the outcome, or a test that varies both proves neither is live.
+    #[test]
+    fn diag_detail_rect_declines_for_each_reason_in_isolation() {
+        // (a) The OVERLAY CAP alone. `prompt_detail_rect` is happy here — three rows are
+        // free above the status row and it returns a real rect — but a 20-row overlay on a
+        // 10-row screen reaches row 9, leaving no legal row strictly below it.
+        let area = Rect::new(0, 0, 80, 10);
+        let ov = palette_overlay_rect(area, 20);
+        assert_eq!(ov.y + ov.height, 9, "precondition: the overlay reaches the status row");
+        assert!(prompt_detail_rect(area, 9, 5).is_some(),
+            "precondition: the inherited bound alone would have PAINTED a box here");
+        assert_eq!(diag_detail_rect(area, 9, ov, 5), None,
+            "so the None is attributable to the overlay cap and to nothing else");
+
+        // (b) The INHERITED <3-free-rows bound alone. An empty overlay caps nothing
+        // (`ov.y + ov.height == 0`), so only the two rows above the status row decide.
+        let tall = Rect::new(0, 0, 80, 24);
+        let no_ov = Rect::new(0, 0, 0, 0);
+        assert_eq!(diag_detail_rect(tall, 2, no_ov, 3), None,
+            "two free rows cannot hold two borders and a line of content");
+        assert!(diag_detail_rect(tall, 3, no_ov, 3).is_some(),
+            "precondition: three free rows CAN — the bound, not the cap, drew the line");
+
+        // (c) An overlay whose bottom edge is BELOW the status row — unreachable from
+        // `palette_overlay_rect`, which cannot exceed its own area, but reachable from a
+        // hostile Resize or a future caller. What this pins is the OUTCOME, and only that:
+        // `checked_sub` is NOT decisive here on its own, because `saturating_sub` would yield
+        // 0 and the `height < 3` guard below would refuse it identically (measured — that
+        // mutation survives). The `?` stays because refusing at the arithmetic is the right
+        // defensive form, but the mutation this fixture actually catches is a plain `-`,
+        // which panics in debug and — the reason the assertion is worth its line — WRAPS in
+        // release into a ~65 000-row rect that would be painted.
+        assert_eq!(diag_detail_rect(tall, 23, Rect::new(0, 0, 80, 40), 3), None,
+            "a cap past the anchor is refused, never turned into a giant rect by underflow");
+    }
+
+    /// The `height < 3` non-degeneracy bound is a BOUNDARY, and the boundary is what needs
+    /// pinning: a fixture that only exercises a 0-row gap leaves `height < 1` — which returns
+    /// a border-only sliver above the status row — indistinguishable from the real guard.
+    ///
+    /// A 1–2 row gap between the overlay's floor and the status row is not a contrived
+    /// geometry; it is reachable at essentially every terminal height, so each row below is a
+    /// live screen size. The gap is asserted BEFORE the outcome so the fixture cannot silently
+    /// drift into testing a 0-row gap again if `palette_overlay_rect`'s bias ever moves.
+    #[test]
+    fn diag_detail_rect_refuses_a_one_or_two_row_gap_below_the_overlay() {
+        for (h, rows, gap) in
+            [(6u16, 1usize, 1u16), (7, 2, 1), (8, 2, 2), (8, 3, 1), (10, 5, 1), (11, 5, 2),
+             (12, 7, 1)]
+        {
+            let area = Rect::new(0, 0, 80, h);
+            let ov = palette_overlay_rect(area, rows);
+            let status_row = h - 1;
+            assert_eq!(status_row - (ov.y + ov.height), gap,
+                "precondition: {h} rows x {rows} list rows leaves a {gap}-row gap, {ov:?}");
+            assert!(prompt_detail_rect(area, status_row, 3).is_some(),
+                "precondition: {h}x{rows}: the inherited bound alone would have PAINTED here");
+            assert_eq!(diag_detail_rect(area, status_row, ov, 3), None,
+                "{h}x{rows}: a {gap}-row gap holds two borders and no interior — refuse it");
+        }
+        // The other side of the same boundary, so it cannot be tightened either: three rows
+        // is exactly enough, and the box that comes back is the minimum legal one.
+        let area = Rect::new(0, 0, 80, 10);
+        let ov = palette_overlay_rect(area, 2);
+        assert_eq!(9 - (ov.y + ov.height), 3, "precondition: a 3-row gap, {ov:?}");
+        let r = diag_detail_rect(area, 9, ov, 3).expect("three rows is enough");
+        assert_eq!((r.y, r.height), (ov.y + ov.height, 3), "two borders and one interior row");
+    }
+
+    /// The cap RAISES the box rather than sliding it: the bottom border stays pinned above
+    /// the status row, so a capped box is short, never floating.
+    #[test]
+    fn diag_detail_rect_shrinks_from_the_top_when_the_overlay_intrudes() {
+        let area = Rect::new(0, 0, 80, 24);
+        let ov = palette_overlay_rect(area, 15); // list_h 15 → h 18 at y 1, reaching row 18
+        assert_eq!((ov.y, ov.height), (1, 18), "precondition: a tall overlay to cap under");
+        let uncapped = prompt_detail_rect(area, 23, 10).expect("10 lines fit uncapped");
+        assert_eq!(uncapped.y, 11, "precondition: uncapped, the box would start under the overlay");
+        let r = diag_detail_rect(area, 23, ov, 10).expect("three rows remain below the overlay");
+        assert_eq!(r.y, 19, "raised to the first row below the overlay");
+        assert_eq!(r.y + r.height, 23, "and still bottom-anchored above the status row");
+        assert_eq!(r.height, 4, "shrunk by exactly what the cap took");
+        assert_eq!((r.x, r.width), (uncapped.x, uncapped.width), "width ladder untouched");
     }
 
     /// palette_overlay_rect sizes height to the actual row count, not fixed-15.

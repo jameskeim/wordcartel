@@ -403,6 +403,27 @@ fn elide_path_left(line: &str, width: usize) -> String {
     format!("\u{2026}{tail}")
 }
 
+/// The status row's disclosure boxes: whichever of them the live editor state calls for.
+///
+/// One delegation out of `render::paint_status`, holding the per-surface guards that used to
+/// sit inline there. The seam exists because `render.rs` is a budgeted anti-regrowth hub
+/// (`tests/module_budgets.rs`) and a second inline guard pushed it over: a new disclosure box
+/// must add a *branch here*, in the painters' own module, not bulk to the status-row hub.
+///
+/// Neither box is an `OVERLAYS`-table render site — see the two painters' own docs. Both
+/// paint nothing at all when their owning surface is absent or has nothing to disclose, so
+/// the ordinary status row is byte-identical to what it was before this seam existed.
+pub(crate) fn paint_detail_boxes(frame: &mut Frame, editor: &Editor, area: Rect,
+    status_row: u16, cs: &ChromeStyles)
+{
+    if let Some(ref prompt) = editor.prompt {
+        paint_prompt_detail(frame, prompt, area, status_row, cs);
+    }
+    if let Some(ref diag) = editor.diag {
+        paint_diag_detail(frame, diag, area, status_row, cs);
+    }
+}
+
 /// Paint a prompt's `detail` disclosure box directly above the status row.
 ///
 /// **Not an `OVERLAYS`-table painter.** The prompt's row in `overlays.rs` is, and stays,
@@ -427,7 +448,7 @@ fn elide_path_left(line: &str, width: usize) -> String {
 /// **indented line is an item** — path-shaped, with the filename and the trailing age at its
 /// END — so it elides from the LEFT via `elide_path_left`. Eliding a heading from the left
 /// produced the observed `…ng 18 that may hold unsaved work:` on a 60-column terminal.
-pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Prompt,
+fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Prompt,
     area: Rect, status_row: u16, cs: &ChromeStyles)
 {
     let lines = &prompt.detail;
@@ -466,6 +487,110 @@ pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Pro
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
             Rect::new(ov_rect.x + 1, y, inner_w as u16, 1),
+        );
+    }
+}
+
+/// Plain word wrap to `width` columns — prose, not paths.
+///
+/// The prompt disclosure's left-elision rule is deliberately NOT inherited here: it exists so a
+/// path keeps its filename and its trailing age, and applied to a sentence it would eat exactly
+/// the words a reader starts from. Runs of whitespace collapse to a single space (the wire
+/// message is one logical paragraph however the engine punctuated its newlines), and a word
+/// longer than the whole box is hard-broken rather than dropped, so no fragment of the
+/// explanation can silently vanish. An empty or whitespace-only message yields no rows at all —
+/// a blank line in the box would read as a rendering fault.
+///
+/// Counted in `chars`, matching every other overlay-box fitter in this module.
+fn wrap_prose(text: &str, width: usize) -> Vec<String> {
+    if width == 0 { return Vec::new(); }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+        // A single word wider than the box: break it hard so the tail still reaches the screen.
+        while cur.chars().count() > width {
+            out.push(cur.chars().take(width).collect());
+            cur = cur.chars().skip(width).collect();
+        }
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
+/// Paint the diagnostic detail box — the wrapped full `message` plus its `engine · code`
+/// attribution — bottom-anchored above the status row while the quick-fix overlay is open.
+///
+/// **Why a separate box rather than more rows in the overlay.** The overlay's title is one
+/// character-truncated line: adequate for `Did you mean "receive"?`, useless for the full
+/// sentences the grammar and style engines report. Growing the centered overlay instead would
+/// make the explanation and the fix rows compete for one box, and on a short terminal the
+/// suggestions — the actionable part — would be the rows pushed out. An independent region can
+/// decline to paint on its own, so the explanation is what yields.
+///
+/// **The consequence, which is load-bearing:** because this box can vanish, nothing actionable
+/// may live in it. It carries the message, the attribution, and (courtesy only) the `href`. The
+/// action rows, `Learn more` included, all stay in the overlay.
+///
+/// **Not an `OVERLAYS`-table painter**, exactly like `paint_prompt_detail`: the diag row in
+/// `overlays.rs` is and stays `RenderSite::Frame(paint_diag)`. This is body painted *for* that
+/// one overlay from `render::paint_status`, not a second render site — so `RenderSite` keeps its
+/// single-valued axis and H21's render-coverage test is untouched (E11 §6).
+///
+/// Geometry, including the strict cap below the overlay that keeps the two rects disjoint, lives
+/// in `chrome_geom::diag_detail_rect`; `None` from it means "no room" and paints nothing at all.
+/// When the box is shorter than the composed lines, the last visible row becomes an `…and N
+/// more` count, so a truncated explanation announces itself instead of just stopping.
+fn paint_diag_detail(frame: &mut Frame, diag: &crate::diag_overlay::DiagOverlay,
+    area: Rect, status_row: u16, cs: &ChromeStyles)
+{
+    // `palette_overlay_rect`'s WIDTH is a pure function of `area.width` — the row count only
+    // moves its height — so wrapping to it before the rect exists is exact, not an estimate.
+    let inner_w = palette_overlay_rect(area, 1).width.saturating_sub(2) as usize;
+    let mut lines = wrap_prose(&diag.anchor.message, inner_w);
+    // The attribution OMITS the code entirely when the engine reported none — a trailing
+    // separator would advertise a field that does not exist.
+    lines.push(match diag.anchor.code.as_deref() {
+        Some(c) => format!("{} \u{b7} {}", diag.anchor.source.label(), c),
+        None => diag.anchor.source.label().to_string(),
+    });
+    if let Some(href) = diag.anchor.href.as_deref() { lines.push(href.to_string()); }
+
+    let overlay = palette_overlay_rect(area, diag.row_count());
+    let Some(ov_rect) = crate::chrome_geom::diag_detail_rect(area, status_row, overlay, lines.len())
+    else { return };
+
+    frame.render_widget(Clear, ov_rect);
+    frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).border_style(cs.overlay_border),
+        ov_rect,
+    );
+
+    // Re-read the interior from the rect the geometry actually returned, so the paint stays in
+    // bounds even if the width ladder is ever made row-count-dependent behind our backs.
+    let paint_w = ov_rect.width.saturating_sub(2) as usize;
+    let body_h = ov_rect.height.saturating_sub(2) as usize;
+    for i in 0..body_h {
+        let text = if body_h < lines.len() && i + 1 == body_h {
+            format!("\u{2026}and {} more", lines.len() - i)
+        } else {
+            lines[i].clone()
+        };
+        // Prose keeps its OPENING words when it must be cut — the prompt box's heading rule,
+        // for the same reason: a sentence's meaning is at its start.
+        let fitted: String = text.chars().take(paint_w).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
+            Rect::new(ov_rect.x + 1, ov_rect.y + 1 + i as u16, paint_w as u16, 1),
         );
     }
 }
@@ -803,7 +928,8 @@ pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyl
         crate::app::keep_overlay_visible(h, d.selected, d.row_count(), &mut d.scroll_top);
     }
     if let Some(ref diag_ov) = editor.diag {
-        let row_count = diag_ov.row_count();
+        let rows = diag_ov.rows();
+        let row_count = rows.len();
         let ov_rect = palette_overlay_rect(area, row_count);
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
@@ -827,16 +953,20 @@ pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyl
             let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h_u16);
             let highlight_style = cs.overlay_selected;
             let scroll_top = diag_ov.scroll_top;
-            let end = (scroll_top + list_h).min(row_count);
 
-            let n_sugg = diag_ov.anchor.suggestions.len();
-            let items: Vec<ListItem> = (scroll_top..end).map(|i| {
-                let label = if i < n_sugg {
-                    crate::diag_overlay::suggestion_label(&diag_ov.anchor.suggestions[i])
-                } else if i == n_sugg {
-                    "Ignore once".to_string()
-                } else {
-                    "Add to dictionary".to_string()
+            // E11 §5.1: labels come from the SAME computed row list the windowing, mouse
+            // hit-testing, and apply paths read — never from re-derived index arithmetic.
+            use crate::diag_overlay::DiagRow;
+            let items: Vec<ListItem> = rows.iter().skip(scroll_top).take(list_h).map(|row| {
+                let label = match row {
+                    DiagRow::Suggestion(i) => diag_ov.anchor.suggestions.get(*i)
+                        .map_or_else(String::new, crate::diag_overlay::suggestion_label),
+                    DiagRow::FetchingFixes => "fetching fixes…".to_string(),
+                    DiagRow::NoFixes => "(no fixes available)".to_string(),
+                    DiagRow::LearnMore => "Learn more (copy link)".to_string(),
+                    DiagRow::IgnoreOnce => "Ignore once".to_string(),
+                    DiagRow::AddToDictionary => "Add to dictionary".to_string(),
+                    DiagRow::DismissSession => "Dismiss for this session".to_string(),
                 };
                 let truncated: String = label.chars().take(list_area.width as usize).collect();
                 ListItem::new(Line::from(truncated))
@@ -1229,6 +1359,143 @@ mod tests {
             "the footer text must land in its OWN dedicated row: {:?}", row_text(&term, footer_row));
         assert!(!row_text(&term, title_row).contains("new-chapter"),
             "and must NOT be squeezed into the border title instead: {:?}", row_text(&term, title_row));
+    }
+
+    // ---- the diag overlay paints the COMPUTED row list ----------------------------
+
+    /// E11 §5.1: `paint_diag`'s labels must come from `DiagOverlay::rows()`, so what the writer
+    /// READS is what mouse hit-testing and Enter ACT on. Asserted on the drawn cell grid rather
+    /// than on the row list, because the row list being right proves nothing about the painter:
+    /// the old label ladder re-derived row identity from `i < n_sugg` arithmetic of its own, and
+    /// that is exactly the drift this test exists to catch. The fixture is the shape where the
+    /// two disagree hardest — a Grammar flag mid-fetch with a documentation link, whose every
+    /// row is one the old ladder could not name.
+    ///
+    /// FAIL-VERIFY (mutation): restore the old `i < n_sugg` label ladder — all three row
+    /// assertions fail (the rows read `Ignore once` / `Add to dictionary` / blank). Confirmed,
+    /// then reverted.
+    #[test]
+    fn diag_rows_reach_the_screen_with_their_row_model_labels() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX, code: Some("R".into()),
+            href: Some("https://example/rule".into()), message: "m".into(),
+            suggestions: vec![] });
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Fetching;
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_diag(f, &mut e, &cs)).expect("draw");
+        let first = ov_rect.y + 1; // list starts inside the border; no query row
+        let drawn: Vec<String> = (0..3).map(|i| row_text(&term, first + i)).collect();
+        assert!(drawn[0].contains("fetching fixes"),
+            "row 0 is the live-fetch placeholder, not a silent blank: {:?}", drawn[0]);
+        assert!(drawn[1].contains("Learn more (copy link)"),
+            "the href row is drawn where rows() puts it: {:?}", drawn[1]);
+        assert!(drawn[2].contains("Dismiss for this session"),
+            "a Grammar flag gets the session dismiss, not the spelling rows: {:?}", drawn[2]);
+        assert!(!drawn.iter().any(|r| r.contains("Ignore once") || r.contains("Add to dictionary")),
+            "and NEVER the spelling-shaped rows — the visible-no-op this effort exists to fix");
+    }
+
+    /// A spelling flag with `n` fixes labelled `fix-00`…, the shape the test above cannot make:
+    /// its fixture has ZERO suggestions, so `DiagRow::Suggestion(i) => suggestions.get(*i)` — the
+    /// one place the painter still does an index lookup of its own, and the exact shape of the
+    /// ladder the row model replaced — reaches no assertion there.
+    fn spelling_with_fixes(n: usize) -> wordcartel_core::diagnostics::Diagnostic {
+        wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "m".into(),
+            suggestions: (0..n).map(|i|
+                wordcartel_core::diagnostics::Suggestion::ReplaceWith(format!("fix-{i:02}"))).collect(),
+        }
+    }
+
+    /// E11 §5.1, the SUGGESTION half: a suggestion row must paint the suggestion its index names,
+    /// on the row `rows()` puts it. This is the overlay's PRIMARY content — a `Suggestion` arm
+    /// that painted blank would silently empty the quick-fix list, and with a zero-suggestion
+    /// fixture as the only coverage the whole suite stays green while it does.
+    ///
+    /// FAIL-VERIFY (mutation): make the painter's `DiagRow::Suggestion(_)` arm yield
+    /// `String::new()` — both suggestion-row assertions fail (the rows read blank) while the two
+    /// standing-action assertions stay green. Confirmed, then reverted.
+    #[test]
+    fn suggestion_rows_paint_the_suggestion_their_index_names() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(spelling_with_fixes(2)); // rows: [S0, S1, IgnoreOnce, AddToDictionary]
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_diag(f, &mut e, &cs)).expect("draw");
+        let first = ov_rect.y + 1;
+        let drawn: Vec<String> = (0..4).map(|i| row_text(&term, first + i)).collect();
+        assert!(drawn[0].contains("fix-00"), "row 0 paints suggestion 0: {:?}", drawn[0]);
+        assert!(drawn[1].contains("fix-01"), "row 1 paints suggestion 1 — not 0 again, not blank: {:?}", drawn[1]);
+        assert!(drawn[2].contains("Ignore once"), "the standing rows follow the block: {:?}", drawn[2]);
+        assert!(drawn[3].contains("Add to dictionary"), "…in order: {:?}", drawn[3]);
+    }
+
+    /// E11 §5.1, the WINDOW: the painted slice starts at `scroll_top`, not at 0. Every other diag
+    /// paint fixture is short enough to fit whole (`list_h >= row_count`), where the scroll offset
+    /// is dead code — so this one is deliberately taller than the 15-row budget and driven to the
+    /// LAST row, the only arrangement in which dropping the offset is observable.
+    ///
+    /// FAIL-VERIFY (mutation): change the painter's `rows.iter().skip(scroll_top)` to `skip(0)` —
+    /// this test fails (the window's first row reads `fix-00`, and the last reads `fix-14` instead
+    /// of the dictionary row). Confirmed, then reverted.
+    #[test]
+    fn the_painted_window_starts_at_scroll_top_not_at_row_zero() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(spelling_with_fixes(18)); // 18 fixes + ignore + add-dict = 20 rows
+        let row_count = e.diag.as_ref().unwrap().row_count();
+        let list_h = crate::list_window::list_h_for(row_count, 24);
+        assert_eq!((row_count, list_h), (20, 15), "precondition: the list overflows its window");
+        e.diag.as_mut().unwrap().selected = row_count - 1; // paint re-windows onto the last row
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = palette_overlay_rect(area, row_count);
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_diag(f, &mut e, &cs)).expect("draw");
+        assert_eq!(e.diag.as_ref().unwrap().scroll_top, 5,
+            "precondition: keep_overlay_visible scrolled the window to show the last row");
+        let first = ov_rect.y + 1;
+        let drawn: Vec<String> = (0..list_h as u16).map(|i| row_text(&term, first + i)).collect();
+        assert!(drawn[0].contains("fix-05"),
+            "the window's first drawn row is rows[scroll_top], not rows[0]: {:?}", drawn[0]);
+        assert!(drawn[14].contains("Add to dictionary"),
+            "…and its last is the selected final row: {:?}", drawn[14]);
+        assert!(!drawn.iter().any(|r| r.contains("fix-00") || r.contains("fix-04")),
+            "the scrolled-past rows are not on screen at all");
+    }
+
+    // ---- the detail box's prose wrap (E11 §6) -------------------------------------
+
+    /// Three rules, three fixtures — each one arranged so that ONLY the rule it names decides
+    /// the outcome, because a message that happens to fit tests none of them.
+    #[test]
+    fn wrap_prose_breaks_at_spaces_hard_breaks_giant_words_and_drops_nothing() {
+        // (a) Break at a space, never mid-word. 20 columns, words that straddle the margin.
+        assert_eq!(wrap_prose("the quick brown fox jumped over", 20),
+            vec!["the quick brown fox", "jumped over"],
+            "wraps on the last space that fits, so no word is cut in half");
+
+        // (b) A word wider than the whole box has no space to break at — the rule above cannot
+        // fire, and dropping the overflow would silently swallow part of the explanation.
+        let url = "https://example.test/a/very/long/rule/path";
+        assert_eq!(wrap_prose(url, 10),
+            vec!["https://ex", "ample.test", "/a/very/lo", "ng/rule/pa", "th"],
+            "hard-broken into full-width rows; every character still reaches the screen");
+        assert_eq!(wrap_prose(url, 10).concat(), url, "and reassembles to the original, exactly");
+
+        // (c) Nothing to say → NO row. A blank interior row reads as a rendering fault, and an
+        // empty vec is also what lets the geometry decline instead of drawing an empty box.
+        assert!(wrap_prose("", 20).is_empty(), "an empty message yields no rows at all");
+        assert!(wrap_prose("   \n\t ", 20).is_empty(), "and neither does whitespace-only");
+        assert!(wrap_prose("anything", 0).is_empty(), "nor does a zero-width box");
     }
 
     // ---- the DRAWN box is the one chrome_geom describes ---------------------------
