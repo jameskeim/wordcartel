@@ -979,47 +979,6 @@ delicate seam, plus ordering proofs and race tests.
 Anchors: `lsp_client.rs::{FlushGuard, LspProvider::notify_change, LspProvider::request_fixes}`,
 `diagnostics_run.rs::dispatch_one` (the latch site). Grounding: Fable, 2026-07-26, during E11 T5.
 
-### E15 — vale is unreachable — doc_uri mints untitled: unconditionally and vale-ls publishes nothing for it
-<!-- item: E15 -->
-
-**Vale has never produced a diagnostic. For any document, since E10 shipped.** Found by E11's T10
-live probe (`scratchpad/e11/probe/t10-live-results.md`, 2026-07-26), established at the wire with
-wordcartel's exact initialization params differing only in the URI.
-
-**Mechanism.** `lsp_rpc::doc_uri` mints `untitled:wcartel-{buffer}-{generation}` unconditionally —
-there is no path-aware variant, and `on_change` ignores its `path` argument entirely. **vale-ls
-publishes nothing for an `untitled:` URI**; it requires a URI naming a file that exists on disk.
-E11 ships correct vale fix-mapping (probe-proven at the wire: 5 candidates for one spelling
-diagnostic, via `edit.changes[uri]` + a bare `"quickfix"` kind) that no user can currently reach.
-
-**Why E10 missed it.** E10's T11 probe recorded vale as SKIP — `vale-ls` was not installed on that
-machine, so only the absent-binary hint was exercised. E10's separate wire probe drove `vale-ls`
-with a `file://` URI directly, which masked the defect precisely.
-
-**The user-visible symptom is the worst kind:** a silent `[REVIEW · vale]` empty view with nothing
-flagged and no hint — it reads as "vale found no problems." That is a no-silent-UI violation, which
-is why **E11 folded in a loudness mitigation only: vale now ships DISABLED by default**, so the menu
-says "vale — off" and selecting it refuses through the shipped disabled-engine status. A user who
-explicitly enables it in config still gets it. **This item is the real fix, and it restores the
-default.**
-
-**Why the real fix is its own effort, not a fold-in.** It needs, at minimum:
-- a **per-engine URI policy** (an `LspEngine` hook) — harper and ltex are happy with `untitled:`;
-- **rework of generation semantics for stable URIs.** The whole staleness discriminator keys on
-  generation-tagged URIs through `uri_owner`; a stable `file://` URI collapses that and reopens the
-  late-publish attribution class E11's spec spent six gate rounds closing (and which E11's own T4/T10
-  work shows is easy to get subtly wrong);
-- an **honest degrade for unsaved/scratch buffers** — vale structurally cannot check a buffer with
-  no file on disk, so the lens must say so rather than show empty;
-- **one genuinely open wire question the probe did not settle: does vale-ls lint the didChange-synced
-  text, or the file on disk?** If the latter, unsaved edits are invisible to it and the semantic model
-  ("results reflect the saved file, not the buffer") is its own product decision. **Probe this before
-  designing.**
-
-Anchors: `lsp_rpc::doc_uri`, `lsp_client::ClientState::{on_change, on_publish}`, `uri_owner`,
-`diagnostics_run::install_core_providers`. Related: E10 (shipped the provider), E11 (shipped the
-mapping + the default-off mitigation). Grounding: Fable, 2026-07-26. ~M.
-
 ### B19 — Display-column-aware text fitting — wrap_prose and its sibling fitters count chars, not columns
 <!-- item: B19 -->
 
@@ -1043,3 +1002,56 @@ no panic, no wrong edit — a display-fidelity defect, which is why it rode.
 
 Anchors: `render_overlays::{wrap_prose, paint_prompt_detail, elide_path_left}`. The project already
 tests multibyte text (`é` / `中` / `🙂`) elsewhere, so fixtures exist to model on. ~S–M.
+
+### E16 — Vale via CLI one-shot on buffer content — replaces the vale-ls provider
+<!-- item: E16 -->
+
+**The vale path, decided 2026-07-26 after a live probe reversed an earlier design choice.**
+Supersedes [[E15]] (dropped) and replaces the `vale-ls` LSP provider, which is being removed.
+
+**Why vale-ls cannot work as a live lens — probe-established, not inferred**
+(`scratchpad/e15/probe/vale-sync-probe-results.md`, real `vale-ls` 0.3.8 + `vale` 3.14.2):
+- **vale-ls lints the file on DISK, never the synced buffer.** An error introduced only via
+  `didChange` never produced a diagnostic; an on-disk error already fixed in the buffer still
+  reported as present two changes later. A clean, unmixed negative on both directions.
+- **`didChange` produces ZERO server messages.** No re-lint of any kind.
+- **`didSave` re-reads disk and ignores its own `text` parameter** — proven by writing a third
+  variant directly to disk out-of-band and saving with `text` still set to the buffer state: the
+  publish matched the disk contents, not `text`.
+- `file://` naming a nonexistent path → an always-empty `publishDiagnostics` (distinguishable from
+  `untitled:`, which gets total silence).
+- **`.vale.ini` is directory-scoped**, confirmed: byte-identical documents in two directories with
+  different configs produced different check sets. So a "write the buffer to a temp file elsewhere"
+  workaround would silently apply the wrong rules.
+
+So no URI fix makes vale-ls follow your typing. That reverses the 2026-07-25 arc decision (design
+space ⚠OPEN 1), which chose vale-ls over vale-CLI on grounds that were true but incomplete — nobody
+knew vale-ls could not see an unsaved buffer.
+
+**The replacement: the vale CLI, one-shot, over stdin.** Verified working:
+`printf '…' | vale --no-exit --output=JSON --ext=.md` returns full JSON — `Span`, `Check`,
+`Message`, `Severity`, `Match`, `Line`, `Link`, and the `Action` object (`suggest`/`replace` with
+params). That is everything a `Diagnostic` plus its `Suggestion` list needs, and it lints the text
+we hand it, giving vale the SAME live semantics as harper and ltex.
+
+**What this needs.**
+- The one-shot subprocess primitive — item [[PD]] (`wc.async`), whose hook already names vale-CLI as
+  its proof case. Alternatively a narrower internal spawn if PD stays deferred; that is the first
+  design fork.
+- A JSON→`Diagnostic` mapping (not the LSP path). `Span` is a byte range within `Line`; the
+  `Action` object maps to our `Suggestion` variants. `Link` populates `href` when the style author
+  supplied one.
+- **Run with the working directory set to the document's own directory**, or `.vale.ini` discovery
+  finds the wrong config (see the directory-scoped finding above). This is the detail most likely to
+  be missed.
+- Drops the `vale-ls` dependency entirely — a user installs only `vale`.
+- Reuses `DiagSource::Vale`, which stays reserved in core: the source identity is unchanged, only
+  the transport differs.
+
+**Also worth carrying forward:** the `untitled:` URI limitation E15 documented is not vale-specific
+in principle — any future LSP engine requiring a real on-disk file would hit it. harper and ltex are
+unaffected (both work fine with `untitled:`). If such an engine ever appears, E15's grounding is in
+the archive.
+
+Prior art / context: E10 (shipped the vale-ls provider), E11 (shipped the mapping + disabled it by
+default), [[E15]] (dropped — superseded by this). ~M.

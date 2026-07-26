@@ -2784,3 +2784,46 @@ synthetic verification. `smoke: 9/9 PASS`.
 Spec: `docs/superpowers/specs/2026-07-25-e11-diagnostics-viewing-action-design.md` (six Codex
 rounds + three post-READY amendments). Plan: `docs/superpowers/plans/2026-07-25-e11-diagnostics-viewing-action-plan.md`
 (five rounds). Probes + decisions: `scratchpad/e11/`. Sub-arc: E10 → E11 → E8-impl → E12-if-ever.
+
+### E15 — vale is unreachable — doc_uri mints untitled: unconditionally and vale-ls publishes nothing for it
+<!-- item: E15 -->
+
+**Vale has never produced a diagnostic. For any document, since E10 shipped.** Found by E11's T10
+live probe (`scratchpad/e11/probe/t10-live-results.md`, 2026-07-26), established at the wire with
+wordcartel's exact initialization params differing only in the URI.
+
+**Mechanism.** `lsp_rpc::doc_uri` mints `untitled:wcartel-{buffer}-{generation}` unconditionally —
+there is no path-aware variant, and `on_change` ignores its `path` argument entirely. **vale-ls
+publishes nothing for an `untitled:` URI**; it requires a URI naming a file that exists on disk.
+E11 ships correct vale fix-mapping (probe-proven at the wire: 5 candidates for one spelling
+diagnostic, via `edit.changes[uri]` + a bare `"quickfix"` kind) that no user can currently reach.
+
+**Why E10 missed it.** E10's T11 probe recorded vale as SKIP — `vale-ls` was not installed on that
+machine, so only the absent-binary hint was exercised. E10's separate wire probe drove `vale-ls`
+with a `file://` URI directly, which masked the defect precisely.
+
+**The user-visible symptom is the worst kind:** a silent `[REVIEW · vale]` empty view with nothing
+flagged and no hint — it reads as "vale found no problems." That is a no-silent-UI violation, which
+is why **E11 folded in a loudness mitigation only: vale now ships DISABLED by default**, so the menu
+says "vale — off" and selecting it refuses through the shipped disabled-engine status. A user who
+explicitly enables it in config still gets it. **This item is the real fix, and it restores the
+default.**
+
+**Why the real fix is its own effort, not a fold-in.** It needs, at minimum:
+- a **per-engine URI policy** (an `LspEngine` hook) — harper and ltex are happy with `untitled:`;
+- **rework of generation semantics for stable URIs.** The whole staleness discriminator keys on
+  generation-tagged URIs through `uri_owner`; a stable `file://` URI collapses that and reopens the
+  late-publish attribution class E11's spec spent six gate rounds closing (and which E11's own T4/T10
+  work shows is easy to get subtly wrong);
+- an **honest degrade for unsaved/scratch buffers** — vale structurally cannot check a buffer with
+  no file on disk, so the lens must say so rather than show empty;
+- **one genuinely open wire question the probe did not settle: does vale-ls lint the didChange-synced
+  text, or the file on disk?** If the latter, unsaved edits are invisible to it and the semantic model
+  ("results reflect the saved file, not the buffer") is its own product decision. **Probe this before
+  designing.**
+
+Anchors: `lsp_rpc::doc_uri`, `lsp_client::ClientState::{on_change, on_publish}`, `uri_owner`,
+`diagnostics_run::install_core_providers`. Related: E10 (shipped the provider), E11 (shipped the
+mapping + the default-off mitigation). Grounding: Fable, 2026-07-26. ~M.
+
+**DROPPED 2026-07-26 — superseded by [[E16]].** A live probe (`scratchpad/e15/probe/vale-sync-probe-results.md`) established that vale-ls lints the file on DISK, never the synced buffer: `didChange` produces zero server messages, and `didSave` re-reads disk while ignoring its own `text` parameter. So the URI fix this item describes would NOT have made vale follow the writer's typing — it would only have made vale report on the last save. The vale-ls provider is being removed in favour of the vale CLI one-shot over stdin ([[E16]]), which lints the text we hand it. The grounding below is kept because the `untitled:` URI limitation is not vale-specific in principle: any future LSP engine requiring a real on-disk file would hit it. harper and ltex are unaffected.

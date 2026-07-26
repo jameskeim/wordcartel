@@ -39,9 +39,11 @@ pub enum Suggestion {
 pub enum DiagSource {
     /// harper-ls — the bundled core provider (Effort A).
     Harper,
-    /// ltex-ls-plus — reserved vocabulary; provider ships in the ltex/vale effort.
+    /// ltex-ls-plus — a shipped LSP provider (grammar, via LanguageTool).
     LTeX,
-    /// vale / vale-ls — reserved vocabulary; provider ships in the ltex/vale effort.
+    /// vale — reserved vocabulary; NO provider ships today. The vale-ls LSP provider was removed
+    /// because it lints the file on disk rather than the synced buffer, so it cannot back a live
+    /// lens; the replacement is a one-shot CLI provider over the same source identity.
     Vale,
     /// A non-core engine, named statically (plugin-declared engines; test mocks).
     Plugin(&'static str),
@@ -73,7 +75,7 @@ impl DiagSource {
 /// A single flagged issue in a checked text, as reported by a
 /// `wordcartel::diag_provider::DiagnosticsProvider` in the shell. Diagnostics are pure data —
 /// this crate holds no linting logic, no sorting, and no rendering. Each engine's provider (e.g.
-/// harper-ls, and future ltex/vale/plugin providers) tags its own diagnostics with its
+/// harper-ls and ltex-ls-plus, plus future vale/plugin providers) tags its own diagnostics with its
 /// `DiagSource` and sorts its results ascending by `range.start` before handing them to the
 /// shell's `DiagStore`, which just holds them, partitioned per source; `wordcartel::render` is
 /// what paints them and turns each diagnostic's `suggestions` into a menu for the shell UI.
