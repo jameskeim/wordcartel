@@ -628,6 +628,25 @@ with tests:
   dismissal takes effect immediately (in-place refilter, no server round trip) and re-applies
   to every future publish this session. Not persisted (dies with the process, like
   `session_ignores`).
+- **Considered decisions (T7 review — deliberate, not overlooked; a later reader must not
+  "fix" these by accident):**
+  1. **The empty-line refusal CLOSES the overlay** — consistent with `diag_apply_selected`'s
+     close-regardless-of-outcome contract and its shipped failure precedents (add-to-dict IO
+     error; "no dictionary path configured"). The one principled exception is Learn-more,
+     which stays open because a copy is not an OUTCOME of the overlay's purpose — a refusal
+     is.
+  2. **The refusal belt's asymmetry is designed:** `.line` is the true "nothing to key on"
+     guard; an empty `.sentence` cannot over-match because pair EQUALITY still requires the
+     line-unit to match exactly, bounding it inside the documented collision class.
+  3. **The filter's `O(diagnostics × paragraph)` cost is ACCEPTED:** it runs per debounced
+     publish, never per keystroke, and the (source, code) pre-filter prunes before any unit
+     derivation. Honest worst case: a blank-line-free document with many same-rule
+     diagnostics (each derivation scans to document bounds). Both halves of the escape hatch,
+     recorded: splitting `dismissal_units_at` to short-circuit stays FORBIDDEN (the
+     identical-derivation rule exists because a split lets the two sides disagree); the
+     sanctioned fix, if live use ever shows the worst case, is a byte-cap on the window scan
+     INSIDE the single shared function — both sides inherit the same bound by construction.
+     Deliberately not implemented now.
 
 ### 5.4 Learn more (D5)
 
