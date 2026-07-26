@@ -3,7 +3,7 @@
 
 # Backlog
 
-**35 open · 84 shipped · 2 dropped**
+**34 open · 85 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -21,7 +21,6 @@ Blocking Effort P: **0**
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
 | PD | wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain | needs-design | feature | SM |  | wc.async — the deferred one-shot subprocess primitive (linter-arc effort d, but INDEPENDENT of the linter spine): a CLOSED Rust op-menu (wc.async{op,args,on_done}) + Msg::AsyncDone pump-drain + resource/security caps, with a formatter (prettier/fmt) or vale-CLI driver. The !Send constraint forces the closed-primitive shape (P3 F1-option-A). Depends ONLY on the shipped plugin system. Design: docs/design/prose-linters-design-space.md §2/§6 + effort-p3-grounding.md. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
-| E11 | Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand) | needs-design | feature | M |  | Multi-engine linting effort (c): the diagnostics VIEWING/ACTION delta — per-diagnostic 'learn more'/href + a detail region on DiagOverlay; per-engine (non-harper) dictionary/rule writers; the executeCommand relay; more-suggestions population. Consumes the SHIPPED-BUT-UNUSED Diagnostic.code/href fields. Parallelizable with E10. Design: docs/design/prose-linters-design-space.md §1/§6. |
 | E12 | Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows | needs-design | feature | M |  | Multi-engine linting effort (e), LAST/optional: plugins declare an LSP server + contribute dynamic engine-menu rows (MenuRowAction::Plugin widening). Only if plugin-authored engines materialize. Needs wc.async (PD) + the shipped spine + the deferred plugin-dynamic-menu-section effort. Design: docs/design/prose-linters-design-space.md §5/§6. |
 | E14 | Rule-level disable — persist a per-engine disabled-rule list and deliver it to all three engines | triage | feature | M |  | Deferred out of E11 (2026-07-25 human scope call) — the PERSISTENT form of the session dismiss E11 ships. Stronger story than E13: user-visible and recurring (a writer who uses the passive deliberately is told forever; a session dismiss must be redone every session). Mechanisms all live-probe-confirmed: ltex disabledRules via the settings channel; harper the linters bool map it already pushes; vale client-side filter on code ONLY (its settings channel is inert). THE FORK that wants its own effort: where it PERSISTS — the app has never written config back, and the only user-state files are dictionary.txt / settings-overrides.toml / session.toml, so this needs a new user-state file or a settings-overrides extension, a call reaching well beyond diagnostics. Also owed: a command surface (contract law 2), not just an overlay row. Decision record: scratchpad/e11/decisions.md D7. |
 | E15 | vale is unreachable — doc_uri mints untitled: unconditionally and vale-ls publishes nothing for it | triage | bug | M |  | VALE HAS NEVER PRODUCED A DIAGNOSTIC, for any document, since E10 shipped — found by E11 T10 live probe (2026-07-26), established at the wire with wordcartel's exact init params differing only in the URI. lsp_rpc::doc_uri mints untitled:wcartel-{buffer}-{generation} unconditionally (on_change ignores its path arg); vale-ls publishes NOTHING for an untitled: URI — it needs a URI naming a file that exists on disk. E10 missed it because its T11 probe recorded vale as SKIP (binary not installed) and its wire probe used a file:// URI directly, masking it exactly. Symptom is a SILENT [REVIEW · vale] empty view that reads as "found no problems" — a no-silent-UI violation, so E11 folded in a loudness mitigation ONLY: vale ships DISABLED by default. THIS ITEM IS THE REAL FIX and restores the default. Not a fold-in because it needs a per-engine URI policy hook, rework of generation semantics for stable URIs (the staleness discriminator keys on generation-tagged URIs via uri_owner; a stable file:// URI collapses it and reopens the late-publish attribution class E11 spent six gate rounds closing), an honest degrade for unsaved buffers, and ONE OPEN WIRE QUESTION the probe did not settle: does vale-ls lint the didChange-synced text or the disk file? Probe that before designing. Anchors: lsp_rpc::doc_uri, lsp_client::ClientState::{on_change,on_publish}, uri_owner, diagnostics_run::install_core_providers. |
@@ -49,10 +48,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>84 shipped</summary>
+<details><summary>85 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| E11 | Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand) | 2026-07-26 | f666842 |
 | E10 | Multi-engine linting (b) — ltex-ls-plus + vale-ls providers (LSP) + JVM lifecycle + engine menu | 2026-07-25 | 9c2d9e4 |
 | H32 | Consolidate the 13 duplicated test scratch-path helpers into one crate-wide seam | 2026-07-25 | 636f036 |
 | H33 | Test set_var(HOME) mutates process-wide state read by three config tests as an oracle | 2026-07-25 | 636f036 |

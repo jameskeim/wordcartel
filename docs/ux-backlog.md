@@ -503,13 +503,6 @@ tellable only if there is one seam to register into. (`DiagSource::Plugin` antic
   lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
 - Config namespace and persistence; interaction with the density presets (E1).
 
-### E11 — Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
-<!-- item: E11 -->
-
-Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
-
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
-
 ### E12 — Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows
 <!-- item: E12 -->
 

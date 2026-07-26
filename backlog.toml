@@ -1079,13 +1079,15 @@ shipped_commit = "9c2d9e4"
 [[item]]
 id = "E11"
 title = "Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "E"
 hook = "Multi-engine linting effort (c): the diagnostics VIEWING/ACTION delta — per-diagnostic 'learn more'/href + a detail region on DiagOverlay; per-engine (non-harper) dictionary/rule writers; the executeCommand relay; more-suggestions population. Consumes the SHIPPED-BUT-UNUSED Diagnostic.code/href fields. Parallelizable with E10. Design: docs/design/prose-linters-design-space.md §1/§6."
-doc = "ux-backlog.md#e11"
+doc = "backlog-archive.md#e11"
 created = "2026-07-13"
+shipped_date = "2026-07-26"
+shipped_commit = "f666842"
 
 [[item]]
 id = "E12"

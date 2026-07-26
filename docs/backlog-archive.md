@@ -2725,3 +2725,62 @@ hints; SKIP vale-ls absent; finding: the custom `ltex/workspaceSpecificConfigura
 exercised — handled defensively). Render zero-touch; command-surface conformant. Sub-arc:
 E10 → [[E11]] → E8-impl → E12-if-ever. Grounding/forks: `scratchpad/lens-linting-arc/`; memory
 [[wordcartel-lens-linting-arc]].
+
+### E11 — Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
+<!-- item: E11 -->
+
+**SHIPPED 2026-07-26** (merge `f666842`). Filed as a viewing delta; two live protocol probes against
+the real `ltex-ls-plus` and `vale-ls` binaries reframed it into a repair-then-build effort, because
+the substrate underneath was broken three ways that were invisible from the code alone.
+
+**What the probes found.** ltex's code actions never carry the bare `"quickfix"` kind our parser
+required, and its edits arrive as `edit.documentChanges[]` rather than `edit.changes[uri]` — so ltex
+fixes attached *nothing*. vale's fixes were lost to our batched request shape (batched, vale-ls
+returned only spelling actions and silently dropped every repetition fix; individually all seven
+came back). And the two standing action rows were spelling-shaped: `Ignore once` suppressed only
+`DiagnosticKind::Spelling`, making it a visible no-op on the grammar flags ltex and vale mostly
+emit, while `Add to dictionary` copied the whole flagged range — a full sentence for a passive-voice
+flag — into `dictionary.txt`.
+
+**What shipped** (human decisions D1–D10, recorded with reasoning in `scratchpad/e11/decisions.md`):
+engine-parameterized fix mapping (per-engine kinds, both edit shapes, attach-all rather than the
+first); **on-demand** fix fetching at overlay open, replacing the batched post-publish request and
+deleting the Assembly/watchdog that parked underlines behind a fix round trip; kind-aware action
+rows plus a **session dismissal** keyed on the enclosing sentence AND line (both stored, both
+required equal, one shared parse-free derivation on both sides, no candidate classification); a
+bottom-anchored **detail box** with the wrapped message + `engine · code`, chosen over extending the
+centered overlay so a small terminal drops the explanation rather than the actionable suggestions;
+and a **Learn-more** row copying the rule URL through the clipboard seam with a status ack, present
+only when the engine sent a link (ltex always; harper never; vale's built-in styles none).
+
+**Cut or filed rather than absorbed:** the executeCommand relay (D8 — observed capabilities show no
+server offers anything fix-, dictionary-, or rule-shaped; ltex's own such actions are command-only
+and CLIENT-handled by its design); severity in the core `Diagnostic` (a per-engine constant that
+contradicts across engines — ltex sends Warning on everything, vale Error on everything);
+[[E13]] (ltex dictionary push), [[E14]] (rule-level disable), [[E15]] (vale unreachable),
+[[H37]] (the teardown accepted-send race), [[B19]] (display-column fitting).
+
+**Vale ships DISABLED by default.** The live probe established that vale has never produced a
+diagnostic for any document since E10: `doc_uri` mints `untitled:` unconditionally and vale-ls
+publishes nothing for such a URI. E11's vale mapping is correct and probe-proven at the wire but
+unreachable, so it ships dormant and honest rather than as an empty lens reading "no problems
+found". [[E15]] is the real fix and restores the default.
+
+**Durable lessons.** (1) The dominant defect class across the whole effort was **tests that cannot
+fail** — eleven instances, the shape always being *the asserted state is also the default state*.
+The rule that came out of it: for a CONJUNCTIVE predicate, each conjunct needs a fixture where that
+conjunct alone decides the outcome; varying both together tests neither. Two of the pair key's own
+conjuncts were unpinned by nine purpose-written fixtures. (2) The live probe found two defects that
+six spec rounds, five plan rounds, nine task reviews and ~1950 tests all missed — including an ltex
+**publish-cardinality** desync (harper emits one publish per check, ltex does not; an await-gated
+`last_raw` then desyncs from the store and permanently kills fixes for the just-repaired
+diagnostic). E10's "exercise every ORDERING of a mechanism's concurrent inputs" lesson recurring one
+effort later on the same subsystem, with a new axis: cardinality. (3) A fix for one gate finding
+created the next one three times over; re-reading the *revised* artifact each round is what caught
+them. Both final gates returned GO, with Codex adjudicating the retirement of a rule it had itself
+argued for, and the whole-branch review re-driving the live repro at HEAD because the fix had only
+synthetic verification. `smoke: 9/9 PASS`.
+
+Spec: `docs/superpowers/specs/2026-07-25-e11-diagnostics-viewing-action-design.md` (six Codex
+rounds + three post-READY amendments). Plan: `docs/superpowers/plans/2026-07-25-e11-diagnostics-viewing-action-plan.md`
+(five rounds). Probes + decisions: `scratchpad/e11/`. Sub-arc: E10 → E11 → E8-impl → E12-if-ever.
