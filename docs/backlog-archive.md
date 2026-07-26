@@ -2757,7 +2757,8 @@ only when the engine sent a link (ltex always; harper never; vale's built-in sty
 server offers anything fix-, dictionary-, or rule-shaped; ltex's own such actions are command-only
 and CLIENT-handled by its design); severity in the core `Diagnostic` (a per-engine constant that
 contradicts across engines — ltex sends Warning on everything, vale Error on everything);
-[[E13]] (ltex dictionary push), [[E14]] (rule-level disable), [[E15]] (vale unreachable),
+[[E14]] (engine-side suppression — rule disable AND the ltex dictionary push, which was briefly
+filed apart as E13 and folded back in 2026-07-26), [[E15]] (vale unreachable),
 [[H37]] (the teardown accepted-send race), [[B19]] (display-column fitting).
 
 **Vale ships DISABLED by default.** The live probe established that vale has never produced a
@@ -2827,3 +2828,40 @@ Anchors: `lsp_rpc::doc_uri`, `lsp_client::ClientState::{on_change, on_publish}`,
 mapping + the default-off mitigation). Grounding: Fable, 2026-07-26. ~M.
 
 **DROPPED 2026-07-26 — superseded by [[E16]].** A live probe (`scratchpad/e15/probe/vale-sync-probe-results.md`) established that vale-ls lints the file on DISK, never the synced buffer: `didChange` produces zero server messages, and `didSave` re-reads disk while ignoring its own `text` parameter. So the URI fix this item describes would NOT have made vale follow the writer's typing — it would only have made vale report on the last save. The vale-ls provider is being removed in favour of the vale CLI one-shot over stdin ([[E16]]), which lints the text we hand it. The grounding below is kept because the `untitled:` URI limitation is not vale-specific in principle: any future LSP engine requiring a real on-disk file would hit it. harper and ltex are unaffected.
+
+### E13 — Push the personal dictionary into ltex's settings channel (server-side spelling suppression)
+<!-- item: E13 -->
+
+**Deferred out of E11 (2026-07-25, deliberate human scope call — not an oversight.)** Adding a word
+to the personal dictionary already suppresses it across ALL engines, client-side: `retain_unignored`
+refilters every source's slot against the dictionary ∪ session ignores, and ltex/vale spelling
+diagnostics classify as `DiagnosticKind::Spelling`, so they are dropped before paint. The writer
+cannot tell the difference — no underline appears, counts and navigation are correct.
+
+**What this item would add:** suppression at the SOURCE for ltex. A live probe against
+ltex-ls-plus 18.7.0 (`scratchpad/e11/probe/ltex-probe-results.md`, 2026-07-25) confirmed the
+mechanism works and needs NO new file writers: delivering `{"dictionary": {"en-US": ["floopmuffin"]}}`
+through the existing settings channel (`didChangeConfiguration` → the server re-pulls
+`workspace/configuration` → republishes without the word) took ~1s and required no forced edit. The
+same probe confirmed `disabledRules` works identically. So the seam is `ltex_settings` + the shipped
+`reload_dictionary_enabled` → `settings_push` nudge.
+
+**Why it was NOT taken in E11, and the consequences to weigh when it is picked up:**
+- **Zero user-visible change.** The client-side filter already delivers the whole UX; this buys
+  correctness-at-the-source and stops invisible wasted work on the engine side.
+- **Unbounded payload growth.** It ships the writer's ENTIRE personal dictionary inside every
+  settings response, forever, growing as the feature is used over years. Needs a size posture
+  (cap? only push words the engine has actually flagged? per-language partition?).
+- **A second source of truth for suppression** that must stay in sync with the client-side filter —
+  including on word REMOVAL, not just addition.
+- **Per-language keying.** ltex's dictionary is keyed by language (`en-US`); the personal dictionary
+  is not. That mapping needs a decision.
+- **vale gets nothing.** Its settings channel is inert — the same probe showed
+  `didChangeConfiguration` produces only a `window/logMessage` and the server never sends
+  `workspace/configuration`. Any vale-side equivalent would mean editing engine-native vocab files,
+  a class of writer this app has never had.
+
+Prior art / context: E10 (the ltex + vale providers), E11 (the viewing/action layer). Decision
+record: `scratchpad/e11/decisions.md` D6. ~S.
+
+**DROPPED 2026-07-26 — FOLDED INTO [[E14]], not rejected.** E13 and E14 are one effort: both push suppression state into an engine through the settings channel, both need the same answer to *where does this persist*, and both need the same delivery plumbing and test surface. Filed apart, the persistence argument gets had twice and the plumbing gets built twice. The dictionary half also does not stand alone — on its own it buys correctness-at-the-source and invisible saved work against a real sync obligation — but as a rider on E14's rule half, where the plumbing and the persistence decision already exist, it is nearly free. The grounding below is preserved in full; E14 carries the live version.

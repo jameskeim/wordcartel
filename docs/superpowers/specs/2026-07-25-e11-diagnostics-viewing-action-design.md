@@ -53,6 +53,10 @@ not re-openable here):
    `Diagnostic` type (probe-settled: a per-engine constant that contradicts across engines —
    §8.2); the ltex dictionary settings-push is **deferred to E13** (D6); rule-level disable is
    **deferred to E14** (D7). E13/E14 are already filed in `backlog.toml`.
+   *(Bookkeeping note, 2026-07-26: E13 was subsequently folded into E14 as one effort — they share the
+   settings channel, the persistence decision, and the test surface. E14 carries both halves; E13 is
+   dropped as folded-in, with its grounding preserved in `docs/backlog-archive.md`. The D6/D7 decisions
+   themselves are unchanged.)*
 
 ---
 
