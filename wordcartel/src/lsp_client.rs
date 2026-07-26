@@ -47,6 +47,10 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     /// -32601 method-not-found).
     fn answer_request(method: &str, req: &Value, cfg: &ProviderConfig) -> Option<Value>;
     fn classify(d: &Value) -> DiagnosticKind;
+    /// E11 §4: is this CodeAction `kind` a FIX this engine delivers as an edit?
+    /// Probe-grounded per engine — command-only kinds are excluded by knowledge, not luck.
+    #[allow(dead_code)] // E11 T2 scaffold — consumed by T4's on_fix_response; allow removed there
+    fn is_fix_kind(kind: &str) -> bool;
 }
 
 /// The shared spelling-vs-grammar fallback heuristic (E10 §7/§8): a lowercase "spell"
@@ -948,6 +952,7 @@ mod tests {
         fn settings_push(_cfg: &ProviderConfig) -> Option<Value> { None }
         fn answer_request(_method: &str, _req: &Value, _cfg: &ProviderConfig) -> Option<Value> { None }
         fn classify(_d: &Value) -> DiagnosticKind { DiagnosticKind::Grammar }
+        fn is_fix_kind(kind: &str) -> bool { kind == "quickfix" }
     }
 
     fn cfg() -> ProviderConfig {

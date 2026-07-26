@@ -67,6 +67,9 @@ impl LspEngine for ValeEngine {
         }
         crate::lsp_client::classify_spell_heuristic(d)
     }
+
+    // probe §2:
+    fn is_fix_kind(kind: &str) -> bool { kind == "quickfix" }
 }
 
 #[cfg(test)]

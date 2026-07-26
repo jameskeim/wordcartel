@@ -108,6 +108,9 @@ impl crate::lsp_client::LspEngine for HarperEngine {
     }
 
     fn classify(d: &Value) -> DiagnosticKind { classify_lsp(d) }
+
+    // probe-verified bare kind + edit.changes:
+    fn is_fix_kind(kind: &str) -> bool { kind == "quickfix" }
 }
 
 /// The BARE, unwrapped harper settings object (spec §8) — the pre-T1 `settings_object` body,

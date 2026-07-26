@@ -85,6 +85,9 @@ impl LspEngine for LtexEngine {
         }
         crate::lsp_client::classify_spell_heuristic(d)
     }
+
+    // ONLY acceptSuggestions carries an edit (probe Q2):
+    fn is_fix_kind(kind: &str) -> bool { kind == "quickfix.ltex.acceptSuggestions" }
 }
 
 /// The bare ltex settings object — `language` is the sole E10 key (spec §9).
