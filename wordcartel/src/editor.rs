@@ -623,6 +623,14 @@ pub struct Editor {
     /// latch, cleared in set_render_mode on entering Review). One hint per source per entry —
     /// informative, not naggy. Spec §9.
     pub diag_hint_shown: std::collections::BTreeSet<wordcartel_core::diagnostics::DiagSource>,
+    /// E11 §3.2: the monotonic mint for on-demand fix-request correlation tokens. Each
+    /// `quick_fix` takes the current value and increments. MONOTONIC AND NEVER REUSED is the
+    /// whole guarantee: reopening the same diagnostic unedited reproduces every identity field
+    /// (buffer, version, range), so the token is the ONLY thing that distinguishes a live
+    /// request from a displaced one — a wrapped or reset counter would let a stale terminal
+    /// silently clear a live fetch. Starts at 1 so `Some(0)` can never be a default-shaped
+    /// accident.
+    pub next_fix_token: u64,
     /// E10 §6: the armed idle-suspend deadline for the heavy (ltex) engine — `Some(due_ms)`
     /// after a leaving-Review transition, cleared on re-entry or fire. Read by the
     /// `timers.rs` "diag_idle" row; never persisted.
@@ -758,6 +766,7 @@ impl Editor {
             diag_providers: crate::diag_provider::ProviderSet::default(),
             active_analysis_source: wordcartel_core::diagnostics::DiagSource::Harper,
             diag_hint_shown: std::collections::BTreeSet::new(),
+            next_fix_token: 1,
             diag_idle_due: None,
             outline: None,
             theme_picker: None,

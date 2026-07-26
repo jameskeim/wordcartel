@@ -21,11 +21,24 @@ pub struct DiagOverlay {
     /// to apply a quick-fix if the buffer was mutated while the overlay was
     /// open (Fix A4: stale-range panic / wrong-offset apply guard).
     pub opened_version: u64,
+    /// E11 §3.2: the correlation token of this overlay's on-demand fix request — `Some` iff the
+    /// request was ACCEPTED (a terminal is owed). The delivery arm keys on token equality alone
+    /// (§3.4), because a reopen reproduces every other identity field.
+    pub fix_token: Option<u64>,
+    /// E11 §5.2: whether a fix fetch is still outstanding. Never a silent wait — the state is a
+    /// visible row.
+    pub fix_state: FixState,
 }
+
+/// E11 §5.2: the overlay's fix-fetch state. `Fetching` iff the open-time `request_fixes`
+/// returned `Accepted::Yes`; `Done` at delivery/expiry, or immediately at open on `Accepted::No`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FixState { Fetching, Done }
 
 impl DiagOverlay {
     pub fn new(anchor: Diagnostic, buffer_id: BufferId, opened_version: u64) -> Self {
-        DiagOverlay { anchor, selected: 0, scroll_top: 0, buffer_id, opened_version }
+        DiagOverlay { anchor, selected: 0, scroll_top: 0, buffer_id, opened_version,
+            fix_token: None, fix_state: FixState::Done }
     }
 
     /// Total row count: one per suggestion, plus "ignore once" + "add to dictionary".

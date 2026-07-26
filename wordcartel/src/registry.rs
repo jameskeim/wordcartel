@@ -499,7 +499,30 @@ impl Registry {
                 .find(|d| d.range.start <= caret && caret <= d.range.end)
                 .cloned();
             if let Some(d) = diag {
-                c.editor.open_diag(d);
+                c.editor.open_diag(d.clone());
+                // E11 §3.2/§3.6: the overlay is already up (nothing blocks); fire the on-demand
+                // fetch at the ACTIVE lens engine under a freshly minted token and set the fetch
+                // state FROM THE RESULT. `Accepted::No` means no message is coming, so the
+                // overlay resolves to Done here rather than waiting forever.
+                let token = c.editor.next_fix_token;
+                c.editor.next_fix_token += 1;
+                let bid = c.editor.active().id;
+                let ver = c.editor.active().document.version;
+                let src = c.editor.active_analysis_source;
+                let accepted = c.editor.diag_providers.request_fixes(src, token, bid, ver,
+                    d.range.clone(), d.code.clone(), d.message.clone());
+                if let Some(ov) = c.editor.diag.as_mut() {
+                    match accepted {
+                        crate::diag_provider::Accepted::Yes => {
+                            ov.fix_token = Some(token);
+                            ov.fix_state = crate::diag_overlay::FixState::Fetching;
+                        }
+                        crate::diag_provider::Accepted::No => {
+                            ov.fix_token = None;
+                            ov.fix_state = crate::diag_overlay::FixState::Done;
+                        }
+                    }
+                }
             } else {
                 c.editor.set_status(crate::status::StatusKind::Info, "no diagnostic here");
             }
@@ -1984,6 +2007,80 @@ mod tests {
         ed.active_mut().view.mode = crate::editor::RenderMode::Review;
         dispatch_id(&mut ed, "diag_prev");
         assert_eq!(ed.active().document.selection.primary().head, 0, "diag_prev must land on the diagnostic in Review");
+    }
+
+    // -----------------------------------------------------------------------
+    // E11 T5: quick_fix mints a token and fires the on-demand fix request.
+    // -----------------------------------------------------------------------
+
+    /// A Review editor with one valid Harper diagnostic under the caret — the exact state in
+    /// which `quick_fix` opens the overlay.
+    fn review_editor_with_a_diagnostic_under_the_caret() -> Editor {
+        let mut ed = Editor::new_from_text("teh cat\n", None, (80, 24));
+        ed.active_mut().view.mode = crate::editor::RenderMode::Review;
+        let v = ed.active().document.version;
+        let slot = ed.active_mut().diagnostics
+            .slot_mut(wordcartel_core::diagnostics::DiagSource::Harper);
+        slot.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: Some("C1".into()),
+            href: None, message: "x".into(), suggestions: vec![] }];
+        slot.computed_version = v;
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        ed
+    }
+
+    /// E11 §3.2: `quick_fix` mints a token, routes the request to the ACTIVE lens engine, and
+    /// sets the overlay's fetch state FROM THE RESULT. The counter must advance — the token is
+    /// the SOLE delivery correlation, so a reused one would let a displaced request's terminal
+    /// clear a live fetch (spec round-2 Critical 1).
+    #[test]
+    fn quick_fix_fires_a_fix_request_and_sets_fetching_from_accepted() {
+        let mut ed = review_editor_with_a_diagnostic_under_the_caret();
+        let rec = crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper);
+        let calls = rec.calls_handle();
+        ed.diag_providers.install(Box::new(rec), true);
+        let token = ed.next_fix_token;
+        dispatch_id(&mut ed, "quick_fix");
+        assert!(calls.lock().unwrap().iter().any(|c| matches!(c,
+            crate::diag_provider::ProviderCall::RequestFixes { token: t, range, code, .. }
+                if *t == token && *range == (0..3) && code.as_deref() == Some("C1"))),
+            "the anchor's identity rides the request under the minted token");
+        let ov = ed.diag.as_ref().expect("quick_fix opened the overlay");
+        assert_eq!(ov.fix_token, Some(token), "the overlay holds the token it will be keyed on");
+        assert_eq!(ov.fix_state, crate::diag_overlay::FixState::Fetching);
+        assert_eq!(ed.next_fix_token, token + 1, "the counter advanced — tokens are never reused");
+    }
+
+    /// `Accepted::No` (unavailable engine, dead thread, a provider with no fix support) means
+    /// NOTHING will ever be emitted — the handler must resolve the overlay itself rather than
+    /// leave a Fetching state only a message could clear.
+    #[test]
+    fn quick_fix_with_a_refusing_provider_is_done_immediately_and_holds_no_token() {
+        let mut ed = review_editor_with_a_diagnostic_under_the_caret();
+        ed.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper)
+            .with_accepted(crate::diag_provider::Accepted::No)), true);
+        dispatch_id(&mut ed, "quick_fix");
+        let ov = ed.diag.as_ref().expect("the overlay still opens — refusal is not a failure");
+        assert_eq!(ov.fix_state, crate::diag_overlay::FixState::Done, "no silent wait");
+        assert_eq!(ov.fix_token, None, "no token is held for a request that was never accepted");
+    }
+
+    /// The token counter is MONOTONIC across requests — the guard the delivery arm's
+    /// token-equality correlation rests on.
+    #[test]
+    fn successive_quick_fixes_mint_strictly_increasing_tokens() {
+        let mut ed = review_editor_with_a_diagnostic_under_the_caret();
+        ed.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), true);
+        dispatch_id(&mut ed, "quick_fix");
+        let first = ed.diag.as_ref().unwrap().fix_token.expect("first token");
+        ed.diag = None;
+        dispatch_id(&mut ed, "quick_fix");
+        let second = ed.diag.as_ref().unwrap().fix_token.expect("second token");
+        assert!(second > first, "tokens strictly increase ({first} → {second})");
     }
 
     // -----------------------------------------------------------------------

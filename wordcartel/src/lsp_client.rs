@@ -99,10 +99,7 @@ pub(crate) enum Cmd {
     /// E11 §3.2: fetch fix candidates for ONE diagnostic, on demand (quick-fix overlay open).
     /// `token` is the correlation identity; `code`/`message` ride because a byte range alone
     /// cannot deterministically pick the raw diagnostic to echo (overlapping anchors exist).
-    // T4 builds the CONSUMER (the whole `pending_fix` machine); the sole producer is T5's
-    // `LspProvider::request_fixes`, so the non-test build sees no construction site until then.
-    // Allow removed in T5 (the warning-free-build gate is per commit).
-    #[allow(dead_code)]
+    /// Produced solely by `LspProvider::request_fixes` (T5) — the app-side handle's seam.
     RequestFixes { token: u64, buffer_id: BufferId, version: u64,
         range: std::ops::Range<usize>, code: Option<String>, message: String },
 }
@@ -894,6 +891,23 @@ impl<E: LspEngine> DiagnosticsProvider for LspProvider<E> {
 
     fn notify_close(&mut self, buffer_id: BufferId) {
         let _ = self.cmd_tx.send(Inbound::Cmd(Cmd::Close { buffer_id }));
+    }
+
+    /// Forward an on-demand fix request (E11 §3.2). `Accepted::Yes` PROMISES exactly one
+    /// `Msg::DiagFixesReady` for `token` — the client thread owes it from the machine, the
+    /// deadline, or its `FlushGuard`. Two ways that promise could be broken, both refused here:
+    /// before `ensure_running` the receiver is still ours, so a send would "succeed" into a
+    /// channel nobody drains with no `FlushGuard` in existence (the overlay would strand in
+    /// "fetching…" forever); after the thread dies the send errs, and — exactly as
+    /// `notify_change` does — that flips availability. Non-blocking either way (hot-path law).
+    fn request_fixes(&mut self, token: u64, buffer_id: BufferId, version: u64,
+        range: std::ops::Range<usize>, code: Option<String>, message: String) -> Accepted {
+        if !self.started { return Accepted::No; } // no thread ⟹ no terminal ⟹ no acceptance
+        match self.cmd_tx.send(Inbound::Cmd(Cmd::RequestFixes { token, buffer_id, version,
+            range, code, message })) {
+            Ok(()) => Accepted::Yes,
+            Err(_) => { self.set_availability(Availability::Unavailable); Accepted::No }
+        }
     }
 
     fn reload_dictionary(&mut self) { let _ = self.cmd_tx.send(Inbound::Cmd(Cmd::ReloadDict)); }
@@ -1773,5 +1787,53 @@ mod tests {
             "result":{"capabilities":{}}})), 0);
         assert!(sends(&replay).iter().any(|v| v["method"] == "textDocument/didOpen"),
             "the queued change replays as a didOpen after the resume handshake");
+    }
+
+    // ── T5: the app-side handle's fix request (E11 §3.2 — Accepted ⟹ a terminal is owed) ────
+
+    /// A never-spawned handle STILL HOLDS the receiver in `rx`, so `cmd_tx.send` returns `Ok`
+    /// into a channel NOBODY drains — and with no client thread there is no `FlushGuard` to owe
+    /// the terminal either. An `Accepted::Yes` there would strand the overlay in "fetching…"
+    /// forever, so the un-started handle must REFUSE.
+    #[test]
+    fn request_fixes_without_a_client_thread_is_not_accepted() {
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
+        let mut p = LspProvider::<TestEngine>::new(msg_tx, cfg());
+        assert!(p.rx.is_some(), "precondition: the receiver is still app-side — no thread runs");
+        assert_eq!(p.request_fixes(1, BufferId(0), 1, 0..1, None, "m".into()), Accepted::No,
+            "no client thread ⟹ no terminal is possible ⟹ never accept");
+    }
+
+    /// The disconnected-channel leg, mirroring `notify_change`: a started handle whose thread has
+    /// died flips availability and refuses (the thread's `FlushGuard` already ran, so no terminal
+    /// can come from a send that lands nowhere).
+    #[test]
+    fn request_fixes_on_a_dead_channel_marks_unavailable_and_is_not_accepted() {
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
+        let mut p = LspProvider::<TestEngine>::new(msg_tx, cfg());
+        p.started = true; // pretend ensure_running spawned the thread…
+        p.rx = None;      // …and that the thread then exited, dropping the receiver.
+        assert_eq!(p.request_fixes(2, BufferId(0), 1, 0..1, None, "m".into()), Accepted::No);
+        assert_eq!(p.availability(), Availability::Unavailable);
+    }
+
+    /// The accepting leg: with the client up, the request goes out VERBATIM — the token and the
+    /// `code`/`message` disambiguators must survive the hop, or §3.3 cannot pick the raw to echo.
+    #[test]
+    fn request_fixes_sends_the_command_verbatim_when_the_client_is_up() {
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
+        let mut p = LspProvider::<TestEngine>::new(msg_tx, cfg());
+        p.started = true; // the thread is "up"; its receiver is still `p.rx`, so the test can read it
+        assert_eq!(p.request_fixes(9, BufferId(3), 7, 2..5, Some("C1".into()), "m".into()),
+            Accepted::Yes);
+        let rx = p.rx.take().expect("receiver");
+        match rx.try_recv() {
+            Ok(Inbound::Cmd(Cmd::RequestFixes { token, buffer_id, version, range, code, message })) => {
+                assert_eq!((token, buffer_id, version, range), (9, BufferId(3), 7, 2..5));
+                assert_eq!(code.as_deref(), Some("C1"));
+                assert_eq!(message, "m");
+            }
+            _ => panic!("expected exactly one Cmd::RequestFixes on the wire"),
+        }
     }
 }

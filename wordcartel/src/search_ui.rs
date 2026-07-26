@@ -135,6 +135,31 @@ pub(crate) fn search_pin(editor: &mut Editor) {
     }
 }
 
+/// E11 §3.4: deliver a fix terminal — token-keyed CONSUMPTION, version-gated DISPLAY. Any
+/// terminal for a token nobody holds is silence (displaced/expired/closed requests). TWO
+/// call sites: `app::reduce_dispatch`'s arm and `prompts::intercept`'s modal-delivery arm
+/// (the DiagProviderEvent "second delivery site" precedent) — one body, no drift.
+pub(crate) fn apply_diag_fixes_ready(editor: &mut Editor, token: u64, version: u64,
+    suggestions: Vec<wordcartel_core::diagnostics::Suggestion>) {
+    if editor.diag.as_ref().map(|ov| ov.fix_token) != Some(Some(token)) { return; }
+    let same_version = editor.diag.as_ref()
+        .map(|ov| ov.opened_version == version && editor.active().document.version == version)
+        .unwrap_or(false);
+    if same_version {
+        if let Some(ov) = editor.diag.as_mut() {
+            ov.anchor.suggestions = suggestions;
+            ov.fix_state = crate::diag_overlay::FixState::Done;
+            // T6 replaces this clamp with apply_fix_delivery (the §5.2 selection policy).
+            ov.selected = ov.selected.min(ov.row_count().saturating_sub(1));
+        }
+    } else {
+        editor.diag = None;
+        editor.set_status_full(crate::status::StatusKind::Warning,
+            "document changed; re-open", crate::status::StatusLifetime::Sticky,
+            crate::status::StatusSource::Host, None);
+    }
+}
+
 /// Accept, ignore, or add-to-dict based on the overlay's current selection.
 /// Clears `editor.diag` when done (regardless of outcome).
 pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
