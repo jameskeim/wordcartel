@@ -30,7 +30,6 @@ impl LspEngine for LtexEngine {
     const PUBLISH_TIMEOUT_MS: u64 = 15_000;
     /// The JVM + model warm lands in first-CHECK latency: 2-min worst case + margin (spec §4).
     const FIRST_CHECK_TIMEOUT_MS: Option<u64> = Some(180_000);
-    const CODEACTION_TIMEOUT_MS: u64 = 5_000;
     const SUSPENDABLE: bool = true;
 
     // T11-probe flag: the bare invocation is the documented stdio default; verify live.

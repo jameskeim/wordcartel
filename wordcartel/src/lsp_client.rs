@@ -34,7 +34,6 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     /// `Some(ms)` = warm-phase deadline until the first publish of each child process
     /// (consumed by T2; declared here so the trait is complete from day one).
     const FIRST_CHECK_TIMEOUT_MS: Option<u64>;
-    const CODEACTION_TIMEOUT_MS: u64;
     /// Idle suspend-the-child eligibility (consumed by T3; ltex-only).
     const SUSPENDABLE: bool;
     fn spawn_command() -> Command;
@@ -119,17 +118,18 @@ pub(crate) enum Phase { Initializing, Running, ShuttingDown, Suspended }
 pub(crate) struct DocState {
     pub(crate) uri: String, pub(crate) lsp_version: i32, pub(crate) our_version: u64,
     pub(crate) generation: u64, pub(crate) text: String, pub(crate) open: bool,
+    /// The raw LSP diagnostics array from the most recent publish for this doc, version-tagged
+    /// (`our_version`) — the on-demand quick-fix fetch's source (E11 §3). NEVER STORED by this
+    /// task (spec round-4 Minor 5): T3 adds the field + clearing sites only; ALL storage is
+    /// T4's await-attribution.
+    #[allow(dead_code)] // E11 T3 bridge — first read lands with T4's attribution; allow removed there
+    pub(crate) last_raw: Option<(u64, Vec<Value>)>,
 }
 /// A didOpen/didChange awaiting its `publishDiagnostics` (or the publish watchdog).
 pub(crate) struct AwaitPublish { pub(crate) our_version: u64, pub(crate) generation: u64, pub(crate) deadline: u64 }
-/// Converted diagnostics parked while a batched codeAction is in flight (or its watchdog).
-pub(crate) struct Assembly {
-    pub(crate) our_version: u64, pub(crate) generation: u64,
-    pub(crate) diags: Vec<Diagnostic>, pub(crate) deadline: u64,
-}
 /// What an outstanding JSON-RPC request id means when its response lands.
 pub(crate) enum PendingKind {
-    Initialize, Shutdown, CodeAction { buffer_id: BufferId, generation: u64, our_version: u64 },
+    Initialize, Shutdown,
 }
 
 /// The pure protocol state machine (spec §3.3), parameterized over the engine `E`. No IO — feed it
@@ -145,7 +145,6 @@ pub(crate) struct ClientState<E: LspEngine> {
     pub(crate) next_id: u64,
     pub(crate) pending_requests: HashMap<u64, PendingKind>,
     pub(crate) awaiting_publish: HashMap<BufferId, AwaitPublish>,
-    pub(crate) assembling: HashMap<BufferId, Assembly>,
     pub(crate) spawn_attempts: u32,
     /// True once this child process has produced its first owned-URI publish (E10 §4) — gates
     /// which watchdog deadline `on_change` stamps. Reset in `on_spawned` so a respawned child
@@ -170,7 +169,7 @@ impl<E: LspEngine> ClientState<E> {
         ClientState {
             phase: Phase::Initializing, cfg, docs: HashMap::new(), uri_owner: HashMap::new(),
             next_generation: 1, queued: Vec::new(), next_id: 1, pending_requests: HashMap::new(),
-            awaiting_publish: HashMap::new(), assembling: HashMap::new(), spawn_attempts: 1,
+            awaiting_publish: HashMap::new(), spawn_attempts: 1,
             first_publish_seen: false, expected_eofs: 0,
             _engine: std::marker::PhantomData,
         }
@@ -183,9 +182,7 @@ impl<E: LspEngine> ClientState<E> {
 
     /// The soonest watchdog deadline, if any — the pump's `recv_timeout` bound (idle = `None`).
     pub(crate) fn next_deadline(&self) -> Option<u64> {
-        self.awaiting_publish.values().map(|a| a.deadline)
-            .chain(self.assembling.values().map(|a| a.deadline))
-            .min()
+        self.awaiting_publish.values().map(|a| a.deadline).min()
     }
 
     /// The `initialize` request — engine params under the shared envelope.
@@ -315,7 +312,8 @@ impl<E: LspEngine> ClientState<E> {
                 "jsonrpc":"2.0","method":"textDocument/didOpen",
                 "params":{"textDocument":{"uri":uri,"languageId": E::LANGUAGE_ID,"version":lsp_version,"text":text}}})));
             self.docs.insert(buffer_id,
-                DocState { uri, lsp_version, our_version: version, generation, text, open: true });
+                DocState { uri, lsp_version, our_version: version, generation, text, open: true,
+                    last_raw: None });
         } else {
             let (uri, generation, lsp_version) = {
                 let d = self.docs.get_mut(&buffer_id).expect("open doc exists");
@@ -338,8 +336,7 @@ impl<E: LspEngine> ClientState<E> {
     /// latched in-flight version is guaranteed its terminal and no `flush_outstanding` can re-emit.
     fn on_close(&mut self, buffer_id: BufferId) -> Vec<Action> {
         let mut out = Vec::new();
-        let outstanding = self.awaiting_publish.remove(&buffer_id).map(|a| a.our_version)
-            .or_else(|| self.assembling.remove(&buffer_id).map(|a| a.our_version));
+        let outstanding = self.awaiting_publish.remove(&buffer_id).map(|a| a.our_version);
         if let Some(version) = outstanding {
             out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id, version,
                 source: E::SOURCE, diagnostics: Vec::new() }));
@@ -390,8 +387,6 @@ impl<E: LspEngine> ClientState<E> {
             Some(PendingKind::Initialize) => self.on_initialized(now),
             Some(PendingKind::Shutdown) =>
                 vec![Action::Send(json!({"jsonrpc":"2.0","method":"exit"})), Action::Exit],
-            Some(PendingKind::CodeAction { buffer_id, generation, our_version }) =>
-                self.on_codeaction_response(buffer_id, generation, our_version, &v),
             None => Vec::new(),
         }
     }
@@ -415,9 +410,10 @@ impl<E: LspEngine> ClientState<E> {
     }
 
     /// A `publishDiagnostics` notification. URI-keyed generation attribution (spec §3.3 Receive):
-    /// an absent uri → drop; empty result → emit terminal + clear awaiting; non-empty → eager-
-    /// assemble one batched codeAction, parking the converted set.
-    fn on_publish(&mut self, v: &Value, now: u64) -> Vec<Action> {
+    /// an absent uri → drop; otherwise emit the converted set IMMEDIATELY, suggestionless — the
+    /// batched codeAction round trip is gone (E11 §3): fixes are fetched on-demand when the
+    /// writer opens the quick-fix overlay (a later task), never blocking paint.
+    fn on_publish(&mut self, v: &Value, _now: u64) -> Vec<Action> {
         let params = &v["params"];
         let uri = match params["uri"].as_str() { Some(u) => u.to_string(), None => return Vec::new() };
         let (buffer_id, generation) = match self.uri_owner.get(&uri) {
@@ -443,61 +439,8 @@ impl<E: LspEngine> ClientState<E> {
         if let Some(a) = self.awaiting_publish.remove(&buffer_id) {
             debug_assert_eq!(a.generation, generation, "awaiting generation matches attributed publish");
         }
-        if converted.is_empty() {
-            return vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
-                source: E::SOURCE, diagnostics: Vec::new() })];
-        }
-        let (start, end) = match raw_envelope(&raw) {
-            Some(e) => e,
-            None => return vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
-                source: E::SOURCE, diagnostics: converted })], // no envelope → emit converted suggestionless
-        };
-        let id = self.alloc_id();
-        self.pending_requests.insert(id, PendingKind::CodeAction { buffer_id, generation,
-            our_version: tagged });
-        self.assembling.insert(buffer_id, Assembly { our_version: tagged, generation,
-            diags: converted, deadline: now + E::CODEACTION_TIMEOUT_MS });
-        vec![Action::Send(codeaction_request(id, &uri, start, end, &raw))]
-    }
-
-    /// A codeAction RESPONSE. Remove the assembly FIRST (terminal-guarantee), attach suggestions to
-    /// the parked diagnostics, and emit. A superseded generation is discarded (never emitted against
-    /// newer text) — an empty terminal still clears the latch.
-    fn on_codeaction_response(&mut self, buffer_id: BufferId, generation: u64, our_version: u64,
-        v: &Value) -> Vec<Action> {
-        // Stale-response guard: consume the parked assembly ONLY when BOTH its generation AND its
-        // our_version match this response's request. A request that stalled past its watchdog (v1)
-        // could otherwise consume a NEWER assembly (v2, re-parked by a later publish under the same
-        // generation) and attach v1-computed edits. On mismatch, DISCARD this response and leave the
-        // assembly untouched — it still terminates via its own response or watchdog (no wedged latch).
-        match self.assembling.get(&buffer_id) {
-            Some(a) if a.our_version == our_version && a.generation == generation => {}
-            _ => return Vec::new(),
-        }
-        let assembly = self.assembling.remove(&buffer_id).expect("assembly present — matched just above");
-        let live = self.docs.get(&buffer_id)
-            .map(|d| d.open && d.generation == generation && assembly.generation == generation)
-            .unwrap_or(false);
-        if !live {
-            // Superseded mid-fetch: discard the (possibly wrong-range) fixes but clear the latch.
-            return vec![Action::Emit(Msg::DiagnosticsDone { buffer_id,
-                version: assembly.our_version, source: E::SOURCE, diagnostics: Vec::new() })];
-        }
-        let (uri, text) = self.docs.get(&buffer_id)
-            .map(|d| (d.uri.clone(), d.text.clone())).unwrap_or_default();
-        let actions = v["result"].as_array().cloned().unwrap_or_default();
-        let mut diags = assembly.diags;
-        for d in &mut diags {
-            for a in &actions {
-                if let Some(s) = crate::lsp_rpc::quickfix_suggestion(a, &uri, &text, &d.range) {
-                    d.suggestions.push(s);
-                    break;
-                }
-            }
-        }
-        diags.sort_by_key(|d| d.range.start);
-        vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: assembly.our_version,
-            source: E::SOURCE, diagnostics: diags })]
+        vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
+            source: E::SOURCE, diagnostics: converted })]
     }
 
     /// Convert an LSP diagnostics array to our byte-ranged set against `text` (spec §6/§7). Drops
@@ -529,8 +472,9 @@ impl<E: LspEngine> ClientState<E> {
         out
     }
 
-    /// Watchdogs (spec §3.4). Both remove the tracked entry BEFORE emitting (terminal-guarantee):
-    /// publish past deadline → empty terminal; assembly past deadline → converted, suggestionless.
+    /// The publish watchdog (spec §3.4): removes the tracked entry BEFORE emitting
+    /// (terminal-guarantee) — a publish past deadline emits an empty terminal so the
+    /// single-in-flight latch never wedges.
     pub(crate) fn on_deadline(&mut self, now: u64) -> Vec<Action> {
         let mut out = Vec::new();
         let expired_pub: Vec<BufferId> = self.awaiting_publish.iter()
@@ -539,14 +483,6 @@ impl<E: LspEngine> ClientState<E> {
             if let Some(a) = self.awaiting_publish.remove(&b) {
                 out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
                     source: E::SOURCE, diagnostics: Vec::new() }));
-            }
-        }
-        let expired_asm: Vec<BufferId> = self.assembling.iter()
-            .filter(|(_, a)| now >= a.deadline).map(|(b, _)| *b).collect();
-        for b in expired_asm {
-            if let Some(a) = self.assembling.remove(&b) {
-                out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
-                    source: E::SOURCE, diagnostics: a.diags }));
             }
         }
         out
@@ -576,15 +512,11 @@ impl<E: LspEngine> ClientState<E> {
     }
 
     /// Drain-as-it-emits: an empty version-tagged terminal for every entry STILL tracked in
-    /// `awaiting_publish` + `assembling` + queued `Cmd::Change`, removing each as it emits. Idempotent
-    /// (a second call emits nothing) — the FlushGuard's drop can call it after `on_server_gone` did.
+    /// `awaiting_publish` + queued `Cmd::Change`, removing each as it emits. Idempotent (a second
+    /// call emits nothing) — the FlushGuard's drop can call it after `on_server_gone` did.
     pub(crate) fn flush_outstanding(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         for (b, a) in self.awaiting_publish.drain() {
-            out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
-                source: E::SOURCE, diagnostics: Vec::new() }));
-        }
-        for (b, a) in self.assembling.drain() {
             out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
                 source: E::SOURCE, diagnostics: Vec::new() }));
         }
@@ -601,31 +533,6 @@ impl<E: LspEngine> ClientState<E> {
 /// An LSP position value → `(line, utf16-character)`.
 fn pos(v: &Value) -> Option<(u32, u32)> {
     Some((v.get("line")?.as_u64()? as u32, v.get("character")?.as_u64()? as u32))
-}
-
-/// The UTF-16 envelope (min start .. max end) over a raw LSP diagnostics array — the codeAction
-/// query range. `None` if no diagnostic carries a well-formed range.
-fn raw_envelope(raw: &[Value]) -> Option<((u32, u32), (u32, u32))> {
-    let mut min_s: Option<(u32, u32)> = None;
-    let mut max_e: Option<(u32, u32)> = None;
-    for d in raw {
-        let r = d.get("range")?;
-        let s = pos(r.get("start")?)?;
-        let e = pos(r.get("end")?)?;
-        min_s = Some(min_s.map_or(s, |m| m.min(s)));
-        max_e = Some(max_e.map_or(e, |m| m.max(e)));
-    }
-    Some((min_s?, max_e?))
-}
-
-/// A batched `textDocument/codeAction` request over `range`, carrying the publish's raw diagnostics
-/// as context (the server's own positions — no round-trip conversion error, spec §3.3.5).
-fn codeaction_request(id: u64, uri: &str, start: (u32, u32), end: (u32, u32), raw: &[Value]) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"method":"textDocument/codeAction","params":{
-        "textDocument":{"uri":uri},
-        "range":{"start":{"line":start.0,"character":start.1},"end":{"line":end.0,"character":end.1}},
-        "context":{"diagnostics": raw}
-    }})
 }
 
 // ── The imperative shell: app-side handle + client thread + FlushGuard ──────────────────────────
@@ -943,7 +850,6 @@ mod tests {
         const READER_THREAD: &'static str = "wcartel-test-read";
         const PUBLISH_TIMEOUT_MS: u64 = 1_000;
         const FIRST_CHECK_TIMEOUT_MS: Option<u64> = Some(30_000);
-        const CODEACTION_TIMEOUT_MS: u64 = 500;
         const SUSPENDABLE: bool = true;
         fn spawn_command() -> Command { Command::new("wcartel-no-such-test-engine") }
         fn initialize_params(_cfg: &ProviderConfig) -> Value {
