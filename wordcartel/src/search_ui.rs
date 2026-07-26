@@ -214,7 +214,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
             if let Some(s) = suggestion { diag_apply_suggestion(editor, &s, a, b, doc_len, clock); }
         }
         Some(DiagRow::LearnMore) => {} // T8 fills this in (copy the href + the mandatory ack).
-        Some(DiagRow::DismissSession) => {} // T7 fills this in (the session-dismissal key).
+        Some(DiagRow::DismissSession) => diag_dismiss_session(editor, a),
         // The inert rows (§5.2) and an out-of-range selection: no edit, overlay stays open.
         None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes) => {}
     }
@@ -249,6 +249,30 @@ fn diag_add_to_dictionary(editor: &mut Editor, a: usize, b: usize) {
         None => editor.set_status_full(crate::status::StatusKind::Warning, "no dictionary path configured",
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
     }
+    editor.diag = None;
+    crate::diagnostics_run::retain_unignored(editor);
+}
+
+/// "Dismiss for this session" (E11 §5.3) — the non-spelling standing action, and the reason the
+/// spelling rows are no longer offered on grammar/style flags. `session_ignores` could not do this
+/// job: it matches a surface WORD and suppresses only `Spelling`, so on a grammar flag it was a
+/// visible no-op. The dismissal is keyed instead to one OCCURRENCE — the engine, its code, and the
+/// pair of parse-free text units (enclosing sentence + enclosing line) at the anchor.
+///
+/// A blank line has an EMPTY line unit, which would match every other blank line in the document;
+/// that key is refused loudly at store time rather than stored (no silent UI). Otherwise: store,
+/// close, and refilter in place — no server round-trip, exactly as the ignore/add-dict rows do.
+fn diag_dismiss_session(editor: &mut Editor, a: usize) {
+    let Some((source, code)) = editor.diag.as_ref()
+        .map(|ov| (ov.anchor.source, ov.anchor.code.clone().unwrap_or_default())) else { return; };
+    let key = crate::diagnostics_run::dismissal_units_at(&editor.active().document.buffer, a);
+    if key.line.is_empty() {
+        editor.set_status_full(crate::status::StatusKind::Warning, "cannot dismiss here",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        editor.diag = None;
+        return;
+    }
+    editor.session_dismissals.insert((source, code, key));
     editor.diag = None;
     crate::diagnostics_run::retain_unignored(editor);
 }
@@ -635,5 +659,49 @@ mod tests {
         e.set_status(crate::status::StatusKind::Info, "later ack");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
         let _ = std::fs::remove_file(&parent);
+    }
+
+    /// E11 §5.3 (T7): the empty-key belt. A blank line has an EMPTY line-unit, which would key a
+    /// dismissal that matches every other blank line in the document — refuse at store time and
+    /// say so, rather than storing a key that silences unrelated flags.
+    #[test]
+    fn dismiss_on_an_empty_line_is_refused_at_store_time() {
+        let mut e = Editor::new_from_text("a\n\nb\n", None, (40, 10));
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 2..2,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX,
+            code: Some("R".into()), href: None, message: "m".into(), suggestions: vec![] };
+        e.open_diag(d);
+        // Select the DismissSession row (Grammar, no href, Done ⇒ rows = [NoFixes, Dismiss]).
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Done;
+        e.diag.as_mut().unwrap().selected = 1;
+        crate::search_ui::diag_apply_selected(&mut e, &crate::test_support::TestClock::new(0));
+        assert!(e.session_dismissals.is_empty(), "empty line-unit ⇒ refused (belt)");
+        assert_eq!(e.status_text(), "cannot dismiss here");
+    }
+
+    /// The companion the refusal test cannot supply: the `DismissSession` arm's SUCCESS path.
+    /// Without it an arm that only ever refused would still pass the belt test above. Pins the
+    /// stored triple (source, code, pair key), the close, and the in-place refilter.
+    #[test]
+    fn dismiss_stores_the_pair_key_closes_and_refilters_in_place() {
+        let mut e = Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        let d = Diagnostic { range: 18..23, kind: DiagnosticKind::Grammar, source: DiagSource::LTeX,
+            code: Some("R".into()), href: None, message: "m".into(), suggestions: vec![] };
+        e.active_mut().diagnostics.slot_mut(DiagSource::LTeX).diagnostics = vec![d.clone()];
+        assert_eq!(e.active().diagnostics.slot(DiagSource::LTeX).unwrap().diagnostics.len(), 1,
+            "precondition: the flag is in the store before the dismissal");
+        e.open_diag(d);
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Done;
+        e.diag.as_mut().unwrap().selected = 1; // rows = [NoFixes, DismissSession]
+        diag_apply_selected(&mut e, &TestClock(0));
+        let key = crate::diagnostics_run::dismissal_units_at(&e.active().document.buffer, 18);
+        assert_eq!(key.sentence, "Delta epsilon zeta.");
+        assert!(e.session_dismissals.contains(&(DiagSource::LTeX, "R".to_string(), key)),
+            "the (source, code, pair-key) triple is stored");
+        assert!(e.diag.is_none(), "the overlay closes on a dismissal");
+        assert!(e.active().diagnostics.slot(DiagSource::LTeX).unwrap().diagnostics.is_empty(),
+            "the underline disappears immediately — retain_unignored ran");
     }
 }

@@ -609,6 +609,12 @@ pub struct Editor {
     pub dictionary: std::collections::HashSet<String>,
     /// Session-level words to ignore (added via ignore-word command).
     pub session_ignores: std::collections::HashSet<String>,
+    /// E11 §5.3: session dismissals of INDIVIDUAL non-spelling flags, keyed by
+    /// `(source, code-or-empty, pair key)`. The pair key (enclosing sentence + enclosing line) is
+    /// what scopes a dismissal to one occurrence; `session_ignores` above cannot do this job
+    /// because it matches on the surface word and only suppresses `Spelling`. Ephemeral by
+    /// design — never persisted, so a dismissal outlives no session.
+    pub session_dismissals: crate::diagnostics_run::DismissSet,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
     /// Registered diagnostics providers (Effort A/SPINE). Empty `ProviderSet` by default →
@@ -762,6 +768,7 @@ impl Editor {
             export_cfg: crate::config::ExportConfig::default(),
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
+            session_dismissals: std::collections::HashSet::new(),
             diag: None,
             diag_providers: crate::diag_provider::ProviderSet::default(),
             active_analysis_source: wordcartel_core::diagnostics::DiagSource::Harper,
