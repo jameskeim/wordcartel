@@ -362,8 +362,8 @@ fn reduce_dispatch(msg: Msg, editor: &mut Editor, ctx: &crate::overlays::Dispatc
         Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
-        Msg::DiagFixesReady { token, version, suggestions, .. } =>
-            crate::search_ui::apply_diag_fixes_ready(editor, token, version, suggestions),
+        Msg::DiagFixesReady { token, buffer_id, version, suggestions, .. } =>
+            crate::search_ui::apply_diag_fixes_ready(editor, buffer_id, token, version, suggestions),
         Msg::DiagProviderEvent { source, event } =>
             crate::diag_provider::apply_provider_event(editor, source, event, ctx.clock),
         Msg::Tick => crate::timers::on_tick(editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs),

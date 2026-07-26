@@ -135,22 +135,31 @@ pub(crate) fn search_pin(editor: &mut Editor) {
     }
 }
 
-/// E11 §3.4: deliver a fix terminal — token-keyed CONSUMPTION, version-gated DISPLAY. Any
+/// E11 §3.4: deliver a fix terminal — (token, buffer)-keyed CONSUMPTION, version-gated
+/// DISPLAY; delivery consumes the token, so a re-delivery is silence. Any
 /// terminal for a token nobody holds is silence (displaced/expired/closed requests). TWO
 /// call sites: `app::reduce_dispatch`'s arm and `prompts::intercept`'s modal-delivery arm
 /// (the DiagProviderEvent "second delivery site" precedent) — one body, no drift.
-pub(crate) fn apply_diag_fixes_ready(editor: &mut Editor, token: u64, version: u64,
+pub(crate) fn apply_diag_fixes_ready(editor: &mut Editor, buffer_id: crate::editor::BufferId,
+    token: u64, version: u64,
     suggestions: Vec<wordcartel_core::diagnostics::Suggestion>) {
-    if editor.diag.as_ref().map(|ov| ov.fix_token) != Some(Some(token)) { return; }
+    // The buffer must match too: two freshly-opened buffers both sit at version 0, so the
+    // version check alone cannot discriminate them. Unreachable today (nothing switches
+    // buffers with the overlay up), but it goes live the moment anything does.
+    let ours = editor.diag.as_ref()
+        .is_some_and(|ov| ov.fix_token == Some(token) && ov.buffer_id == buffer_id);
+    if !ours { return; }
     let same_version = editor.diag.as_ref()
         .map(|ov| ov.opened_version == version && editor.active().document.version == version)
         .unwrap_or(false);
     if same_version {
         if let Some(ov) = editor.diag.as_mut() {
-            ov.anchor.suggestions = suggestions;
-            ov.fix_state = crate::diag_overlay::FixState::Done;
-            // T6 replaces this clamp with apply_fix_delivery (the §5.2 selection policy).
-            ov.selected = ov.selected.min(ov.row_count().saturating_sub(1));
+            // Consume the token: the request this overlay was waiting on is now satisfied, so
+            // a second terminal for it is silence. The state machine already promises
+            // exactly-once; this makes the delivery body self-protecting rather than
+            // dependent on that promise holding forever.
+            ov.fix_token = None;
+            ov.apply_fix_delivery(suggestions); // §5.2 selection policy — identity, not clamp
         }
     } else {
         editor.diag = None;
@@ -160,17 +169,24 @@ pub(crate) fn apply_diag_fixes_ready(editor: &mut Editor, token: u64, version: u
     }
 }
 
-/// Accept, ignore, or add-to-dict based on the overlay's current selection.
-/// Clears `editor.diag` when done (regardless of outcome).
+/// Activate the overlay's currently selected row (E11 §5.1 — keyed on the `DiagRow` VALUE,
+/// never on an index comparison). Clears `editor.diag` when an activatable row runs,
+/// regardless of outcome; the non-activatable rows leave it open.
 pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    use crate::diag_overlay::DiagRow;
     // Clone what we need out of the overlay before mutating editor.
     let overlay_info = editor.diag.as_ref().map(|ov| {
-        let is_ignore = ov.is_ignore();
-        let is_add_dict = ov.is_add_dict();
+        let row = ov.selected_row();
         let suggestion = ov.chosen_suggestion().cloned();
-        (ov.anchor.range.start, ov.anchor.range.end, is_ignore, is_add_dict, suggestion, ov.opened_version)
+        (ov.anchor.range.start, ov.anchor.range.end, row, suggestion, ov.opened_version)
     });
-    let Some((raw_a, raw_b, is_ignore, is_add_dict, suggestion, opened_version)) = overlay_info else { return; };
+    let Some((raw_a, raw_b, row, suggestion, opened_version)) = overlay_info else { return; };
+
+    // E11 §5.2: the fetch-state rows are inert at ALL times. Returning HERE — before the
+    // stale-anchor guard below — is what makes that unconditional: nothing is being applied,
+    // so there is no stale range to refuse, and an async delivery can never turn a documented
+    // no-op into an action (nor into a surprise overlay dismissal).
+    if matches!(row, None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes)) { return; }
 
     // Fix A4: if the buffer was mutated while the overlay was open, the anchor
     // ranges are stale.  Refuse to apply — a stale range can cause a panic on
@@ -189,59 +205,79 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
     let a = raw_a.min(doc_len);
     let b = raw_b.min(doc_len);
 
-    if is_ignore {
-        // Effort A: ephemeral session-ignore. Add the surface word, close, then refilter the store
-        // in place (no server round-trip — a full re-check to remove one underline is pure waste
-        // under LSP full-doc sync; the old re-arm is dropped, spec §7.3).
-        let word = editor.active().document.buffer.slice(a..b).to_string();
-        editor.session_ignores.insert(word);
-        editor.diag = None;
-        crate::diagnostics_run::retain_unignored(editor);
-    } else if is_add_dict {
-        // Effort A: single writer, no double-write (spec §7.4). `editor.dictionary` is updated FIRST
-        // and unconditionally — instant client-side suppression that holds even with no path — then
-        // `append_word_to_dict` (the sole file writer) persists to harper-ls's `userDictPath` and
-        // `reload_dictionary()` nudges the server to re-read that same file (a config resend, NOT a
-        // second write). The None case still suppresses the word; harper falls back to its own path.
-        let word = editor.active().document.buffer.slice(a..b).to_string();
-        editor.dictionary.insert(word.clone());
-        match editor.diag_cfg.dictionary.clone() {
-            // fs-chokepoint-allow: (w) config-class read — the personal dictionary, not document content
-            Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
-                Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
-                Err(e) => editor.set_status_full(crate::status::StatusKind::Error, format!("add to dictionary failed: {e}"),
-                    crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
-            },
-            None => editor.set_status_full(crate::status::StatusKind::Warning, "no dictionary path configured",
-                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
+    // Exhaustive on purpose: a new `DiagRow` variant must be PLACED here by the compiler,
+    // not silently absorbed into a catch-all.
+    match row {
+        Some(DiagRow::IgnoreOnce) => diag_ignore_once(editor, a, b),
+        Some(DiagRow::AddToDictionary) => diag_add_to_dictionary(editor, a, b),
+        // The row carries the index; `suggestion` was resolved through it above.
+        Some(DiagRow::Suggestion(_)) => {
+            if let Some(s) = suggestion { diag_apply_suggestion(editor, &s, a, b, doc_len, clock); }
         }
-        editor.diag = None;
-        crate::diagnostics_run::retain_unignored(editor);
-    } else if let Some(s) = suggestion {
-        // Apply the suggestion as an undoable edit, then close.
-        let (cs, edit) = match &s {
-            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) =>
-                crate::commands::build_range_replace(a, b, t, doc_len),
-            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) =>
-                crate::commands::build_range_replace(b, b, t, doc_len),
-            wordcartel_core::diagnostics::Suggestion::Remove =>
-                crate::commands::build_range_replace(a, b, "", doc_len),
-        };
-        // Determine cursor position: for ReplaceWith/InsertAfter place after inserted text;
-        // for Remove place at a (start of deleted region).
-        let new_cursor = match &s {
-            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) => a + t.len(),
-            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) => b + t.len(),
-            wordcartel_core::diagnostics::Suggestion::Remove => a,
-        };
-        let txn = wordcartel_core::history::Transaction::new(cs)
-            .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
-        let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // H24: see module doc
-        crate::registry::unfold_ancestors_of(editor, new_cursor);
-        crate::edit_apply::resettle(editor); // reflect the unfold on the already-reparsed tree
-        editor.diag = None;
+        Some(DiagRow::LearnMore) => {} // T8 fills this in (copy the href + the mandatory ack).
+        Some(DiagRow::DismissSession) => {} // T7 fills this in (the session-dismissal key).
+        None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes) => {} // returned above
     }
-    // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
+}
+
+/// "Ignore once" (Effort A): ephemeral session-ignore. Add the surface word, close, then
+/// refilter the store in place (no server round-trip — a full re-check to remove one underline
+/// is pure waste under LSP full-doc sync; the old re-arm is dropped, spec §7.3).
+fn diag_ignore_once(editor: &mut Editor, a: usize, b: usize) {
+    let word = editor.active().document.buffer.slice(a..b).to_string();
+    editor.session_ignores.insert(word);
+    editor.diag = None;
+    crate::diagnostics_run::retain_unignored(editor);
+}
+
+/// "Add to dictionary" (Effort A): single writer, no double-write (spec §7.4).
+/// `editor.dictionary` is updated FIRST and unconditionally — instant client-side suppression
+/// that holds even with no path — then `append_word_to_dict` (the sole file writer) persists to
+/// harper-ls's `userDictPath` and `reload_dictionary()` nudges the server to re-read that same
+/// file (a config resend, NOT a second write). The None case still suppresses the word; harper
+/// falls back to its own path.
+fn diag_add_to_dictionary(editor: &mut Editor, a: usize, b: usize) {
+    let word = editor.active().document.buffer.slice(a..b).to_string();
+    editor.dictionary.insert(word.clone());
+    match editor.diag_cfg.dictionary.clone() {
+        // fs-chokepoint-allow: (w) config-class read — the personal dictionary, not document content
+        Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
+            Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
+            Err(e) => editor.set_status_full(crate::status::StatusKind::Error, format!("add to dictionary failed: {e}"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
+        },
+        None => editor.set_status_full(crate::status::StatusKind::Warning, "no dictionary path configured",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
+    }
+    editor.diag = None;
+    crate::diagnostics_run::retain_unignored(editor);
+}
+
+/// Apply a chosen suggestion as one undoable edit, then close the overlay. `a`/`b` are the
+/// anchor range already clamped to `doc_len` by the caller.
+fn diag_apply_suggestion(editor: &mut Editor, s: &wordcartel_core::diagnostics::Suggestion,
+    a: usize, b: usize, doc_len: usize, clock: &dyn wordcartel_core::history::Clock) {
+    let (cs, edit) = match s {
+        wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) =>
+            crate::commands::build_range_replace(a, b, t, doc_len),
+        wordcartel_core::diagnostics::Suggestion::InsertAfter(t) =>
+            crate::commands::build_range_replace(b, b, t, doc_len),
+        wordcartel_core::diagnostics::Suggestion::Remove =>
+            crate::commands::build_range_replace(a, b, "", doc_len),
+    };
+    // Determine cursor position: for ReplaceWith/InsertAfter place after inserted text;
+    // for Remove place at a (start of deleted region).
+    let new_cursor = match s {
+        wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) => a + t.len(),
+        wordcartel_core::diagnostics::Suggestion::InsertAfter(t) => b + t.len(),
+        wordcartel_core::diagnostics::Suggestion::Remove => a,
+    };
+    let txn = wordcartel_core::history::Transaction::new(cs)
+        .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
+    let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // H24: see module doc
+    crate::registry::unfold_ancestors_of(editor, new_cursor);
+    crate::edit_apply::resettle(editor); // reflect the unfold on the already-reparsed tree
+    editor.diag = None;
 }
 
 /// Search overlay intercepts KEY INPUT only; non-key messages (FilterDone/JobDone/
@@ -440,6 +476,102 @@ mod tests {
             matches!(c, crate::diag_provider::ProviderCall::NotifyChange { .. })),
             "no full re-check is dispatched — the client filter hides the word immediately");
         assert!(e.dictionary.contains("teh"), "word also suppressed client-side");
+    }
+
+    /// Build a suggestion-free Grammar diagnostic — the shape whose row 0 IS a fetch-state
+    /// row (`FetchingFixes` while fetching, `NoFixes` once done).
+    fn grammar_no_sugg() -> Diagnostic {
+        Diagnostic { range: 0..1, kind: DiagnosticKind::Grammar, source: DiagSource::LTeX,
+            code: Some("R".into()), href: None, message: "m".into(), suggestions: vec![] }
+    }
+
+    /// E11 §5.2: the two fetch-state rows are NOT activatable. Enter on them neither edits the
+    /// document nor dismisses the overlay — the row is inert, in both fetch states.
+    #[test]
+    fn enter_on_fetching_and_nofixes_rows_is_a_noop() {
+        for fetch_state in [crate::diag_overlay::FixState::Fetching,
+                            crate::diag_overlay::FixState::Done] {
+            let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+            e.open_diag(grammar_no_sugg());
+            e.diag.as_mut().unwrap().fix_state = fetch_state;
+            e.diag.as_mut().unwrap().selected = 0; // FetchingFixes or NoFixes, per state
+            let v = e.active().document.version;
+            crate::search_ui::diag_apply_selected(&mut e, &crate::test_support::TestClock::new(0));
+            assert_eq!(e.active().document.version, v, "no edit from a no-op row");
+            assert!(e.diag.is_some(), "overlay stays open — the row is inert, not a dismissal");
+        }
+    }
+
+    /// The teeth of the test above: "inert" has to mean inert, not "happens to fall through to
+    /// a branch that does nothing". A STALE anchor makes the two behaviours separable — every
+    /// activatable row closes the overlay with the Fix-A4 sticky warning, so a no-op row that
+    /// merely fell through the row match would close it too. It must not: nothing is being
+    /// applied, so there is nothing for the stale-range guard to refuse.
+    #[test]
+    fn a_no_op_row_stays_inert_even_when_the_anchor_is_stale() {
+        for fetch_state in [crate::diag_overlay::FixState::Fetching,
+                            crate::diag_overlay::FixState::Done] {
+            let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+            e.open_diag(grammar_no_sugg());
+            e.diag.as_mut().unwrap().fix_state = fetch_state;
+            e.diag.as_mut().unwrap().selected = 0;
+            e.active_mut().document.version += 1; // buffer mutated while the overlay was open
+            crate::search_ui::diag_apply_selected(&mut e, &TestClock(0));
+            assert!(e.diag.is_some(), "an inert row does not trip the stale-anchor refusal");
+            assert_ne!(e.status_text(), "document changed; re-open",
+                "no refusal status either — nothing was applied");
+        }
+    }
+
+    /// E11 §3.4 + T5-review carry-forward 1: the delivery guard is (token, buffer, version).
+    /// Two freshly-opened buffers both sit at version 0, so the version check alone cannot
+    /// discriminate them — only `buffer_id` can. Unreachable through `reduce` today (no
+    /// overlay-surviving buffer switch exists), so the guard is exercised directly.
+    #[test]
+    fn a_terminal_for_another_buffer_is_dropped_even_at_the_same_version() {
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        e.open_diag(grammar_no_sugg());
+        let ov = e.diag.as_mut().unwrap();
+        ov.fix_token = Some(7);
+        ov.fix_state = crate::diag_overlay::FixState::Fetching;
+        let other = crate::editor::BufferId(e.active().id.0 + 1);
+        let version = e.active().document.version;
+        apply_diag_fixes_ready(&mut e, other, 7, version,
+            vec![Suggestion::ReplaceWith("x".into())]);
+        let ov = e.diag.as_ref().expect("overlay untouched");
+        assert!(ov.anchor.suggestions.is_empty(), "another buffer's terminal delivered nothing");
+        assert_eq!(ov.fix_state, crate::diag_overlay::FixState::Fetching, "still waiting");
+    }
+
+    /// T5-review carry-forward 2: delivery CONSUMES the token. The state machine promises one
+    /// terminal per token, but the delivery body must be self-protecting — a second terminal
+    /// for a consumed token would otherwise wipe the delivered suggestions (and re-aim Enter).
+    #[test]
+    fn delivery_consumes_the_token_so_a_second_terminal_cannot_wipe_it() {
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        e.open_diag(grammar_no_sugg());
+        let ov = e.diag.as_mut().unwrap();
+        ov.fix_token = Some(7);
+        ov.fix_state = crate::diag_overlay::FixState::Fetching;
+        let (bid, version) = (e.active().id, e.active().document.version);
+        apply_diag_fixes_ready(&mut e, bid, 7, version, vec![Suggestion::ReplaceWith("x".into())]);
+        assert_eq!(e.diag.as_ref().unwrap().fix_token, None, "the token is consumed on delivery");
+        apply_diag_fixes_ready(&mut e, bid, 7, version, vec![]); // a second terminal, same token
+        assert_eq!(e.diag.as_ref().unwrap().anchor.suggestions.len(), 1,
+            "the re-delivery was dropped; the delivered suggestions survive");
+    }
+
+    /// The `prompts::intercept` DiagFixesReady arm is defense-in-depth: no production route
+    /// raises a modal prompt while the quick-fix overlay is open. That XOR is a real invariant
+    /// of `open_prompt`, not an assumption — pin it, so a future prompt-raising path that
+    /// leaves the overlay up shows as a red test rather than as a mis-aimed delivery.
+    #[test]
+    fn open_prompt_closes_the_diag_overlay() {
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        e.open_diag(grammar_no_sugg());
+        assert!(e.diag.is_some(), "precondition: the overlay is up");
+        e.open_prompt(crate::prompt::Prompt::quit_confirm());
+        assert!(e.diag.is_none(), "raising a modal prompt closes the quick-fix overlay");
     }
 
     /// A17 T4: an invalid-regex replace-all refusal must land Sticky/Error — surviving a

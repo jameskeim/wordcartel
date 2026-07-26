@@ -803,7 +803,8 @@ pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyl
         crate::app::keep_overlay_visible(h, d.selected, d.row_count(), &mut d.scroll_top);
     }
     if let Some(ref diag_ov) = editor.diag {
-        let row_count = diag_ov.row_count();
+        let rows = diag_ov.rows();
+        let row_count = rows.len();
         let ov_rect = palette_overlay_rect(area, row_count);
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
@@ -827,16 +828,20 @@ pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyl
             let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h_u16);
             let highlight_style = cs.overlay_selected;
             let scroll_top = diag_ov.scroll_top;
-            let end = (scroll_top + list_h).min(row_count);
 
-            let n_sugg = diag_ov.anchor.suggestions.len();
-            let items: Vec<ListItem> = (scroll_top..end).map(|i| {
-                let label = if i < n_sugg {
-                    crate::diag_overlay::suggestion_label(&diag_ov.anchor.suggestions[i])
-                } else if i == n_sugg {
-                    "Ignore once".to_string()
-                } else {
-                    "Add to dictionary".to_string()
+            // E11 §5.1: labels come from the SAME computed row list the windowing, mouse
+            // hit-testing, and apply paths read — never from re-derived index arithmetic.
+            use crate::diag_overlay::DiagRow;
+            let items: Vec<ListItem> = rows.iter().skip(scroll_top).take(list_h).map(|row| {
+                let label = match row {
+                    DiagRow::Suggestion(i) => diag_ov.anchor.suggestions.get(*i)
+                        .map_or_else(String::new, crate::diag_overlay::suggestion_label),
+                    DiagRow::FetchingFixes => "fetching fixes…".to_string(),
+                    DiagRow::NoFixes => "(no fixes available)".to_string(),
+                    DiagRow::LearnMore => "Learn more (copy link)".to_string(),
+                    DiagRow::IgnoreOnce => "Ignore once".to_string(),
+                    DiagRow::AddToDictionary => "Add to dictionary".to_string(),
+                    DiagRow::DismissSession => "Dismiss for this session".to_string(),
                 };
                 let truncated: String = label.chars().take(list_area.width as usize).collect();
                 ListItem::new(Line::from(truncated))
@@ -1229,6 +1234,45 @@ mod tests {
             "the footer text must land in its OWN dedicated row: {:?}", row_text(&term, footer_row));
         assert!(!row_text(&term, title_row).contains("new-chapter"),
             "and must NOT be squeezed into the border title instead: {:?}", row_text(&term, title_row));
+    }
+
+    // ---- the diag overlay paints the COMPUTED row list ----------------------------
+
+    /// E11 §5.1: `paint_diag`'s labels must come from `DiagOverlay::rows()`, so what the writer
+    /// READS is what mouse hit-testing and Enter ACT on. Asserted on the drawn cell grid rather
+    /// than on the row list, because the row list being right proves nothing about the painter:
+    /// the old label ladder re-derived row identity from `i < n_sugg` arithmetic of its own, and
+    /// that is exactly the drift this test exists to catch. The fixture is the shape where the
+    /// two disagree hardest — a Grammar flag mid-fetch with a documentation link, whose every
+    /// row is one the old ladder could not name.
+    ///
+    /// FAIL-VERIFY (mutation): restore the old `i < n_sugg` label ladder — all three row
+    /// assertions fail (the rows read `Ignore once` / `Add to dictionary` / blank). Confirmed,
+    /// then reverted.
+    #[test]
+    fn diag_rows_reach_the_screen_with_their_row_model_labels() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX, code: Some("R".into()),
+            href: Some("https://example/rule".into()), message: "m".into(),
+            suggestions: vec![] });
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Fetching;
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_diag(f, &mut e, &cs)).expect("draw");
+        let first = ov_rect.y + 1; // list starts inside the border; no query row
+        let drawn: Vec<String> = (0..3).map(|i| row_text(&term, first + i)).collect();
+        assert!(drawn[0].contains("fetching fixes"),
+            "row 0 is the live-fetch placeholder, not a silent blank: {:?}", drawn[0]);
+        assert!(drawn[1].contains("Learn more (copy link)"),
+            "the href row is drawn where rows() puts it: {:?}", drawn[1]);
+        assert!(drawn[2].contains("Dismiss for this session"),
+            "a Grammar flag gets the session dismiss, not the spelling rows: {:?}", drawn[2]);
+        assert!(!drawn.iter().any(|r| r.contains("Ignore once") || r.contains("Add to dictionary")),
+            "and NEVER the spelling-shaped rows — the visible-no-op this effort exists to fix");
     }
 
     // ---- the DRAWN box is the one chrome_geom describes ---------------------------
