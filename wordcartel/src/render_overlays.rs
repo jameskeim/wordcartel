@@ -403,6 +403,27 @@ fn elide_path_left(line: &str, width: usize) -> String {
     format!("\u{2026}{tail}")
 }
 
+/// The status row's disclosure boxes: whichever of them the live editor state calls for.
+///
+/// One delegation out of `render::paint_status`, holding the per-surface guards that used to
+/// sit inline there. The seam exists because `render.rs` is a budgeted anti-regrowth hub
+/// (`tests/module_budgets.rs`) and a second inline guard pushed it over: a new disclosure box
+/// must add a *branch here*, in the painters' own module, not bulk to the status-row hub.
+///
+/// Neither box is an `OVERLAYS`-table render site — see the two painters' own docs. Both
+/// paint nothing at all when their owning surface is absent or has nothing to disclose, so
+/// the ordinary status row is byte-identical to what it was before this seam existed.
+pub(crate) fn paint_detail_boxes(frame: &mut Frame, editor: &Editor, area: Rect,
+    status_row: u16, cs: &ChromeStyles)
+{
+    if let Some(ref prompt) = editor.prompt {
+        paint_prompt_detail(frame, prompt, area, status_row, cs);
+    }
+    if let Some(ref diag) = editor.diag {
+        paint_diag_detail(frame, diag, area, status_row, cs);
+    }
+}
+
 /// Paint a prompt's `detail` disclosure box directly above the status row.
 ///
 /// **Not an `OVERLAYS`-table painter.** The prompt's row in `overlays.rs` is, and stays,
@@ -466,6 +487,110 @@ pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Pro
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
             Rect::new(ov_rect.x + 1, y, inner_w as u16, 1),
+        );
+    }
+}
+
+/// Plain word wrap to `width` columns — prose, not paths.
+///
+/// The prompt disclosure's left-elision rule is deliberately NOT inherited here: it exists so a
+/// path keeps its filename and its trailing age, and applied to a sentence it would eat exactly
+/// the words a reader starts from. Runs of whitespace collapse to a single space (the wire
+/// message is one logical paragraph however the engine punctuated its newlines), and a word
+/// longer than the whole box is hard-broken rather than dropped, so no fragment of the
+/// explanation can silently vanish. An empty or whitespace-only message yields no rows at all —
+/// a blank line in the box would read as a rendering fault.
+///
+/// Counted in `chars`, matching every other overlay-box fitter in this module.
+fn wrap_prose(text: &str, width: usize) -> Vec<String> {
+    if width == 0 { return Vec::new(); }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+        // A single word wider than the box: break it hard so the tail still reaches the screen.
+        while cur.chars().count() > width {
+            out.push(cur.chars().take(width).collect());
+            cur = cur.chars().skip(width).collect();
+        }
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
+/// Paint the diagnostic detail box — the wrapped full `message` plus its `engine · code`
+/// attribution — bottom-anchored above the status row while the quick-fix overlay is open.
+///
+/// **Why a separate box rather than more rows in the overlay.** The overlay's title is one
+/// character-truncated line: adequate for `Did you mean "receive"?`, useless for the full
+/// sentences the grammar and style engines report. Growing the centered overlay instead would
+/// make the explanation and the fix rows compete for one box, and on a short terminal the
+/// suggestions — the actionable part — would be the rows pushed out. An independent region can
+/// decline to paint on its own, so the explanation is what yields.
+///
+/// **The consequence, which is load-bearing:** because this box can vanish, nothing actionable
+/// may live in it. It carries the message, the attribution, and (courtesy only) the `href`. The
+/// action rows, `Learn more` included, all stay in the overlay.
+///
+/// **Not an `OVERLAYS`-table painter**, exactly like `paint_prompt_detail`: the diag row in
+/// `overlays.rs` is and stays `RenderSite::Frame(paint_diag)`. This is body painted *for* that
+/// one overlay from `render::paint_status`, not a second render site — so `RenderSite` keeps its
+/// single-valued axis and H21's render-coverage test is untouched (E11 §6).
+///
+/// Geometry, including the strict cap below the overlay that keeps the two rects disjoint, lives
+/// in `chrome_geom::diag_detail_rect`; `None` from it means "no room" and paints nothing at all.
+/// When the box is shorter than the composed lines, the last visible row becomes an `…and N
+/// more` count, so a truncated explanation announces itself instead of just stopping.
+pub(crate) fn paint_diag_detail(frame: &mut Frame, diag: &crate::diag_overlay::DiagOverlay,
+    area: Rect, status_row: u16, cs: &ChromeStyles)
+{
+    // `palette_overlay_rect`'s WIDTH is a pure function of `area.width` — the row count only
+    // moves its height — so wrapping to it before the rect exists is exact, not an estimate.
+    let inner_w = palette_overlay_rect(area, 1).width.saturating_sub(2) as usize;
+    let mut lines = wrap_prose(&diag.anchor.message, inner_w);
+    // The attribution OMITS the code entirely when the engine reported none — a trailing
+    // separator would advertise a field that does not exist.
+    lines.push(match diag.anchor.code.as_deref() {
+        Some(c) => format!("{} \u{b7} {}", diag.anchor.source.label(), c),
+        None => diag.anchor.source.label().to_string(),
+    });
+    if let Some(href) = diag.anchor.href.as_deref() { lines.push(href.to_string()); }
+
+    let overlay = palette_overlay_rect(area, diag.row_count());
+    let Some(ov_rect) = crate::chrome_geom::diag_detail_rect(area, status_row, overlay, lines.len())
+    else { return };
+
+    frame.render_widget(Clear, ov_rect);
+    frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).border_style(cs.overlay_border),
+        ov_rect,
+    );
+
+    // Re-read the interior from the rect the geometry actually returned, so the paint stays in
+    // bounds even if the width ladder is ever made row-count-dependent behind our backs.
+    let paint_w = ov_rect.width.saturating_sub(2) as usize;
+    let body_h = ov_rect.height.saturating_sub(2) as usize;
+    for i in 0..body_h {
+        let text = if body_h < lines.len() && i + 1 == body_h {
+            format!("\u{2026}and {} more", lines.len() - i)
+        } else {
+            lines[i].clone()
+        };
+        // Prose keeps its OPENING words when it must be cut — the prompt box's heading rule,
+        // for the same reason: a sentence's meaning is at its start.
+        let fitted: String = text.chars().take(paint_w).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(fitted, cs.ov_query))),
+            Rect::new(ov_rect.x + 1, ov_rect.y + 1 + i as u16, paint_w as u16, 1),
         );
     }
 }
@@ -1345,6 +1470,32 @@ mod tests {
             "…and its last is the selected final row: {:?}", drawn[14]);
         assert!(!drawn.iter().any(|r| r.contains("fix-00") || r.contains("fix-04")),
             "the scrolled-past rows are not on screen at all");
+    }
+
+    // ---- the detail box's prose wrap (E11 §6) -------------------------------------
+
+    /// Three rules, three fixtures — each one arranged so that ONLY the rule it names decides
+    /// the outcome, because a message that happens to fit tests none of them.
+    #[test]
+    fn wrap_prose_breaks_at_spaces_hard_breaks_giant_words_and_drops_nothing() {
+        // (a) Break at a space, never mid-word. 20 columns, words that straddle the margin.
+        assert_eq!(wrap_prose("the quick brown fox jumped over", 20),
+            vec!["the quick brown fox", "jumped over"],
+            "wraps on the last space that fits, so no word is cut in half");
+
+        // (b) A word wider than the whole box has no space to break at — the rule above cannot
+        // fire, and dropping the overflow would silently swallow part of the explanation.
+        let url = "https://example.test/a/very/long/rule/path";
+        assert_eq!(wrap_prose(url, 10),
+            vec!["https://ex", "ample.test", "/a/very/lo", "ng/rule/pa", "th"],
+            "hard-broken into full-width rows; every character still reaches the screen");
+        assert_eq!(wrap_prose(url, 10).concat(), url, "and reassembles to the original, exactly");
+
+        // (c) Nothing to say → NO row. A blank interior row reads as a rendering fault, and an
+        // empty vec is also what lets the geometry decline instead of drawing an empty box.
+        assert!(wrap_prose("", 20).is_empty(), "an empty message yields no rows at all");
+        assert!(wrap_prose("   \n\t ", 20).is_empty(), "and neither does whitespace-only");
+        assert!(wrap_prose("anything", 0).is_empty(), "nor does a zero-width box");
     }
 
     // ---- the DRAWN box is the one chrome_geom describes ---------------------------
