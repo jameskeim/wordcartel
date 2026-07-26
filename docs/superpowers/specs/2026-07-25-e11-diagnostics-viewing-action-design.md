@@ -245,13 +245,30 @@ overlay's anchor (§3.5).
      `on_server_gone` already cleared). With it the no-leak invariant is UNIFORM across all
      three reopen paths — crash-respawn, watchdog retirement, and suspend/resume — pinned by
      the T4 cycle-count test extended to the resume path.
-  2. **Await-attribution:** `last_raw` is stored ONLY when the publish ANSWERS a live
-     `awaiting_publish` entry, and its tag is the AWAIT's `our_version` (`a.our_version` —
-     recorded when the soliciting didOpen/didChange was sent), never the ambient
-     `d.our_version`. Unsolicited publishes (e.g. ltex's config-triggered republishes,
-     probe-observed in Q3) do NOT update `last_raw`. Within a never-timed-out generation the
-     app-side in-flight latch guarantees at most one solicited check outstanding per buffer,
-     so an answering publish's await-version is the honest snapshot identity.
+  2. **Lockstep attribution (T10-F1 correction — this is the NORMATIVE rule; the code
+     implements it):** `last_raw` is updated UNCONDITIONALLY on every attributed publish,
+     tagged with the same value that publish's `DiagnosticsDone` carries (`tagged`, the
+     ambient `d.our_version`) — so the store and the echo source move together BY
+     CONSTRUCTION, and the invariant is: **the displayed anchor's provenance always equals
+     the echo's provenance.**
+     **Why the earlier await-attribution rule was RETIRED (do not "restore" it):** round 4 of
+     the spec gate added a rule that stored `last_raw` only when a publish answered a live
+     `awaiting_publish` entry, tagged with the await's version — protecting snapshot
+     provenance. The T10 live probe proved that rule assumed a publish/await CARDINALITY —
+     exactly one publish per solicitation — that harper honors and ltex violates: an ltex
+     straggler publish answering the NEXT check's await left `last_raw` holding the prior
+     check's raws under the current tag while the store took the final publish, a 100%
+     reproducible apply→undo→reopen desync that permanently killed the repaired diagnostic's
+     fixes ("(no fixes available)" with no fetch). Pairing, not snapshot provenance, is the
+     load-bearing property. The provenance residual the await rule protected against is
+     instead STRUCTURALLY bounded (round 4's mechanism, unchanged): `Suggestion` carries text
+     only, the applied edit is built from the frozen `anchor.range` plus the user-selected
+     visible string, the send-time triple-match filters, and `opened_version` refuses any
+     post-open change — a misattributed publish can at worst DISPLAY a stale suggestion,
+     never redirect an edit. Both final gates verified that bound on the shipped code.
+     Regression pins: `straggler_publish_between_checks_does_not_desync_anchor_from_echo`
+     (reddens if await-gating is restored) and
+     `every_attributed_publish_updates_last_raw_in_lockstep_with_the_store`.
   **The residual, and why a mis-attributed request cannot become a wrong EDIT (round-4
   Critical 1 — consequence bounded by MECHANISM, not prose):** with a version-omitting server,
   one mis-attribution interleaving survives any client-side rule — an UNSOLICITED republish
@@ -794,16 +811,17 @@ transcripts are on disk; use their exact action objects as fixtures).
 conversion. **`last_raw` ownership (round-4 Minor 5, stated so the split cannot be read two
 ways): T3 adds ONLY the `DocState.last_raw` field and its clearing sites (close; the §3.3
 retirement) — it stores NOTHING (the field stays `None`; no fix requests exist yet, so this
-is inert and green). ALL storage — the await-attribution rule — lands in T4 with the rest of
-the attribution machinery; an interim ambient-version store would recreate the round-3
-Critical.** Includes the deliberate rewrite of the affected harper pinned tests (§3.7) — the
+is inert and green). ALL storage lands in T4 with the rest of the attribution machinery.
+(Historical note: this originally named the await-attribution rule, since RETIRED by the
+T10-F1 correction — §3.3 rule 2, lockstep attribution, is normative.)** Includes the deliberate rewrite of the affected harper pinned tests (§3.7) — the
 task's description says so in its commit message.
 
 **T4 — the `pending_fix` slot + request/response/deadline/flush (TDD).** §3.3/§3.4 complete:
 `Cmd::RequestFixes` (token-carrying) with first-class `on_inbound` materialization (slot +
-deadline live in EVERY phase, never queued), the §3.3 ATTRIBUTION rules — await-attribution
-(`last_raw` stored only when a publish answers a live await, tagged with the await's
-`our_version`; unsolicited publishes never stored) + generation retirement on watchdog expiry
+deadline live in EVERY phase, never queued), the §3.3 ATTRIBUTION rules — as-built: the
+await-attribution rule, since RETIRED and replaced by lockstep attribution in the T10-F1
+fix commit (§3.3 rule 2 is normative; this task text is the execution record) + generation
+retirement on watchdog expiry
 (`on_deadline` removes the retired `uri_owner` entry, sends `didClose`, clears `last_raw`,
 marks the doc closed; the round-3 Critical-1 regression: a late publish to the retired URI is
 dropped whole, never tagged; the round-4 Important-2 no-leak regression: after N retirement

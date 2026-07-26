@@ -1026,3 +1026,27 @@ default.**
 Anchors: `lsp_rpc::doc_uri`, `lsp_client::ClientState::{on_change, on_publish}`, `uri_owner`,
 `diagnostics_run::install_core_providers`. Related: E10 (shipped the provider), E11 (shipped the
 mapping + the default-off mitigation). Grounding: Fable, 2026-07-26. ~M.
+
+### B19 — Display-column-aware text fitting — wrap_prose and its sibling fitters count chars, not columns
+<!-- item: B19 -->
+
+**Filed out of E11's whole-branch review (2026-07-26), which ruled it does NOT block merge.**
+`render_overlays::wrap_prose` wraps on a `chars()` count, not display columns. A CJK message wrapped
+to a 28-column interior therefore yields 28-CHARACTER lines that ratatui clips at 28 COLUMNS —
+roughly half of every line never reaches the screen, and the `…and N more` elision count does not
+account for the loss. Probed at 40×14: no panic, no frame resize; silent truncation only.
+
+**Why it is filed module-wide rather than fixed in place.** Every other fitter in that module
+behaves identically — `elide_path_left`, `paint_prompt_detail`, and the overlay row truncation all
+count chars. Fixing `wrap_prose` alone would leave the detail box column-correct while the overlay
+title above it and the prompt box beside it stay char-counted, which is worse than uniform: the
+same message would fit differently in two adjacent boxes. The fix is one pass over the module's
+fitting helpers, using the width machinery the layout engine already has (the editor proper is
+column-correct — this is a chrome/overlay gap, not a core one).
+
+**Consequence when it bites:** a writer using CJK (or any wide-glyph script) sees prose-linter
+explanations, prompt detail, and elided paths truncated well before the visible edge. No data loss,
+no panic, no wrong edit — a display-fidelity defect, which is why it rode.
+
+Anchors: `render_overlays::{wrap_prose, paint_prompt_detail, elide_path_left}`. The project already
+tests multibyte text (`é` / `中` / `🙂`) elsewhere, so fixtures exist to model on. ~S–M.
