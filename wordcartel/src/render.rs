@@ -1258,6 +1258,15 @@ mod tests {
     /// un-paint the title. So both directions are pinned on text ONLY this box produces —
     /// the message's TAIL, which is precisely what the one-line title drops, and the
     /// attribution line, which nothing else in the app renders.
+    ///
+    /// **The short screen is 80x8, and the 8 is load-bearing.** At 80x6 the box rect and the
+    /// overlay rect are the SAME rect (`x=16 w=48 y=0 h=5`), and the overlay paints last — so
+    /// a box that failed to decline would be clobbered off the grid and the negatives below
+    /// would hold anyway, documenting the decline instead of pinning it. 80x8 puts the
+    /// overlay's floor two rows above the status row: the cap still refuses (two rows cannot
+    /// hold two borders and a line), but an UNCAPPED box would reach row 5 with its last
+    /// composed line — the attribution — in the clear, where the negative can see it. Measured:
+    /// removing the cap reddens the attribution assertion here and not at 80x6.
     #[test]
     fn diag_detail_box_renders_message_on_tall_screens_and_declines_on_short() {
         let mk = || {
@@ -1277,9 +1286,15 @@ mod tests {
             "the message's TAIL reaches the screen — the whole point, since the title cuts it \
              at `…by this sente`:\n{tall}");
         assert!(tall.contains("LTeX \u{b7} PASSIVE_VOICE"), "attribution line renders:\n{tall}");
-        let short = screen_text(&render_to_buffer(&mut mk(), 80, 6));
+        // Precondition, stated in geometry rather than in prose: at 80x8 the overlay stops
+        // two rows above the status row, so an uncapped box WOULD have visible rows here.
+        let short_area = Rect::new(0, 0, 80, 8);
+        let short_ov = crate::chrome_geom::palette_overlay_rect(short_area, 2);
+        assert_eq!(7 - (short_ov.y + short_ov.height), 2,
+            "precondition: {short_ov:?} leaves two rows in the clear above the status row");
+        let short = screen_text(&render_to_buffer(&mut mk(), 80, 8));
         assert!(short.contains("The passive voice was used"),
-            "precondition: the TITLE still renders at 80x6, which is why the naive negative \
+            "precondition: the TITLE still renders at 80x8, which is why the naive negative \
              assertion cannot be used to detect the box:\n{short}");
         assert!(!short.contains("sentence."),
             "the box DECLINED on a short screen — nothing load-bearing lived in it:\n{short}");

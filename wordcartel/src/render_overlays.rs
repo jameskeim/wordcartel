@@ -448,7 +448,7 @@ pub(crate) fn paint_detail_boxes(frame: &mut Frame, editor: &Editor, area: Rect,
 /// **indented line is an item** — path-shaped, with the filename and the trailing age at its
 /// END — so it elides from the LEFT via `elide_path_left`. Eliding a heading from the left
 /// produced the observed `…ng 18 that may hold unsaved work:` on a 60-column terminal.
-pub(crate) fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Prompt,
+fn paint_prompt_detail(frame: &mut Frame, prompt: &crate::prompt::Prompt,
     area: Rect, status_row: u16, cs: &ChromeStyles)
 {
     let lines = &prompt.detail;
@@ -549,7 +549,7 @@ fn wrap_prose(text: &str, width: usize) -> Vec<String> {
 /// in `chrome_geom::diag_detail_rect`; `None` from it means "no room" and paints nothing at all.
 /// When the box is shorter than the composed lines, the last visible row becomes an `…and N
 /// more` count, so a truncated explanation announces itself instead of just stopping.
-pub(crate) fn paint_diag_detail(frame: &mut Frame, diag: &crate::diag_overlay::DiagOverlay,
+fn paint_diag_detail(frame: &mut Frame, diag: &crate::diag_overlay::DiagOverlay,
     area: Rect, status_row: u16, cs: &ChromeStyles)
 {
     // `palette_overlay_rect`'s WIDTH is a pure function of `area.width` — the row count only

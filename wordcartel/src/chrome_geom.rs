@@ -618,9 +618,48 @@ mod tests {
 
         // (c) An overlay whose bottom edge is BELOW the status row — unreachable from
         // `palette_overlay_rect`, which cannot exceed its own area, but reachable from a
-        // hostile Resize or a future caller. The cap must decline, not wrap the subtraction.
+        // hostile Resize or a future caller. What this pins is the OUTCOME, and only that:
+        // `checked_sub` is NOT decisive here on its own, because `saturating_sub` would yield
+        // 0 and the `height < 3` guard below would refuse it identically (measured — that
+        // mutation survives). The `?` stays because refusing at the arithmetic is the right
+        // defensive form, but the mutation this fixture actually catches is a plain `-`,
+        // which panics in debug and — the reason the assertion is worth its line — WRAPS in
+        // release into a ~65 000-row rect that would be painted.
         assert_eq!(diag_detail_rect(tall, 23, Rect::new(0, 0, 80, 40), 3), None,
             "a cap past the anchor is refused, never turned into a giant rect by underflow");
+    }
+
+    /// The `height < 3` non-degeneracy bound is a BOUNDARY, and the boundary is what needs
+    /// pinning: a fixture that only exercises a 0-row gap leaves `height < 1` — which returns
+    /// a border-only sliver above the status row — indistinguishable from the real guard.
+    ///
+    /// A 1–2 row gap between the overlay's floor and the status row is not a contrived
+    /// geometry; it is reachable at essentially every terminal height, so each row below is a
+    /// live screen size. The gap is asserted BEFORE the outcome so the fixture cannot silently
+    /// drift into testing a 0-row gap again if `palette_overlay_rect`'s bias ever moves.
+    #[test]
+    fn diag_detail_rect_refuses_a_one_or_two_row_gap_below_the_overlay() {
+        for (h, rows, gap) in
+            [(6u16, 1usize, 1u16), (7, 2, 1), (8, 2, 2), (8, 3, 1), (10, 5, 1), (11, 5, 2),
+             (12, 7, 1)]
+        {
+            let area = Rect::new(0, 0, 80, h);
+            let ov = palette_overlay_rect(area, rows);
+            let status_row = h - 1;
+            assert_eq!(status_row - (ov.y + ov.height), gap,
+                "precondition: {h} rows x {rows} list rows leaves a {gap}-row gap, {ov:?}");
+            assert!(prompt_detail_rect(area, status_row, 3).is_some(),
+                "precondition: {h}x{rows}: the inherited bound alone would have PAINTED here");
+            assert_eq!(diag_detail_rect(area, status_row, ov, 3), None,
+                "{h}x{rows}: a {gap}-row gap holds two borders and no interior — refuse it");
+        }
+        // The other side of the same boundary, so it cannot be tightened either: three rows
+        // is exactly enough, and the box that comes back is the minimum legal one.
+        let area = Rect::new(0, 0, 80, 10);
+        let ov = palette_overlay_rect(area, 2);
+        assert_eq!(9 - (ov.y + ov.height), 3, "precondition: a 3-row gap, {ov:?}");
+        let r = diag_detail_rect(area, 9, ov, 3).expect("three rows is enough");
+        assert_eq!((r.y, r.height), (ov.y + ov.height, 3), "two borders and one interior row");
     }
 
     /// The cap RAISES the box rather than sliding it: the bottom border stays pinned above

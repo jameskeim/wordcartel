@@ -682,10 +682,22 @@ prompt precedent exactly:
   hit-test already share, so the cap tracks the live overlay geometry by construction. The box
   vanishing on small terminals is WHY nothing load-bearing lives in it: the action rows,
   including Learn-more, stay in the centered overlay.
-- Paint: a `render_overlays::paint_diag_detail(frame, diag, area, status_row, cs)` called from
-  `render.rs::paint_status` beside the existing `paint_prompt_detail` call, guarded on
-  `editor.diag.is_some()` — the shipped "painted *for* that one overlay, not a second render
+- Paint: a `render_overlays::paint_diag_detail(frame, diag, area, status_row, cs)`, reached
+  via `render_overlays::paint_detail_boxes` — the ONE delegation `render.rs::paint_status`
+  makes, which owns BOTH disclosure-box guards (the prompt's and the diag's; T9-review
+  amendment, §9 note) — the shipped "painted *for* that one overlay, not a second render
   site" pattern (`RenderSite` keeps its single-valued axis; no `OVERLAYS` table change).
+- **Considered decision (T9 review — deliberate; do not "fix" by accident): the message
+  appears in BOTH the overlay title (truncated) and the box (in full).** Two surfaces, two
+  jobs: the title is the ORIENTATION surface that survives every screen size (the D4
+  constraint — the box may vanish, and stripping the title would make tiny screens worse
+  than pre-E11); the box is the READING surface (full message + attribution). Same source
+  text at two fidelities — the standard title/body shape, not duplication-as-defect. Pinned
+  by the existing pair: `paint_diag`'s title tests + the box-unique-content test (the message
+  TAIL the title truncates away, plus the attribution — text only the box produces). The
+  sanctioned alternative, IF the human ever re-weighs small-screen orientation, is
+  title → `engine · code` attribution with the box owning the message alone — a D4 amendment
+  (it moves attribution's home), a product call, not an effort-tail change.
 - Content rules: message wrapped to the box width (plain wrapping — prose, not path-shaped;
   the prompt's left-elision rule is for paths and is NOT inherited), attribution + href as
   single truncated lines, and the prompt precedent's last-row `…and N more` summary when the
@@ -752,7 +764,12 @@ palette/hint surface.** Conformance reasoning per `docs/design/command-surface-c
   holds suggestions).
 - The underline PAINT path: `render.rs::gather_row_ctx`/`row_spans_placed` and everything S6/S8
   — untouched (diagnostics still enter as byte-ranged values through `active_lens_diags`).
-  `render.rs`'s only edit is the one guarded `paint_diag_detail` call in `paint_status` (§6).
+  `render.rs`'s only edit is in `paint_status`, where the two parallel disclosure-box guards
+  (prompt + diag) collapsed into ONE `render_overlays::paint_detail_boxes` delegation
+  (T9-review amendment: the guarded-call form would have breached the `render.rs` hub budget;
+  the delegation follows the module-structure law — the hub sheds an arm, and future
+  disclosure boxes register in `render_overlays`, not the hub — and took the hub BELOW its
+  pre-E11 line count).
 - The engine lifecycle: warm deadlines, suspend/resume, availability, the E10 lifecycle
   predicates (`should_run_diagnostics` — never a `RenderMode::Review` literal in new code).
 - The E11-adjacent status quirk (all enabled engines arm regardless of active lens; degraded
