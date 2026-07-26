@@ -213,7 +213,15 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         Some(DiagRow::Suggestion(_)) => {
             if let Some(s) = suggestion { diag_apply_suggestion(editor, &s, a, b, doc_len, clock); }
         }
-        Some(DiagRow::LearnMore) => {} // T8 fills this in (copy the href + the mandatory ack).
+        Some(DiagRow::LearnMore) => {
+            // E11 §5.4 (D5): copy is the action (OSC 52 ⇒ works over SSH/tmux); the ack is
+            // MANDATORY — clipboard copy is invisible, an unacknowledged row reads as dead.
+            if let Some(href) = editor.diag.as_ref().and_then(|ov| ov.anchor.href.clone()) {
+                editor.clipboard_sync_request = Some(href);
+                editor.set_status(crate::status::StatusKind::Info, "link copied");
+            }
+            // Overlay stays open (spec §5.4).
+        }
         Some(DiagRow::DismissSession) => diag_dismiss_session(editor, a),
         // The inert rows (§5.2) and an out-of-range selection: no edit, overlay stays open.
         None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes) => {}
@@ -734,5 +742,64 @@ mod tests {
         assert!(e.diag.is_none(), "the overlay closes on a dismissal");
         assert!(e.active().diagnostics.slot(DiagSource::LTeX).unwrap().diagnostics.is_empty(),
             "the underline disappears immediately — retain_unignored ran");
+    }
+
+    /// E11 §5.4 (T8): `LearnMore` copies the href to the clipboard-sync seam, acks on the
+    /// status line (the mandatory ack — a clipboard copy is otherwise invisible), and — unlike
+    /// every other row — leaves the overlay OPEN (a copy is not an outcome of the overlay's
+    /// purpose; the writer keeps working in it).
+    #[test]
+    fn learn_more_copies_href_acks_and_keeps_the_overlay_open() {
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX,
+            code: Some("PASSIVE_VOICE".into()),
+            href: Some("https://community.languagetool.org/rule/show/PASSIVE_VOICE?lang=en-US".into()),
+            message: "m".into(), suggestions: vec![] };
+        e.open_diag(d);
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Done;
+        // rows for Grammar + href + Done + no suggestions: [NoFixes, LearnMore, DismissSession]
+        e.diag.as_mut().unwrap().selected = 1;
+        crate::search_ui::diag_apply_selected(&mut e, &crate::test_support::TestClock::new(0));
+        assert_eq!(e.clipboard_sync_request.as_deref(),
+            Some("https://community.languagetool.org/rule/show/PASSIVE_VOICE?lang=en-US"),
+            "the href reached the shipped copy-out intent");
+        assert_eq!(e.status_text(), "link copied", "the MANDATORY ack (D5)");
+        assert!(e.diag.is_some(), "copy is not a dismissal — the overlay stays open");
+    }
+
+    /// Companion to the test above: same diagnostic, same code, same text/position, same
+    /// SELECTED INDEX — only `href` flips from `Some` to `None`. Row 1 must then be
+    /// `DismissSession` instead of `LearnMore` (E11 §5.1: `LearnMore` is present iff
+    /// `href.is_some()`), so the outcome flips entirely: no clipboard request, no "link
+    /// copied" ack, and the overlay CLOSES (a dismissal, unlike `LearnMore`, always closes).
+    /// This is the conjunctive half the test above cannot supply on its own — it isolates
+    /// the `href` axis with everything else held constant, and mutation-verifies the
+    /// `rows()` `is_some` gate: delete it and row 1 stays `LearnMore` here too, so the
+    /// dismissal never fires and the overlay would stay open, failing every assertion below.
+    #[test]
+    fn learn_more_row_is_absent_without_a_href_and_row_1_falls_back_to_dismiss() {
+        let mut e = Editor::new_from_text("ab\n", None, (40, 10));
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Grammar,
+            source: wordcartel_core::diagnostics::DiagSource::LTeX,
+            code: Some("PASSIVE_VOICE".into()), href: None,
+            message: "m".into(), suggestions: vec![] };
+        e.open_diag(d);
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Done;
+        // rows for Grammar + no href + Done + no suggestions: [NoFixes, DismissSession]
+        assert_eq!(e.diag.as_ref().unwrap().rows(),
+            vec![crate::diag_overlay::DiagRow::NoFixes, crate::diag_overlay::DiagRow::DismissSession],
+            "no href ⇒ no LearnMore row, at all — precondition for the rest of this test");
+        e.diag.as_mut().unwrap().selected = 1;
+        crate::search_ui::diag_apply_selected(&mut e, &crate::test_support::TestClock::new(0));
+        assert!(e.clipboard_sync_request.is_none(), "no href ⇒ nothing was ever copied");
+        assert_ne!(e.status_text(), "link copied", "no href ⇒ the copy ack must not fire");
+        assert!(e.diag.is_none(),
+            "row 1 was DismissSession, not LearnMore — a dismissal closes the overlay");
+        let key = crate::diagnostics_run::dismissal_units_at(&e.active().document.buffer, 0);
+        assert!(e.session_dismissals.contains(&(DiagSource::LTeX, "PASSIVE_VOICE".to_string(), key)),
+            "row 1 actually ran the dismissal, not a silent no-op");
     }
 }
