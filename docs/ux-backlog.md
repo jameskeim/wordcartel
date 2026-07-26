@@ -950,3 +950,38 @@ would make this the app's first foreign-config writer.
 
 Prior art / context: E10 (the providers), E11 (the viewing/action layer + the session dismiss this
 would upgrade), [[E13]] (the sibling deferral). Decision record: `scratchpad/e11/decisions.md` D7. ~M.
+
+### H37 — Accepted-send/drop race in LSP client teardown — a send in the FlushGuard drain window reports Accepted::Yes for a message nothing will drain
+<!-- item: H37 -->
+
+**Accepted-send/drop race in the LSP client teardown (pre-existing, Effort-A era; surfaced by E11 T5.)**
+`lsp_client.rs::FlushGuard::drop` drains unread commands via `try_recv()` until `Empty`, then the
+`Receiver` deallocates when the guard's fields drop. A `cmd_tx.send` landing in the window between the
+final `Empty` and the deallocation returns `Ok` (std mpsc sends succeed while the Receiver object
+exists), so the caller reports `Accepted::Yes` for a message nothing will ever drain — violating the
+exactly-once terminal guarantee at the seam. The window is instruction-scale and opens only during
+client-thread death (handle drop, budget-exhaustion `Exit`, shutdown, panic-unwind).
+
+**Two affected message classes, and the shipped one is the WORSE one:**
+- `Cmd::Change` (since Effort A) — an accepted-in-window change latches `in_flight_version`
+  permanently at `diagnostics_run.rs::dispatch_one`; `due_sources` excludes in-flight slots, so that
+  engine silently never dispatches again for that buffer until close/restart. No user affordance.
+- `Cmd::RequestFixes` (E11) — a VISIBLE stuck "fetching…" row. Esc closes it, and a reopen's send
+  then returns `Err` (receiver gone) → `Accepted::No` → an honest "no fixes available". Full recovery
+  in one gesture. E11 adds a rare, interactive, better-signposted, self-recovering instance of an
+  existing hole; it does not widen the window, which is gated on thread death rather than send timing.
+
+**Not closable at the provider layer** — any post-send re-check is itself racy against the drain.
+**A real fix** is a closing-flag protocol: `Shared.closing: AtomicBool`, set SeqCst by the guard
+BEFORE its final drain; senders check it AFTER a successful send and downgrade to `Accepted::No`.
+Note that std mpsc offers no atomic drain-then-drop (dropping the receiver first loses queued
+messages; draining first leaves the window). The flag introduces a double-terminal case needing
+per-class reasoning: benign for fix requests (no token stored, so the reduce guard drops the
+terminal), but NOT benign for `notify_change`, where an unlatched empty `DiagnosticsDone` at the
+current version would blank painted underlines until the next recheck — so the apply side needs a
+companion guard. Alternatively a heavier pump-ack per send. **Must cover BOTH message classes to be
+worth doing**, which makes it larger than any one linting effort. ~40–80 lines in the crate's most
+delicate seam, plus ordering proofs and race tests.
+
+Anchors: `lsp_client.rs::{FlushGuard, LspProvider::notify_change, LspProvider::request_fixes}`,
+`diagnostics_run.rs::dispatch_one` (the latch site). Grounding: Fable, 2026-07-26, during E11 T5.
