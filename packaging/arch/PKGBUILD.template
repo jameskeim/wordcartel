@@ -36,8 +36,6 @@ optdepends=(
   'texlive-xetex: PDF export via pandoc --pdf-engine=xelatex'
   'harper: grammar/spelling diagnostics in Review mode (harper-ls language server)'
   'ltex-ls-plus: LanguageTool grammar/language diagnostics in Review mode (requires Java 21+)'
-  'vale: prose style diagnostics in Review mode (the vale-ls backend CLI)'
-  'vale-ls: prose style diagnostics in Review mode (Vale language server)'
 )
 provides=('wcartel')
 # The release-dist profile already strips the binary; skip makepkg's strip/debug stages.

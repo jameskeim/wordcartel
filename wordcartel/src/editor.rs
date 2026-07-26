@@ -2395,14 +2395,22 @@ mod tests {
     // Task 6 (SPINE): the switchable analysis lens — set_analysis_source.
     // ------------------------------------------------------------------
 
+    /// BOTH refusal paths: an INSTALLED-but-disabled engine, and a source with no provider at
+    /// all (vale, whose provider was removed — the disabled half used to be covered by the
+    /// vale-ships-dormant test that went with it).
     #[test]
     fn set_analysis_source_refuses_disabled_engine() {
+        use wordcartel_core::diagnostics::DiagSource;
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
         e.diag_providers.install(Box::new(
-            crate::diag_provider::RecordingProvider::new().with_source(
-                wordcartel_core::diagnostics::DiagSource::Harper)), true);
-        e.set_analysis_source(wordcartel_core::diagnostics::DiagSource::Vale);
-        assert_eq!(e.active_analysis_source, wordcartel_core::diagnostics::DiagSource::Harper);
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::LTeX)), false);
+        e.set_analysis_source(DiagSource::LTeX); // installed, disabled
+        assert_eq!(e.active_analysis_source, DiagSource::Harper);
+        assert!(e.status_text().contains("not enabled"));
+        e.set_analysis_source(DiagSource::Vale); // never installed
+        assert_eq!(e.active_analysis_source, DiagSource::Harper);
         assert!(e.status_text().contains("not enabled"));
     }
 

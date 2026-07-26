@@ -103,7 +103,7 @@ pub fn lsp_range_to_bytes(text: &str, start: (u32, u32), end: (u32, u32))
 
 /// E11 §4: map ONE CodeAction to a `Suggestion` targeting `anchor`, accepting fix kinds via
 /// the ENGINE's table (`accept_kind` — a fn so this stays engine-agnostic plumbing) and BOTH
-/// edit shapes: `edit.changes[uri]` (harper/vale, probe-verified) and
+/// edit shapes: `edit.changes[uri]` (harper and vale, both probe-verified) and
 /// `edit.documentChanges[]` (ltex, probe-verified exclusive). The action's edit range is a
 /// MATCHING KEY against `anchor` and is then discarded — `Suggestion` carries text only
 /// (the apply-safety invariant, spec §3.3).
@@ -156,8 +156,8 @@ fn edits_to_suggestion(edits: &[serde_json::Value], doc_text: &str,
 }
 
 /// E11 §4: ALL matching actions for `anchor`, response order, deduped (the shipped `break`
-/// capped attachment at one suggestion per diagnostic — multi-candidate is real on both new
-/// engines: vale 5-for-one, ltex 2-for-`recieve`, both probe-verified).
+/// capped attachment at one suggestion per diagnostic — multi-candidate is real: ltex
+/// 2-for-`recieve`, vale 5-for-one, both probe-verified).
 pub(crate) fn collect_fix_suggestions(
     actions: &[serde_json::Value], our_uri: &str, doc_text: &str,
     anchor: &std::ops::Range<usize>, accept_kind: impl Fn(&str) -> bool,
@@ -374,6 +374,11 @@ mod tests {
             Some(Suggestion::ReplaceWith("receive".into())));
     }
 
+    /// KEPT after the vale-ls provider was removed: it pins the ENGINE-GENERIC parser for a
+    /// bare `"quickfix"` action carrying `edit.changes[uri]`, against a real captured server
+    /// payload. That is harper's shape too (and vale's own CLI `Action` output is the same fix
+    /// model), so the coverage outlives the transport — it names no engine type, only
+    /// `action_fix_suggestion`.
     #[test]
     fn verbatim_vale_misspelling_action_maps() {
         // vale-probe-results.md §1+§2 verbatim: the first of the 5 spelling quickfixes, with
@@ -451,6 +456,9 @@ mod tests {
             |k| k == "quickfix.ltex.acceptSuggestions"), None);
     }
 
+    /// Also KEPT after the provider removal — multi-candidate attachment on the `edit.changes`
+    /// shape is engine-generic (harper takes the same path; ltex is the `documentChanges` twin
+    /// above), and this is the only test that pins ALL candidates attaching in response order.
     #[test]
     fn vale_changes_shape_still_maps_and_collect_attaches_all_candidates() {
         // Probe §2: bare "quickfix" + edit.changes[uri]; 5 candidates for one diagnostic.
@@ -499,6 +507,5 @@ mod tests {
         assert!(crate::ltex_ls::LtexEngine::is_fix_kind("quickfix.ltex.acceptSuggestions"));
         assert!(!crate::ltex_ls::LtexEngine::is_fix_kind("quickfix.ltex.addToDictionary"));
         assert!(!crate::ltex_ls::LtexEngine::is_fix_kind("quickfix"));
-        assert!(crate::vale_ls::ValeEngine::is_fix_kind("quickfix"));
     }
 }
