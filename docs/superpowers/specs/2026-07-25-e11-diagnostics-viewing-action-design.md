@@ -234,6 +234,17 @@ overlay's anchor (§3.5).
      reopen without them would strand one `uri_owner` entry and one open server-side document
      PER TIMEOUT, unbounded. T4 pins the no-leak property (after N retirement cycles,
      `uri_owner` holds exactly the live URIs and a didClose was sent per retired one).
+     **T4-review fold-in (adjacent PRE-EXISTING debt, not new E11 behavior): `on_spawned` now
+     also clears `uri_owner`.** The suspend→unpark resume path deliberately bypasses
+     `on_server_gone` (the expected-EOF drain), and `on_spawned` — unlike `on_server_gone` —
+     never cleared the map, so every idle-suspend/resume cycle stranded the pre-suspend URI's
+     entry. That leak shipped with E10's suspend feature (merge `9c2d9e4`); it is
+     correctness-safe (a late publish to a stranded URI fails the `docs` generation check and
+     drops) but unbounded in principle. Clearing in `on_spawned` is semantically right (it
+     marks every doc closed, retiring every open URI) and harmless on the crash path (where
+     `on_server_gone` already cleared). With it the no-leak invariant is UNIFORM across all
+     three reopen paths — crash-respawn, watchdog retirement, and suspend/resume — pinned by
+     the T4 cycle-count test extended to the resume path.
   2. **Await-attribution:** `last_raw` is stored ONLY when the publish ANSWERS a live
      `awaiting_publish` entry, and its tag is the AWAIT's `our_version` (`a.our_version` —
      recorded when the soliciting didOpen/didChange was sent), never the ambient
@@ -352,11 +363,17 @@ is the delivery key (round-2 Critical 1); the identity fields ride along for deb
 asserts/logging, never for correlation.
 
 - `on_server_response` routes `PendingKind::FixRequest` to a new
-  `on_fix_response`: drop if generation stale (superseded requests were already de-registered
-  at replacement, §3.3); else map every action via the §4 mapping against the anchor range, and
-  emit `DiagFixesReady` with ALL matched suggestions (possibly empty). Clear the slot.
+  `on_fix_response`: **drop if the token is not the live slot's (a displaced/expired request's
+  late response — its terminal was already emitted); a stale-generation response FOR the live
+  slot resolves it empty immediately** (T4-review amendment: the response consumed the
+  request's `pending_requests` entry, so nothing can ever answer that request again — waiting
+  out the deadline would be a knowingly-futile "fetching…", a no-silent-UI violation; the
+  immediate empty resolution IS the token's one terminal). Else map every action via the §4
+  mapping against the anchor range, and emit `DiagFixesReady` with ALL matched suggestions
+  (possibly empty). Clear the slot.
   **Guarantee: every `Accepted::Yes` `RequestFixes` produces exactly one `DiagFixesReady`
-  carrying its token** — from exactly one of: the server response; the deadline expiry (empty);
+  carrying its token** — from exactly one of: the server response (fix-bearing, empty, or the
+  stale-generation immediate resolution above); the deadline expiry (empty);
   replacement by a newer request (empty, emitted at replacement time, §3.3); the
   change-invalidation resolution (empty, §3.3); the no-triple-match resolution (empty, §3.3);
   the DOCUMENT-CLOSE resolution (empty, at `on_close`, §3.3); `on_server_gone`'s flush

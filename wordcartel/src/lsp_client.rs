@@ -246,6 +246,12 @@ impl<E: LspEngine> ClientState<E> {
         self.first_publish_seen = false;
         self.phase = Phase::Initializing;
         for d in self.docs.values_mut() { d.open = false; }
+        // That loop retires every open URI, so the ownership map goes with it. Load-bearing on the
+        // SUSPEND→UNPARK resume path, which deliberately bypasses `on_server_gone` (the
+        // expected-EOF drain) and so would otherwise strand the pre-suspend URI's entry every idle
+        // cycle; harmless on the crash path, where `on_server_gone` has already cleared. With it
+        // the no-leak invariant is uniform across all three reopen paths.
+        self.uri_owner.clear();
         self.pending_requests.clear();
         let id = self.alloc_id();
         self.pending_requests.insert(id, PendingKind::Initialize);
@@ -725,8 +731,10 @@ impl<E: LspEngine> ClientState<E> {
     ///
     /// A slot that is gone or now belongs to a different token was ALREADY terminated
     /// (replacement/close/deadline each de-register the sent id, so this is belt-and-braces).
-    /// A STALE GENERATION is dropped without emitting and WITHOUT clearing the slot — that
-    /// request's terminal is then owed by its still-live deadline; clearing here would lose it.
+    /// A STALE GENERATION *for the live slot* resolves it EMPTY, immediately: this response
+    /// consumed the request's `pending_requests` entry, so nothing can ever answer that request
+    /// again — waiting out its 10 s leash would be a knowingly futile "fetching…". The immediate
+    /// empty resolution IS the token's one terminal.
     fn on_fix_response(&mut self, token: u64, buffer_id: BufferId, generation: u64,
         version: u64, range: std::ops::Range<usize>, v: &Value) -> Vec<Action> {
         match &self.pending_fix {
@@ -736,9 +744,13 @@ impl<E: LspEngine> ClientState<E> {
             }
             _ => return Vec::new(),
         }
-        let (uri, text) = match self.docs.get(&buffer_id) {
-            Some(d) if d.generation == generation => (d.uri.clone(), d.text.clone()),
-            _ => return Vec::new(),
+        let fresh = match self.docs.get(&buffer_id) {
+            Some(d) if d.generation == generation => Some((d.uri.clone(), d.text.clone())),
+            _ => None,
+        };
+        let (uri, text) = match fresh {
+            Some(pair) => pair,
+            None => return self.resolve_pending_fix_empty().into_iter().collect(),
         };
         let empty: Vec<Value> = Vec::new();
         let actions = v.get("result").and_then(|r| r.as_array()).unwrap_or(&empty);
@@ -1381,6 +1393,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_generation_fix_response_resolves_its_own_live_slot() {
+        // T4-review Important: a stale-GENERATION response FOR the live slot must resolve it
+        // NOW. The response consumed the request's `pending_requests` entry, so nothing can
+        // ever answer that request again — waiting out the 10s leash would be a knowingly
+        // futile "fetching…" (a no-silent-UI violation). The still-silent DISPLACED case is
+        // pinned by `replacement_terminates_displaced_request_and_deregisters_its_id`.
+        let mut st = running();
+        change(&mut st, 0, 1, 0);
+        publish_one(&mut st, "untitled:wcartel-0-1", 5); // answers the await → last_raw tagged v1
+        let out = req(&mut st, 7, 1, 10);
+        let id = sends(&out).iter().find(|v| v["method"] == "textDocument/codeAction")
+            .and_then(|v| v["id"].as_u64()).expect("the request went out under generation 1");
+        // Bump the generation UNDER the in-flight request: a same-version didChange (so the
+        // §3.3 change-invalidation never fires and the slot survives), then a watchdog
+        // retirement, then the reopen — generation 2, the slot still owing token 7.
+        change(&mut st, 0, 1, 20);
+        st.on_deadline(20 + TestEngine::PUBLISH_TIMEOUT_MS); // retires generation 1
+        change(&mut st, 0, 1, 1_030);                        // reopens under generation 2
+        assert!(st.pending_fix.is_some(), "the slot is still live when the response lands");
+        let late = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":[]})), 1_040);
+        assert_eq!(fix_readies(&late), vec![(7, vec![])],
+            "the stale-generation response resolves ITS OWN live slot immediately");
+        assert!(st.pending_fix.is_none(), "the slot is cleared, not left owing its deadline");
+        let expired = st.on_deadline(1_030 + FIX_REQUEST_TIMEOUT_MS);
+        assert!(fix_readies(&expired).is_empty(),
+            "and the leash emits nothing afterwards — exactly ONE terminal for token 7");
+    }
+
+    #[test]
     fn fix_deadline_fires_even_while_initializing() {
         // Round-1 finding-2 regression: the slot + deadline are live in EVERY phase.
         let mut st = ClientState::<TestEngine>::new(cfg());
@@ -1477,6 +1519,28 @@ mod tests {
         assert!(sends(&reopen).iter().any(|v| v["method"] == "textDocument/didOpen"
             && v["params"]["textDocument"]["uri"] == "untitled:wcartel-0-4"));
         assert_eq!(st.uri_owner.len(), 1, "exactly the one live URI after N cycles");
+        // T4-review fold-in: the THIRD reopen path — suspend → unpark resume — deliberately
+        // bypasses `on_server_gone` (the expected-EOF drain), so `on_spawned` is what must
+        // retire the pre-suspend URI. Without its clear, every idle cycle strands one entry.
+        for cycle in 1..=2u64 {
+            st.on_inbound(Inbound::Cmd(Cmd::Suspend), base);
+            st.on_inbound(Inbound::ServerEof, base); // the deliberate-kill EOF drains (E10)
+            let resume = st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0),
+                version: 9 + cycle, path: None, text: "c".into() }), base);
+            assert!(resume.iter().any(|a| matches!(a, Action::Unpark)),
+                "resume cycle {cycle}: a Change while parked warrants a fresh child");
+            let spawn = st.on_spawned(base);
+            let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+            let replay = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+                "result":{"capabilities":{}}})), base);
+            let uri = sends(&replay).iter().find(|v| v["method"] == "textDocument/didOpen")
+                .and_then(|v| v["params"]["textDocument"]["uri"].as_str())
+                .expect("the replayed change reopens the document").to_string();
+            assert_eq!(st.uri_owner.len(), 1,
+                "resume cycle {cycle}: no-leak is UNIFORM across all three reopen paths");
+            assert!(st.uri_owner.contains_key(&uri), "resume cycle {cycle}: and it is the LIVE uri");
+            base += 1_000_000;
+        }
     }
 
     #[test]
@@ -1601,6 +1665,43 @@ mod tests {
             .filter_map(|m| if let Msg::DiagFixesReady { token, suggestions, .. } = m {
                 assert!(suggestions.is_empty()); Some(token) } else { None }).collect();
         assert_eq!(got, vec![6], "an UNREAD RequestFixes still gets its empty terminal on drop");
+    }
+
+    #[test]
+    fn shutdown_with_a_live_slot_terminates_it_exactly_once_at_guard_drop() {
+        // §3.4 exactly-once, the SHUTDOWN leg: `Cmd::Shutdown` does not flush — the terminal
+        // arrives from `FlushGuard::drop` after `Control::Exit`. That is an interaction
+        // between two code paths, so pin it: exactly one terminal for the token across the
+        // whole sequence, and the flush stays idempotent (a prior `on_server_gone` flush must
+        // not let the guard's own emit a second one).
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Inbound>();
+        let mut state = running();
+        let held = state.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 11,
+            buffer_id: BufferId(0), version: 1, range: 0..1, code: None,
+            message: "m".into() }), 0); // held (no doc, no raws) — it survives to the drop
+        assert!(fix_readies(&held).is_empty(), "accepted, nothing owed yet");
+        let sd = state.on_inbound(Inbound::Cmd(Cmd::Shutdown), 1);
+        assert!(fix_readies(&sd).is_empty(), "Cmd::Shutdown does NOT flush");
+        assert!(state.pending_fix.is_some(), "the slot survives the shutdown request");
+        let id = sends(&sd)[0]["id"].as_u64().expect("the shutdown request id");
+        let exit = state.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,
+            "result":Value::Null})), 2);
+        assert!(exit.iter().any(|a| matches!(a, Action::Exit)), "the response drives Exit");
+        assert!(fix_readies(&exit).is_empty(), "still nothing emitted at Exit");
+        drop(FlushGuard { state, cmd_rx, msg_tx });
+        let got: Vec<u64> = std::iter::from_fn(|| msg_rx.try_recv().ok())
+            .filter_map(|m| if let Msg::DiagFixesReady { token, suggestions, .. } = m {
+                assert!(suggestions.is_empty()); Some(token) } else { None }).collect();
+        assert_eq!(got, vec![11], "EXACTLY one terminal, emitted by the guard's drop");
+        // The idempotence half, on an identical sequence: the guard's drop calls
+        // `flush_outstanding`, so a second call must yield nothing (no double terminal).
+        let mut st2 = running();
+        st2.on_inbound(Inbound::Cmd(Cmd::RequestFixes { token: 12, buffer_id: BufferId(0),
+            version: 1, range: 0..1, code: None, message: "m".into() }), 0);
+        st2.on_inbound(Inbound::Cmd(Cmd::Shutdown), 1);
+        assert_eq!(fix_readies(&st2.flush_outstanding()), vec![(12, vec![])]);
+        assert!(fix_readies(&st2.flush_outstanding()).is_empty(), "a second flush yields nothing");
     }
 
     /// The Outcome-B seam engine: `TestEngine`'s impl verbatim with the single const flipped,
