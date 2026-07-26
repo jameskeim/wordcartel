@@ -497,7 +497,7 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
     }
 }
 
-/// Build the core provider catalog (harper today), fold `linters` into per-engine enablement
+/// Build the core provider catalog (harper, ltex today), fold `linters` into per-engine enablement
 /// (warning on unknown names), install into `editor.diag_providers`, and seed the default lens
 /// (first enabled source in cycle order). Providers spawn nothing here — lazy, as before.
 /// `linters`: `None` → every core engine enabled; `Some(list)` → exactly the named engines
@@ -505,24 +505,34 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
 /// site the config fold's `linters` comment points at (SPINE Task 8, spec §9).
 pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
-    // The complete core catalog in cycle order (E10 T6).
-    let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale];
-    // Which engines are enabled: None → the on-by-default core; Some(list) → exactly the named
-    // (config_name). `vale` is OFF by default (E11 T10 / backlog E15): `lsp_rpc::doc_uri` mints
-    // `untitled:` URIs and vale-ls publishes nothing at all for a URI that does not name a file
-    // on disk, so an enabled-by-default vale presents a permanently empty `[REVIEW · vale]` lens
-    // that reads as "vale found no problems" — the silent-UI failure this project forbids. Off by
-    // default makes the dormancy honest (the menu says "off"; the lens command refuses) until E15
-    // gives vale a URI it can lint. An explicit `linters` entry still turns it on.
+    // The complete core catalog in cycle order. `vale` is NOT in it: a live probe established
+    // that vale-ls lints the file ON DISK and never the buffer we sync to it (`didChange`
+    // produces no server messages; `didSave` re-reads disk and ignores its own `text`), so it
+    // cannot back a live lens at all. The provider is gone; `DiagSource::Vale` stays reserved in
+    // core for the replacement transport (the vale CLI, one-shot over the buffer text).
+    let catalog: &[DiagSource] = &[DiagSource::Harper, DiagSource::LTeX];
+    // Which engines are enabled: None → the whole core catalog; Some(list) → exactly the named
+    // (config_name).
     let enabled_of = |src: DiagSource| -> bool {
         match &cfg.diagnostics.linters {
-            None => src != DiagSource::Vale,
+            None => true,
             Some(list) => list.iter().any(|n| n == src.config_name()),
         }
     };
     if let Some(list) = &cfg.diagnostics.linters {
+        // Whether the list names any real catalog engine besides vale — if not, dropping vale
+        // leaves nothing enabled at all, and the warning below says so.
+        let other_engine_named = catalog.iter().any(|&s| enabled_of(s));
         for name in list {
-            if !catalog.iter().any(|s| s.config_name() == name) {
+            if catalog.iter().any(|s| s.config_name() == name) { continue; }
+            // `vale` stays a RECOGNISED name — the engine is known, the transport is gone. Saying
+            // "unknown engine" would be false, and this warns rather than ignoring silently.
+            if name == DiagSource::Vale.config_name() {
+                let consequence = if other_engine_named { "" }
+                    else { " — no other engine is named, so no linter is enabled" };
+                warns.push(format!("config: diagnostics.linters — \"vale\" is not available in \
+                    this build (vale-ls cannot lint unsaved buffers); ignoring it{consequence}"));
+            } else {
                 warns.push(format!(
                     "config: diagnostics.linters — unknown engine \"{name}\" (known: {})",
                     catalog.iter().map(|s| s.config_name()).collect::<Vec<_>>().join(", ")));
@@ -547,16 +557,9 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
                     max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for ltex (spec §9)
                     language: Some(cfg.diagnostics.ltex_language.clone()),
                 })),
-            DiagSource::Vale => Box::new(crate::lsp_client::LspProvider::<crate::vale_ls::ValeEngine>::new(
-                msg_tx.clone(),
-                crate::diag_provider::ProviderConfig {
-                    grammar: cfg.diagnostics.grammar,
-                    dictionary: None,
-                    max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH, // inert for vale (spec §9)
-                    language: None,
-                })),
-            // Exhaustive — every core engine has an arm; Plugin engines are not in this catalog.
-            DiagSource::Plugin(_) => continue,
+            // Exhaustive — every core engine has an arm. `Vale` has no provider in this build and
+            // `Plugin` engines are not in this catalog, so neither can appear here.
+            DiagSource::Vale | DiagSource::Plugin(_) => continue,
         };
         editor.diag_providers.install(provider, enabled_of(src));
     }
@@ -585,15 +588,18 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
 /// The engine-management dynamic menu rows (E10 §11): one row per registered engine,
 /// state-in-label ("on" / "off" / "warming…" / "not installed"), dispatching that engine's
 /// toggle command — menu ⊆ palette by construction. `Plugin` sources are skipped (their
-/// rows are E12's plugin-contributed-menu effort). Availability is lazily discovered: an
-/// absent binary reads "on" until Review first attempts a spawn (spec §11 display note).
+/// rows are E12's plugin-contributed-menu effort), as is `Vale`, whose provider and commands
+/// were removed. Availability is lazily discovered: an absent binary reads "on" until Review
+/// first attempts a spawn (spec §11 display note).
 pub fn engine_menu_rows(editor: &Editor) -> Vec<(String, crate::menu::MenuRowAction)> {
     use crate::diag_provider::Availability;
     editor.diag_providers.sources().filter_map(|src| {
         let cmd = match src {
             DiagSource::Harper => "toggle_engine_harper",
             DiagSource::LTeX => "toggle_engine_ltex",
-            DiagSource::Vale => "toggle_engine_vale",
+            // No provider, hence no `toggle_engine_vale` command to dispatch — a row here would
+            // exist only to refuse (contract law 4: every menu row names a real command).
+            DiagSource::Vale => return None,
             DiagSource::Plugin(_) => return None,
         };
         let state = if !editor.diag_providers.is_enabled(src) { "off" }
@@ -1388,52 +1394,84 @@ mod tests {
         let mut warns = Vec::new();
         install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
         let sources: Vec<DiagSource> = e.diag_providers.sources().collect();
-        assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX, DiagSource::Vale],
-            "the complete E10 catalog in cycle order");
+        assert_eq!(sources, vec![DiagSource::Harper, DiagSource::LTeX],
+            "the complete catalog in cycle order — vale has no provider in this build");
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper), "both ship enabled");
+        assert!(e.diag_providers.is_enabled(DiagSource::LTeX));
         assert!(warns.is_empty());
     }
 
     // ------------------------------------------------------------------
-    // E11 T10 / E15: vale ships dormant (it cannot lint an `untitled:` URI).
+    // The vale removal: no provider, but the NAME is still recognised.
     // ------------------------------------------------------------------
 
     #[test]
-    fn vale_is_disabled_by_default_and_its_surfaces_say_so() {
-        // Shipping vale ON would present a permanently empty `[REVIEW · vale]` lens that reads
-        // as "vale found no problems". Pin BOTH halves: the default itself, and that the two
-        // surfaces a writer meets vale through report the dormancy honestly.
+    fn vale_has_no_provider_and_no_engine_menu_row() {
+        // vale-ls lints the file on disk, never the synced buffer, so no provider is installed.
+        // Nothing may pretend otherwise: no registration, no menu row, and the lens setter
+        // refuses (there is no `analysis_engine_vale` command left to reach it with anyway).
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut warns = Vec::new();
         install_core_providers(&mut e, &crate::config::Config::default(), &tx, &mut warns);
-        assert!(!e.diag_providers.is_enabled(DiagSource::Vale), "vale ships dormant");
-        assert!(e.diag_providers.is_enabled(DiagSource::Harper), "…and ONLY vale is dormant");
-        assert!(e.diag_providers.is_enabled(DiagSource::LTeX));
-        assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens seed skips it too");
+        assert!(!e.diag_providers.sources().any(|s| s == DiagSource::Vale), "no vale provider");
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens seed is harper");
         assert!(warns.is_empty());
-        // Surface 1 — the engine menu row reads "off".
         let labels: Vec<String> = engine_menu_rows(&e).into_iter().map(|(l, _)| l).collect();
-        assert!(labels.iter().any(|l| l == "vale — off"),
-            "the engine menu says vale is off; rows = {labels:?}");
-        // Surface 2 — `analysis_engine_vale`'s setter refuses through the shipped disabled path
-        // rather than opening the empty lens.
+        assert!(!labels.iter().any(|l| l.starts_with("vale")),
+            "no vale row in the engine menu; rows = {labels:?}");
         e.set_analysis_source(DiagSource::Vale);
         assert_eq!(e.active_analysis_source, DiagSource::Harper, "the lens did not switch");
-        assert!(e.status_text().contains("not enabled"));
     }
 
     #[test]
-    fn an_explicit_linters_entry_still_enables_vale() {
-        // Only the DEFAULT changed — a writer who asks for vale still gets it.
+    fn an_explicit_linters_vale_entry_warns_honestly_and_enables_nothing() {
+        // "vale" is a KNOWN name with no transport — the warning must say so rather than claim
+        // the name is unknown, and it must never be dropped on the floor silently.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.linters = Some(vec!["harper".into(), "vale".into()]);
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper), "the rest of the list applies");
+        assert!(!e.diag_providers.is_enabled(DiagSource::LTeX));
+        assert!(!e.diag_providers.is_enabled(DiagSource::Vale), "and vale enables nothing");
+        assert_eq!(warns, vec!["config: diagnostics.linters — \"vale\" is not available in this \
+            build (vale-ls cannot lint unsaved buffers); ignoring it".to_string()]);
+        assert!(!warns[0].contains("unknown"), "the name IS known — only the transport is gone");
+    }
+
+    #[test]
+    fn a_lone_vale_linters_entry_warns_that_nothing_is_enabled() {
+        // Same drop as above, but with vale the ONLY named engine: no catalog engine ends up
+        // enabled at all, and the warning must say so — not just that vale itself was dropped.
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut cfg = crate::config::Config::default();
         cfg.diagnostics.linters = Some(vec!["vale".into()]);
         let mut warns = Vec::new();
         install_core_providers(&mut e, &cfg, &tx, &mut warns);
-        assert!(e.diag_providers.is_enabled(DiagSource::Vale), "opting in still works");
-        assert_eq!(e.active_analysis_source, DiagSource::Vale, "and it seeds the lens");
-        assert!(warns.is_empty());
+        assert!(!e.diag_providers.is_enabled(DiagSource::Harper));
+        assert!(!e.diag_providers.is_enabled(DiagSource::LTeX));
+        assert!(!e.diag_providers.is_enabled(DiagSource::Vale));
+        assert_eq!(warns, vec!["config: diagnostics.linters — \"vale\" is not available in this \
+            build (vale-ls cannot lint unsaved buffers); ignoring it — no other engine is named, \
+            so no linter is enabled".to_string()]);
+    }
+
+    #[test]
+    fn an_unknown_linters_entry_still_warns_as_unknown() {
+        // The vale arm must not swallow genuinely unknown names, and the known-set it prints
+        // lists only engines that actually run.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.linters = Some(vec!["grammarly".into()]);
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert_eq!(warns, vec!["config: diagnostics.linters — unknown engine \"grammarly\" \
+            (known: harper, ltex)".to_string()]);
     }
 
     // ------------------------------------------------------------------
@@ -1458,8 +1496,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut warns = Vec::new();
         let mut cfg = crate::config::Config::default();
-        cfg.diagnostics.default_engine = Some(DiagSource::Vale);
-        cfg.diagnostics.linters = Some(vec!["harper".into(), "ltex".into()]); // vale NOT enabled
+        cfg.diagnostics.default_engine = Some(DiagSource::LTeX);
+        cfg.diagnostics.linters = Some(vec!["harper".into()]); // ltex NOT enabled
         install_core_providers(&mut e, &cfg, &tx, &mut warns);
         assert_eq!(e.active_analysis_source, DiagSource::Harper,
             "known-but-disabled → harper-first fallback (spec §13)");
@@ -1557,15 +1595,16 @@ mod tests {
 
     /// The COMPLETE spec-§11 label matrix — every cell of enabled×availability:
     /// disabled → "off" (wins over availability); enabled+Unavailable → "not installed";
-    /// enabled+Starting → "warming…"; enabled+Ready → "on"; enabled+Idle → "on"; and the
-    /// Plugin-source skip. Two fixture editors cover the five cells across three sources.
+    /// enabled+Starting → "warming…"; enabled+Ready → "on"; enabled+Idle → "on"; plus the
+    /// command-less skips (Plugin, and Vale now that its provider and commands are gone).
+    /// Three fixture editors cover the five cells across the two command-bearing sources.
     #[test]
     fn engine_menu_rows_state_labels_and_toggle_actions() {
         use crate::diag_provider::{Availability, RecordingProvider};
         use crate::menu::MenuRowAction;
         use crate::registry::CommandId;
-        /// A fixture editor with the three core engines at the given (availability, enabled).
-        fn fixture(cells: [(DiagSource, Availability, bool); 3]) -> crate::editor::Editor {
+        /// A fixture editor with the two core engines at the given (availability, enabled).
+        fn fixture(cells: [(DiagSource, Availability, bool); 2]) -> crate::editor::Editor {
             let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
             for (src, avail, enabled) in cells {
                 e.diag_providers.install(Box::new(RecordingProvider::new()
@@ -1574,35 +1613,42 @@ mod tests {
             e
         }
 
-        // Scenario A: on (Ready) / warming… / not installed — all ENABLED — plus Plugin skip.
+        // Scenario A: on (Ready) / warming… — both ENABLED — plus the two command-less skips.
         let mut e = fixture([
             (DiagSource::Harper, Availability::Ready, true),
             (DiagSource::LTeX, Availability::Starting, true),
-            (DiagSource::Vale, Availability::Unavailable, true),
         ]);
         e.diag_providers.install(Box::new(RecordingProvider::new()
             .with_source(DiagSource::Plugin("mock"))), true); // skipped: no command (E12)
+        // Skipped for the same reason: even an installed+enabled+Ready vale has no
+        // `toggle_engine_vale` command for a row to name.
+        e.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Vale).with_availability(Availability::Ready)), true);
         let rows = engine_menu_rows(&e);
-        assert_eq!(rows.len(), 3, "Plugin sources are skipped (spec §11)");
+        assert_eq!(rows.len(), 2, "command-less sources are skipped (spec §11)");
         assert_eq!(rows[0], ("Harper — on".to_string(),
             MenuRowAction::Command(CommandId("toggle_engine_harper"))));
         assert_eq!(rows[1], ("LTeX — warming…".to_string(),
             MenuRowAction::Command(CommandId("toggle_engine_ltex"))));
-        assert_eq!(rows[2], ("vale — not installed".to_string(),
-            MenuRowAction::Command(CommandId("toggle_engine_vale"))),
-            "enabled + Unavailable → not installed");
 
-        // Scenario B: the remaining cells — enabled+Idle → "on"; disabled → "off" (wins over
+        // Scenario B: enabled+Unavailable → "not installed"; disabled → "off" (wins over
         // availability, here a Ready recorder).
         let e2 = fixture([
-            (DiagSource::Harper, Availability::Idle, true),
+            (DiagSource::Harper, Availability::Unavailable, true),
             (DiagSource::LTeX, Availability::Ready, false),
-            (DiagSource::Vale, Availability::Starting, false),
         ]);
         let rows2 = engine_menu_rows(&e2);
-        assert_eq!(rows2[0].0, "Harper — on", "enabled + Idle (not yet summoned) → on");
+        assert_eq!(rows2[0].0, "Harper — not installed", "enabled + Unavailable → not installed");
         assert_eq!(rows2[1].0, "LTeX — off", "disabled wins over Ready availability");
-        assert_eq!(rows2[2].0, "vale — off", "disabled wins over Starting availability");
+
+        // Scenario C: the last two cells — enabled+Idle → "on"; disabled+Starting → "off".
+        let e3 = fixture([
+            (DiagSource::Harper, Availability::Idle, true),
+            (DiagSource::LTeX, Availability::Starting, false),
+        ]);
+        let rows3 = engine_menu_rows(&e3);
+        assert_eq!(rows3[0].0, "Harper — on", "enabled + Idle (not yet summoned) → on");
+        assert_eq!(rows3[1].0, "LTeX — off", "disabled wins over Starting availability");
     }
 
     // ── T7: the session dismiss — pair key (sentence + line) + equality filter ────────────────

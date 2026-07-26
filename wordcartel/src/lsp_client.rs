@@ -20,7 +20,7 @@ use crate::limits::DIAG_MAX_SEND_BYTES;
 use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource};
 
 /// One LSP engine's identity + protocol variations (spec §3.2). ZST impls
-/// (`HarperEngine`, `LtexEngine`, `ValeEngine`); the core monomorphizes per engine.
+/// (`HarperEngine`, `LtexEngine`); the core monomorphizes per engine.
 pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
     const SOURCE: DiagSource;
     const INSTALL_HINT: &'static str;
@@ -230,8 +230,8 @@ impl<E: LspEngine> ClientState<E> {
             "params": E::initialize_params(&self.cfg)})
     }
 
-    /// The `didChangeConfiguration` PUSH — engine payload; `None` = engine never pushes
-    /// (vale), and the caller skips the frame entirely.
+    /// The `didChangeConfiguration` PUSH — engine payload; `None` = engine never pushes, and
+    /// the caller skips the frame entirely.
     fn settings_push_action(&self) -> Option<Action> {
         E::settings_push(&self.cfg).map(|settings| Action::Send(json!({
             "jsonrpc":"2.0","method":"workspace/didChangeConfiguration",

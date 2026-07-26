@@ -700,9 +700,16 @@ pub(crate) fn load_with_fs(fs: &dyn crate::fsx::Fs, paths: &[PathBuf],
             match name.as_str() {
                 "harper" => cfg.diagnostics.default_engine = Some(DiagSource::Harper),
                 "ltex" => cfg.diagnostics.default_engine = Some(DiagSource::LTeX),
-                "vale" => cfg.diagnostics.default_engine = Some(DiagSource::Vale),
+                // "vale" stays a RECOGNISED name — the engine is known, its transport is not.
+                // vale-ls lints the file on disk and never the buffer we sync to it, so the
+                // provider was removed; saying "unknown engine" here would be false, and
+                // dropping the key silently would leave the writer wondering. Warn + fall back
+                // to the seed (the first enabled engine, harper unless `linters` says otherwise).
+                "vale" => warns.push(
+                    "config: diagnostics.default_engine — \"vale\" is not available in this build \
+                     (vale-ls cannot lint unsaved buffers); using the first enabled engine".to_string()),
                 other => warns.push(format!(
-                    "config: diagnostics.default_engine — unknown engine \"{other}\" (known: harper, ltex, vale)")),
+                    "config: diagnostics.default_engine — unknown engine \"{other}\" (known: harper, ltex)")),
             }
         }
         if let Some(v) = raw.diagnostics.ltex.language { cfg.diagnostics.ltex_language = v; }
@@ -1500,6 +1507,21 @@ default_engine = "grammarly"
         assert_eq!(cfg2.diagnostics.default_engine, None, "unknown name → not set");
         assert!(warns2.iter().any(|w| w.contains("default_engine") && w.contains("grammarly")),
             "unknown default_engine warns with the known set");
+    }
+
+    /// `vale` is a recognised name with no provider behind it: the fold must warn HONESTLY
+    /// (never "unknown engine" — the name is known) and fall back rather than error.
+    #[test]
+    fn diagnostics_default_engine_vale_warns_that_it_is_unavailable() {
+        let (cfg, warns) = load_cfg("de_vale.toml", r#"
+[diagnostics]
+default_engine = "vale"
+"#);
+        assert_eq!(cfg.diagnostics.default_engine, None, "no provider → no seed override");
+        assert_eq!(warns, vec!["config: diagnostics.default_engine — \"vale\" is not available \
+            in this build (vale-ls cannot lint unsaved buffers); using the first enabled engine"
+            .to_string()]);
+        assert!(!warns[0].contains("unknown"), "the name IS known — only the transport is gone");
     }
 
     #[test]

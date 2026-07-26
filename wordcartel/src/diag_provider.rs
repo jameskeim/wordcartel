@@ -22,7 +22,7 @@ pub struct ProviderConfig {
     pub dictionary: Option<std::path::PathBuf>,
     pub max_file_length: u64,
     /// Engine language code (ltex); `None` for engines without a language knob (E10 §9 —
-    /// the one engine-varying field; harper/vale receive `None` and ignore it).
+    /// the one engine-varying field; harper receives `None` and ignores it).
     pub language: Option<String>,
 }
 
@@ -377,6 +377,7 @@ mod tests {
         assert!(!set.is_enabled(DiagSource::Plugin("mock")));
         assert!(set.set_enabled(DiagSource::Plugin("mock"), true));
         assert!(set.is_enabled(DiagSource::Plugin("mock")));
+        // Vale has no provider in this build, so it is a genuinely unregistered source here.
         assert!(!set.set_enabled(DiagSource::Vale, true), "unknown source → false");
     }
 

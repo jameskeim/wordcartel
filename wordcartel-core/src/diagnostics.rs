@@ -1,10 +1,11 @@
 //! In-document grammar/spell diagnostics: the pure data contract (Effort A §3.1). Values here are
 //! byte ranges into a checked text, produced by a `wordcartel::diag_provider::DiagnosticsProvider`
-//! in the shell (harper-ls over LSP, Effort A) and consumed by the shell's DiagStore/render/provider
-//! seam. This module holds no IO and no linting logic — the embedded `harper-core` backend that
-//! used to live here was removed when Effort A swapped it for the external harper-ls language
-//! server (the build-weight payoff: `burn`/`harper-core` are no longer in this crate's dependency
-//! graph). Diagnostics are sorted ascending by `range.start` by whichever provider produces them.
+//! in the shell (harper-ls and ltex-ls-plus both ship over LSP; Effort A / E10) and consumed by the
+//! shell's DiagStore/render/provider seam. This module holds no IO and no linting logic — the
+//! embedded `harper-core` backend that used to live here was removed when Effort A swapped it for
+//! the external harper-ls language server (the build-weight payoff: `burn`/`harper-core` are no
+//! longer in this crate's dependency graph). Diagnostics are sorted ascending by `range.start` by
+//! whichever provider produces them.
 
 /// The linter-agnostic category of a flagged issue — whether a provider judged it a
 /// spelling problem or a grammar/style problem. Providers (e.g. harper-ls over LSP) map
@@ -39,9 +40,12 @@ pub enum Suggestion {
 pub enum DiagSource {
     /// harper-ls — the bundled core provider (Effort A).
     Harper,
-    /// ltex-ls-plus — reserved vocabulary; provider ships in the ltex/vale effort.
+    /// ltex-ls-plus — a shipped LSP provider (grammar, via LanguageTool).
     LTeX,
-    /// vale / vale-ls — reserved vocabulary; provider ships in the ltex/vale effort.
+    /// vale — reserved vocabulary; NO provider ships today. The vale-ls LSP provider was removed
+    /// because it lints the file on disk rather than the synced buffer, so it cannot back a live
+    /// lens; the planned replacement is a one-shot CLI provider over the same source identity
+    /// (backlog E16, not yet built).
     Vale,
     /// A non-core engine, named statically (plugin-declared engines; test mocks).
     Plugin(&'static str),
@@ -73,7 +77,7 @@ impl DiagSource {
 /// A single flagged issue in a checked text, as reported by a
 /// `wordcartel::diag_provider::DiagnosticsProvider` in the shell. Diagnostics are pure data —
 /// this crate holds no linting logic, no sorting, and no rendering. Each engine's provider (e.g.
-/// harper-ls, and future ltex/vale/plugin providers) tags its own diagnostics with its
+/// harper-ls and ltex-ls-plus, plus future vale/plugin providers) tags its own diagnostics with its
 /// `DiagSource` and sorts its results ascending by `range.start` before handing them to the
 /// shell's `DiagStore`, which just holds them, partitioned per source; `wordcartel::render` is
 /// what paints them and turns each diagnostic's `suggestions` into a menu for the shell UI.

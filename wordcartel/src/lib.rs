@@ -59,7 +59,6 @@ pub mod lsp_rpc;
 mod lsp_client;
 pub mod harper_ls;
 pub(crate) mod ltex_ls;
-pub(crate) mod vale_ls;
 pub mod fold;
 pub mod outline_overlay;
 pub mod compose;
