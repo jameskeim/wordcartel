@@ -497,7 +497,7 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
     }
 }
 
-/// Build the core provider catalog (harper today), fold `linters` into per-engine enablement
+/// Build the core provider catalog (harper, ltex today), fold `linters` into per-engine enablement
 /// (warning on unknown names), install into `editor.diag_providers`, and seed the default lens
 /// (first enabled source in cycle order). Providers spawn nothing here — lazy, as before.
 /// `linters`: `None` → every core engine enabled; `Some(list)` → exactly the named engines
@@ -520,13 +520,18 @@ pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
         }
     };
     if let Some(list) = &cfg.diagnostics.linters {
+        // Whether the list names any real catalog engine besides vale — if not, dropping vale
+        // leaves nothing enabled at all, and the warning below says so.
+        let other_engine_named = catalog.iter().any(|&s| enabled_of(s));
         for name in list {
             if catalog.iter().any(|s| s.config_name() == name) { continue; }
             // `vale` stays a RECOGNISED name — the engine is known, the transport is gone. Saying
             // "unknown engine" would be false, and this warns rather than ignoring silently.
             if name == DiagSource::Vale.config_name() {
-                warns.push("config: diagnostics.linters — \"vale\" is not available in this build \
-                    (vale-ls cannot lint unsaved buffers); ignoring it".to_string());
+                let consequence = if other_engine_named { "" }
+                    else { " — no other engine is named, so no linter is enabled" };
+                warns.push(format!("config: diagnostics.linters — \"vale\" is not available in \
+                    this build (vale-ls cannot lint unsaved buffers); ignoring it{consequence}"));
             } else {
                 warns.push(format!(
                     "config: diagnostics.linters — unknown engine \"{name}\" (known: {})",
@@ -1435,6 +1440,24 @@ mod tests {
         assert_eq!(warns, vec!["config: diagnostics.linters — \"vale\" is not available in this \
             build (vale-ls cannot lint unsaved buffers); ignoring it".to_string()]);
         assert!(!warns[0].contains("unknown"), "the name IS known — only the transport is gone");
+    }
+
+    #[test]
+    fn a_lone_vale_linters_entry_warns_that_nothing_is_enabled() {
+        // Same drop as above, but with vale the ONLY named engine: no catalog engine ends up
+        // enabled at all, and the warning must say so — not just that vale itself was dropped.
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = crate::config::Config::default();
+        cfg.diagnostics.linters = Some(vec!["vale".into()]);
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(!e.diag_providers.is_enabled(DiagSource::Harper));
+        assert!(!e.diag_providers.is_enabled(DiagSource::LTeX));
+        assert!(!e.diag_providers.is_enabled(DiagSource::Vale));
+        assert_eq!(warns, vec!["config: diagnostics.linters — \"vale\" is not available in this \
+            build (vale-ls cannot lint unsaved buffers); ignoring it — no other engine is named, \
+            so no linter is enabled".to_string()]);
     }
 
     #[test]

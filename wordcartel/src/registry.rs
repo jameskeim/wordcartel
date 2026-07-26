@@ -598,9 +598,9 @@ impl Registry {
                 wordcartel_core::diagnostics::DiagSource::LTeX, on, c.clock);
             CommandResult::Handled
         });
-        // No `analysis_engine_vale` / `toggle_engine_vale`: vale has no provider in this build,
-        // so it is not a settable option and those entries could only ever refuse (contract
-        // law 2 — every user-settable option IS a command, and only those).
+        // No `analysis_engine_vale` / `toggle_engine_vale`: vale has no provider in this build.
+        // Registering them anyway would still force them into the palette (contract law 3 — the
+        // palette is exhaustive over the registry), where they could only ever refuse.
 
         // Prose lenses (S8) — Rule 8: 5 palette-only set primitives + one stateful cycle rep; the
         // shared setter is lenses::set_prose_lens (Law 6). Per-buffer state on View. A14: no
@@ -2186,8 +2186,9 @@ mod tests {
     }
 
     /// The vale commands are GONE with the provider: with nothing to set, a palette entry could
-    /// only refuse. Pinned so a future engine sweep does not reintroduce a command with no
-    /// option behind it (contract law 2).
+    /// only refuse (contract law 3 — the palette is exhaustive over the registry, so registering
+    /// them would force them in). Pinned so a future engine sweep does not reintroduce a command
+    /// with no option behind it.
     #[test]
     fn the_vale_commands_are_not_registered() {
         let reg = Registry::builtins();

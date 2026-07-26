@@ -262,7 +262,8 @@ command; palette-exhaustive; menu ⊆ palette). Concretely:
 - **Set-per-state + a cycle (contract law 8):** `analysis_engine_harper` / `_ltex` / `_vale`
   (palette-only set primitives) + an `analysis_next` cycle carried in the menu with state-in-label — exactly
   the `keymap_next` / `toggle_chrome` precedent. Per-engine `diag_enable_<engine>` toggles pair with the
-  same shape.
+  same shape. (**Note 2026-07-26:** the vale-ls provider was removed — see ⚠OPEN 1 — so
+  `analysis_engine_vale` / `toggle_engine_vale` were removed with it; `harper`/`ltex` commands stand.)
 - **A per-engine menu section.** The engines + their live state (Ready / warming / off / not-installed) are
   live editor state → a **dynamic menu section** fits (`DynamicSection { category, rows: fn(&Editor) ->
   Vec<(String, MenuRowAction)> }`, `menu.rs:46`). **Coupling answer:** a **builtin** dynamic section (a Rust
@@ -337,6 +338,13 @@ never blocks the spine on the deferred dynamic-menu or plugin-server work.
    parts, but a 2nd lifecycle model in the seam OR a `wc.async` driver instead of a provider). The harper
    LSP precedent does not cleanly govern here (vale needs no incremental sync + no dep-shed). *Recommend
    vale-ls as the provider; vale-CLI as the `wc.async` driver.* — a genuine resource/product fork.
+
+   **SUPERSEDED 2026-07-26:** a live protocol probe reversed this recommendation. vale-ls lints the file
+   ON DISK, not the buffer synced to it — `didChange` produces zero server messages and `didSave` re-reads
+   disk, ignoring its own `text` param — so it cannot back a live lens at all, regardless of residency
+   trade-offs. The vale-ls provider was removed (`DiagSource::Vale` stays reserved in core); the
+   replacement path is now a one-shot vale-CLI provider over the same source identity, filed as backlog
+   **E16** (not yet built). Probe evidence: `scratchpad/e15/probe/vale-sync-probe-results.md`.
 2. **Detail/explanation panel: extend the centered `DiagOverlay` vs. build the Fresh `UtilityDock`
    side-panel.** Extend-overlay ships in-effort and is cheap; the dock is the recorded principled end-state
    (`ux-backlog.md` S1) but is a separate *windowing* effort. *Recommend extend-overlay now; dock later.*
