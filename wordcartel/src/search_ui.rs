@@ -678,6 +678,37 @@ mod tests {
         crate::search_ui::diag_apply_selected(&mut e, &crate::test_support::TestClock::new(0));
         assert!(e.session_dismissals.is_empty(), "empty line-unit ⇒ refused (belt)");
         assert_eq!(e.status_text(), "cannot dismiss here");
+        // Review M2: the refusal deliberately CLOSES the overlay (settled) — pin it, so the
+        // behaviour is asserted rather than assumed by the reader of the arm.
+        assert!(e.diag.is_none(), "the refusal closes the overlay, it does not leave it open");
+    }
+
+    /// E11 §5.3, review FIX 1 — the STORE side of the `None → ""` keying `DismissSet` documents.
+    /// A code-less engine still gets per-occurrence dismissal: the anchor's absent `code` must key
+    /// as the empty string, so the stored triple re-matches other code-LESS flags on that pair and
+    /// leaves a coded flag on the very same sentence+line alone.
+    #[test]
+    fn an_anchor_without_a_code_stores_the_empty_string_key() {
+        let mut e = Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        let mk = |range: std::ops::Range<usize>, code: Option<&str>| Diagnostic { range,
+            kind: DiagnosticKind::Grammar, source: DiagSource::LTeX,
+            code: code.map(Into::into), href: None, message: "m".into(), suggestions: vec![] };
+        // Both flags sit inside "Delta epsilon zeta." ⇒ ONE pair key; only `code` separates them.
+        e.active_mut().diagnostics.slot_mut(DiagSource::LTeX).diagnostics =
+            vec![mk(18..23, None), mk(24..31, Some("R"))];
+        e.open_diag(mk(18..23, None));
+        e.diag.as_mut().unwrap().fix_state = crate::diag_overlay::FixState::Done;
+        e.diag.as_mut().unwrap().selected = 1; // rows = [NoFixes, DismissSession]
+        diag_apply_selected(&mut e, &TestClock(0));
+        let key = crate::diagnostics_run::dismissal_units_at(&e.active().document.buffer, 18);
+        assert!(e.session_dismissals.contains(&(DiagSource::LTeX, String::new(), key)),
+            "an absent anchor code keys as the EMPTY STRING, not as a wildcard");
+        let kept: Vec<std::ops::Range<usize>> =
+            e.active().diagnostics.slot(DiagSource::LTeX).unwrap()
+                .diagnostics.iter().map(|d| d.range.clone()).collect();
+        assert_eq!(kept, vec![24..31],
+            "the code-less flag went; the coded flag on the same pair key stayed");
     }
 
     /// The companion the refusal test cannot supply: the `DismissSession` arm's SUCCESS path.

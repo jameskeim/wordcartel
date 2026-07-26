@@ -268,12 +268,17 @@ pub(crate) fn dismissal_units_at(buf: &wordcartel_core::buffer::TextBuffer, pos:
     -> DismissKey {
     let pos = pos.min(buf.len());
     let line = buf.byte_to_line(pos);
-    // Expand to the nearest blank-line/document boundaries (source-level paragraph).
+    // Expand to the nearest blank-line/document boundaries (source-level paragraph). "Blank" is
+    // TRIM-empty, not strict-empty: CommonMark treats a whitespace-only line as blank, and both
+    // shipped paragraph walkers (`nav.rs`, `ventilate.rs`) agree — a strict-empty test silently
+    // swallowed the preceding block into the key. One predicate, both directions, one function:
+    // the store and filter sides cannot disagree.
+    let blank = |n: usize| crate::lines::line_text(buf, n).trim().is_empty();
     let mut first = line;
-    while first > 0 && !crate::lines::line_text(buf, first - 1).is_empty() { first -= 1; }
+    while first > 0 && !blank(first - 1) { first -= 1; }
     let total = crate::lines::total_logical_lines(buf);
     let mut last = line;
-    while last + 1 < total && !crate::lines::line_text(buf, last + 1).is_empty() { last += 1; }
+    while last + 1 < total && !blank(last + 1) { last += 1; }
     let win_start = crate::lines::line_start(buf, first);
     let win_end = if last + 1 < total { crate::lines::line_start(buf, last + 1) }
         else { buf.len() };
@@ -293,8 +298,8 @@ pub(crate) fn dismissal_units_at(buf: &wordcartel_core::buffer::TextBuffer, pos:
 ///
 /// `buf` is the buffer the ranges were computed against, which is NOT necessarily the active one
 /// (a publish can land on a background buffer); the derivation is parse-free precisely so that is
-/// safe. Cost is `O(enclosing paragraph)` per diagnostic and the caller only reaches it once the
-/// writer has actually dismissed something.
+/// safe. Cost is `O(enclosing paragraph)` per diagnostic, and the caller only reaches it for a
+/// diagnostic whose `(source, code)` already matched a dismissal — see `retain_over_union`.
 fn is_dismissed(d: &Diagnostic, buf: &wordcartel_core::buffer::TextBuffer,
     dismissals: &DismissSet) -> bool {
     let key = dismissal_units_at(buf, d.range.start);
@@ -303,11 +308,25 @@ fn is_dismissed(d: &Diagnostic, buf: &wordcartel_core::buffer::TextBuffer,
 
 /// Drop every `Spelling` diagnostic whose surface word (sliced from `text`) is in `union`, and
 /// every diagnostic of any kind that matches a session dismissal; retain everything else. Byte
-/// ranges index into `text`/`buf`, which are the buffer content of the diagnostics' version.
+/// ranges index into `text`/`buf`, which are the buffer content of the diagnostics' version — the
+/// two are one version by contract, checked below.
 fn retain_over_union(diags: &mut Vec<Diagnostic>, buf: &wordcartel_core::buffer::TextBuffer,
     text: &str, union: &std::collections::HashSet<String>, dismissals: &DismissSet) {
+    // `text` IS `buf`'s content — the callers pass a `buf.to_string()` they already hold, so the
+    // spelling slice and the pair-key derivation see one and the same version. A stale `text`
+    // would filter spelling against one document and dismissals against another; not evaluated in
+    // release (the compare is `O(document)`).
+    debug_assert_eq!(text, buf.to_string(),
+        "retain_over_union: `text` must be `buf`'s own content");
+    // The cheap half of the dismissal rule, hoisted (spec §5.3 cost note): `(source, code)` is a
+    // hash lookup, the pair key costs `O(enclosing paragraph)` to derive. Prune by the prefix
+    // FIRST, so a diagnostic from an engine/rule the writer never dismissed derives no unit at
+    // all — the cost tracks the MATCHING-source diagnostics, not every diagnostic.
+    let prefixes: std::collections::HashSet<(DiagSource, &str)> =
+        dismissals.iter().map(|(s, c, _)| (*s, c.as_str())).collect();
     diags.retain(|d| {
-        if !dismissals.is_empty() && is_dismissed(d, buf, dismissals) { return false; }
+        if prefixes.contains(&(d.source, d.code.as_deref().unwrap_or("")))
+            && is_dismissed(d, buf, dismissals) { return false; }
         if d.kind != DiagnosticKind::Spelling { return true; }
         let surface = text.get(d.range.start..d.range.end).unwrap_or("");
         !union.contains(&surface.to_lowercase())
@@ -1548,6 +1567,26 @@ mod tests {
         assert_eq!(k.line, "Para one here. Para two here.");
     }
 
+    /// ADDED (review FIX 2) — "blank" is TRIM-empty, not strict-empty. `line_text` strips only the
+    /// trailing newline, so a whitespace-only separator used to count as paragraph CONTENT and the
+    /// window swallowed the neighbouring block: the key was then bound to text the writer never
+    /// selected. One fixture per walk direction: the two loops share ONE predicate, so both are
+    /// pinned against a future edit that re-splits it.
+    #[test]
+    fn a_whitespace_only_line_is_a_blank_boundary() {
+        // Backward walk: the heading above must NOT be pulled into the window.
+        let up = crate::editor::Editor::new_from_text("# Title\n   \nBeta two.\n", None, (80, 24));
+        let k = dismissal_units_at(&up.active().document.buffer, 12); // start of "Beta two."
+        assert_eq!(k.sentence, "Beta two.", "the whitespace-only line above stops the window");
+        assert_eq!(k.line, "Beta two.");
+        // Forward walk: an unterminated first sentence must not run on into the block below.
+        // (A terminated one would be cut by the segmenter anyway — no discrimination.)
+        let down = crate::editor::Editor::new_from_text("Alpha beta\n \t \nGamma three.\n",
+            None, (80, 24));
+        let k2 = dismissal_units_at(&down.active().document.buffer, 0);
+        assert_eq!(k2.sentence, "Alpha beta", "the whitespace-only line below stops the window");
+    }
+
     // ── T7 harness (all bodies complete — plan-gate round-2 finding 4) ──────────────────────
 
     fn gdiag(range: std::ops::Range<usize>, code: &str) -> Diagnostic {
@@ -1633,9 +1672,13 @@ mod tests {
 
     #[test]
     fn dismissed_sentence_does_not_suppress_a_longer_containing_sentence() {
-        // Round-3: EQUALITY, not containment. The segmenter keeps "Dr. Smith arrived." as
-        // ONE sentence (the shipped textobj doctest), which literally CONTAINS the dismissed
-        // "Smith arrived." — containment would suppress it; equality must not.
+        // Round-3, AMENDED (review M1): what this actually pins is that a dismissal does not
+        // reach a flag in a DIFFERENT PARAGRAPH whose sentence merely contains the dismissed one —
+        // and here the two sentences also sit on different LINES, so the `line` conjunct alone
+        // already decides it. A containment implementation of `sentence` still passes. The test
+        // that isolates equality-vs-containment is the sibling
+        // `containment_on_the_same_line_does_not_suppress`, where ONE line holds both sentences.
+        // The segmenter keeps "Dr. Smith arrived." as ONE sentence (the shipped textobj doctest).
         let mut e = crate::editor::Editor::new_from_text(
             "Smith arrived. Yes.\n\nDr. Smith arrived. Indeed.\n", None, (80, 24));
         e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
@@ -1690,6 +1733,61 @@ mod tests {
         assert_eq!(slot_ranges(&e), vec![19..24], "containment is NOT equality ⇒ survives");
     }
 
+    /// ADDED (review FIX 1) — the `(source, code)` half of the triple was UNPINNED: every fixture
+    /// used ONE source (`LTeX`) and ONE code (`"R"`), so dropping either conjunct from the match
+    /// left the whole battery green. The three tests below each hold the pair key FIXED and vary
+    /// exactly ONE conjunct, so that conjunct alone decides the outcome.
+    ///
+    /// Here: another ENGINE's flag on the same sentence AND line. Without the `source` conjunct a
+    /// writer dismissing an ltex rule would also silence harper/vale on that very text.
+    #[test]
+    fn a_dismissal_does_not_cross_engines() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        dismiss_at(&mut e, 18, "R"); // LTeX / "R" / the "Delta epsilon zeta." pair
+        let mut d = gdiag(18..23, "R");
+        d.source = DiagSource::Harper; // SAME pair key, SAME code — only the engine differs
+        let v = e.active().document.version;
+        let slot = e.active_mut().diagnostics.slot_mut(DiagSource::Harper);
+        slot.diagnostics = vec![d];
+        slot.computed_version = v;
+        retain_unignored(&mut e);
+        let kept: Vec<std::ops::Range<usize>> = e.active().diagnostics.slot(DiagSource::Harper)
+            .map(|s| s.diagnostics.iter().map(|d| d.range.clone()).collect()).unwrap_or_default();
+        assert_eq!(kept, vec![18..23], "a different engine's flag on the same units survives");
+    }
+
+    /// The `code` conjunct in isolation: same engine, same pair key, a different RULE.
+    /// Without it, dismissing one ltex rule would silence every other rule on that sentence.
+    #[test]
+    fn a_dismissal_does_not_cross_codes() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        dismiss_at(&mut e, 18, "R");
+        seed_slot(&mut e, vec![gdiag(18..23, "S")]); // SAME source, SAME pair key, code "S"
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![18..23], "a different rule code survives");
+    }
+
+    /// The `None → ""` keying `DismissSet`'s doc specifies: a code-less engine still gets
+    /// per-occurrence dismissal, not a wildcard over the key. Both flags below share ONE pair key
+    /// and differ only in `code`, so the empty-string dismissal must take the code-less one and
+    /// leave the coded one — the `unwrap_or_default` on the FILTER side.
+    #[test]
+    fn an_absent_code_keys_as_the_empty_string() {
+        let mut e = crate::editor::Editor::new_from_text(
+            "Alpha beta gamma. Delta epsilon zeta.\n", None, (80, 24));
+        let key = dismissal_units_at(&e.active().document.buffer, 18);
+        e.session_dismissals.insert((DiagSource::LTeX, String::new(), key));
+        let mut no_code = gdiag(18..23, "R");
+        no_code.code = None;
+        // Both inside "Delta epsilon zeta." ⇒ identical pair key; only `code` separates them.
+        seed_slot(&mut e, vec![no_code, gdiag(24..31, "R")]);
+        retain_unignored(&mut e);
+        assert_eq!(slot_ranges(&e), vec![24..31],
+            "the code-less flag is dismissed; a coded flag on the same key is not");
+    }
+
     #[test]
     fn identical_pair_across_roles_is_suppressed_documented_behavior() {
         // Round-5 Minor-3, on a GENUINE cross-role fixture (plan-gate round-3 finding 1):
@@ -1740,9 +1838,17 @@ mod tests {
         e.install_scratch();
         crate::workspace::goto_scratch(&mut e);
         assert_ne!(e.active().id, target, "the target buffer is NOT active");
+        // Review M3: pin the headline claim. The block tree of a non-active buffer is deliberately
+        // stale (the lazy-reparse law), so the filter must not touch it — a future edit reaching
+        // for the lens/classifier here bumps this generation and trips the assert.
+        let gen_before = e.by_id(target).unwrap().document.blocks_generation();
         apply_diagnostics_done(&mut e, target, v, DiagSource::LTeX, vec![gdiag(18..23, "R")]);
-        let stored = e.by_id_mut(target).unwrap().diagnostics.slot(DiagSource::LTeX)
-            .map(|s| s.diagnostics.len()).unwrap_or(0);
-        assert_eq!(stored, 0, "dismissal filtered on the non-active buffer's own text");
+        assert_eq!(e.by_id(target).unwrap().document.blocks_generation(), gen_before,
+            "no reparse of the non-active buffer — no tree was touched");
+        // `unwrap_or(0)` would also yield 0 for a missing slot, so pin the slot's EXISTENCE first.
+        let slot = e.by_id(target).unwrap().diagnostics.slot(DiagSource::LTeX)
+            .expect("the apply created the LTeX slot on the target buffer");
+        assert!(slot.diagnostics.is_empty(),
+            "dismissal filtered on the non-active buffer's own text");
     }
 }
