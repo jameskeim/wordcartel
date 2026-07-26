@@ -491,7 +491,10 @@ diagnostic `codeAction` is harper's native shape — it is where the parser's `"
 
 ```rust
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum DiagRow {
+// `pub`, not `pub(crate)`: `diag_overlay` is a `pub mod` and `rows()` is a `pub fn`, so a
+// crate-private return type trips `private_interfaces` and breaks the warning-free build gate.
+// Its neighbours `DiagOverlay` and `FixState` are `pub` for the same reason.
+pub enum DiagRow {
     Suggestion(usize),   // index into anchor.suggestions
     FetchingFixes,       // §5.2 — present only while a fetch is live
     NoFixes,             // §5.2 — terminal, only when a fetch came back empty/expired
@@ -501,7 +504,7 @@ pub(crate) enum DiagRow {
     DismissSession,      // non-Spelling only
 }
 impl DiagOverlay {
-    pub(crate) fn rows(&self) -> Vec<DiagRow> { /* pure fn of anchor + fetch state */ }
+    pub fn rows(&self) -> Vec<DiagRow> { /* pure fn of anchor + fetch state */ }
 }
 ```
 
@@ -534,6 +537,12 @@ with tests:
   non-empty delivery; `NoFixes` on an empty one) — deterministic and test-pinned, not a
   side effect of clamping.
 - `FetchingFixes`/`NoFixes` remain no-op rows under Enter at ALL times (activation tests).
+  **Ordering scope note (T6-review regression fix):** inertness governs EXECUTION — an inert
+  row never performs an edit, at any time — while the stale-overlay `opened_version` guard
+  runs FIRST in `diag_apply_selected` and closes with the shipped "document changed;
+  re-open" warning regardless of which row is selected. The guard shipped ahead of row
+  handling; hoisting an inert-row early-return above it is a behavior change, not a free
+  refactor.
 - Named residual: an Enter already in flight when delivery lands executes against the reset
   row — the overlay's primary action, applied as a normal UNDOABLE edit with the caret moved
   to it (the standard async-popup trade; bounded by undo and by the visible list change).

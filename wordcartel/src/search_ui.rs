@@ -171,7 +171,12 @@ pub(crate) fn apply_diag_fixes_ready(editor: &mut Editor, buffer_id: crate::edit
 
 /// Activate the overlay's currently selected row (E11 §5.1 — keyed on the `DiagRow` VALUE,
 /// never on an index comparison). Clears `editor.diag` when an activatable row runs,
-/// regardless of outcome; the non-activatable rows leave it open.
+/// regardless of outcome; at the same document version the non-activatable rows leave it open.
+///
+/// Ordering (E11 §5.2 note): the stale-anchor guard runs FIRST and closes the overlay with the
+/// sticky "document changed; re-open" warning for EVERY row — inertness governs EXECUTION (an
+/// inert row never edits, which the exhaustive match below enforces), not whether a dead overlay
+/// is allowed to answer a keypress with silence.
 pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
     use crate::diag_overlay::DiagRow;
     // Clone what we need out of the overlay before mutating editor.
@@ -181,12 +186,6 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         (ov.anchor.range.start, ov.anchor.range.end, row, suggestion, ov.opened_version)
     });
     let Some((raw_a, raw_b, row, suggestion, opened_version)) = overlay_info else { return; };
-
-    // E11 §5.2: the fetch-state rows are inert at ALL times. Returning HERE — before the
-    // stale-anchor guard below — is what makes that unconditional: nothing is being applied,
-    // so there is no stale range to refuse, and an async delivery can never turn a documented
-    // no-op into an action (nor into a surprise overlay dismissal).
-    if matches!(row, None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes)) { return; }
 
     // Fix A4: if the buffer was mutated while the overlay was open, the anchor
     // ranges are stale.  Refuse to apply — a stale range can cause a panic on
@@ -216,7 +215,8 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         }
         Some(DiagRow::LearnMore) => {} // T8 fills this in (copy the href + the mandatory ack).
         Some(DiagRow::DismissSession) => {} // T7 fills this in (the session-dismissal key).
-        None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes) => {} // returned above
+        // The inert rows (§5.2) and an out-of-range selection: no edit, overlay stays open.
+        None | Some(DiagRow::FetchingFixes) | Some(DiagRow::NoFixes) => {}
     }
 }
 
@@ -485,41 +485,64 @@ mod tests {
             code: Some("R".into()), href: None, message: "m".into(), suggestions: vec![] }
     }
 
-    /// E11 §5.2: the two fetch-state rows are NOT activatable. Enter on them neither edits the
-    /// document nor dismisses the overlay — the row is inert, in both fetch states.
+    /// The boundary this test and its companion pin (E11 §5.2 ordering note): inertness governs EXECUTION,
+    /// the stale-anchor guard governs ENTRY. THIS half is the stale side — the overlay is dead
+    /// (the document moved under it), so Enter on `fetching fixes…` / `(no fixes available)` gets
+    /// the same shipped Fix-A4 sticky warning every activatable row gets, rather than answering a
+    /// keypress with total silence. It must still perform no EDIT: inert is inert.
+    ///
+    /// FAIL-VERIFY (mutation): reinstate the hoisted
+    /// `if matches!(row, None | Some(FetchingFixes) | Some(NoFixes)) { return; }` above the
+    /// version check — this test fails (overlay stays open, status empty) while its same-version
+    /// companion below stays green. Confirmed, then reverted.
     #[test]
-    fn enter_on_fetching_and_nofixes_rows_is_a_noop() {
+    fn enter_on_an_inert_row_in_a_stale_overlay_closes_with_the_shipped_warning() {
         for fetch_state in [crate::diag_overlay::FixState::Fetching,
                             crate::diag_overlay::FixState::Done] {
             let mut e = Editor::new_from_text("ab\n", None, (40, 10));
             e.open_diag(grammar_no_sugg());
             e.diag.as_mut().unwrap().fix_state = fetch_state;
             e.diag.as_mut().unwrap().selected = 0; // FetchingFixes or NoFixes, per state
+            // Move the document under the open overlay through the real edit funnel, so the
+            // staleness is the one a writer actually produces (a version bump by hand would
+            // pin the guard against a state the funnel can never reach).
+            let id = e.active().id;
+            let opened_at = e.diag.as_ref().unwrap().opened_version;
+            let (cs, edit) = crate::commands::build_multi_replace(
+                &[(0, 0, "X".into())], e.active().document.buffer.len());
+            assert_eq!(crate::edit_apply::apply_edit(&mut e, id,
+                wordcartel_core::history::Transaction::new(cs), edit,
+                wordcartel_core::history::EditKind::Other, &TestClock(0)),
+                crate::edit_apply::EditOutcome::Applied, "precondition: the funnel edit committed");
             let v = e.active().document.version;
-            crate::search_ui::diag_apply_selected(&mut e, &crate::test_support::TestClock::new(0));
-            assert_eq!(e.active().document.version, v, "no edit from a no-op row");
-            assert!(e.diag.is_some(), "overlay stays open — the row is inert, not a dismissal");
+            assert_ne!(v, opened_at, "precondition: the overlay's anchor is now stale");
+            crate::search_ui::diag_apply_selected(&mut e, &TestClock(0));
+            assert_eq!(e.active().document.version, v, "the Enter itself performed no edit");
+            assert!(e.diag.is_none(), "a dead overlay closes on Enter, whichever row is selected");
+            assert_eq!(e.status_text(), "document changed; re-open");
+            assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+            assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         }
     }
 
-    /// The teeth of the test above: "inert" has to mean inert, not "happens to fall through to
-    /// a branch that does nothing". A STALE anchor makes the two behaviours separable — every
-    /// activatable row closes the overlay with the Fix-A4 sticky warning, so a no-op row that
-    /// merely fell through the row match would close it too. It must not: nothing is being
-    /// applied, so there is nothing for the stale-range guard to refuse.
+    /// The other half of that boundary: at the SAME version the overlay is alive, and there the
+    /// inert rows really are inert — no edit, no dismissal, no status. Kept beside the stale case
+    /// so the pair pins the ordering itself rather than one side of it (a guard that closed on
+    /// every Enter, or one that never closed, would fail exactly one of the two).
     #[test]
-    fn a_no_op_row_stays_inert_even_when_the_anchor_is_stale() {
+    fn enter_on_an_inert_row_same_version_does_nothing_and_stays_open() {
         for fetch_state in [crate::diag_overlay::FixState::Fetching,
                             crate::diag_overlay::FixState::Done] {
             let mut e = Editor::new_from_text("ab\n", None, (40, 10));
             e.open_diag(grammar_no_sugg());
             e.diag.as_mut().unwrap().fix_state = fetch_state;
             e.diag.as_mut().unwrap().selected = 0;
-            e.active_mut().document.version += 1; // buffer mutated while the overlay was open
+            let v = e.active().document.version;
             crate::search_ui::diag_apply_selected(&mut e, &TestClock(0));
-            assert!(e.diag.is_some(), "an inert row does not trip the stale-anchor refusal");
+            assert_eq!(e.active().document.version, v, "no edit from a no-op row");
+            assert!(e.diag.is_some(), "the overlay stays open — the row is inert, not a dismissal");
             assert_ne!(e.status_text(), "document changed; re-open",
-                "no refusal status either — nothing was applied");
+                "and nothing was refused — the anchor is live");
         }
     }
 

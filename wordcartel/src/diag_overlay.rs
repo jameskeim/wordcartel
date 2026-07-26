@@ -76,9 +76,17 @@ impl DiagOverlay {
     /// else gets the session dismiss).
     ///
     /// # Examples
-    /// ```ignore
-    /// // A spelling flag with one fix, fetch complete:
-    /// // [Suggestion(0), IgnoreOnce, AddToDictionary]
+    /// ```
+    /// # use wordcartel::diag_overlay::{DiagOverlay, DiagRow};
+    /// # use wordcartel::editor::BufferId;
+    /// # use wordcartel_core::diagnostics::{DiagSource, Diagnostic, DiagnosticKind, Suggestion};
+    /// let d = Diagnostic { range: 0..3, kind: DiagnosticKind::Spelling,
+    ///     source: DiagSource::Harper, code: None, href: None, message: "misspelled".into(),
+    ///     suggestions: vec![Suggestion::ReplaceWith("the".into())] };
+    /// // A spelling flag with one fix, fetch complete (the `FixState::Done` a fresh overlay has):
+    /// let ov = DiagOverlay::new(d, BufferId(1), 0);
+    /// assert_eq!(ov.rows(), vec![DiagRow::Suggestion(0), DiagRow::IgnoreOnce,
+    ///     DiagRow::AddToDictionary]);
     /// ```
     pub fn rows(&self) -> Vec<DiagRow> {
         let mut out: Vec<DiagRow> = (0..self.anchor.suggestions.len())

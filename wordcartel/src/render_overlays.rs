@@ -1275,6 +1275,78 @@ mod tests {
             "and NEVER the spelling-shaped rows — the visible-no-op this effort exists to fix");
     }
 
+    /// A spelling flag with `n` fixes labelled `fix-00`…, the shape the test above cannot make:
+    /// its fixture has ZERO suggestions, so `DiagRow::Suggestion(i) => suggestions.get(*i)` — the
+    /// one place the painter still does an index lookup of its own, and the exact shape of the
+    /// ladder the row model replaced — reaches no assertion there.
+    fn spelling_with_fixes(n: usize) -> wordcartel_core::diagnostics::Diagnostic {
+        wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "m".into(),
+            suggestions: (0..n).map(|i|
+                wordcartel_core::diagnostics::Suggestion::ReplaceWith(format!("fix-{i:02}"))).collect(),
+        }
+    }
+
+    /// E11 §5.1, the SUGGESTION half: a suggestion row must paint the suggestion its index names,
+    /// on the row `rows()` puts it. This is the overlay's PRIMARY content — a `Suggestion` arm
+    /// that painted blank would silently empty the quick-fix list, and with a zero-suggestion
+    /// fixture as the only coverage the whole suite stays green while it does.
+    ///
+    /// FAIL-VERIFY (mutation): make the painter's `DiagRow::Suggestion(_)` arm yield
+    /// `String::new()` — both suggestion-row assertions fail (the rows read blank) while the two
+    /// standing-action assertions stay green. Confirmed, then reverted.
+    #[test]
+    fn suggestion_rows_paint_the_suggestion_their_index_names() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(spelling_with_fixes(2)); // rows: [S0, S1, IgnoreOnce, AddToDictionary]
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_diag(f, &mut e, &cs)).expect("draw");
+        let first = ov_rect.y + 1;
+        let drawn: Vec<String> = (0..4).map(|i| row_text(&term, first + i)).collect();
+        assert!(drawn[0].contains("fix-00"), "row 0 paints suggestion 0: {:?}", drawn[0]);
+        assert!(drawn[1].contains("fix-01"), "row 1 paints suggestion 1 — not 0 again, not blank: {:?}", drawn[1]);
+        assert!(drawn[2].contains("Ignore once"), "the standing rows follow the block: {:?}", drawn[2]);
+        assert!(drawn[3].contains("Add to dictionary"), "…in order: {:?}", drawn[3]);
+    }
+
+    /// E11 §5.1, the WINDOW: the painted slice starts at `scroll_top`, not at 0. Every other diag
+    /// paint fixture is short enough to fit whole (`list_h >= row_count`), where the scroll offset
+    /// is dead code — so this one is deliberately taller than the 15-row budget and driven to the
+    /// LAST row, the only arrangement in which dropping the offset is observable.
+    ///
+    /// FAIL-VERIFY (mutation): change the painter's `rows.iter().skip(scroll_top)` to `skip(0)` —
+    /// this test fails (the window's first row reads `fix-00`, and the last reads `fix-14` instead
+    /// of the dictionary row). Confirmed, then reverted.
+    #[test]
+    fn the_painted_window_starts_at_scroll_top_not_at_row_zero() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.open_diag(spelling_with_fixes(18)); // 18 fixes + ignore + add-dict = 20 rows
+        let row_count = e.diag.as_ref().unwrap().row_count();
+        let list_h = crate::list_window::list_h_for(row_count, 24);
+        assert_eq!((row_count, list_h), (20, 15), "precondition: the list overflows its window");
+        e.diag.as_mut().unwrap().selected = row_count - 1; // paint re-windows onto the last row
+        let area = Rect::new(0, 0, 80, 24);
+        let ov_rect = palette_overlay_rect(area, row_count);
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_diag(f, &mut e, &cs)).expect("draw");
+        assert_eq!(e.diag.as_ref().unwrap().scroll_top, 5,
+            "precondition: keep_overlay_visible scrolled the window to show the last row");
+        let first = ov_rect.y + 1;
+        let drawn: Vec<String> = (0..list_h as u16).map(|i| row_text(&term, first + i)).collect();
+        assert!(drawn[0].contains("fix-05"),
+            "the window's first drawn row is rows[scroll_top], not rows[0]: {:?}", drawn[0]);
+        assert!(drawn[14].contains("Add to dictionary"),
+            "…and its last is the selected final row: {:?}", drawn[14]);
+        assert!(!drawn.iter().any(|r| r.contains("fix-00") || r.contains("fix-04")),
+            "the scrolled-past rows are not on screen at all");
+    }
+
     // ---- the DRAWN box is the one chrome_geom describes ---------------------------
 
     #[test]
