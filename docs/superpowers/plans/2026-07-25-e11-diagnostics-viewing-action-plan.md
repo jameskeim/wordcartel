@@ -49,12 +49,16 @@ live probe.
 - Create: `scratchpad/e11/probe/t1-perdiag-results.md` (+ a probe script beside it)
 - No source changes. This task BINDS T4's request-construction step.
 
-**What it must establish (spec §2.3):** the E11 pre-spec probe's single-diagnostic ltex request
-(exact range, one diagnostic echoed in `context.diagnostics`) returned ONLY the three
-command-only actions — NO `quickfix.ltex.acceptSuggestions` — while the whole-document batch
-returned an accept-suggestion for the same diagnostic. T1 re-runs the probe
-(`scratchpad/e11/probe/ltex_probe.py` is the template) against real `ltex-ls-plus`, varying ONLY
-the request construction, echoing the server's RAW diagnostic bytes verbatim:
+**EXECUTED — Outcome A recorded (`scratchpad/e11/probe/t1-perdiag-results.md`), and the brief's
+premise was FALSIFIED:** the pre-spec probe's "single-diagnostic returns no accept-suggestion,
+batch does" claim was a fixture artifact — its own raw capture shows `floopmuffin` gets NO
+`acceptSuggestions` in ANY shape (LanguageTool has zero replacements for the nonword; the
+write-up's prose contradicted its own JSON). Re-targeted on `recieve` (two real candidates),
+ALL variants below elicit the fixes identically; controls show the response tracks the
+requested RANGE, not the context contents. Spec §2.3 carries the correction. The original task
+description (kept for the record): T1 re-runs the probe (`scratchpad/e11/probe/ltex_probe.py`
+is the template) against real `ltex-ls-plus`, varying ONLY the request construction, echoing
+the server's RAW diagnostic bytes verbatim:
 
 - [ ] **Step 1:** Variant A — range = the diagnostic's exact range; `context.diagnostics` =
   [that one raw diagnostic, verbatim].
@@ -65,7 +69,8 @@ the request construction, echoing the server's RAW diagnostic bytes verbatim:
 - [ ] **Step 4:** Record verbatim JSON per variant in the results file with a one-line verdict:
   which variants elicit `acceptSuggestions` for the targeted diagnostic.
 
-**Binding outcomes (write the chosen letter into the results file; T4 Step 5 reads it):**
+**Binding outcomes (RECORDED: A — write the chosen letter into the results file; T4 Step 5
+reads it; the ltex `FIX_CONTEXT_ALL_RAWS` default-`false` stands, no flip):**
 - **Outcome A (any single-raw variant works):** T4's default construction stands — echo the
   triple-matched raw alone.
 - **Outcome B (only all-raws-in-context works):** T4 uses the spec's documented per-engine

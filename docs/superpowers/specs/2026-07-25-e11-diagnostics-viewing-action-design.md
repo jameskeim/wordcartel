@@ -108,30 +108,37 @@ not re-openable here):
 | vale settings channel inert (`didChangeConfiguration` → `logMessage` only; never pulls) | vale probe §4 |
 | vale hover advertised but `null` on markdown prose (the documented trap) | vale probe §5 |
 
-### 2.3 ⚠ The one genuinely UNVERIFIED wire behavior — and how this effort de-risks it
+### 2.3 The ltex per-diagnostic question — RESOLVED by the T1 probe (Outcome A); the original
+### premise was a fixture artifact
 
-**How ltex answers a per-diagnostic codeAction request is NOT established.** The ltex probe's
-single-diagnostic request (Q2: `floopmuffin` alone in `context.diagnostics`, range exactly its
-range) returned ONLY the three command-only actions — **no `acceptSuggestions` fix** — while the
-full-range batched request returned an accept-suggestion action for that same diagnostic. The
-probe does not explain the difference (request construction? context echo fidelity? an ltex
-quirk). The vale probe established per-diagnostic requests work (7/7 repetition fixes); ltex's
-per-diagnostic behavior is the open question, and D2's design sends per-diagnostic requests.
+**Correction (T1 execution, `scratchpad/e11/probe/t1-perdiag-results.md`; this section
+originally asserted an unexplained anomaly — that assertion was FALSE).** The pre-spec probe's
+write-up claimed its single-diagnostic `floopmuffin` request returned only command-only actions
+while the whole-document batch returned an accept-suggestion for that same diagnostic. T1
+re-checked the pre-spec probe's own raw capture (`results_summary.json`,
+`phase_a3_codeaction_all_response`): **`floopmuffin` receives NO `acceptSuggestions` action in
+ANY request shape, including the batch** — the earlier write-up's prose contradicted its own
+raw JSON. Root cause: LanguageTool has zero suggested replacements for the invented nonword, and
+accept-suggestion actions are generated per-suggestion — the fixture could not demonstrate the
+phenomenon in any construction. No construction-dependent gap ever existed.
 
-De-risking, in order:
-1. **Echo the server's own bytes back** (§3.3): the state machine retains each open document's
-   last raw published diagnostics array and builds the on-demand request by echoing the matching
-   RAW diagnostic verbatim — eliminating reconstruction-fidelity as a failure mode (ltex is known
-   to match context diagnostics against its internal state; a hand-rebuilt diagnostic risks a
-   silent mismatch the probe may have just demonstrated).
-2. **T1 is a wire probe, not code** (§10): before any pipeline code changes, re-run the ltex
-   probe with the raw-echo request shape (and variants: exact range vs cursor position) to pin
-   what elicits `acceptSuggestions` per-diagnostic. Its findings bind the plan.
-3. **Documented fallback:** if ltex genuinely will not answer per-diagnostic, the request SHAPE
-   becomes a per-engine `LspEngine` hook (range = the one diagnostic; context = all retained raw
-   diagnostics — the shape ltex demonstrably answers, still ONE request at overlay-open, still
-   on-demand; the response is then filtered to actions whose edit targets the anchor's range).
-   This changes no architecture — only what one request contains.
+**What T1 actually established (real `ltex-ls-plus` 18.7.0, target `recieve` — two real
+LanguageTool candidates):** all three request variants (single raw echoed / all raws echoed /
+caret-style empty range) elicit the `quickfix.ltex.acceptSuggestions` fixes identically, and
+controls show the response tracks the requested RANGE, not the contents of
+`context.diagnostics`. **Binding outcome A:** T4's default single-raw echo stands;
+`FIX_CONTEXT_ALL_RAWS` stays `false` for every engine. The Outcome-B seam (the const + its
+`TestEngineAllRaws` test) SHIPS as designed — dead-but-designed, tested insurance (controller
+ruling at T1 adjudication; this spec concurs: a zero-cost tested seam beats deleting it
+mid-execution). The vale probe had already established per-diagnostic requests work there
+(7/7 repetition fixes).
+
+The §3.3 raw-echo design (retain and echo the server's own bytes) stands on its remaining
+rationale — eliminating reconstruction-fidelity as a failure mode — no longer on the retracted
+anomaly. **Unchanged and NOT softened by this correction (probe-observed, request-construction-
+independent):** the two real ltex breakages driving D1 — the shipped `kind == "quickfix"` gate
+rejects `quickfix.ltex.acceptSuggestions`, and `quickfix_suggestion` reads only `edit.changes`
+while ltex sends exclusively `edit.documentChanges[]` (§2.2's table; §4's repair).
 
 ---
 
@@ -818,9 +825,11 @@ T6; T10 last.
 
 ## 11. Risks + honest flags
 
-1. **The ltex per-diagnostic anomaly (§2.3)** — the one unverified wire behavior; T1 exists to
-   pin it and the fallback request-shape hook is pre-designed. It gates T4's construction detail,
-   not the architecture.
+1. **The ltex per-diagnostic question (§2.3) — RESOLVED, Outcome A.** T1 falsified the
+   original anomaly premise (a fixture artifact: a nonword with zero LanguageTool
+   replacements; the pre-spec write-up contradicted its own raw capture) and established that
+   every request variant elicits the fixes identically. The default single-raw echo stands;
+   the Outcome-B seam ships as tested, dead-by-default insurance.
 2. **The harper pinned-test rewrite (§3.7)** — deliberate, stated, scoped to the tests that
    encode the parked pipeline.
 3. **The D9∧D10 pair key (§5.3)** — every dismissal stores BOTH parse-free units (enclosing
