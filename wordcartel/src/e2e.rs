@@ -3121,8 +3121,10 @@ fn journey_open_save_export_saveas_reopen() {
         Some(d.join("chapter one.md").as_path()), "buffer rekeyed to the CHOSEN path");
 
     // 3. EXPORT with a destination — bare Enter reproduces the derived path.
+    let origin = h.editor.borrow().active().id;
     h.editor.borrow_mut().open_destination_picker(&h.fs, &h.tx,
-        crate::file_browser::DestinationPurpose::Export { ext: "html".into() },
+        crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+            scope: crate::export::ExportScope::WholeDocument, origin },
         d.clone(), "chapter one.html".into());
     h.pump_listing();
     h.key(KeyCode::Enter);

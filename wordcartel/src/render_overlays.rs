@@ -628,8 +628,8 @@ fn file_browser_title(fb: &crate::file_browser::FileBrowser) -> String {
         BrowseMode::Recents => " Recent files ".to_string(),
         BrowseMode::Destination { purpose, .. } => match purpose {
             DestinationPurpose::SaveAs => format!(" Save As: {dir} "),
-            DestinationPurpose::WriteBlock => format!(" Write Block to: {dir} "),
-            DestinationPurpose::Export { ext } => format!(" Export .{ext} to: {dir} "),
+            DestinationPurpose::WriteBlock { .. } => format!(" Write Block to: {dir} "),
+            DestinationPurpose::Export { ext, .. } => format!(" Export .{ext} to: {dir} "),
         },
     }
 }
@@ -1152,14 +1152,18 @@ mod tests {
     #[test]
     fn each_picker_mode_is_titled_for_what_it_actually_does() {
         let dir = std::env::temp_dir().join(format!("wc-render-title-{}", std::process::id()));
+        // The table is built BEFORE the per-case editor exists, and the title match reads
+        // neither `origin` nor `scope` — a synthetic id is the honest stand-in here.
+        let origin = crate::editor::BufferId(0);
         let cases: [(BrowseMode, &str, &str); 5] = [
             (BrowseMode::Select, "Open:", "Save"),
             (BrowseMode::Recents, "Recent files", "Open:"),
             (BrowseMode::Destination { purpose: DestinationPurpose::SaveAs,
                 field: String::new(), field_cursor: 0 }, "Save As:", "Open:"),
-            (BrowseMode::Destination { purpose: DestinationPurpose::WriteBlock,
+            (BrowseMode::Destination { purpose: DestinationPurpose::WriteBlock { origin },
                 field: String::new(), field_cursor: 0 }, "Write Block to:", "Open:"),
-            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into() },
+            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
                 field: String::new(), field_cursor: 0 }, "Export .pdf to:", "Open:"),
         ];
         for (mode, expected, forbidden) in cases {

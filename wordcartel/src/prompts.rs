@@ -297,9 +297,10 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteExport => {
             if let Some(pe) = editor.pending_export.take() {
-                // User explicitly confirmed clobbering the existing target.
+                // User explicitly confirmed clobbering the existing target. The bool return
+                // is discarded — a refusal has already set its own status (A22 §5.4).
                 crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true,
-                    std::sync::Arc::clone(fs));
+                    pe.scope, pe.origin, std::sync::Arc::clone(fs));
             }
         }
         PromptAction::OverwriteSaveAs => {
@@ -332,7 +333,7 @@ pub fn resolve_prompt(
         PromptAction::OverwriteWriteBlock => {
             if let Some(t) = editor.pending_write_block.take() {
                 if let Some(b) = editor.active().marked_block {
-                    perform_block_write(editor, &t, b.start, b.end, fs);
+                    perform_block_write(editor, &t.target, b.start, b.end, fs);
                 } else {
                     editor.set_status(crate::status::StatusKind::Info, "no marked block");
                 }
@@ -506,7 +507,9 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
         let (tx, _rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
-        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
             std::env::temp_dir(), "   ".into());
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.status_text(), "write block: empty path");
@@ -776,7 +779,9 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
         let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
-        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
             std::env::temp_dir(), target.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
@@ -798,13 +803,59 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
         let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
-        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
             std::env::temp_dir(), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
+    }
+
+    // T6 — confirm-boundary scope carriage, seeded side. The STATUS is the load-bearing
+    // synchronous assertion (spec §11): a confirm boundary that degrades scope to
+    // WholeDocument dispatches happily and leaves this status unset.
+    #[test]
+    fn overwrite_export_confirm_refuses_when_block_scope_finds_no_mark() {
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", None, (80, 24));
+        let origin = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let d = crate::test_support::scratch_dir("a22-t6");
+        let target = d.join("out.html");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.pending_export = Some(crate::export::PendingExport {
+            ext: "html".into(), target,
+            scope: crate::export::ExportScope::MarkedBlock, origin });
+        // The mark is deliberately ABSENT — the conjunct under test.
+        let ex = crate::jobs::InlineExecutor::default();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &crate::test_support::TestClock(0), &tx, &crate::test_support::test_fs());
+        assert_eq!(e.status_text(), "no marked block — export cancelled");
+    }
+    // Positive-control twin: same seed, mark PRESENT → bounded recv yields ExportDone.
+    #[test]
+    fn overwrite_export_confirm_dispatches_when_the_mark_is_present() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = crate::test_support::scratch_dir("a22-t6-ctrl");
+        let target = d.join("out.html");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.pending_export = Some(crate::export::PendingExport {
+            ext: "html".into(), target,
+            scope: crate::export::ExportScope::MarkedBlock, origin });
+        let ex = crate::jobs::InlineExecutor::default();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &crate::test_support::TestClock(0), &tx, &crate::test_support::test_fs());
+        // matches!, not is_ok: the requirement is "yields an ExportDone", not "yields
+        // some message" (no picker is open here, but assert the class, not the count).
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(crate::app::Msg::ExportDone { .. })),
+            "the confirm path must dispatch when scope's conjuncts all hold");
     }
 
     #[test]

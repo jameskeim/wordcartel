@@ -21,8 +21,8 @@ pub struct FileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestinationPurpose {
     SaveAs,
-    WriteBlock,
-    Export { ext: String },
+    WriteBlock { origin: crate::editor::BufferId },
+    Export { ext: String, scope: crate::export::ExportScope, origin: crate::editor::BufferId },
 }
 
 /// Select mode chooses an existing entry; destination mode navigates AND names.

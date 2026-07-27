@@ -137,8 +137,9 @@ pub fn block_write(editor: &mut Editor,
         .and_then(|p| p.parent())
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let origin = editor.active().id;
     editor.open_destination_picker(fs, msg_tx,
-        crate::file_browser::DestinationPurpose::WriteBlock, dir, String::new());
+        crate::file_browser::DestinationPurpose::WriteBlock { origin }, dir, String::new());
 }
 
 /// Set `pending_block_begin` to the current caret position (^KB).

@@ -286,8 +286,20 @@ fn redirect_to_export(
     }
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(fallback_dir);
     let field = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A22 D1: scope/origin derive from the flow the writer STARTED. WriteBlock carries the
+    // origin captured at ^KW — deliberately NOT re-captured here, so a buffer switched
+    // under the picker is caught at dispatch, not laundered. The Export arm is unreachable
+    // today (extension policy never runs for an Export purpose) but stays total.
+    let (scope, origin) = match purpose {
+        crate::file_browser::DestinationPurpose::WriteBlock { origin } =>
+            (crate::export::ExportScope::MarkedBlock, *origin),
+        crate::file_browser::DestinationPurpose::SaveAs =>
+            (crate::export::ExportScope::WholeDocument, editor.active().id),
+        crate::file_browser::DestinationPurpose::Export { scope, origin, .. } =>
+            (*scope, *origin),
+    };
     editor.open_destination_picker(fs, msg_tx,
-        crate::file_browser::DestinationPurpose::Export { ext }, dir, field);
+        crate::file_browser::DestinationPurpose::Export { ext, scope, origin }, dir, field);
 }
 
 /// Execute a destination-mode Enter. THE single place a picker commit becomes a write.
@@ -325,7 +337,7 @@ pub(crate) fn commit_destination(
         CommitOutcome::Nothing => {
             let noun = match purpose {
                 crate::file_browser::DestinationPurpose::SaveAs => "save-as",
-                crate::file_browser::DestinationPurpose::WriteBlock => "write block",
+                crate::file_browser::DestinationPurpose::WriteBlock { .. } => "write block",
                 crate::file_browser::DestinationPurpose::Export { .. } => "export",
             };
             editor.set_status_full(crate::status::StatusKind::Warning,
@@ -414,28 +426,27 @@ pub(crate) fn commit_destination(
                             editor, chosen, resolved, executor, clock, msg_tx, fs);
                     }
                 }
-                crate::file_browser::DestinationPurpose::WriteBlock => {
+                crate::file_browser::DestinationPurpose::WriteBlock { origin } => {
                     let Some(b) = editor.active().marked_block else {
                         editor.set_status(crate::status::StatusKind::Info, "no marked block");
                         return;
                     };
                     if exists {
-                        editor.pending_write_block = Some(resolved);
-                        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(
-                            editor.pending_write_block.as_ref().expect("just set")));
+                        editor.pending_write_block = Some(crate::editor::PendingWriteBlock {
+                            target: resolved.clone(), origin });
+                        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&resolved));
                     } else {
                         crate::prompts::perform_block_write(editor, &resolved, b.start, b.end, fs);
                     }
                 }
-                crate::file_browser::DestinationPurpose::Export { ext } => {
+                crate::file_browser::DestinationPurpose::Export { ext, scope, origin } => {
                     if exists {
                         editor.pending_export = Some(crate::export::PendingExport {
-                            ext, target: resolved });
-                        editor.open_prompt(crate::prompt::Prompt::export_overwrite(
-                            &editor.pending_export.as_ref().expect("just set").target));
+                            ext, target: resolved.clone(), scope, origin });
+                        editor.open_prompt(crate::prompt::Prompt::export_overwrite(&resolved));
                     } else {
                         crate::export::do_export(editor, &ext, &resolved, msg_tx, false,
-                            std::sync::Arc::clone(fs));
+                            scope, origin, std::sync::Arc::clone(fs));
                     }
                 }
             }
@@ -852,7 +863,7 @@ mod tests {
             "the save is refused outright — not queued behind a confirm");
         let fb = e.file_browser.as_ref().expect("the Export destination picker replaces it");
         assert!(matches!(&fb.mode, crate::file_browser::BrowseMode::Destination {
-            purpose: crate::file_browser::DestinationPurpose::Export { ext }, .. }
+            purpose: crate::file_browser::DestinationPurpose::Export { ext, .. }, .. }
             if ext == "docx"), "the refusal hands the writer the Export flow for that format");
         assert!(e.status().map_or("", |s| s.text()).contains("docx"),
             "and says why — no silent UI: {:?}", e.status().map_or("", |s| s.text()));
@@ -1358,6 +1369,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
+        // A SaveAs redirect derives its origin from the ACTIVE buffer — this fixture never
+        // switches, so the id captured here is the one the redirect must carry.
+        let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "notes.html".into());
         crate::test_support::pump_listing(&mut e, &rx);
@@ -1378,7 +1392,8 @@ mod tests {
         match &e.file_browser.as_ref().expect("export picker opened").mode {
             crate::file_browser::BrowseMode::Destination { purpose, field, .. } => {
                 assert_eq!(purpose,
-                    &crate::file_browser::DestinationPurpose::Export { ext: "html".into() });
+                    &crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                        scope: crate::export::ExportScope::WholeDocument, origin });
                 assert_eq!(field, "notes.html");
             }
             other => panic!("expected destination mode, got {other:?}"),
@@ -1505,8 +1520,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
-            crate::file_browser::DestinationPurpose::WriteBlock, d.clone(), "excerpt".into());
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "excerpt".into());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
 
@@ -1516,6 +1533,63 @@ mod tests {
         assert!(e.active().document.path.is_none(),
             "write-block does NOT rekey the buffer — it exports a slice");
         assert!(e.active().marked_block.is_some(), "block stays after write");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T2-shape — the redirect DERIVES MarkedBlock and CARRIES the ^KW origin.
+    #[test]
+    fn writeblock_typed_redirect_derives_block_scope_and_carries_the_kw_origin() {
+        let d = tmp("a22-derive");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::file_browser_commit::commit_destination(&mut e, &fs, &ex, &clk, &tx);
+        match &e.file_browser.as_ref().expect("redirect reopens as Export").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => assert_eq!(
+                purpose, &crate::file_browser::DestinationPurpose::Export {
+                    ext: "html".into(),
+                    scope: crate::export::ExportScope::MarkedBlock, origin },
+                "a WholeDocument-deriving redirect fails the scope; a re-capturing one \
+                 is caught by the carried-origin case below"),
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T2 carried-origin — active != origin at redirect time, so carried and re-derived
+    // DIFFER: a re-capturing implementation reads B here and fails.
+    #[test]
+    fn writeblock_redirect_carries_the_original_origin_across_a_buffer_switch() {
+        let d = tmp("a22-carried");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::workspace::new_empty_buffer(&mut e); // the pump-vector stand-in
+        assert_ne!(e.active().id, origin, "fixture: carried and re-derived must differ");
+        crate::file_browser_commit::commit_destination(&mut e, &fs, &ex, &clk, &tx);
+        match &e.file_browser.as_ref().expect("redirect proceeds — verify is at dispatch").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => match purpose {
+                crate::file_browser::DestinationPurpose::Export { origin: o, .. } =>
+                    assert_eq!(*o, origin,
+                        "§5.2: NOT re-captured — re-derivation launders the switch"),
+                other => panic!("expected Export purpose, got {other:?}"),
+            },
+            other => panic!("expected destination mode, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1534,8 +1608,10 @@ mod tests {
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         // Seeded exactly as `run_export` seeds it — the Enter-through path.
+        let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
-            crate::file_browser::DestinationPurpose::Export { ext: "html".into() },
+            crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
             d.clone(), "notes.html".into());
         // Pump the async listing to completion — the state real usage actually reaches.
         // `d` also contains the source file `notes.md`, so the SAME `rx` used for the

@@ -41,6 +41,14 @@ pub struct PendingAfterSave {
     pub at_ms: u64,
 }
 
+/// State crossing the write-block overwrite confirm: the resolved target plus the
+/// originating buffer, verified again when the confirm fires (A22 D4-iv).
+#[derive(Debug, Clone)]
+pub struct PendingWriteBlock {
+    pub target: std::path::PathBuf,
+    pub origin: BufferId,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     LivePreview,
@@ -547,7 +555,7 @@ pub struct Editor {
     /// different `resolved` on a later round trip — a silent wrong-target write.
     pub pending_save_as_chosen: Option<PathBuf>,
     /// The target awaiting an OverwriteWriteBlock confirmation (^KW existing file). (9A Task 4)
-    pub pending_write_block: Option<PathBuf>,
+    pub pending_write_block: Option<PendingWriteBlock>,
     /// H5 clean-recovery: the EXACT set of provably-valueless recovery files snapshotted when
     /// the `clean_recovery` prompt was raised. The confirm deletes THIS snapshot — never a
     /// re-scan — so a file appearing after the prompt opened can never be swept (TOCTOU-safe).

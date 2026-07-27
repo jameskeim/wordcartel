@@ -49,6 +49,8 @@ pub enum Msg {
         /// case finalization must refuse to clobber a target that appeared in
         /// the meantime (TOCTOU guard; Codex pre-merge gate).
         overwrite_confirmed: bool,
+        /// What this export read (A22 D3-4): drives the completion status wording only.
+        scope: crate::export::ExportScope,
     },
     TransformDone {
         buffer_id: crate::editor::BufferId,
@@ -2444,6 +2446,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2490,6 +2493,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(b"<h1>Hello</h1>\n".to_vec())),
             overwrite_confirmed: false,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2531,6 +2535,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(new_bytes.clone())),
             overwrite_confirmed: true,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2572,6 +2577,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
