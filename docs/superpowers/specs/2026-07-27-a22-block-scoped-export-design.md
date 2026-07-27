@@ -561,8 +561,14 @@ than by adding commands (which would be the excluded Option E) or by amending th
 Two binding lessons govern. **E11:** for a conjunctive predicate, each conjunct needs a fixture
 where that conjunct alone decides the outcome — here the dispatch predicate is
 `scope carried ∧ origin unchanged ∧ mark present`, so each test below flips exactly one
-conjunct against a baseline that passes. **C5:** render the screen, don't assert the struct —
-chrome surfaces are asserted on painted frames / user-visible strings, not on enum fields.
+conjunct against a baseline that passes. The rule applies **per assertion, not per test**: a
+test sound on one conjunct proves nothing about its others (spec-gate round 3 caught exactly
+this — T4's mode-survival assertion was sound while its drain assertion, with nothing seeded,
+read the same on a correct and a wrong implementation). For every multi-assertion case below,
+each assertion states or implies what it reads when that specific behavior is wrong; an
+assertion whose expected value is also the fixture's default/untouched state is a defect.
+**C5:** render the screen, don't assert the struct — chrome surfaces are asserted on painted
+frames / user-visible strings, not on enum fields.
 
 A third rule governs every refusal assertion, because `do_export` spawns a thread: **absence is
 scheduling-weak on the export path.** An immediate `try_recv()`/file-existence check after a
@@ -590,11 +596,31 @@ the subprocess.
   purpose is `Export { ext: "docx", scope: MarkedBlock, origin: <same id> }` AND the status
   reads `"docx is an export format — opening Export for the marked block"`. SaveAs twin →
   `WholeDocument` + today's status byte-for-byte (the conjunct-isolating contrast).
+  - *Carried-not-recaptured origin (its own fixture — in the baseline above, active id ==
+    origin, so a re-capturing implementation reads identically):* open the WriteBlock picker
+    on buffer A, switch the active buffer to B (`switch_to_index` — the redirect runs in the
+    `Commit` arm BEFORE the WriteBlock arm's origin verify, so it proceeds), type
+    `report.html`, Enter with `|| true` → the reopened Export purpose's `origin` is **A**.
+    **On an implementation that re-captures `editor.active().id` at the redirect (§5.2 step 4
+    violated), it reads B and the assertion fails** — and the downstream `BufferChanged`
+    refusal this carriage exists to arm would be silently laundered away.
 - **T3 — redirect derivation, Row-2 path:** empty field, highlighted existing `report.docx`
   in a WriteBlock picker → same purpose assertions, Row-2 wording.
-- **T4 — probe gate:** same setup as T2 with `|| false` → status
-  `"pandoc not found — install it to export"`, `editor.file_browser` still `Some` with mode
-  still `WriteBlock` and the field intact, quit-drain state untouched, no Export picker.
+- **T4 — probe gate, two fixtures (the ordering conjunct needs its own):**
+  - *Flow survival (WriteBlock):* same setup as T2 with `|| false` → status exactly
+    `"pandoc not found — install it to export"`, `editor.file_browser` still `Some` with mode
+    still `WriteBlock` and the field intact, no Export picker. The exact-status assertion also
+    constrains gate-before-reason ordering: an implementation that set the redirect `reason`
+    before probing would read the Warning wording instead. (No drain assertion here — the
+    drain-abort is SaveAs-gated and a WriteBlock fixture cannot constrain it either way.)
+  - *Gate-precedes-drain-abort (SaveAs, SEEDED):* seed `editor.quit_drain = Some(..)` and
+    `editor.pending_save_as = Some(..)` — the state the assertion is about — open a SaveAs
+    picker, type `report.docx`, Enter via `commit_destination_with_probe(.., || false)` →
+    the pandoc refusal status, picker still `Some`/SaveAs, AND `quit_drain`/`pending_save_as`
+    **still `Some`**. Discriminating because seeded non-default: **on an implementation where
+    the pandoc gate runs after the drain-abort (§5.2 steps reversed), both fields read `None`
+    and the assertion fails**; with nothing seeded it would read the same either way — the
+    exact vacuity this fixture exists to avoid.
 - **T5 — dispatch refusals through `do_export`:** MarkedBlock scope with no mark →
   `do_export(..) == false` AND status `"no marked block — export cancelled"`; origin-mismatch
   twin → `false` + `"buffer changed — export cancelled"`. Both observables are synchronous and
@@ -621,11 +647,15 @@ the subprocess.
   yields an `ExportDone`, proving the confirm path dispatches when it should.
 - **T7 — palette invariant:** extend the existing `run_export_with_probe` picker-seed test to
   assert the purpose equals `Export { ext: "html", scope: WholeDocument, origin: active id }`.
-- **T8 — Write-Block origin verify, both moments:** open ^KW picker, switch buffers, commit →
+- **T8 — Write-Block origin verify, both moments:** open ^KW picker on buffer A, switch to a
+  buffer B that has NO mark, commit → status exactly
   `"buffer changed — write block cancelled"` AND the target file does not exist; twin through
   `PendingWriteBlock`/`OverwriteWriteBlock`. The absence check is sound HERE (unlike T5/T6):
   `perform_block_write` writes synchronously on the main thread, so a wrong implementation has
-  already created the file by the time the assertion runs (§11 preamble).
+  already created the file by the time the assertion runs (§11 preamble). B-has-no-mark makes
+  the EXACT status also constrain refusal ordering (§5.3 step 1 before step 2): an
+  implementation that read the mark before verifying origin would read `"no marked block"`
+  instead and fail the equality.
 - **T9 — chrome, rendered (C5):** paint the file browser (`TestBackend`, the existing
   `render_overlays.rs` destination-title fixture pattern) with a `MarkedBlock` Export purpose →
   the title row contains `" Export .pdf (marked block) to:"`; the `WholeDocument` twin renders
