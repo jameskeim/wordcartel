@@ -391,9 +391,18 @@ pub(crate) fn commit_destination_with_probe(
                 _ if from_highlight => match classify_highlight_target(&raw) {
                     HighlightVerdict::Write => raw,
                     HighlightVerdict::ExportInstead(ext) => {
-                        let reason = format!(
-                            "{} is a {ext} file \u{2014} opening Export instead",
-                            raw.display());
+                        // A22 D3 surface 1: the redirect names the scope the Export it opens
+                        // will use, so a Write-Block writer is never told "Export" and left to
+                        // guess whether the block or the whole document is on its way out.
+                        let reason = if matches!(purpose,
+                            crate::file_browser::DestinationPurpose::WriteBlock { .. })
+                        {
+                            format!("{} is a {ext} file \u{2014} opening Export for the \
+                                     marked block", raw.display())
+                        } else {
+                            format!("{} is a {ext} file \u{2014} opening Export instead",
+                                raw.display())
+                        };
                         redirect_to_export(editor, fs, msg_tx, &purpose, &raw, ext, &reason, dir,
                             &pandoc_available);
                         return;
@@ -411,9 +420,16 @@ pub(crate) fn commit_destination_with_probe(
                     ExtVerdict::Defaulted(p) | ExtVerdict::Honoured(p) => p,
                     ExtVerdict::Redirect { path, ext } => {
                         // F4: refuse the save, explain, and carry the typed path into the
-                        // export destination picker — advice with somewhere to go.
-                        let reason =
-                            format!("{ext} is an export format \u{2014} opening Export instead");
+                        // export destination picker — advice with somewhere to go. A22 D3
+                        // surface 1: name the scope when the abandoned flow was ^KW.
+                        let reason = if matches!(purpose,
+                            crate::file_browser::DestinationPurpose::WriteBlock { .. })
+                        {
+                            format!("{ext} is an export format \u{2014} opening Export for the \
+                                     marked block")
+                        } else {
+                            format!("{ext} is an export format \u{2014} opening Export instead")
+                        };
                         redirect_to_export(editor, fs, msg_tx, &purpose, &path, ext, &reason, dir,
                             &pandoc_available);
                         return;
@@ -822,13 +838,24 @@ mod tests {
     /// entirely, so a Foreign-arm case has to be driven with `All`, exactly as a writer would.
     fn row2_enter_onto(d: &std::path::Path, name: &str, types: crate::config::FileTypeFilter)
         -> (crate::editor::Editor, std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
+        row2_enter_onto_prepared(d, name, types,
+            &|_e| crate::file_browser::DestinationPurpose::SaveAs)
+    }
+
+    /// `row2_enter_onto`, with the flow the writer STARTED left to the caller: `prepare` runs
+    /// on the fresh editor and yields the purpose the picker opens with, so a Write-Block
+    /// fixture can also mark the block its flow implies and hand back the ^KW origin.
+    fn row2_enter_onto_prepared(
+        d: &std::path::Path, name: &str, types: crate::config::FileTypeFilter,
+        prepare: &dyn Fn(&mut crate::editor::Editor) -> crate::file_browser::DestinationPurpose,
+    ) -> (crate::editor::Editor, std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
         let mut e = crate::editor::Editor::new_from_text("markdown body\n", None, (80, 24));
         e.files_type_filter = types;
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
-        e.open_destination_picker(&fs, &tx,
-            crate::file_browser::DestinationPurpose::SaveAs, d.to_path_buf(), String::new());
+        let purpose = prepare(&mut e);
+        e.open_destination_picker(&fs, &tx, purpose, d.to_path_buf(), String::new());
         crate::test_support::pump_listing(&mut e, &rx);
         for _ in 0..12 {
             let on_it = e.file_browser.as_ref()
@@ -902,6 +929,45 @@ mod tests {
             if ext == "docx"), "the refusal hands the writer the Export flow for that format");
         assert!(e.status().map_or("", |s| s.text()).contains("docx"),
             "and says why — no silent UI: {:?}", e.status().map_or("", |s| s.text()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A22 T3, the Row-2 twin of the test above: the SAME gesture from a Write-Block picker.
+    /// The redirect must derive `MarkedBlock`, carry the ^KW origin, and say so — Row 2 builds
+    /// its reason at a DIFFERENT call site from the typed path, so a fix applied to only one
+    /// of the two leaves this screen scope-blind.
+    #[test]
+    fn row2_from_a_write_block_picker_redirects_for_the_marked_block() {
+        let d = tmp("row2-docx-wb");
+        std::fs::write(d.join("report.docx"), b"PK\x03\x04 not really a docx\n").expect("seed");
+        let origin = std::cell::Cell::new(None);
+        let (e, _fs) = row2_enter_onto_prepared(&d, "report.docx",
+            crate::config::FileTypeFilter::Documents, &|e| {
+                e.active_mut().marked_block =
+                    Some(crate::editor::MarkedBlock { start: 0, end: 8, hidden: false });
+                let id = e.active().id;
+                origin.set(Some(id));
+                crate::file_browser::DestinationPurpose::WriteBlock { origin: id }
+            });
+        let origin = origin.get().expect("the fixture opened a Write-Block picker");
+        assert_eq!(std::fs::read(d.join("report.docx")).expect("still there"),
+            b"PK\x03\x04 not really a docx\n",
+            "block bytes must never land inside a foreign document format either");
+        match &e.file_browser.as_ref().expect("the Export destination picker replaces it").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => assert_eq!(
+                purpose, &crate::file_browser::DestinationPurpose::Export {
+                    ext: "docx".into(),
+                    scope: crate::export::ExportScope::MarkedBlock, origin },
+                "Row 2 derives scope+origin from the flow the writer started, like the \
+                 typed path"),
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        // Exact, path included (spec §6.1 — ends_with would tolerate a mangled path
+        // prefix). `raw` at the Row-2 site is dir.join(name), pre-resolution.
+        assert_eq!(e.status_text(), format!(
+            "{} is a docx file \u{2014} opening Export for the marked block",
+            d.join("report.docx").display()),
+            "surface 1 Row-2: scope-blind wording says 'opening Export instead'");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1436,6 +1502,10 @@ mod tests {
             }
             other => panic!("expected destination mode, got {other:?}"),
         }
+        // A22 §7.4: the Save-As redirect wording is the byte-preservation guard — the scope
+        // note is added for the block flow ONLY, never to the whole-document string.
+        assert_eq!(e.status_text(), "html is an export format \u{2014} opening Export instead",
+            "SaveAs redirect wording is unchanged byte-for-byte");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1599,6 +1669,11 @@ mod tests {
                  is caught by the carried-origin case below"),
             other => panic!("expected destination mode, got {other:?}"),
         }
+        // A22 D3 surface 1 (T2): the redirect that abandons the Write-Block names the scope
+        // the Export it offers will use.
+        assert_eq!(e.status_text(),
+            "html is an export format \u{2014} opening Export for the marked block",
+            "surface 1: a scope-blind redirect keeps 'opening Export instead'");
         let _ = std::fs::remove_dir_all(&d);
     }
 

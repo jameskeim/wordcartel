@@ -275,8 +275,15 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
             crate::file_browser_commit::ExtVerdict::Defaulted(p) => p,
             crate::file_browser_commit::ExtVerdict::Honoured(p) => p,
             crate::file_browser_commit::ExtVerdict::Redirect { path, ext } => {
-                return Some(format!("\u{2192} {} \u{2014} {ext} is an export format",
-                    path.display()));
+                // A22 D3 surface 2: the ONLY pre-commit surface — a Write-Block flow names
+                // the scope the offered Export will use.
+                let block = matches!(purpose, DestinationPurpose::WriteBlock { .. });
+                return Some(if block {
+                    format!("\u{2192} {} \u{2014} {ext} is an export format (exports the \
+                             marked block)", path.display())
+                } else {
+                    format!("\u{2192} {} \u{2014} {ext} is an export format", path.display())
+                });
             }
             // `ExtVerdict` grew this fourth arm in Task 19's review, after this footer's
             // brief was written — flagged per the dispatch note rather than silently
