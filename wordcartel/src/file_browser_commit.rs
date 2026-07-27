@@ -486,6 +486,10 @@ pub(crate) fn commit_destination_with_probe(
                         return;
                     };
                     if exists {
+                        // ORDER IS LOAD-BEARING: this construction is sound only because it sits
+                        // AFTER the origin gate above, where `origin == active().id` holds. No test
+                        // constrains it — re-deriving here is extensionally identical today, so a
+                        // hoist above the gate would pass the whole suite (A22 spec §11, probe P3).
                         editor.pending_write_block = Some(crate::editor::PendingWriteBlock {
                             target: resolved.clone(), origin });
                         editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&resolved));
