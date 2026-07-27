@@ -1,7 +1,7 @@
 # A22 — Block-scoped export: the Write-Block → Export redirect honours the mark
 
 **Status:** design spec for effort branch `effort-a22-block-scoped-export` (base `8f5ec04`).
-**Decisions:** `scratchpad/a22/decisions.md` (D1–D4) is binding; this spec implements it and does
+**Decisions:** `scratchpad/a22/decisions.md` (D1–D5) is binding; this spec implements it and does
 not re-open it. Grounding evidence: `scratchpad/a22/fable-grounding.md`, verified at `8f5ec04`.
 **Backlog:** item `A22` (kind `bug`), prose `docs/ux-backlog.md` `<!-- item: A22 -->`; sequenced
 first in `docs/design/backlog-sequence.md`.
@@ -318,12 +318,22 @@ undo/redo — so a present mark is always sliceable. `hidden` is deliberately no
 `do_export` becomes:
 
 1. `let stdin = match resolve_export_input(editor, scope, origin) { Ok(s) => s, Err(r) => {
-   status per §6.2; return; } }` — on refusal **no thread is spawned and no `ExportDone` is ever
-   sent**; nothing downstream awaits one (`ExportDone` is fire-and-forget into the reducer), so
-   no flow hangs.
+   status per §6.2; return false; } }` — on refusal **no thread is spawned and no `ExportDone`
+   is ever sent**; nothing downstream awaits one (`ExportDone` is fire-and-forget into the
+   reducer), so no flow hangs.
 2. `buffer_id = editor.active().id` — unchanged line; post-verification it equals `origin`.
 3. Thread spawn, sinks, temp path, `run_pandoc`: unchanged. The `Msg::ExportDone` send adds
-   `scope`.
+   `scope`. Returns `true`.
+
+**Return value (new): `do_export` returns `bool` — `true` iff an export worker was dispatched,
+`false` iff a §6.2 refusal fired.** This is the synchronous observable the refusal tests assert
+on (§11-T5): "no worker was spawned" is otherwise a claim about thread scheduling that an
+immediate channel/filesystem check cannot prove (the E11 vacuity class — the checked state is
+also the not-finished-yet state). Precedent for a picker-flow fn whose return value carries
+"did the follow-up start": `Editor::open_destination_picker` returns whether it opened, with a
+doc comment mandating callers use the RETURN VALUE rather than sniffing state. Both production
+call sites discard it (the refusal has already set its status; there is no follow-up control
+flow to steer), so the fn is deliberately NOT `#[must_use]`; tests consume it.
 
 Both existing `do_export` call sites (`commit_destination`'s Export arm; the `OverwriteExport`
 prompt arm) now pass `scope`/`origin`; verification therefore covers BOTH dispatch moments with
@@ -333,8 +343,9 @@ Export flow's context is captured at `run_export_with_probe` and verified like a
 ### 5.5 The confirm arms — `prompts::resolve_prompt`
 
 - `PromptAction::OverwriteExport`: `if let Some(pe) = editor.pending_export.take() {
-  do_export(editor, &pe.ext, &pe.target, msg_tx, true, pe.scope, pe.origin, Arc::clone(fs)) }` —
-  verification and block re-read happen inside `do_export`; D2's post-confirm refusal falls out.
+  do_export(editor, &pe.ext, &pe.target, msg_tx, true, pe.scope, pe.origin, Arc::clone(fs)); }` —
+  the `bool` return is discarded (§5.4); verification and block re-read happen inside
+  `do_export`, so D2's post-confirm refusal falls out.
 - `PromptAction::OverwriteWriteBlock`: takes `PendingWriteBlock { target, origin }`; **origin
   verify first** (`"buffer changed — write block cancelled"`, `Warning`+`Sticky`), then the
   existing mark re-read (`"no marked block"` Info wording unchanged), then
@@ -426,24 +437,33 @@ current kind and wording — this spec adds strings; it does not restyle shipped
 From the verified 13-site `DestinationPurpose::Export` census plus the `WriteBlock`
 unit→struct change and the carrier/message changes. "Forced" = fails to compile until edited.
 
-**Production (13):**
+**Production, compiler-forced (9 files):**
 
 | File | Symbol / arm | Change |
 |---|---|---|
 | `file_browser.rs` | `DestinationPurpose` | enum reshape (§4.2) |
-| `export.rs` | `ExportScope` (new), `PendingExport`, `resolve_export_input` (new), `ExportRefusal` (new), `do_export`, `run_export_with_probe` | §4.1/4.3/5.4/5.1 |
+| `export.rs` | `ExportScope` (new), `PendingExport`, `resolve_export_input` (new), `ExportRefusal` (new), `do_export` (signature + `bool` return), `run_export_with_probe` | §4.1/4.3/5.4/5.1 |
 | `editor.rs` | `PendingWriteBlock` (new), `pending_write_block` field type | §4.4 |
 | `blocks_marked.rs` | `block_write` | `WriteBlock { origin }` construct |
 | `file_browser_commit.rs` | `redirect_to_export` (probe param + derivation), `commit_destination` → `_with_probe` seam, noun-match `WriteBlock` pattern, `WriteBlock { origin }` arm (verify + `PendingWriteBlock`), `Export { ext, scope, origin }` arm | §5.2/5.3 |
-| `file_browser_intercept.rs` | Enter arm | **unchanged** (calls the wrapper) |
-| `file_browser.rs` | `footer_target` Redirect arm; `cancel_destination` | §6.1-2 / §5.6 |
-| `prompts.rs` | `OverwriteExport`, `OverwriteWriteBlock`, intercept `ExportDone` arm | §5.5/5.7 |
+| `prompts.rs` | `OverwriteExport` (new `PendingExport` fields), `OverwriteWriteBlock` (`PendingWriteBlock` take), intercept `ExportDone` arm (must supply `apply_export_done`'s new param) | §5.5/5.7 |
 | `render_overlays.rs` | title match: `WriteBlock { .. }` pattern, `Export` arm reads `scope` | §6.1-3 |
-| `app.rs` | `Msg::ExportDone` decl; `reduce_dispatch` arm forwards `scope` | §4.5 |
+| `app.rs` | `Msg::ExportDone` decl; `reduce_dispatch` arm (must supply `apply_export_done`'s new param) | §4.5 |
 | `jobs_apply.rs` | `apply_export_done` signature + status | §5.7 |
 
-Unforced and unchanged by design: `matches!(purpose, DestinationPurpose::SaveAs)` sites
-(`redirect_to_export`, the `Nothing` arm), `Export { .. }`/wildcard matches
+**Production, required but NOT compiler-forced** (behavior changes the compiler will not
+demand — the plan must carry them as explicit tasks with tests, since nothing fails to build if
+they are forgotten): `file_browser.rs::footer_target`'s `Redirect` arm scope wording (§6.1-2 —
+`purpose` is already destructured; the new wording is an addition, not a type change);
+`file_browser.rs::cancel_destination`'s added `pending_export = None` (§5.6 — an added
+statement); the origin-verify blocks themselves in the `WriteBlock` arm and
+`OverwriteWriteBlock` (the *bindings* are forced by the variant reshape, the *checks* are not);
+the §6.1 scope-keyed redirect-status wordings (a `WholeDocument`-only string would compile).
+§11's T2/T3/T6/T8/T9 are the fixtures that catch each of these respectively.
+
+Unforced and unchanged by design: `file_browser_intercept.rs`'s Enter arm (calls the unchanged
+`commit_destination` wrapper and compiles as-is), `matches!(purpose, DestinationPurpose::SaveAs)`
+sites (`redirect_to_export`, the `Nothing` arm), `Export { .. }`/wildcard matches
 (`file_browser.rs` extension-policy gate, the `chosen` match, the noun match's Export arm),
 `Msg::ExportDone`'s custom `Debug` arm.
 
@@ -544,6 +564,18 @@ where that conjunct alone decides the outcome — here the dispatch predicate is
 conjunct against a baseline that passes. **C5:** render the screen, don't assert the struct —
 chrome surfaces are asserted on painted frames / user-visible strings, not on enum fields.
 
+A third rule governs every refusal assertion, because `do_export` spawns a thread: **absence is
+scheduling-weak on the export path.** An immediate `try_recv()`/file-existence check after a
+call that *might* have spawned a worker proves nothing — a wrongly-spawned worker may simply
+not have finished, and the assertion reads the same either way (the E11 vacuity class: the
+asserted state is also the not-done-yet state). The tree already encodes this:
+`file_browser_commit.rs`'s export-commit tests and the `e2e.rs` export journey use BOUNDED
+receives precisely because `do_export` is threaded. Refusal tests therefore assert on
+**synchronous observables that a wrong implementation flips** — `do_export`'s `bool` return
+(§5.4) and the refusal status — never on an immediate absence probe. Write-Block is different
+in kind: `perform_block_write` runs `save_atomic_with_fs` synchronously on the main thread, so
+file-absence checks ARE sound there (T8).
+
 **The fixture that fails if scope is dropped (T1):** buffer `"AAA\nBBB\nCCC\n"` with
 `marked_block` over `"BBB\n"`. `resolve_export_input(e, MarkedBlock, id)` must return exactly
 `"BBB\n"`; `WholeDocument` must return the full text. A regression that drops scope anywhere on
@@ -563,20 +595,37 @@ the subprocess.
 - **T4 — probe gate:** same setup as T2 with `|| false` → status
   `"pandoc not found — install it to export"`, `editor.file_browser` still `Some` with mode
   still `WriteBlock` and the field intact, quit-drain state untouched, no Export picker.
-- **T5 — dispatch refusals through `do_export`:** MarkedBlock scope with no mark → status
-  `"no marked block — export cancelled"`, no file created, and no `ExportDone` on the channel
-  (`try_recv` is `Err(Empty)` — nothing was spawned to send one); origin-mismatch twin →
-  `"buffer changed — export cancelled"`.
+- **T5 — dispatch refusals through `do_export`:** MarkedBlock scope with no mark →
+  `do_export(..) == false` AND status `"no marked block — export cancelled"`; origin-mismatch
+  twin → `false` + `"buffer changed — export cancelled"`. Both observables are synchronous and
+  neither is the default state: **on an implementation that dispatched when it should have
+  refused, `do_export` returns `true` (the assertion fails immediately, independent of
+  scheduling) and the status is not the refusal text** (dispatch sets no status), so either
+  assertion alone catches the wrong path deterministically. No `try_recv`/file-absence probe is
+  used (§11 preamble). **Positive control (proves the instrument):** a third case with the mark
+  PRESENT and origin intact → `do_export(..) == true` and a BOUNDED `recv_timeout` yields
+  exactly one `Msg::ExportDone` (any `result` — on a pandoc-less gate machine it is
+  `Err(spawn)`, and `guarded_export` guarantees a spawned worker always sends exactly one
+  message), demonstrating that `true`/message-arrival is what dispatch actually looks like —
+  the refusal cases' `false` is therefore a discriminating reading, not a value that every
+  execution produces.
 - **T6 — confirm-boundary scope carriage (the D2 post-confirm moment):** seed
   `pending_export = Some(PendingExport { scope: MarkedBlock, origin, .. })` with the mark then
-  CLEARED, fire `PromptAction::OverwriteExport` → the cancel status, nothing written. This
-  fixture fails if the confirm boundary silently degrades scope to `WholeDocument` — which
-  would export happily — isolating the carriage conjunct.
+  CLEARED, fire `PromptAction::OverwriteExport` → **the load-bearing assertion is the status**,
+  exactly `"no marked block — export cancelled"`. Synchronous and discriminating: if the
+  confirm boundary silently degrades scope to `WholeDocument`, `resolve_export_input` returns
+  `Ok(whole text)`, `do_export` dispatches, no refusal status is set — the assertion reads the
+  pre-prompt status and fails. No file-absence probe (this path goes through `resolve_prompt`,
+  which discards `do_export`'s return, and an immediate absence check is the §11-preamble
+  vacuity). Positive-control twin: same seed with the mark PRESENT → bounded `recv_timeout`
+  yields an `ExportDone`, proving the confirm path dispatches when it should.
 - **T7 — palette invariant:** extend the existing `run_export_with_probe` picker-seed test to
   assert the purpose equals `Export { ext: "html", scope: WholeDocument, origin: active id }`.
 - **T8 — Write-Block origin verify, both moments:** open ^KW picker, switch buffers, commit →
-  `"buffer changed — write block cancelled"`, no write; twin through
-  `PendingWriteBlock`/`OverwriteWriteBlock`.
+  `"buffer changed — write block cancelled"` AND the target file does not exist; twin through
+  `PendingWriteBlock`/`OverwriteWriteBlock`. The absence check is sound HERE (unlike T5/T6):
+  `perform_block_write` writes synchronously on the main thread, so a wrong implementation has
+  already created the file by the time the assertion runs (§11 preamble).
 - **T9 — chrome, rendered (C5):** paint the file browser (`TestBackend`, the existing
   `render_overlays.rs` destination-title fixture pattern) with a `MarkedBlock` Export purpose →
   the title row contains `" Export .pdf (marked block) to:"`; the `WholeDocument` twin renders
@@ -590,10 +639,11 @@ the subprocess.
   substring passes under BOTH wordings and under a scope-dropped regression, so it constrains
   the write happening at all, and nothing about scope. It stays (it guards the write); T10
   carries the scope discrimination with exact-match assertions.
-- **T11 — mid-flow edit remap (the reason scope is a flag):** open the flow, apply an edit
-  through the funnel that shifts the mark (insert before `start`), dispatch → the export
-  contains the block's CURRENT text. This is the fixture that fails under the rejected
-  stored-offsets design and passes under re-read.
+- **T11 — mid-flow edit remap (the reason scope is a flag):** mark a block, apply an edit
+  through the funnel that shifts it (insert before `start`), then assert
+  `resolve_export_input(e, MarkedBlock, id)` returns the block's CURRENT (post-remap) text —
+  the observable is the seam's returned `String`, synchronous, no pandoc involved. This is the
+  fixture that fails under the rejected stored-offsets design and passes under re-read.
 
 Suites ride where their subjects live (`export.rs`, `file_browser_commit.rs`, `prompts.rs`,
 `render_overlays.rs`, `jobs_apply.rs`); no new test infrastructure. Existing suites must pass
@@ -617,5 +667,9 @@ strings are preserved byte-for-byte). PTY smoke suite: run per project law
 - **Restyling the pre-existing `"no marked block"` Info statuses** — untouched (§6.2).
 - **The saved-source gate on the redirect path** — deliberately not added (D4; `do_export`
   needs no `document.path`).
-- **`export_*_block` commands / plugin-reachable block export** — the §9 law-10 shadow; a
-  future contract-touching effort if ever wanted.
+- **Parameterized, non-interactive export** — a caller naming scope AND destination without a
+  picker. Block-scoped export is plugin-reachable TODAY via the registered `block_write`
+  command (§9.1); what does not exist — **equally for whole-document export**, whose four
+  commands also open a picker — is a picker-free, argument-taking form. That is the post-P
+  parameterization law 10 already contemplates; if ever built, it is built for both scopes as
+  one deliberate contract-touching act (§9.1's closing paragraph).
