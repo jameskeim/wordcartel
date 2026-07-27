@@ -21,8 +21,8 @@ pub struct FileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestinationPurpose {
     SaveAs,
-    WriteBlock,
-    Export { ext: String },
+    WriteBlock { origin: crate::editor::BufferId },
+    Export { ext: String, scope: crate::export::ExportScope, origin: crate::editor::BufferId },
 }
 
 /// Select mode chooses an existing entry; destination mode navigates AND names.
@@ -275,8 +275,15 @@ pub(crate) fn footer_target(fs: &dyn crate::fsx::Fs, fb: &FileBrowser) -> Option
             crate::file_browser_commit::ExtVerdict::Defaulted(p) => p,
             crate::file_browser_commit::ExtVerdict::Honoured(p) => p,
             crate::file_browser_commit::ExtVerdict::Redirect { path, ext } => {
-                return Some(format!("\u{2192} {} \u{2014} {ext} is an export format",
-                    path.display()));
+                // A22 D3 surface 2: the ONLY pre-commit surface — a Write-Block flow names
+                // the scope the offered Export will use.
+                let block = matches!(purpose, DestinationPurpose::WriteBlock { .. });
+                return Some(if block {
+                    format!("\u{2192} {} \u{2014} {ext} is an export format (exports the \
+                             marked block)", path.display())
+                } else {
+                    format!("\u{2192} {} \u{2014} {ext} is an export format", path.display())
+                });
             }
             // `ExtVerdict` grew this fourth arm in Task 19's review, after this footer's
             // brief was written — flagged per the dispatch note rather than silently
@@ -380,6 +387,10 @@ pub(crate) fn cancel_destination(editor: &mut crate::editor::Editor) {
     // both — see the sweep in `prompts.rs`.
     editor.pending_save_as_chosen = None;
     editor.pending_write_block = None;
+    // A22 D4-iii: not load-bearing today (only ever set after the picker closes, like
+    // `pending_write_block` above) — cleared for the same symmetry: every place that
+    // abandons a destination flow sweeps the same pending set.
+    editor.pending_export = None;
     if editor.quit_drain.is_some() {
         editor.quit_drain = None;
         editor.quit_drain_advance = false;
@@ -1149,5 +1160,23 @@ mod tests {
              bypassed `fs` and hit the real file");
         assert!(matches!(e.status().map(|s| s.kind()), Some(crate::status::StatusKind::Error)),
             "the seam's IO error must surface on the status line, not silently");
+    }
+
+    // D4-iii — Esc on a destination picker sweeps the SAME pending set everywhere.
+    // Neither field is ever Some while the picker is open today (both are set post-picker),
+    // so this is hygiene, not a live-bug fix — but the test is still discriminating: an
+    // implementation without the added clear leaves pending_export Some.
+    #[test]
+    fn cancel_destination_sweeps_pending_export_like_the_rest() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let origin = e.active().id;
+        e.pending_export = Some(crate::export::PendingExport { ext: "html".into(),
+            target: std::path::PathBuf::from("/t/out.html"),
+            scope: crate::export::ExportScope::WholeDocument, origin });
+        e.pending_write_block = Some(crate::editor::PendingWriteBlock {
+            target: std::path::PathBuf::from("/t/x.md"), origin });
+        cancel_destination(&mut e);
+        assert!(e.pending_export.is_none(), "the added clear is missing");
+        assert!(e.pending_write_block.is_none(), "the pre-existing clear regressed");
     }
 }

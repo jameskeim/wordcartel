@@ -628,8 +628,15 @@ fn file_browser_title(fb: &crate::file_browser::FileBrowser) -> String {
         BrowseMode::Recents => " Recent files ".to_string(),
         BrowseMode::Destination { purpose, .. } => match purpose {
             DestinationPurpose::SaveAs => format!(" Save As: {dir} "),
-            DestinationPurpose::WriteBlock => format!(" Write Block to: {dir} "),
-            DestinationPurpose::Export { ext } => format!(" Export .{ext} to: {dir} "),
+            DestinationPurpose::WriteBlock { .. } => format!(" Write Block to: {dir} "),
+            // A22 D3 surface 3: an Export picker names its SCOPE, so the writer can see at the
+            // destination screen whether the block or the whole document is on its way out.
+            DestinationPurpose::Export { ext, scope, .. } => match scope {
+                crate::export::ExportScope::MarkedBlock =>
+                    format!(" Export .{ext} (marked block) to: {dir} "),
+                crate::export::ExportScope::WholeDocument =>
+                    format!(" Export .{ext} to: {dir} "),
+            },
         },
     }
 }
@@ -1152,15 +1159,22 @@ mod tests {
     #[test]
     fn each_picker_mode_is_titled_for_what_it_actually_does() {
         let dir = std::env::temp_dir().join(format!("wc-render-title-{}", std::process::id()));
-        let cases: [(BrowseMode, &str, &str); 5] = [
+        // The table is built BEFORE the per-case editor exists, so no real buffer id is in
+        // hand — a synthetic one is inert here: the title never reads `origin`.
+        let origin = crate::editor::BufferId(0);
+        let cases: [(BrowseMode, &str, &str); 6] = [
             (BrowseMode::Select, "Open:", "Save"),
             (BrowseMode::Recents, "Recent files", "Open:"),
             (BrowseMode::Destination { purpose: DestinationPurpose::SaveAs,
                 field: String::new(), field_cursor: 0 }, "Save As:", "Open:"),
-            (BrowseMode::Destination { purpose: DestinationPurpose::WriteBlock,
+            (BrowseMode::Destination { purpose: DestinationPurpose::WriteBlock { origin },
                 field: String::new(), field_cursor: 0 }, "Write Block to:", "Open:"),
-            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into() },
-                field: String::new(), field_cursor: 0 }, "Export .pdf to:", "Open:"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
+                field: String::new(), field_cursor: 0 }, "Export .pdf to:", "(marked block)"),
+            (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into(),
+                scope: crate::export::ExportScope::MarkedBlock, origin },
+                field: String::new(), field_cursor: 0 }, "Export .pdf (marked block) to:", "Open:"),
         ];
         for (mode, expected, forbidden) in cases {
             let mut e = Editor::new_from_text("x\n", None, (80, 24));
@@ -1178,6 +1192,84 @@ mod tests {
             assert!(!row.contains(forbidden),
                 "and must not still say {forbidden:?}: {row:?}");
         }
+    }
+
+    /// Spec §6.1 surface 3 EXACTLY: the WholeDocument title byte-for-byte (any drift —
+    /// wording, dir text, stray marker — fails), and the MarkedBlock title likewise. The
+    /// expected row is CONSTRUCTED (corner + title + fill + corner, per `Borders::ALL`),
+    /// so this asserts the whole screen row, not a fragment — the `contains` checks in the
+    /// mode table above are weaker than the byte-preservation requirement (§7.4).
+    #[test]
+    fn export_titles_render_byte_for_byte_per_scope() {
+        // A FIXED 2-char dir, never touched on disk (the painter only displays fb.dir; the
+        // empty field keeps footer_target at None). Chosen so BOTH titles fit the real box
+        // with room to spare: file_browser_overlay_rect delegates to palette_overlay_rect,
+        // 80*3/5 = 48 wide → 46 interior cells, vs titles of 20 and 35 chars — NO
+        // truncation is in play, which is exactly what a hand-built expectation would
+        // model wrong (a temp_dir path could exceed 46 and ratatui CLIPS the title).
+        let dir = std::path::PathBuf::from("/t");
+        let origin = crate::editor::BufferId(1); // tuple field is pub; the painter never reads it
+        for (scope, title_fmt) in [
+            (crate::export::ExportScope::WholeDocument,
+                format!(" Export .pdf to: {} ", dir.display())),
+            (crate::export::ExportScope::MarkedBlock,
+                format!(" Export .pdf (marked block) to: {} ", dir.display())),
+        ] {
+            let mut e = Editor::new_from_text("x\n", None, (80, 24));
+            let mut fb = empty_destination_fb(dir.clone(), "");
+            fb.mode = BrowseMode::Destination { purpose: DestinationPurpose::Export {
+                ext: "pdf".into(), scope, origin }, field: String::new(), field_cursor: 0 };
+            e.file_browser = Some(fb);
+            crate::derive::rebuild(&mut e);
+            let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+            let r = drawn_box_rect(&term);
+            let fill = (r.width as usize).saturating_sub(2 + title_fmt.chars().count());
+            let expected = format!("{}\u{250c}{title_fmt}{}\u{2510}{}",
+                " ".repeat(r.x as usize),
+                "\u{2500}".repeat(fill),
+                " ".repeat(80usize.saturating_sub(r.x as usize + r.width as usize)));
+            assert_eq!(row_text(&term, r.y), expected,
+                "{scope:?}: the whole painted title row must match byte-for-byte");
+        }
+    }
+
+    // ---- the pre-commit footer names the scope ------------------------------------
+
+    /// T9 footer — the pre-commit surface reaches the SCREEN (C5: render, don't assert the
+    /// struct). A scope-blind `footer_target` paints the plain redirect note here.
+    #[test]
+    fn writeblock_footer_redirect_note_names_the_block_scope_on_screen() {
+        let dir = crate::test_support::scratch_dir("a22-footer");
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let origin = e.active().id;
+        let mut fb = empty_destination_fb(dir.clone(), "notes.html");
+        fb.mode = BrowseMode::Destination {
+            purpose: DestinationPurpose::WriteBlock { origin },
+            field: "notes.html".into(), field_cursor: "notes.html".len() };
+        e.file_browser = Some(fb);
+        crate::derive::rebuild(&mut e);
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        // Layer 1 — the STRING, exact at its single source (spec §6.1 surface 2, full
+        // wording, path included): substring drift anywhere in the note fails here.
+        // Named assumption of this constructed expectation: footer_target's Redirect arm
+        // returns EARLY, before resolve_write_destination, so the displayed path is the
+        // unresolved dir.join("notes.html") — verified against the arm's `return Some(..)`.
+        let footer = crate::file_browser::footer_target(&crate::fsx::RealFs,
+            e.file_browser.as_ref().expect("picker open"));
+        assert_eq!(footer.as_deref(), Some(format!(
+            "\u{2192} {} \u{2014} html is an export format (exports the marked block)",
+            dir.join("notes.html").display()).as_str()));
+        // Layer 2 — it reaches the SCREEN (C5; the spec's frame assertion is contains —
+        // the footer row is shared real estate with disclosure lines and may elide a
+        // long path's left end).
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+        let all: String = (0..24).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("(exports the marked block)"),
+            "the painted footer must carry the scope note: {all}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- the withholding disclosure reaches the SCREEN ----------------------------

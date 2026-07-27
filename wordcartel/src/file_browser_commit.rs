@@ -260,7 +260,8 @@ pub(crate) fn copy_name_into_field(field: &mut String, field_cursor: &mut usize,
 ///
 /// Shared by the two refusals that have somewhere to go: the typed-text `ExtVerdict::Redirect`
 /// (F4) and Row 2's `HighlightVerdict::ExportInstead`. `fallback_dir` is used only when `path`
-/// has no parent.
+/// has no parent. `pandoc_available` gates the whole redirect (A22 D4-ii): with no pandoc there
+/// is nothing to redirect TO, so it refuses before any flow-abandoning side effect.
 // The full write-refusal context: everything `commit_destination` would otherwise inline twice.
 #[allow(clippy::too_many_arguments)]
 fn redirect_to_export(
@@ -272,7 +273,17 @@ fn redirect_to_export(
     ext: String,
     reason: &str,
     fallback_dir: PathBuf,
+    pandoc_available: &dyn Fn() -> bool,
 ) {
+    // A22 D4-ii: no point choosing an Export destination for an export that cannot run —
+    // and the gate must run before ANY flow-abandoning side effect (status, drain-abort,
+    // picker replacement), so a refusal leaves the writer exactly where they were.
+    if !pandoc_available() {
+        editor.set_status_full(crate::status::StatusKind::Error,
+            "pandoc not found \u{2014} install it to export".to_owned(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        return;
+    }
     editor.set_status_full(crate::status::StatusKind::Warning, reason.to_owned(),
         crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     // A redirect IS an abandoned save — the write did not happen, and the writer is being
@@ -286,23 +297,50 @@ fn redirect_to_export(
     }
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(fallback_dir);
     let field = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A22 D1: scope/origin derive from the flow the writer STARTED. WriteBlock carries the
+    // origin captured at ^KW — deliberately NOT re-captured here, so a buffer switched
+    // under the picker is caught at dispatch, not laundered. The Export arm is unreachable
+    // today (extension policy never runs for an Export purpose) but stays total.
+    let (scope, origin) = match purpose {
+        crate::file_browser::DestinationPurpose::WriteBlock { origin } =>
+            (crate::export::ExportScope::MarkedBlock, *origin),
+        crate::file_browser::DestinationPurpose::SaveAs =>
+            (crate::export::ExportScope::WholeDocument, editor.active().id),
+        crate::file_browser::DestinationPurpose::Export { scope, origin, .. } =>
+            (*scope, *origin),
+    };
     editor.open_destination_picker(fs, msg_tx,
-        crate::file_browser::DestinationPurpose::Export { ext }, dir, field);
+        crate::file_browser::DestinationPurpose::Export { ext, scope, origin }, dir, field);
 }
 
 /// Execute a destination-mode Enter. THE single place a picker commit becomes a write.
-///
-/// Dispatches on `DestinationPurpose`, so adding a future destination consumer is one arm
-/// the compiler demands rather than a new branch somewhere else.
-#[allow(clippy::too_many_lines)] // a flat, exhaustive commit-outcome × purpose dispatch — the
-// highest-risk logic in C5 (the module doc comment), kept in ONE function on purpose so the
-// whole write decision is auditable in one place rather than split across call sites.
+/// Production probe = `probe_pandoc` (OnceLock-cached); the seam exists because the merge
+/// gate runs on machines WITHOUT pandoc — tests inject (the run_export_with_probe pattern).
 pub(crate) fn commit_destination(
     editor: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     executor: &dyn crate::jobs::Executor,
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    commit_destination_with_probe(editor, fs, executor, clock, msg_tx,
+        crate::export::probe_pandoc)
+}
+
+/// `commit_destination` with an INJECTABLE pandoc probe — see that wrapper for why.
+///
+/// Dispatches on `DestinationPurpose`, so adding a future destination consumer is one arm
+/// the compiler demands rather than a new branch somewhere else.
+#[allow(clippy::too_many_lines)] // a flat, exhaustive commit-outcome × purpose dispatch — the
+// highest-risk logic in C5 (the module doc comment), kept in ONE function on purpose so the
+// whole write decision is auditable in one place rather than split across call sites.
+pub(crate) fn commit_destination_with_probe(
+    editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    executor: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    pandoc_available: impl Fn() -> bool,
 ) {
     let Some(fb) = editor.file_browser.as_ref() else { return };
     let crate::file_browser::BrowseMode::Destination { purpose, field, .. } = &fb.mode
@@ -325,7 +363,7 @@ pub(crate) fn commit_destination(
         CommitOutcome::Nothing => {
             let noun = match purpose {
                 crate::file_browser::DestinationPurpose::SaveAs => "save-as",
-                crate::file_browser::DestinationPurpose::WriteBlock => "write block",
+                crate::file_browser::DestinationPurpose::WriteBlock { .. } => "write block",
                 crate::file_browser::DestinationPurpose::Export { .. } => "export",
             };
             editor.set_status_full(crate::status::StatusKind::Warning,
@@ -353,10 +391,20 @@ pub(crate) fn commit_destination(
                 _ if from_highlight => match classify_highlight_target(&raw) {
                     HighlightVerdict::Write => raw,
                     HighlightVerdict::ExportInstead(ext) => {
-                        let reason = format!(
-                            "{} is a {ext} file \u{2014} opening Export instead",
-                            raw.display());
-                        redirect_to_export(editor, fs, msg_tx, &purpose, &raw, ext, &reason, dir);
+                        // A22 D3 surface 1: the redirect names the scope the Export it opens
+                        // will use, so a Write-Block writer is never told "Export" and left to
+                        // guess whether the block or the whole document is on its way out.
+                        let reason = if matches!(purpose,
+                            crate::file_browser::DestinationPurpose::WriteBlock { .. })
+                        {
+                            format!("{} is a {ext} file \u{2014} opening Export for the \
+                                     marked block", raw.display())
+                        } else {
+                            format!("{} is a {ext} file \u{2014} opening Export instead",
+                                raw.display())
+                        };
+                        redirect_to_export(editor, fs, msg_tx, &purpose, &raw, ext, &reason, dir,
+                            &pandoc_available);
                         return;
                     }
                     HighlightVerdict::Foreign(ext) => {
@@ -372,10 +420,18 @@ pub(crate) fn commit_destination(
                     ExtVerdict::Defaulted(p) | ExtVerdict::Honoured(p) => p,
                     ExtVerdict::Redirect { path, ext } => {
                         // F4: refuse the save, explain, and carry the typed path into the
-                        // export destination picker — advice with somewhere to go.
-                        let reason =
-                            format!("{ext} is an export format \u{2014} opening Export instead");
-                        redirect_to_export(editor, fs, msg_tx, &purpose, &path, ext, &reason, dir);
+                        // export destination picker — advice with somewhere to go. A22 D3
+                        // surface 1: name the scope when the abandoned flow was ^KW.
+                        let reason = if matches!(purpose,
+                            crate::file_browser::DestinationPurpose::WriteBlock { .. })
+                        {
+                            format!("{ext} is an export format \u{2014} opening Export for the \
+                                     marked block")
+                        } else {
+                            format!("{ext} is an export format \u{2014} opening Export instead")
+                        };
+                        redirect_to_export(editor, fs, msg_tx, &purpose, &path, ext, &reason, dir,
+                            &pandoc_available);
                         return;
                     }
                     ExtVerdict::Refused(path) => {
@@ -414,28 +470,41 @@ pub(crate) fn commit_destination(
                             editor, chosen, resolved, executor, clock, msg_tx, fs);
                     }
                 }
-                crate::file_browser::DestinationPurpose::WriteBlock => {
+                crate::file_browser::DestinationPurpose::WriteBlock { origin } => {
+                    // A22 D4-iv: the flow's buffer, captured at ^KW, must still be active —
+                    // the plugin pump can switch buffers under the open picker. Verify
+                    // BEFORE the mark re-read so the status names the real reason.
+                    if editor.active().id != origin {
+                        editor.set_status_full(crate::status::StatusKind::Warning,
+                            "buffer changed \u{2014} write block cancelled".to_owned(),
+                            crate::status::StatusLifetime::Sticky,
+                            crate::status::StatusSource::Host, None);
+                        return;
+                    }
                     let Some(b) = editor.active().marked_block else {
                         editor.set_status(crate::status::StatusKind::Info, "no marked block");
                         return;
                     };
                     if exists {
-                        editor.pending_write_block = Some(resolved);
-                        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(
-                            editor.pending_write_block.as_ref().expect("just set")));
+                        // ORDER IS LOAD-BEARING: this construction is sound only because it sits
+                        // AFTER the origin gate above, where `origin == active().id` holds. No test
+                        // constrains it — re-deriving here is extensionally identical today, so a
+                        // hoist above the gate would pass the whole suite (A22 spec §11, probe P3).
+                        editor.pending_write_block = Some(crate::editor::PendingWriteBlock {
+                            target: resolved.clone(), origin });
+                        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&resolved));
                     } else {
                         crate::prompts::perform_block_write(editor, &resolved, b.start, b.end, fs);
                     }
                 }
-                crate::file_browser::DestinationPurpose::Export { ext } => {
+                crate::file_browser::DestinationPurpose::Export { ext, scope, origin } => {
                     if exists {
                         editor.pending_export = Some(crate::export::PendingExport {
-                            ext, target: resolved });
-                        editor.open_prompt(crate::prompt::Prompt::export_overwrite(
-                            &editor.pending_export.as_ref().expect("just set").target));
+                            ext, target: resolved.clone(), scope, origin });
+                        editor.open_prompt(crate::prompt::Prompt::export_overwrite(&resolved));
                     } else {
                         crate::export::do_export(editor, &ext, &resolved, msg_tx, false,
-                            std::sync::Arc::clone(fs));
+                            scope, origin, std::sync::Arc::clone(fs));
                     }
                 }
             }
@@ -783,13 +852,24 @@ mod tests {
     /// entirely, so a Foreign-arm case has to be driven with `All`, exactly as a writer would.
     fn row2_enter_onto(d: &std::path::Path, name: &str, types: crate::config::FileTypeFilter)
         -> (crate::editor::Editor, std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
+        row2_enter_onto_prepared(d, name, types,
+            &|_e| crate::file_browser::DestinationPurpose::SaveAs)
+    }
+
+    /// `row2_enter_onto`, with the flow the writer STARTED left to the caller: `prepare` runs
+    /// on the fresh editor and yields the purpose the picker opens with, so a Write-Block
+    /// fixture can also mark the block its flow implies and hand back the ^KW origin.
+    fn row2_enter_onto_prepared(
+        d: &std::path::Path, name: &str, types: crate::config::FileTypeFilter,
+        prepare: &dyn Fn(&mut crate::editor::Editor) -> crate::file_browser::DestinationPurpose,
+    ) -> (crate::editor::Editor, std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
         let mut e = crate::editor::Editor::new_from_text("markdown body\n", None, (80, 24));
         e.files_type_filter = types;
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
-        e.open_destination_picker(&fs, &tx,
-            crate::file_browser::DestinationPurpose::SaveAs, d.to_path_buf(), String::new());
+        let purpose = prepare(&mut e);
+        e.open_destination_picker(&fs, &tx, purpose, d.to_path_buf(), String::new());
         crate::test_support::pump_listing(&mut e, &rx);
         for _ in 0..12 {
             let on_it = e.file_browser.as_ref()
@@ -806,7 +886,14 @@ mod tests {
             assert_eq!(fb.mode.filter_text(&fb.query), "",
                 "precondition: the field is empty — this is Row 2, not Row 4");
         }
-        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+        // Committed via the probe seam rather than the Enter intercept: the intercept cannot
+        // inject, and these fixtures reach the redirect arm — on a pandoc-less machine the
+        // production probe would refuse and the assertions would fail for the environment,
+        // not the code. Enter-through coverage lives in the non-redirect commit tests.
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
         (e, fs)
     }
 
@@ -852,10 +939,73 @@ mod tests {
             "the save is refused outright — not queued behind a confirm");
         let fb = e.file_browser.as_ref().expect("the Export destination picker replaces it");
         assert!(matches!(&fb.mode, crate::file_browser::BrowseMode::Destination {
-            purpose: crate::file_browser::DestinationPurpose::Export { ext }, .. }
+            purpose: crate::file_browser::DestinationPurpose::Export { ext, .. }, .. }
             if ext == "docx"), "the refusal hands the writer the Export flow for that format");
-        assert!(e.status().map_or("", |s| s.text()).contains("docx"),
-            "and says why — no silent UI: {:?}", e.status().map_or("", |s| s.text()));
+        // Behavioural only: a status was raised at all. `.contains("docx")` used to stand
+        // here and could not fail — the FILENAME carries "docx", so any reason string, or a
+        // garbled one, satisfied it. The wording itself is pinned byte-for-byte by
+        // `row2_from_a_save_as_picker_keeps_the_unscoped_redirect_wording` below.
+        assert!(!e.status_text().is_empty(), "and says why — no silent UI");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A22 T3, the Row-2 twin of the test above: the SAME gesture from a Write-Block picker.
+    /// The redirect must derive `MarkedBlock`, carry the ^KW origin, and say so — Row 2 builds
+    /// its reason at a DIFFERENT call site from the typed path, so a fix applied to only one
+    /// of the two leaves this screen scope-blind.
+    #[test]
+    fn row2_from_a_write_block_picker_redirects_for_the_marked_block() {
+        let d = tmp("row2-docx-wb");
+        std::fs::write(d.join("report.docx"), b"PK\x03\x04 not really a docx\n").expect("seed");
+        let origin = std::cell::Cell::new(None);
+        let (e, _fs) = row2_enter_onto_prepared(&d, "report.docx",
+            crate::config::FileTypeFilter::Documents, &|e| {
+                e.active_mut().marked_block =
+                    Some(crate::editor::MarkedBlock { start: 0, end: 8, hidden: false });
+                let id = e.active().id;
+                origin.set(Some(id));
+                crate::file_browser::DestinationPurpose::WriteBlock { origin: id }
+            });
+        let origin = origin.get().expect("the fixture opened a Write-Block picker");
+        assert_eq!(std::fs::read(d.join("report.docx")).expect("still there"),
+            b"PK\x03\x04 not really a docx\n",
+            "block bytes must never land inside a foreign document format either");
+        match &e.file_browser.as_ref().expect("the Export destination picker replaces it").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => assert_eq!(
+                purpose, &crate::file_browser::DestinationPurpose::Export {
+                    ext: "docx".into(),
+                    scope: crate::export::ExportScope::MarkedBlock, origin },
+                "Row 2 derives scope+origin from the flow the writer started, like the \
+                 typed path"),
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        // Exact, path included (spec §6.1 — ends_with would tolerate a mangled path
+        // prefix). `raw` at the Row-2 site is dir.join(name), pre-resolution.
+        assert_eq!(e.status_text(), format!(
+            "{} is a docx file \u{2014} opening Export for the marked block",
+            d.join("report.docx").display()),
+            "surface 1 Row-2: scope-blind wording says 'opening Export instead'");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A22 T3, the fourth cell of the 2-call-site × 2-scope wording matrix: Row 2 reached from
+    /// a whole-document flow (Save-As). The other three cells are pinned byte-for-byte — the
+    /// typed path's two arms and Row 2's block arm above — while this one was only ever seen
+    /// through `.contains("docx")`, which the FILENAME satisfies on its own. The scope note is
+    /// added for the block flow ONLY: this string must stay unchanged (spec §6.1, §7.4).
+    ///
+    /// FAIL-VERIFY: reword the `ExportInstead` arm's whole-document `format!`, watch this
+    /// fail — nothing else in the suite does.
+    #[test]
+    fn row2_from_a_save_as_picker_keeps_the_unscoped_redirect_wording() {
+        let d = tmp("row2-docx-sa");
+        std::fs::write(d.join("report.docx"), b"PK\x03\x04 not really a docx\n").expect("seed");
+        let (e, _fs) = row2_enter_onto(&d, "report.docx", crate::config::FileTypeFilter::Documents);
+        // Exact, path included, and the SaveAs purpose is what selects this arm — a
+        // `contains` here would be satisfied by the seeded filename alone.
+        assert_eq!(e.status_text(), format!(
+            "{} is a docx file \u{2014} opening Export instead", d.join("report.docx").display()),
+            "surface 1 Row-2 whole-document: the scope note must never leak onto this string");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1358,6 +1508,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
+        // A SaveAs redirect derives its origin from the ACTIVE buffer — this fixture never
+        // switches, so the id captured here is the one the redirect must carry.
+        let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "notes.html".into());
         crate::test_support::pump_listing(&mut e, &rx);
@@ -1365,7 +1518,10 @@ mod tests {
         e.quit_drain = Some(crate::editor::QuitDrain {
             queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
 
-        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        // Through the probe seam, not the intercept: this flow reaches the redirect arm, whose
+        // A22 gate would refuse on a pandoc-less machine (see `row2_enter_onto`).
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
 
         assert!(e.pending_save_as.is_none(),
             "a Redirect abandons the save — the armed post-save action must not survive");
@@ -1378,11 +1534,16 @@ mod tests {
         match &e.file_browser.as_ref().expect("export picker opened").mode {
             crate::file_browser::BrowseMode::Destination { purpose, field, .. } => {
                 assert_eq!(purpose,
-                    &crate::file_browser::DestinationPurpose::Export { ext: "html".into() });
+                    &crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                        scope: crate::export::ExportScope::WholeDocument, origin });
                 assert_eq!(field, "notes.html");
             }
             other => panic!("expected destination mode, got {other:?}"),
         }
+        // A22 §7.4: the Save-As redirect wording is the byte-preservation guard — the scope
+        // note is added for the block flow ONLY, never to the whole-document string.
+        assert_eq!(e.status_text(), "html is an export format \u{2014} opening Export instead",
+            "SaveAs redirect wording is unchanged byte-for-byte");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1505,8 +1666,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
-            crate::file_browser::DestinationPurpose::WriteBlock, d.clone(), "excerpt".into());
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "excerpt".into());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
 
@@ -1516,6 +1679,376 @@ mod tests {
         assert!(e.active().document.path.is_none(),
             "write-block does NOT rekey the buffer — it exports a slice");
         assert!(e.active().marked_block.is_some(), "block stays after write");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T2-shape — the redirect DERIVES MarkedBlock and CARRIES the ^KW origin.
+    #[test]
+    fn writeblock_typed_redirect_derives_block_scope_and_carries_the_kw_origin() {
+        let d = tmp("a22-derive");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        match &e.file_browser.as_ref().expect("redirect reopens as Export").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => assert_eq!(
+                purpose, &crate::file_browser::DestinationPurpose::Export {
+                    ext: "html".into(),
+                    scope: crate::export::ExportScope::MarkedBlock, origin },
+                "a WholeDocument-deriving redirect fails the scope; a re-capturing one \
+                 is caught by the carried-origin case below"),
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        // A22 D3 surface 1 (T2): the redirect that abandons the Write-Block names the scope
+        // the Export it offers will use.
+        assert_eq!(e.status_text(),
+            "html is an export format \u{2014} opening Export for the marked block",
+            "surface 1: a scope-blind redirect keeps 'opening Export instead'");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T2 carried-origin — active != origin at redirect time, so carried and re-derived
+    // DIFFER: a re-capturing implementation reads B here and fails.
+    #[test]
+    fn writeblock_redirect_carries_the_original_origin_across_a_buffer_switch() {
+        let d = tmp("a22-carried");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::workspace::new_empty_buffer(&mut e); // the pump-vector stand-in
+        assert_ne!(e.active().id, origin, "fixture: carried and re-derived must differ");
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        match &e.file_browser.as_ref().expect("redirect proceeds — verify is at dispatch").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => match purpose {
+                crate::file_browser::DestinationPurpose::Export { origin: o, .. } =>
+                    assert_eq!(*o, origin,
+                        "§5.2: NOT re-captured — re-derivation launders the switch"),
+                other => panic!("expected Export purpose, got {other:?}"),
+            },
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T4 flow-survival. Assertions and what each rules out (spec §11): exact status rules
+    // out a gate-less implementation (final status would be the redirect Warning — and no
+    // frame paints between same-dispatch status writes, so final IS the only observable);
+    // mode/field rule out refuse-but-reopen-as-Export. Deliberately NOT claimed: that the
+    // reason was never transiently set (terminal reads cannot distinguish set-then-
+    // overwritten; §5.2's gate-first order is a REVIEW check, below).
+    #[test]
+    fn probe_refusal_keeps_the_original_writeblock_picker_alive() {
+        let d = tmp("a22-t4-wb");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || false);
+        assert_eq!(e.status_text(), "pandoc not found \u{2014} install it to export");
+        assert_eq!(e.status().expect("a refusal is never silent").kind(),
+            crate::status::StatusKind::Error);
+        match &e.file_browser.as_ref().expect("original picker survives the refusal").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, field, .. } => {
+                assert!(matches!(purpose,
+                    crate::file_browser::DestinationPurpose::WriteBlock { .. }),
+                    "a refuse-but-still-redirect implementation reopens as Export");
+                assert_eq!(field, "report.html", "the writer's typed name is intact");
+            }
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T4 gate-precedes-drain-abort. ALL THREE drain fields seeded non-default —
+    // quit_drain_advance is a bool defaulting false, so unseeded it reads the same on a
+    // correct and a wrong implementation (spec-gate round 4). On a gate-after-drain-abort
+    // implementation the three read None/None/false and each equality fails.
+    #[test]
+    fn probe_gate_runs_before_the_saveas_drain_abort() {
+        let d = tmp("a22-t4-drain");
+        let mut e = crate::editor::Editor::new_from_text("unsaved\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "report.docx".into());
+        e.pending_save_as = Some(crate::editor::PostSaveAction::Quit);
+        e.quit_drain = Some(crate::editor::QuitDrain {
+            queue: std::collections::VecDeque::new(),
+            mode: crate::editor::QuitMode::SaveAll });
+        e.quit_drain_advance = true;
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || false);
+        assert_eq!(e.status_text(), "pandoc not found \u{2014} install it to export");
+        assert!(e.quit_drain.is_some(), "gate must precede the drain-abort");
+        assert!(e.pending_save_as.is_some(), "the armed post-save action survives");
+        assert!(e.quit_drain_advance, "seeded true; a wrong clear reads false");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| matches!(&fb.mode,
+            crate::file_browser::BrowseMode::Destination {
+                purpose: crate::file_browser::DestinationPurpose::SaveAs, .. })),
+            "the SaveAs picker survives; no Export picker opened");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T8 / B unmarked. The EXACT status is the sole discriminator (spec §11, round-5
+    // correction): a verify-missing implementation falls through to the mark re-read, ALSO
+    // refuses ("no marked block"), and ALSO leaves the target absent — absence here is
+    // corroborative only. B-unmarked also pins refusal ORDER (origin verify first).
+    #[test]
+    fn writeblock_commit_refuses_when_the_buffer_changed() {
+        let d = tmp("a22-t8-unmarked");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "excerpt.md".into());
+        crate::workspace::new_empty_buffer(&mut e); // B: no mark
+        assert_ne!(e.active().id, origin);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled",
+            "verify-missing OR mark-first implementations read 'no marked block' here");
+        assert!(!d.join("excerpt.md").exists(), "corroborative (see comment above)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T8 / B MARKED — the write-suppression discriminator: a verify-missing implementation
+    // passes the mark re-read and SYNCHRONOUSLY writes B's block bytes, so the absence
+    // assertion is sound and load-bearing here (perform_block_write is main-thread).
+    #[test]
+    fn writeblock_commit_never_writes_the_wrong_buffers_block() {
+        let d = tmp("a22-t8-marked");
+        let mut e = crate::editor::Editor::new_from_text("A-body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "excerpt.md".into());
+        crate::workspace::new_empty_buffer(&mut e);
+        // B is the fresh "\n" buffer — mark its single byte directly.
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled");
+        assert!(!d.join("excerpt.md").exists(),
+            "a verify-missing implementation has ALREADY written B's block by now");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- A22 T12 — the Export commit arm's scope/origin CARRIAGE ------------------
+    //
+    // Every other export test leaves the `purpose -> commit arm -> do_export/PendingExport`
+    // hand-off free: an arm that hardcoded `WholeDocument`, or that re-captured
+    // `active().id` instead of carrying `origin`, would stay green while exporting the
+    // wrong bytes or laundering a buffer switch. These four cases are the discriminator.
+
+    /// `(editor, fs, ex, clk, tx, rx, origin, dir)` — the whole apparatus a commit needs.
+    /// Aliased to preempt `clippy::type_complexity` under the deny gate (no `#[allow]`),
+    /// the same way `editor::FoldViewCache` is.
+    type RedirectedExport = (crate::editor::Editor,
+        std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        crate::jobs::InlineExecutor, crate::test_support::TestClock,
+        std::sync::mpsc::Sender<crate::app::Msg>,
+        std::sync::mpsc::Receiver<crate::app::Msg>,
+        crate::editor::BufferId, std::path::PathBuf);
+
+    /// A22 T12 shared fixture: a REAL redirect from a ^KW flow on buffer A — the value under
+    /// test is the carried one, never hand-seeded. The Export picker is left open with field
+    /// "report.html"; see `RedirectedExport` for what comes back.
+    fn redirected_block_export(name: &str) -> RedirectedExport {
+        let d = tmp(name);
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true); // the redirect
+        assert!(matches!(&e.file_browser.as_ref().expect("export picker").mode,
+            crate::file_browser::BrowseMode::Destination { purpose:
+                crate::file_browser::DestinationPurpose::Export { .. }, .. }));
+        (e, fs, ex, clk, tx, rx, origin, d)
+    }
+
+    /// A22 T12 — a BOUNDED drain to channel disconnect; reports whether any message matched
+    /// `pred`. Bounded on purpose, twice over: the fixture's pickers send LISTING messages
+    /// through the same `tx`, so a bare `recv()`/`try_recv()` misreads a CORRECT
+    /// implementation and the drain has to run to disconnect — but an UNBOUNDED drain would
+    /// HANG rather than fail if a future path ever leaked a `Sender<Msg>` clone into
+    /// something long-lived, and a hang in CI is worse than a red assertion. Callers do no
+    /// work once the drain begins, so `DEADLINE` is unreachable on any machine that is not
+    /// already broken.
+    fn drained_any(rx: &std::sync::mpsc::Receiver<crate::app::Msg>,
+        pred: impl Fn(&crate::app::Msg) -> bool) -> bool
+    {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        let stop = std::time::Instant::now() + DEADLINE;
+        let mut hit = false;
+        loop {
+            let left = stop.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(m) => hit |= pred(&m),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return hit,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "the Msg channel never disconnected within {DEADLINE:?} \u{2014} a \
+                     Sender<Msg> clone outlived the flow; this drain must go RED, not hang"),
+            }
+        }
+    }
+
+    // A22 T12a — scope hand-off, no-overwrite path. A commit arm hardcoding WholeDocument
+    // into the do_export call DISPATCHES here (no refusal status) and fails the equality.
+    // NOTE the channel: the fixture's pickers send LISTING messages through the same tx, so
+    // a bare `recv().is_err()` fails on a CORRECT implementation — drain (bounded, see
+    // `drained_any`) and assert no ExportDone specifically. Still deterministic: our tx is
+    // dropped, and the only other senders — listing threads, plus a wrongly-spawned worker
+    // — each send and drop in bounded time.
+    #[test]
+    fn export_commit_arm_forwards_the_carried_block_scope() {
+        let (mut e, fs, ex, clk, tx, rx, _origin, d) = redirected_block_export("a22-t12a");
+        crate::blocks_marked::block_clear(&mut e); // flip the mark-present conjunct
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true); // Enter on "report.html", non-existing
+        assert_eq!(e.status_text(), "no marked block \u{2014} export cancelled");
+        drop(tx);
+        assert!(!drained_any(&rx, |m| matches!(m, crate::app::Msg::ExportDone { .. })),
+            "no worker may have been dispatched (listing messages are expected; \
+             ExportDone is not)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A22 T12b — origin hand-off, no-overwrite path. A re-deriving commit arm (origin :=
+    // active().id) LAUNDERS the switch: verification passes against B, the mark re-read
+    // refuses "no marked block — export cancelled" — a DIFFERENT exact string.
+    #[test]
+    fn export_commit_arm_forwards_the_carried_origin() {
+        let (mut e, fs, ex, clk, tx, rx, origin, d) = redirected_block_export("a22-t12b");
+        crate::workspace::new_empty_buffer(&mut e); // switch to unmarked B
+        assert_ne!(e.active().id, origin);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} export cancelled",
+            "re-derivation reads 'no marked block — export cancelled' instead");
+        drop(tx);
+        assert!(!drained_any(&rx, |m| matches!(m, crate::app::Msg::ExportDone { .. })),
+            "no worker may have been dispatched");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A22 T12's OPPOSITE scope value, no-overwrite path, is covered by the MIGRATED
+    // `export_commits_end_to_end_from_enter_through` below: a commit arm hardcoding
+    // MarkedBlock would refuse that WholeDocument flow (no mark exists) and its bounded
+    // ExportDone receive would time out. The overwrite-path opposite needs its own case:
+
+    // A22 T12d — WholeDocument overwrite construction. A construction hardcoding MarkedBlock
+    // fails the whole-value equality; its confirm leg would then refuse where dispatch is
+    // required, so the bounded receive doubles the discrimination.
+    #[test]
+    fn export_commit_arm_builds_whole_document_pending_export_too() {
+        let d = tmp("a22-t12d");
+        let mut e = crate::editor::Editor::new_from_text("AAA\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        std::fs::write(d.join("out.html"), b"OLD").expect("existing target");
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
+            d.clone(), "out.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        let resolved = crate::fsx::resolve_write_destination(&*fs, &d.join("out.html"))
+            .expect("the scratch target resolves");
+        assert_eq!(e.pending_export, Some(crate::export::PendingExport {
+            ext: "html".into(), target: resolved,
+            scope: crate::export::ExportScope::WholeDocument, origin }),
+            "a MarkedBlock-hardcoding construction fails the whole-value equality");
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &clk, &tx, &crate::test_support::test_fs());
+        drop(tx); // the drain runs to channel disconnect — it would stall out against its
+                  // deadline while the test still held a sender.
+        assert!(drained_any(&rx, |m| matches!(m,
+            crate::app::Msg::ExportDone { scope: crate::export::ExportScope::WholeDocument, .. })),
+            "the confirmed whole-document export must dispatch; a MarkedBlock-carrying \
+             pending would refuse (no mark exists in this fixture)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A22 T12c — PendingExport construction, overwrite path. The switch makes carried and
+    // re-derived origins DIFFER at construction time (the Export arm has no commit-time
+    // verify). WHOLE-VALUE equality per spec §4.3: a field-wise assertion would silently
+    // stop constraining any field a future change adds. The expected `target` is computed
+    // by the SAME production resolver the commit path uses, so a symlinked scratch dir
+    // cannot fail the path axis for a non-carriage reason.
+    #[test]
+    fn export_commit_arm_builds_pending_export_from_the_carried_purpose() {
+        let (mut e, fs, ex, clk, tx, _rx, origin, d) = redirected_block_export("a22-t12c");
+        std::fs::write(d.join("report.html"), b"OLD").expect("existing target");
+        crate::workspace::new_empty_buffer(&mut e);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        let resolved = crate::fsx::resolve_write_destination(&*fs, &d.join("report.html"))
+            .expect("the scratch target resolves");
+        assert_eq!(e.pending_export, Some(crate::export::PendingExport {
+            ext: "html".into(), target: resolved,
+            scope: crate::export::ExportScope::MarkedBlock, origin }),
+            "a WholeDocument-substituting construction fails on scope; a re-deriving one \
+             fails on origin (it stores B); a future field lands in this literal by \
+             compiler force and is constrained from day one");
+        // The confirm leg (complements T6's seeded side): dispatch refuses on the switch.
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &clk, &tx2, &crate::test_support::test_fs());
+        assert_eq!(e.status_text(), "buffer changed \u{2014} export cancelled");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1534,8 +2067,10 @@ mod tests {
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
             std::sync::Arc::new(crate::fsx::RealFs);
         // Seeded exactly as `run_export` seeds it — the Enter-through path.
+        let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
-            crate::file_browser::DestinationPurpose::Export { ext: "html".into() },
+            crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
             d.clone(), "notes.html".into());
         // Pump the async listing to completion — the state real usage actually reaches.
         // `d` also contains the source file `notes.md`, so the SAME `rx` used for the
@@ -1625,6 +2160,116 @@ mod tests {
             "Enter on the picker seeded by run_export_with_probe must dispatch ExportDone \
              for exactly derived_export_path's target (status was {:?})", e.status_text());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- A22 ORDERINGS — the COMMIT dispatch moment, end to end -------------------
+    //
+    // Adopted from the whole-branch gate's orderings probes: the sequences that cross the
+    // TWO dispatch moments (this commit arm; the overwrite confirm) and the TWO invalidation
+    // vectors (the mark cleared; the active buffer switched) — which no single task's tests
+    // could reach. Each drives the REAL flow: ^KW picker -> real redirect -> real Export
+    // picker -> real commit -> real pandoc -> `Msg::ExportDone` through the REAL reducer ->
+    // bytes read back off disk. The confirm-moment half lives in `prompts.rs` beside the
+    // overwrite-confirm tests it exercises; the shared fixture is
+    // `test_support::BlockExportFlow`.
+
+    // The PRIMARY flow the block scope exists for: no invalidation, non-existing target,
+    // dispatch straight off the commit arm. MarkedBlock scope is producible ONLY via this
+    // redirect (palette exports hardcode WholeDocument), so nothing else pins these bytes.
+    #[test]
+    fn block_export_commit_writes_only_the_marked_block_end_to_end() {
+        // Every assertion below reads a SUCCESSFUL export's output, so the whole test skips
+        // without pandoc rather than degrading to a dispatch-only claim that cannot see bytes.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_commit_writes_only_the_marked_block_end_to_end") { return; }
+        let mut f = crate::test_support::start_block_export_flow("a22-o1", "out.html");
+        f.commit(); // non-existing target -> immediate dispatch
+        f.finish_export();
+        // The durable truth: a successful block export produces the scope-keyed completion
+        // wording. A whole-document-degrading dispatch reads "exported {target}" instead.
+        assert!(f.editor.status_history().entries().iter()
+            .any(|s| s.text().starts_with("exported block to ")),
+            "the scope-keyed completion status must be produced by a successful block export");
+        // KNOWN BEHAVIOUR, PINNED — NOT the behaviour we want. Backlog item A24: a Sticky
+        // Warning that OPENS a flow is never retired when that flow succeeds, so A17's Q1
+        // rule (a Warning occupant holds the slot against a later Info candidate) leaves the
+        // redirect's warning on screen and the completion Info lands in history only. The
+        // wording above is therefore unreachable in the live app today. Whoever fixes the A24
+        // status law lands HERE: swap this expectation for the completion wording.
+        assert_eq!(f.editor.status_text(),
+            "html is an export format \u{2014} opening Export for the marked block",
+            "A24: the redirect's Sticky Warning still occupies the slot after success");
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB"), "the marked block must be in the artifact: {html}");
+        assert!(!html.contains("AAA") && !html.contains("CCC"),
+            "whole-document bytes leaked into a block-scoped export: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // Invalidation vector 1 before the FIRST dispatch moment. Unlike the T12a twin (which
+    // asserts the same refusal off a hand-driven commit), this one also proves the negative
+    // on DISK: a scope-degrading dispatch would have written a whole-document artifact.
+    #[test]
+    fn block_export_commit_refuses_when_the_mark_was_cleared() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o3", "out.html");
+        crate::blocks_marked::block_clear(&mut f.editor);
+        f.commit();
+        assert_eq!(f.editor.status_text(), "no marked block \u{2014} export cancelled");
+        assert!(!f.dir.join("out.html").exists(), "a refusal must write nothing");
+        let dir = f.dir.clone();
+        f.assert_no_export_done();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Invalidation vector 2 before the FIRST dispatch moment, with B MARKED — the wrong-bytes
+    // discriminator. An origin-skipping dispatch passes the mark re-read against B and
+    // exports B's block; only the exact status and the absent artifact catch it.
+    #[test]
+    fn block_export_commit_refuses_on_a_buffer_switch_even_when_b_is_marked() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o4", "out.html");
+        crate::workspace::new_empty_buffer(&mut f.editor);
+        f.editor.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        f.commit();
+        assert_eq!(f.editor.status_text(), "buffer changed \u{2014} export cancelled",
+            "an origin-skipping dispatch would have exported B's block");
+        assert!(!f.dir.join("out.html").exists());
+        let dir = f.dir.clone();
+        f.assert_no_export_done();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Refusal-then-retry. D2's accepted cost is that a refusal kills the flow outright, so
+    // the retry has to start over from the ^KW shape — pinned here so a future change that
+    // makes the refusal survivable (or that leaves stale carried state behind) is noticed by
+    // whichever half of this test stops holding.
+    #[test]
+    fn block_export_commit_refusal_then_a_full_restart_succeeds() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o10", "out.html");
+        crate::blocks_marked::block_clear(&mut f.editor);
+        f.commit(); // refusal #1
+        assert_eq!(f.editor.status_text(), "no marked block \u{2014} export cancelled");
+        assert!(f.editor.file_browser.is_none(),
+            "the refusal leaves the flow dead — D2's accepted cost");
+        // The refusal half above needs no pandoc and is this test's alone (o3 pins the status
+        // and the absent artifact, not the dead flow), so the guard sits HERE rather than at the
+        // top: only the retry leg, whose whole claim is the retried bytes, needs the binary.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_commit_refusal_then_a_full_restart_succeeds (the restart leg)") {
+            let _ = std::fs::remove_dir_all(&f.dir);
+            return;
+        }
+        f.editor.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
+        f.restart_from_write_block("out.html");
+        f.commit(); // the redirect, again
+        f.commit(); // Enter on the Export picker -> dispatch
+        f.finish_export();
+        // (The A24 slot suppression documented above applies here too — assert the bytes.)
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB") && !html.contains("AAA"),
+            "the retried flow must still be block-scoped: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     #[test]

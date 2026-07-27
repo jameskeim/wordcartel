@@ -49,6 +49,8 @@ pub enum Msg {
         /// case finalization must refuse to clobber a target that appeared in
         /// the meantime (TOCTOU guard; Codex pre-merge gate).
         overwrite_confirmed: bool,
+        /// What this export read (A22 D3-4): drives the completion status wording only.
+        scope: crate::export::ExportScope,
     },
     TransformDone {
         buffer_id: crate::editor::BufferId,
@@ -353,8 +355,8 @@ fn reduce_dispatch(msg: Msg, editor: &mut Editor, ctx: &crate::overlays::Dispatc
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
-        Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**ctx.fs);
+        Msg::ExportDone { target, result, overwrite_confirmed, scope, .. } => {
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, scope, &**ctx.fs);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, ctx.clock);
@@ -2444,6 +2446,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2490,6 +2493,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(b"<h1>Hello</h1>\n".to_vec())),
             overwrite_confirmed: false,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2531,6 +2535,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(new_bytes.clone())),
             overwrite_confirmed: true,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2572,6 +2577,7 @@ mod tests {
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
+            scope: crate::export::ExportScope::WholeDocument,
         };
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
 
@@ -2581,6 +2587,37 @@ mod tests {
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&source);
         let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    // T13b — scope carriage through reduce_dispatch. A reduce arm that forwards a default
+    // instead of the bound scope produces the WholeDocument wording for the MarkedBlock
+    // message (or vice versa) and fails the exact match.
+    #[test]
+    fn reduce_forwards_export_done_scope_to_the_status() {
+        use crate::export::ExportResult;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+
+        let tmp_dir = crate::test_support::scratch_dir("a22-t13b");
+        for (scope, want) in [
+            (crate::export::ExportScope::MarkedBlock, "exported block to "),
+            (crate::export::ExportScope::WholeDocument, "exported "),
+        ] {
+            let mut e = Editor::new_from_text("# Hello\n", None, (80, 24));
+            let buffer_id = e.active().id;
+            let reg = Registry::builtins();
+            let ex = InlineExecutor::default();
+            let clk = TestClock(0);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let output_path = tmp_dir.join("notes.html");
+            let _ = std::fs::remove_file(&output_path);
+            let msg = Msg::ExportDone { buffer_id, target: output_path.clone(),
+                result: Ok(ExportResult::Bytes(b"<h1>x</h1>".to_vec())),
+                overwrite_confirmed: true, scope };
+            crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx,
+                &crate::test_support::test_fs());
+            assert_eq!(e.status_text(), format!("{want}{}", output_path.display()));
+        }
     }
 
     #[test]

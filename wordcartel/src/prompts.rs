@@ -50,8 +50,8 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
-        Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**ctx.fs);
+        Msg::ExportDone { target, result, overwrite_confirmed, scope, .. } => {
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, scope, &**ctx.fs);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, ctx.clock);
@@ -297,9 +297,10 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteExport => {
             if let Some(pe) = editor.pending_export.take() {
-                // User explicitly confirmed clobbering the existing target.
+                // User explicitly confirmed clobbering the existing target. The bool return
+                // is discarded — a refusal has already set its own status (A22 §5.4).
                 crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true,
-                    std::sync::Arc::clone(fs));
+                    pe.scope, pe.origin, std::sync::Arc::clone(fs));
             }
         }
         PromptAction::OverwriteSaveAs => {
@@ -331,8 +332,17 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteWriteBlock => {
             if let Some(t) = editor.pending_write_block.take() {
-                if let Some(b) = editor.active().marked_block {
-                    perform_block_write(editor, &t, b.start, b.end, fs);
+                // A22 D4-iv, the confirm moment: the buffer can change while the
+                // overwrite modal is open, so the origin captured at ^KW is verified
+                // AGAIN here — before the mark re-read, so the status names the real
+                // reason rather than blaming a missing mark.
+                if editor.active().id != t.origin {
+                    editor.set_status_full(crate::status::StatusKind::Warning,
+                        "buffer changed \u{2014} write block cancelled".to_owned(),
+                        crate::status::StatusLifetime::Sticky,
+                        crate::status::StatusSource::Host, None);
+                } else if let Some(b) = editor.active().marked_block {
+                    perform_block_write(editor, &t.target, b.start, b.end, fs);
                 } else {
                     editor.set_status(crate::status::StatusKind::Info, "no marked block");
                 }
@@ -506,7 +516,9 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
         let (tx, _rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
-        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
             std::env::temp_dir(), "   ".into());
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.status_text(), "write block: empty path");
@@ -776,7 +788,9 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
         let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
-        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
             std::env::temp_dir(), target.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
@@ -798,13 +812,332 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
         let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
-        e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::WriteBlock,
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
             std::env::temp_dir(), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
+    }
+
+    // T8 confirm twin — discriminates a CONFIRM-SITE re-derivation (`origin :=
+    // active().id`): that implementation passes its own check, hits the mark re-read on
+    // unmarked B, and reads "no marked block" — the equality fails. (Construction-site
+    // re-derivation is extensionally identical post-verify — spec carriage map; REVIEW.)
+    #[test]
+    fn overwrite_write_block_refuses_when_the_buffer_changed() {
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        let d = crate::test_support::scratch_dir("a22-t8-confirm");
+        let target = d.join("excerpt.md");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.pending_write_block = Some(crate::editor::PendingWriteBlock {
+            target: target.clone(), origin });
+        crate::workspace::new_empty_buffer(&mut e); // B: no mark
+        assert_ne!(e.active().id, origin);
+        let ex = crate::jobs::InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteWriteBlock,
+            &mut e, &ex, &crate::test_support::TestClock(0), &tx,
+            &crate::test_support::test_fs());
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled");
+        assert_eq!(std::fs::read(&target).expect("still there"), b"OLD",
+            "sound absence-of-effect: the write path is synchronous");
+    }
+
+    // A22 ORDERINGS (adopted from the whole-branch gate) — the Write-Block confirm's own
+    // orderings across its boundary. The twin above hand-seeds `pending_write_block`; these
+    // two ARM it through the real commit arm, so the whole capture -> carry -> verify chain
+    // is under test, and then move the world underneath the open modal.
+
+    // RESTORATION: switched away and back before the confirm. The origin gate must accept a
+    // round trip — a gate that latched "something changed" instead of comparing ids would
+    // refuse a flow the writer never actually abandoned.
+    #[test]
+    fn overwrite_write_block_survives_a_switch_away_and_back() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\nCCC\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
+        let d = crate::test_support::scratch_dir("a22-o13");
+        let target = d.join("out.md");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "out.md".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &TestClock(0), &tx, || true);
+        assert!(e.pending_write_block.is_some(), "an existing target arms the confirm");
+        crate::workspace::new_empty_buffer(&mut e); // away...
+        e.switch_to_index(0);                       // ...and back
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteWriteBlock,
+            &mut e, &ex, &TestClock(0), &tx, &fs);
+        assert_eq!(std::fs::read(&target).expect("written"), b"BBB\n",
+            "a restored origin must write A's block — the write path is synchronous");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // The wrong-bytes discriminator for this boundary, with B MARKED: an origin-skipping
+    // confirm passes its mark re-read against B and overwrites the target with B's byte.
+    // Absence-of-effect is sound here because `perform_block_write` is main-thread.
+    #[test]
+    fn overwrite_write_block_never_writes_the_switched_to_buffers_block() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\nCCC\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
+        let d = crate::test_support::scratch_dir("a22-o14");
+        let target = d.join("out.md");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "out.md".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &TestClock(0), &tx, || true);
+        crate::workspace::new_empty_buffer(&mut e);
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteWriteBlock,
+            &mut e, &ex, &TestClock(0), &tx, &fs);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled");
+        assert_eq!(std::fs::read(&target).expect("still there"), b"OLD",
+            "an origin-skipping confirm has ALREADY written B's byte over the target by now");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T6 — confirm-boundary scope carriage, seeded side. The STATUS is the load-bearing
+    // synchronous assertion (spec §11): a confirm boundary that degrades scope to
+    // WholeDocument dispatches happily and leaves this status unset.
+    #[test]
+    fn overwrite_export_confirm_refuses_when_block_scope_finds_no_mark() {
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", None, (80, 24));
+        let origin = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let d = crate::test_support::scratch_dir("a22-t6");
+        let target = d.join("out.html");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.pending_export = Some(crate::export::PendingExport {
+            ext: "html".into(), target,
+            scope: crate::export::ExportScope::MarkedBlock, origin });
+        // The mark is deliberately ABSENT — the conjunct under test.
+        let ex = crate::jobs::InlineExecutor::default();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &crate::test_support::TestClock(0), &tx, &crate::test_support::test_fs());
+        assert_eq!(e.status_text(), "no marked block — export cancelled");
+    }
+    // Positive-control twin: same seed, mark PRESENT → bounded recv yields ExportDone.
+    #[test]
+    fn overwrite_export_confirm_dispatches_when_the_mark_is_present() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = crate::test_support::scratch_dir("a22-t6-ctrl");
+        let target = d.join("out.html");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.pending_export = Some(crate::export::PendingExport {
+            ext: "html".into(), target,
+            scope: crate::export::ExportScope::MarkedBlock, origin });
+        let ex = crate::jobs::InlineExecutor::default();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &crate::test_support::TestClock(0), &tx, &crate::test_support::test_fs());
+        // matches!, not is_ok: the requirement is "yields an ExportDone", not "yields
+        // some message" (no picker is open here, but assert the class, not the count).
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(crate::app::Msg::ExportDone { .. })),
+            "the confirm path must dispatch when scope's conjuncts all hold");
+    }
+
+    // ---- A22 ORDERINGS — the CONFIRM dispatch moment, end to end ------------------
+    //
+    // Adopted from the whole-branch gate's orderings probes. The two tests above seed
+    // `pending_export` by hand and stop at the dispatch decision; these drive the WHOLE
+    // sequence — ^KW picker -> real redirect -> real Export picker -> real commit -> this
+    // confirm -> real pandoc -> `Msg::ExportDone` through the REAL reducer -> bytes read back
+    // off disk — and then move the world in between the two dispatch moments, which is the
+    // window no single task's tests could reach. The commit-moment half lives in
+    // `file_browser_commit.rs`; the shared fixture is `test_support::BlockExportFlow`.
+
+    // The happy path THROUGH the confirm: the block's bytes must replace the old artifact.
+    #[test]
+    fn block_export_confirm_writes_the_block_over_the_old_artifact() {
+        // The arming check is a precondition every other confirm ordering re-establishes, so
+        // nothing survives here without pandoc: the claim IS the bytes that replace "OLD".
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_writes_the_block_over_the_old_artifact") { return; }
+        let mut f = crate::test_support::start_block_export_flow("a22-o2", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit(); // existing -> PendingExport + the overwrite prompt
+        assert!(f.editor.pending_export.is_some(), "an existing target arms the confirm");
+        f.confirm_export();
+        f.finish_export();
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB") && !html.contains("AAA") && !html.contains("OLD"),
+            "the confirm leg must write the block over the old artifact: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // Invalidation vector 1 in the window BETWEEN the two dispatch moments.
+    #[test]
+    fn block_export_confirm_refuses_when_the_mark_was_cleared_after_the_commit() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o5", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::blocks_marked::block_clear(&mut f.editor); // between the moments
+        f.confirm_export();
+        assert_eq!(f.editor.status_text(), "no marked block \u{2014} export cancelled");
+        assert_eq!(f.artifact("out.html"), "OLD", "the old artifact must survive a refusal");
+        assert!(f.editor.pending_export.is_none(), "the confirm consumed the pending state");
+        let dir = f.dir.clone();
+        f.assert_no_export_done();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Invalidation vector 2 in the same window, with B MARKED — the wrong-bytes
+    // discriminator: a confirm-side origin skip passes the mark re-read and exports B.
+    #[test]
+    fn block_export_confirm_refuses_on_a_buffer_switch_even_when_b_is_marked() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o6", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::workspace::new_empty_buffer(&mut f.editor);
+        f.editor.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        f.confirm_export();
+        assert_eq!(f.editor.status_text(), "buffer changed \u{2014} export cancelled");
+        assert_eq!(f.artifact("out.html"), "OLD");
+        let dir = f.dir.clone();
+        f.assert_no_export_done();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // BOTH vectors at once: the refusal ORDER is specified — origin is verified before the
+    // mark re-read, so the status names the real reason rather than blaming a missing mark.
+    #[test]
+    fn block_export_confirm_names_the_buffer_switch_when_both_invalidations_apply() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o7", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::blocks_marked::block_clear(&mut f.editor);
+        crate::workspace::new_empty_buffer(&mut f.editor);
+        f.confirm_export();
+        assert_eq!(f.editor.status_text(), "buffer changed \u{2014} export cancelled",
+            "a mark-first order reads 'no marked block — export cancelled' here");
+        assert_eq!(f.artifact("out.html"), "OLD");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // RESTORATION: invalidated then restored before the confirm. A gate that latched
+    // "something changed" rather than comparing ids would refuse a flow the writer never
+    // abandoned; a gate that re-derived the origin would accept for the wrong reason.
+    #[test]
+    fn block_export_confirm_survives_a_switch_away_and_back() {
+        // A latching or re-deriving gate is only distinguishable by what lands on disk — an
+        // acceptance with no bytes to read proves nothing — so this test skips whole.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_survives_a_switch_away_and_back") { return; }
+        let mut f = crate::test_support::start_block_export_flow("a22-o8", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::workspace::new_empty_buffer(&mut f.editor); // away...
+        f.editor.switch_to_index(0);                       // ...and back
+        assert_eq!(f.editor.active().id, f.origin);
+        f.confirm_export();
+        f.finish_export();
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB") && !html.contains("AAA"),
+            "a round-tripped switch must still export A's block: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // Scope is a FLAG, not captured offsets: the dispatch reads the mark AS IT STANDS at the
+    // confirm, so a mark cleared and then re-drawn elsewhere exports the NEW block.
+    #[test]
+    fn block_export_confirm_exports_a_mark_redrawn_after_the_commit() {
+        // FLAG-vs-stored-offsets is a claim about WHICH block reaches the artifact: only the
+        // bytes separate the two designs, so the test skips whole rather than weaken to that.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_exports_a_mark_redrawn_after_the_commit") { return; }
+        let mut f = crate::test_support::start_block_export_flow("a22-o9", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::blocks_marked::block_clear(&mut f.editor);
+        f.editor.active_mut().marked_block = // "CCC\n"
+            Some(crate::editor::MarkedBlock { start: 8, end: 12, hidden: false });
+        f.confirm_export();
+        f.finish_export();
+        let html = f.artifact("out.html");
+        assert!(html.contains("CCC") && !html.contains("BBB") && !html.contains("AAA"),
+            "a stored-offsets design exports the stale block here: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // Refusal-then-retry across this boundary, including the DOUBLE FIRE: a refused confirm
+    // has already taken the pending state, so firing the same confirm again must be inert —
+    // not a panic, and above all not a late write onto a target the writer walked away from.
+    #[test]
+    fn block_export_confirm_refusal_is_inert_on_a_repeat_then_a_restart_succeeds() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o11", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::workspace::new_empty_buffer(&mut f.editor);
+        f.confirm_export(); // refusal: buffer changed; the pending is TAKEN
+        assert_eq!(f.editor.status_text(), "buffer changed \u{2014} export cancelled");
+        assert!(f.editor.pending_export.is_none());
+        f.confirm_export(); // a second confirm must be a no-op
+        assert_eq!(f.artifact("out.html"), "OLD");
+        // The double-fire half above is this test's alone (o5 pins the taken pending, never a
+        // repeat) and needs no pandoc — it reads the pre-seeded "OLD" — so the guard sits HERE:
+        // only the retry leg below, whose claim is the overwriting bytes, needs the binary.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_refusal_is_inert_on_a_repeat_then_a_restart_succeeds \
+             (the restart leg)") {
+            let _ = std::fs::remove_dir_all(&f.dir);
+            return;
+        }
+        // Retry from the top, back on A.
+        f.editor.switch_to_index(0);
+        f.restart_from_write_block("out.html");
+        f.commit(); // the redirect
+        f.commit(); // Enter -> existing target -> pending + prompt
+        f.confirm_export();
+        f.finish_export();
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB") && !html.contains("OLD"),
+            "the retried flow must overwrite with the block: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // The origin buffer CLOSED, not merely switched away from. `alloc_id` is a monotonic
+    // counter — it never reuses — so a dead origin can never be laundered into a match by a
+    // later buffer taking its id. Pinned so an id-recycling allocator could not land quietly.
+    #[test]
+    fn block_export_confirm_refuses_when_the_origin_buffer_was_closed() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o12", "out.html");
+        std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
+        f.commit();
+        crate::workspace::new_empty_buffer(&mut f.editor); // active: B
+        f.editor.switch_to_index(0);
+        crate::workspace::close_buffer(&mut f.editor);     // close A — the origin — entirely
+        assert_ne!(f.editor.active().id, f.origin, "fixture: the origin buffer is gone");
+        f.confirm_export();
+        assert_eq!(f.editor.status_text(), "buffer changed \u{2014} export cancelled");
+        assert_eq!(f.artifact("out.html"), "OLD");
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     #[test]
@@ -1115,5 +1448,39 @@ mod tests {
             "Save-As destination picker must open for unnamed buffer");
         assert!(matches!(e.pending_save_as, Some(PostSaveAction::CloseBuffer { .. })),
             "pending_save_as must carry CloseBuffer");
+    }
+
+    // T13c — the prompts-intercept ExportDone arm is the SECOND delivery site; it could
+    // substitute either scope while reduce_dispatch is correct, and only this test fails.
+    // BOTH values exercised (the round-1 plan-gate rule): a carriage claim tested at one
+    // value is passed by an implementation that hardcodes that value.
+    #[test]
+    fn prompt_intercept_forwards_export_done_scope_to_the_status() {
+        let d = crate::test_support::scratch_dir("a22-t13c");
+        for (scope, want) in [
+            (crate::export::ExportScope::MarkedBlock, "exported block to "),
+            (crate::export::ExportScope::WholeDocument, "exported "),
+        ] {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+            e.open_prompt(crate::prompt::Prompt::save_overwrite(std::path::Path::new("/x")));
+            let reg = crate::registry::Registry::builtins();
+            let (km, _) =
+                crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+            let ex = crate::jobs::InlineExecutor::default();
+            let clk = crate::test_support::TestClock(0);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let fs = crate::test_support::test_fs();
+            let ctx = crate::overlays::DispatchCtx {
+                reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+            let target = d.join("out.html");
+            let _ = std::fs::remove_file(&target);
+            let buffer_id = e.active().id;
+            let msg = crate::app::Msg::ExportDone { buffer_id, target: target.clone(),
+                result: Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())),
+                overwrite_confirmed: true, scope };
+            let _ = crate::prompts::intercept(msg, &mut e, &ctx);
+            assert_eq!(e.status_text(), format!("{want}{}", target.display()),
+                "an intercept arm hardcoding the other scope fails this case");
+        }
     }
 }

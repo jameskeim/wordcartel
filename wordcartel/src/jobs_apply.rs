@@ -299,11 +299,21 @@ pub(crate) fn apply_transform_done(
     crate::transform::merge_transform_into(editor, buffer_id, kind, range, result, clock);
 }
 
+/// A22 D3 surface 4: the completion line names what was exported.
+fn export_done_status(scope: crate::export::ExportScope, target: &std::path::Path) -> String {
+    match scope {
+        crate::export::ExportScope::WholeDocument => format!("exported {}", target.display()),
+        crate::export::ExportScope::MarkedBlock =>
+            format!("exported block to {}", target.display()),
+    }
+}
+
 pub(crate) fn apply_export_done(
     editor: &mut crate::editor::Editor,
     target: std::path::PathBuf,
     result: Result<crate::export::ExportResult, crate::filter::FilterError>,
     overwrite_confirmed: bool,
+    scope: crate::export::ExportScope,
     fs: &dyn crate::fsx::Fs,
 ) {
     // TOCTOU guard (Codex pre-merge gate): run_export only prompts for overwrite
@@ -328,7 +338,7 @@ pub(crate) fn apply_export_done(
         Ok(crate::export::ExportResult::Bytes(bytes)) => {
             match file::save_atomic_bytes_with_fs(fs, &target, &bytes) {
                 Ok(()) => {
-                    let status = format!("exported {}", target.display());
+                    let status = export_done_status(scope, &target);
                     editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
@@ -340,7 +350,7 @@ pub(crate) fn apply_export_done(
         Ok(crate::export::ExportResult::TempReady(tmp)) => {
             match fs.rename(&tmp, &target) {
                 Ok(()) => {
-                    let status = format!("exported {}", target.display());
+                    let status = export_done_status(scope, &target);
                     editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
@@ -957,7 +967,8 @@ mod tests {
         std::fs::write(&parent, "i am a file\n").unwrap();
         let target = parent.join("out.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, &crate::fsx::RealFs);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true,
+            crate::export::ExportScope::WholeDocument, &crate::fsx::RealFs);
         assert!(e.status_text().contains("export write failed"));
         assert_sticky_error_survives_info(&mut e);
         let _ = std::fs::remove_file(&parent);
@@ -974,7 +985,8 @@ mod tests {
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         // Inject a create failure via FaultFs: the write will fail before touching disk.
         let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Create);
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, &ff);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true,
+            crate::export::ExportScope::WholeDocument, &ff);
         // The failure must surface as a Sticky Error in the status.
         assert!(e.status_text().contains("export write failed"), "got: {}", e.status_text());
         assert_sticky_error_survives_info(&mut e);
@@ -988,7 +1000,8 @@ mod tests {
         let missing_tmp = std::env::temp_dir().join(format!("wc-c4-exportrename-missing-{}.tmp", std::process::id()));
         let target = std::env::temp_dir().join(format!("wc-c4-exportrename-target-{}.html", std::process::id()));
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true, &crate::fsx::RealFs);
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true,
+            crate::export::ExportScope::WholeDocument, &crate::fsx::RealFs);
         assert!(e.status_text().contains("export rename failed"));
         assert_sticky_error_survives_info(&mut e);
     }
@@ -998,7 +1011,8 @@ mod tests {
         use crate::editor::Editor;
         let target = std::env::temp_dir().join(format!("wc-c4-exportpandoc-{}.html", std::process::id()));
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true, &crate::fsx::RealFs);
+        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true,
+            crate::export::ExportScope::WholeDocument, &crate::fsx::RealFs);
         assert_sticky_error_survives_info(&mut e);
     }
 
@@ -1011,10 +1025,33 @@ mod tests {
         let target = std::env::temp_dir().join(format!("wc-c4-exporttoctou-{}.html", std::process::id()));
         std::fs::write(&target, "existing\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false, &crate::fsx::RealFs);
+        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false,
+            crate::export::ExportScope::WholeDocument, &crate::fsx::RealFs);
         assert!(e.status_text().contains("appeared — re-run export to overwrite"));
         assert_sticky_warning_survives_info(&mut e);
         let _ = std::fs::remove_file(&target);
+    }
+
+    // T10 — the endpoint wording, both scopes, EXACT match. The pre-existing app.rs
+    // assertion is only `contains("exported")` — it passes under both wordings AND under a
+    // scope-dropped regression; these equalities carry the discrimination (spec §11 T10).
+    #[test]
+    fn export_done_status_names_the_scope() {
+        let d = crate::test_support::scratch_dir("a22-t10");
+        for (scope, want) in [
+            (crate::export::ExportScope::WholeDocument, "exported "),
+            (crate::export::ExportScope::MarkedBlock, "exported block to "),
+        ] {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+            let target = d.join("out.html");
+            let _ = std::fs::remove_file(&target);
+            apply_export_done(&mut e, target.clone(),
+                Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true, scope,
+                &crate::fsx::RealFs);
+            let expect = format!("{want}{}", target.display());
+            assert_eq!(e.status_text(), expect,
+                "a reducer/endpoint substituting the other scope produces the other wording");
+        }
     }
 
     /// A17 T5 (F4 Warning table): a paste over the size cap is a recoverable Sticky Warning.

@@ -1144,3 +1144,76 @@ Cheap; the value is closing a branch that currently has no pin at all.
 
 Anchors: `lsp_client::classify_spell_heuristic`, `LspEngine::classify`. Related: the removal that
 surfaced it (`chore-drop-vale-ls-provider`), [[E16]]. ~S.
+
+### A23 — Typed foreign extension is written as markdown; a highlighted one is refused
+<!-- item: A23 -->
+
+The destination picker protects a foreign document format asymmetrically, and the deciding
+factor is only **how the writer named the file**.
+
+**Highlight** an existing `notes.rtf` and press Enter: `classify_highlight_target` returns
+`HighlightVerdict::Foreign` and the commit refuses with a Sticky Warning — *"notes.rtf is a rtf
+file — saving markdown over it would destroy it."*
+
+**Type** `notes.rtf` into the field and press Enter: `apply_extension_policy` reaches its
+`Honoured` arm and the buffer's markdown bytes are written under the foreign name. An
+overwrite-confirm appears only if the file already exists, and it says nothing about format.
+Same destruction the highlight path refuses, silently performed.
+
+The two classifiers are deliberately different functions — `classify_highlight_target`'s doc
+comment explains it must never RENAME its input, which `apply_extension_policy` may do — so this
+is a policy gap between them, not a bug in either. `OUTPUT_EXTS` (`docx`/`pdf`/`html`/`tex`) is
+handled on both paths (typed → `ExtVerdict::Redirect`, highlighted → `ExportInstead`); the gap is
+every OTHER foreign extension: `.rtf`, `.odt`, `.epub`, `.doc`.
+
+Resolving it is a product fork of its own — refuse typed foreign extensions symmetrically, warn
+and proceed, or accept the asymmetry as intentional (a typed name is an explicit act, a
+highlighted one is a selection). That question is why it is filed apart from [[A22]] rather than
+folded into it: A22 asks whether scope survives the Write-Block → Export redirect, this asks when
+markdown may be written over a foreign file, and the two share a file but not a deliberation.
+
+**Provenance:** surfaced 2026-07-27 by the A22 grounding pass
+(`scratchpad/a22/fable-grounding.md` §1.1) while checking a claim in A22's own filing — that a
+Row-2 confirm onto a `.docx` fails to say the write would be plain markdown. That claim proved
+moot (`docx ∈ OUTPUT_EXTS`, so the path redirects to Export and no confirm is reachable; C5
+closed it). This is the true residual nearest to it. Related: [[C5]], [[A22]]. ~S.
+
+### A24 — A flow-initiating warning is never retired when its flow succeeds
+<!-- item: A24 -->
+
+A Sticky Warning that *opens* a flow is never retired when that flow later succeeds, so the
+flow's own success message never reaches the status slot.
+
+**Found by the [[A22]] whole-branch gate (2026-07-27), probe o1** — the only place it surfaced,
+because it needs the whole sequence. After a successful `^KW` → redirect → export,
+`status_text()` still reads the redirect's warning (*"html is an export format — opening Export
+for the marked block"*). `apply_export_done`'s `"exported block to {target}"` is an `Info`, and
+`status::resolve_slot` keeps a `Warning` occupant over an `Info` candidate (A17 Q1 — the same
+rule other tests assert as a feature). Nothing on the success path dismisses the opening
+warning: picker keys go through the overlay intercept and never call `dismiss_status`, and
+main-editor Esc only *clears* it — by then the Info has gone HistoryOnly and never returns. The
+completion wording is reachable only in the messages history.
+
+**The class is older than A22.** The SaveAs → Export redirect suppressed plain
+`"exported {target}"` the same way before that branch; the arbitration is unchanged. A22 made it
+visible by paying a message-layer field for a completion status (decision D3-4) that then cannot
+display in the one flow that produces it — `MarkedBlock` scope is reachable only via the
+redirect, since the palette export commands are hardcoded whole-document.
+
+**Not a data-loss or masking bug.** The exported bytes are correct, and every REFUSAL is itself a
+`Warning`, which does replace the opening warning — so no failure is hidden. What is lost is a
+confirmation.
+
+**The real question, and why it is filed rather than fixed in A22:** *how should a status that
+announces the start of a flow retire when that flow ends?* That is A17 status law and reaches
+past this one case. Two candidate shapes from the gate: (1) edge-triggered supersede — the commit
+arm retires the warning that opened the picker when it commits successfully; (2) topic pairing,
+routing completion through something like `finish_topic` so a flow's end can retire its own
+start. Either is a deliberate amendment to the Q1 slot rule, which other tests assert as intended
+behaviour — so it wants its own deliberation, not a merge-gate patch.
+
+**Already in place for whoever takes it:** `Msg::ExportDone` carries `scope` and
+`export_done_status` builds both wordings, all tested — when the slot rule is fixed the wording
+appears with no further work. [[A22]]'s adopted orderings test for this path pins the current
+behaviour and names this item, so it will fail loudly and point here once the law changes.
+Related: [[A17]], [[A22]]. ~S.

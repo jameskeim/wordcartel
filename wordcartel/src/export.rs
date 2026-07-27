@@ -29,10 +29,53 @@ pub enum ExportResult {
 }
 
 /// Stored on `Editor` while waiting for an `OverwriteExport` confirmation.
-#[derive(Debug, Clone)]
+// PartialEq, Eq ADDED (spec §4.3): T12c asserts whole-value equality on
+// Option<PendingExport>, which does not compile without them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingExport {
     pub ext: String,
     pub target: PathBuf,
+    /// What the confirmed export will read (A22 D1) — carried across the confirm.
+    pub scope: ExportScope,
+    /// The flow's originating buffer (A22 D4-iv) — re-verified at dispatch.
+    pub origin: crate::editor::BufferId,
+}
+
+/// What an export reads: the whole document, or the active buffer's marked block.
+/// A FLAG, deliberately not offsets — offsets are re-read at dispatch because background
+/// merges legally edit buffers while the picker is open and `Buffer::apply` remaps the
+/// mark; a stored offset pair would go stale (A22 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportScope {
+    WholeDocument,
+    MarkedBlock,
+}
+
+/// Why a block-scoped dispatch refused (A22 D2 / D4-iv). Maps 1:1 onto a status string.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExportRefusal {
+    /// The active buffer is not the one this flow started in.
+    BufferChanged,
+    /// Scope is MarkedBlock but the active buffer has no mark (collapsed, undone, cleared).
+    NoMarkedBlock,
+}
+
+/// Resolve what this export reads, verifying the flow's captured context first.
+/// Runs on the main thread at dispatch — the same moment the whole-document path already
+/// snapshots `to_string()` — so the slice is coherent with the remapped mark.
+pub(crate) fn resolve_export_input(
+    editor: &crate::editor::Editor,
+    scope: ExportScope,
+    origin: crate::editor::BufferId,
+) -> Result<String, ExportRefusal> {
+    if editor.active().id != origin { return Err(ExportRefusal::BufferChanged); }
+    match scope {
+        ExportScope::WholeDocument => Ok(editor.active().document.buffer.to_string()),
+        ExportScope::MarkedBlock => match editor.active().marked_block {
+            Some(b) => Ok(editor.active().document.buffer.slice(b.start..b.end)),
+            None => Err(ExportRefusal::NoMarkedBlock),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -155,17 +198,36 @@ fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<
 /// For `WritesOutput` (docx, pdf, tex): writes to an extension-preserving temp
 /// path (`{stem}.tmp-{pid}.{ext}`) via `-o`, then sends TempReady for the rename.
 /// Builds `ExportOpts` from `editor.export_cfg` here, covering BOTH callers.
+///
+/// Returns `true` iff an export worker was dispatched; `false` iff a refusal fired (status
+/// already set). The refusal tests assert on this return — "no worker was spawned" is
+/// otherwise unprovable without racing the scheduler. Production callers discard it
+/// (deliberately NOT #[must_use] — the refusal has already surfaced its status).
+#[allow(clippy::too_many_arguments)] // full dispatch context in one place — as redirect_to_export
 pub(crate) fn do_export(
     editor: &mut crate::editor::Editor,
     ext: &str,
     target: &Path,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
     overwrite_confirmed: bool,
+    scope: ExportScope,
+    origin: crate::editor::BufferId,
     fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
-) {
+) -> bool {
+    let stdin = match resolve_export_input(editor, scope, origin) {
+        Ok(s) => s,
+        Err(r) => {
+            let text = match r {
+                ExportRefusal::NoMarkedBlock => "no marked block \u{2014} export cancelled",
+                ExportRefusal::BufferChanged => "buffer changed \u{2014} export cancelled",
+            };
+            editor.set_status_full(crate::status::StatusKind::Warning, text.to_owned(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return false;
+        }
+    };
     let sink = sink_for_ext(ext);
-    let buffer_id = editor.active().id;
-    let stdin = editor.active().document.buffer.to_string();
+    let buffer_id = editor.active().id; // == origin here, post-verification
     let target = target.to_path_buf();
     let msg_tx = msg_tx.clone();
     let opts = ExportOpts {
@@ -180,8 +242,10 @@ pub(crate) fn do_export(
             target,
             result,
             overwrite_confirmed,
+            scope,
         });
     });
+    true
 }
 
 fn guarded_export(work: impl FnOnce() -> Result<ExportResult, crate::filter::FilterError>)
@@ -301,7 +365,8 @@ pub(crate) fn run_export_with_probe(
     let field = derived.file_name().map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     editor.open_destination_picker(fs, msg_tx,
-        crate::file_browser::DestinationPurpose::Export { ext: ext.to_owned() }, dir, field);
+        crate::file_browser::DestinationPurpose::Export { ext: ext.to_owned(),
+            scope: ExportScope::WholeDocument, origin: editor.active().id }, dir, field);
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +419,8 @@ mod tests {
                 // Compare BY REFERENCE — `DestinationPurpose::Export { ext: String }` is not
                 // `Copy`, so `*purpose` would move a `String` out of a borrow of `fb.mode`.
                 assert_eq!(purpose, &crate::file_browser::DestinationPurpose::Export {
-                    ext: "html".into() });
+                    ext: "html".into(), scope: ExportScope::WholeDocument, origin: e.active().id },
+                    "a MarkedBlock-defaulting run_export breaks the palette invariant");
                 assert_eq!(field, "notes.html",
                     "pre-filled with derived_export_path's file name, so bare Enter == today");
             }
@@ -399,6 +465,160 @@ mod tests {
         run_export_with_probe(&mut e, &fs, "html", &tx, || true);
         assert!(e.file_browser.is_none(), "an unnamed buffer opens NO picker");
         assert!(e.status_text().to_lowercase().contains("save the file first"));
+    }
+
+    // T1 — the pure seam. Each case flips exactly ONE conjunct of
+    // `scope carried ∧ origin unchanged ∧ mark present` (spec §11 E11 rule).
+    #[test]
+    fn resolve_export_input_whole_document_reads_everything() {
+        let e = crate::editor::Editor::new_from_text("AAA\nBBB\nCCC\n", None, (80, 24));
+        let id = e.active().id;
+        assert_eq!(resolve_export_input(&e, ExportScope::WholeDocument, id),
+            Ok("AAA\nBBB\nCCC\n".to_owned()));
+    }
+
+    #[test]
+    fn resolve_export_input_marked_block_reads_only_the_block() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\nCCC\n", None, (80, 24));
+        let id = e.active().id;
+        // hidden: true on purpose — pins the "hidden is display-only, ignored by content
+        // reads" call (spec §2): an implementation consulting `hidden` skips the slice.
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: true });
+        assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id),
+            Ok("BBB\n".to_owned()),
+            "the scope-dropped implementation returns the whole text here");
+    }
+
+    #[test]
+    fn resolve_export_input_refuses_when_the_mark_is_gone() {
+        let e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let id = e.active().id;
+        assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id),
+            Err(ExportRefusal::NoMarkedBlock),
+            "a whole-document-fallback implementation returns Ok(whole) — D2 forbids it");
+    }
+
+    #[test]
+    fn resolve_export_input_refuses_when_the_buffer_changed() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let a = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        crate::workspace::new_empty_buffer(&mut e); // appends AND switches active
+        assert_ne!(e.active().id, a, "fixture: the active buffer really changed");
+        assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, a),
+            Err(ExportRefusal::BufferChanged),
+            "an origin-ignoring implementation reads the NEW active buffer and refuses \
+             with NoMarkedBlock (or slices the wrong buffer) instead");
+    }
+
+    // A22 ORDERINGS (adopted from the whole-branch gate) — the degenerate mark at dispatch.
+    // A collapsed, zero-width mark satisfies "mark present", so the seam must slice it rather
+    // than refuse or panic: an implementation that asserted `start < end`, or that treated an
+    // empty slice as "no block", turns a harmless no-op export into a crash or a wrong
+    // refusal. Empty input is pandoc's problem, not the seam's.
+    #[test]
+    fn resolve_export_input_slices_a_collapsed_mark_to_the_empty_string() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 2, end: 2, hidden: false });
+        assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id), Ok(String::new()),
+            "a whole-document fallback returns Ok(\"AAA\\n\") and a start<end assert panics");
+    }
+
+    // T5 — dispatch refusals. The bool return is the scheduling-free discriminator: a
+    // wrongly-dispatching implementation returns true and fails HERE, before any race.
+    #[test]
+    fn do_export_refuses_block_scope_with_no_mark_and_dispatches_nothing() {
+        let mut e = crate::editor::Editor::new_from_text("# hi\n", None, (80, 24));
+        let id = e.active().id;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = crate::test_support::scratch_dir("a22-t5-refuse");
+        let target = d.join("out.html");
+        let dispatched = do_export(&mut e, "html", &target, &tx, false,
+            ExportScope::MarkedBlock, id, crate::test_support::test_fs());
+        assert!(!dispatched, "a wrongly-dispatching implementation returns true");
+        assert_eq!(e.status_text(), "no marked block — export cancelled");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        // Deterministic absence, no timeout: drop OUR sender; a spawned worker would hold
+        // a clone and its guaranteed single send would arrive as Ok — a wrong
+        // implementation fails this recv deterministically once its worker finishes,
+        // and a correct one errs Disconnected immediately.
+        drop(tx);
+        assert!(rx.recv().is_err(), "no worker may exist to ever send ExportDone");
+    }
+
+    #[test]
+    fn do_export_refuses_when_the_buffer_changed() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let a = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        crate::workspace::new_empty_buffer(&mut e);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = crate::test_support::scratch_dir("a22-t5-switched");
+        let dispatched = do_export(&mut e, "html", &d.join("out.html"), &tx, false,
+            ExportScope::MarkedBlock, a, crate::test_support::test_fs());
+        // B (the fresh "\n" buffer) has no mark, so an origin-re-deriving or verify-skipping
+        // implementation ALSO refuses here — but with "no marked block — export cancelled".
+        // The bool alone does not discriminate in this fixture; the STATUS EQUALITY does.
+        assert!(!dispatched);
+        assert_eq!(e.status_text(), "buffer changed — export cancelled",
+            "a re-deriving/verify-skipping implementation reads 'no marked block — export \
+             cancelled' here");
+        drop(tx);
+        assert!(rx.recv().is_err());
+    }
+
+    // T5 positive control + T13a — proves `false`/no-message is a discriminating reading,
+    // and pins the do_export → Msg::ExportDone scope hand-off AT BOTH VALUES: a message
+    // construction hardcoding EITHER scope fails the opposite iteration (a carriage claim
+    // tested at one value is passed by an implementation that hardcodes that value).
+    #[test]
+    fn do_export_dispatches_and_the_message_carries_the_scope() {
+        for scope in [ExportScope::MarkedBlock, ExportScope::WholeDocument] {
+            let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+            let id = e.active().id;
+            if scope == ExportScope::MarkedBlock {
+                e.active_mut().marked_block =
+                    Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let d = crate::test_support::scratch_dir("a22-t5-control");
+            let dispatched = do_export(&mut e, "html", &d.join("out.html"), &tx, false,
+                scope, id, crate::test_support::test_fs());
+            assert!(dispatched, "{scope:?}: conjuncts all hold, must dispatch");
+            // BOUNDED receive (the file_browser_commit/e2e precedent): guarded_export
+            // guarantees a spawned worker sends exactly one ExportDone, pandoc or no pandoc.
+            let msg = rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the worker always sends exactly one ExportDone");
+            match msg {
+                crate::app::Msg::ExportDone { scope: got, .. } => assert_eq!(got, scope,
+                    "T13a: a construction hardcoding the other scope fails this iteration"),
+                other => panic!("expected ExportDone, got {other:?}"),
+            }
+        }
+    }
+
+    // T11 — the reason scope is a FLAG: the read follows the funnel's remap.
+    #[test]
+    fn resolve_export_input_reads_the_remapped_mark_not_stored_offsets() {
+        let mut e = crate::editor::Editor::new_from_text("hello world\n", None, (40, 10));
+        let id = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 6, end: 11, hidden: false }); // "world"
+        let doc_len = e.active().document.buffer.len();
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "pre ".into())], doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(0));
+        let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other,
+            &crate::test_support::TestClock(0));
+        assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id),
+            Ok("world".to_owned()),
+            "a stored-offsets design still slices [6,11) of 'pre hello world\\n' = 'llo w'");
     }
 
     #[test]
