@@ -388,8 +388,7 @@ pub struct PendingExport {
 /// already set). The refusal tests assert on this return — "no worker was spawned" is
 /// otherwise unprovable without racing the scheduler. Production callers discard it
 /// (deliberately NOT #[must_use] — the refusal has already surfaced its status).
-#[allow(clippy::too_many_arguments)] // the full dispatch context in one place — mirrors
-// redirect_to_export's allow; splitting it would scatter the one verify-then-read decision.
+#[allow(clippy::too_many_arguments)] // the full dispatch context in one place — mirrors redirect_to_export's allow
 pub(crate) fn do_export(
     editor: &mut crate::editor::Editor,
     ext: &str,
@@ -816,7 +815,13 @@ scopes, whole painted row (border glyphs, title, fill, and the cells outside the
     // so this asserts the whole screen row, not a fragment.
     #[test]
     fn export_titles_render_byte_for_byte_per_scope() {
-        let dir = std::env::temp_dir().join(format!("wc-a22-title-{}", std::process::id()));
+        // A FIXED 2-char dir, never touched on disk (the painter only displays fb.dir; the
+        // empty field keeps footer_target at None). Chosen so BOTH titles fit the real box
+        // with room to spare: file_browser_overlay_rect delegates to palette_overlay_rect,
+        // 80*3/5 = 48 wide → 46 interior cells, vs titles of 20 and 35 chars — NO
+        // truncation is in play, which is exactly what a hand-built expectation would
+        // model wrong (a temp_dir path could exceed 46 and ratatui CLIPS the title).
+        let dir = std::path::PathBuf::from("/t");
         let origin = crate::editor::BufferId(1); // tuple field is pub; the painter never reads it
         for (scope, title_fmt) in [
             (crate::export::ExportScope::WholeDocument,
@@ -873,6 +878,9 @@ and the frame check proves it reaches the screen (the spec's own stated frame as
         let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
         // Layer 1 — the STRING, exact at its single source (spec §6.1 surface 2, full
         // wording, path included): substring drift anywhere in the note fails here.
+        // Named assumption of this constructed expectation: footer_target's Redirect arm
+        // returns EARLY, before resolve_write_destination, so the displayed path is the
+        // unresolved dir.join("notes.html") — verified against the arm's `return Some(..)`.
         let footer = crate::file_browser::footer_target(&crate::fsx::RealFs,
             e.file_browser.as_ref().unwrap());
         assert_eq!(footer.as_deref(), Some(format!(
