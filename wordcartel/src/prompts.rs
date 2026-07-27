@@ -332,7 +332,16 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteWriteBlock => {
             if let Some(t) = editor.pending_write_block.take() {
-                if let Some(b) = editor.active().marked_block {
+                // A22 D4-iv, the confirm moment: the buffer can change while the
+                // overwrite modal is open, so the origin captured at ^KW is verified
+                // AGAIN here — before the mark re-read, so the status names the real
+                // reason rather than blaming a missing mark.
+                if editor.active().id != t.origin {
+                    editor.set_status_full(crate::status::StatusKind::Warning,
+                        "buffer changed \u{2014} write block cancelled".to_owned(),
+                        crate::status::StatusLifetime::Sticky,
+                        crate::status::StatusSource::Host, None);
+                } else if let Some(b) = editor.active().marked_block {
                     perform_block_write(editor, &t.target, b.start, b.end, fs);
                 } else {
                     editor.set_status(crate::status::StatusKind::Info, "no marked block");
@@ -812,6 +821,33 @@ mod tests {
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
+    }
+
+    // T8 confirm twin — discriminates a CONFIRM-SITE re-derivation (`origin :=
+    // active().id`): that implementation passes its own check, hits the mark re-read on
+    // unmarked B, and reads "no marked block" — the equality fails. (Construction-site
+    // re-derivation is extensionally identical post-verify — spec carriage map; REVIEW.)
+    #[test]
+    fn overwrite_write_block_refuses_when_the_buffer_changed() {
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        let d = crate::test_support::scratch_dir("a22-t8-confirm");
+        let target = d.join("excerpt.md");
+        std::fs::write(&target, b"OLD").expect("existing target");
+        e.pending_write_block = Some(crate::editor::PendingWriteBlock {
+            target: target.clone(), origin });
+        crate::workspace::new_empty_buffer(&mut e); // B: no mark
+        assert_ne!(e.active().id, origin);
+        let ex = crate::jobs::InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteWriteBlock,
+            &mut e, &ex, &crate::test_support::TestClock(0), &tx,
+            &crate::test_support::test_fs());
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled");
+        assert_eq!(std::fs::read(&target).expect("still there"), b"OLD",
+            "sound absence-of-effect: the write path is synchronous");
     }
 
     // T6 — confirm-boundary scope carriage, seeded side. The STATUS is the load-bearing

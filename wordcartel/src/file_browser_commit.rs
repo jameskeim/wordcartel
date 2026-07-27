@@ -471,6 +471,16 @@ pub(crate) fn commit_destination_with_probe(
                     }
                 }
                 crate::file_browser::DestinationPurpose::WriteBlock { origin } => {
+                    // A22 D4-iv: the flow's buffer, captured at ^KW, must still be active —
+                    // the plugin pump can switch buffers under the open picker. Verify
+                    // BEFORE the mark re-read so the status names the real reason.
+                    if editor.active().id != origin {
+                        editor.set_status_full(crate::status::StatusKind::Warning,
+                            "buffer changed \u{2014} write block cancelled".to_owned(),
+                            crate::status::StatusLifetime::Sticky,
+                            crate::status::StatusSource::Host, None);
+                        return;
+                    }
                     let Some(b) = editor.active().marked_block else {
                         editor.set_status(crate::status::StatusKind::Info, "no marked block");
                         return;
@@ -1798,6 +1808,65 @@ mod tests {
             crate::file_browser::BrowseMode::Destination {
                 purpose: crate::file_browser::DestinationPurpose::SaveAs, .. })),
             "the SaveAs picker survives; no Export picker opened");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T8 / B unmarked. The EXACT status is the sole discriminator (spec §11, round-5
+    // correction): a verify-missing implementation falls through to the mark re-read, ALSO
+    // refuses ("no marked block"), and ALSO leaves the target absent — absence here is
+    // corroborative only. B-unmarked also pins refusal ORDER (origin verify first).
+    #[test]
+    fn writeblock_commit_refuses_when_the_buffer_changed() {
+        let d = tmp("a22-t8-unmarked");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "excerpt.md".into());
+        crate::workspace::new_empty_buffer(&mut e); // B: no mark
+        assert_ne!(e.active().id, origin);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled",
+            "verify-missing OR mark-first implementations read 'no marked block' here");
+        assert!(!d.join("excerpt.md").exists(), "corroborative (see comment above)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T8 / B MARKED — the write-suppression discriminator: a verify-missing implementation
+    // passes the mark re-read and SYNCHRONOUSLY writes B's block bytes, so the absence
+    // assertion is sound and load-bearing here (perform_block_write is main-thread).
+    #[test]
+    fn writeblock_commit_never_writes_the_wrong_buffers_block() {
+        let d = tmp("a22-t8-marked");
+        let mut e = crate::editor::Editor::new_from_text("A-body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "excerpt.md".into());
+        crate::workspace::new_empty_buffer(&mut e);
+        // B is the fresh "\n" buffer — mark its single byte directly.
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} write block cancelled");
+        assert!(!d.join("excerpt.md").exists(),
+            "a verify-missing implementation has ALREADY written B's block by now");
         let _ = std::fs::remove_dir_all(&d);
     }
 
