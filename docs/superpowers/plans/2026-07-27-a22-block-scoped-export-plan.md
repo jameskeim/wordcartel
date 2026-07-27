@@ -41,7 +41,7 @@ command; if an implementer believes their task needs to, STOP and escalate.
 | T2/T3 purpose-shape | Task 1 (extended in 3) | T9 | Task 3 |
 | T2/T3 wording | Task 3 | T10 | Task 5 |
 | T4 (2 fixtures) | Task 2 | T11 | Task 1 |
-| T5 + T13a | Task 1 | T12a/b/c | Task 6 |
+| T5 + T13a | Task 1 | T12a/b/c (+ T12d, the WholeDocument twin) | Task 6 |
 | T6 | Task 1 | T13b/c | Task 5 |
 | T7 | Task 1 | cancel-tidy test | Task 7 |
 
@@ -144,34 +144,44 @@ existing seed test):
         let d = crate::test_support::scratch_dir("a22-t5-switched");
         let dispatched = do_export(&mut e, "html", &d.join("out.html"), &tx, false,
             ExportScope::MarkedBlock, a, crate::test_support::test_fs());
-        assert!(!dispatched, "an origin-re-deriving implementation dispatches from B");
-        assert_eq!(e.status_text(), "buffer changed — export cancelled");
+        // B (the fresh "\n" buffer) has no mark, so an origin-re-deriving or verify-skipping
+        // implementation ALSO refuses here — but with "no marked block — export cancelled".
+        // The bool alone does not discriminate in this fixture; the STATUS EQUALITY does.
+        assert!(!dispatched);
+        assert_eq!(e.status_text(), "buffer changed — export cancelled",
+            "a re-deriving/verify-skipping implementation reads 'no marked block — export \
+             cancelled' here");
         drop(tx);
         assert!(rx.recv().is_err());
     }
 
     // T5 positive control + T13a — proves `false`/no-message is a discriminating reading,
-    // and pins the do_export → Msg::ExportDone scope hand-off.
+    // and pins the do_export → Msg::ExportDone scope hand-off AT BOTH VALUES: a message
+    // construction hardcoding EITHER scope fails the opposite iteration (a carriage claim
+    // tested at one value is passed by an implementation that hardcodes that value).
     #[test]
-    fn do_export_block_scope_dispatches_and_the_message_carries_the_scope() {
-        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
-        let id = e.active().id;
-        e.active_mut().marked_block =
-            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
-        let (tx, rx) = std::sync::mpsc::channel();
-        let d = crate::test_support::scratch_dir("a22-t5-control");
-        let dispatched = do_export(&mut e, "html", &d.join("out.html"), &tx, false,
-            ExportScope::MarkedBlock, id, crate::test_support::test_fs());
-        assert!(dispatched, "mark present + origin intact must dispatch");
-        // BOUNDED receive (the file_browser_commit/e2e precedent): guarded_export
-        // guarantees a spawned worker sends exactly one ExportDone, pandoc or no pandoc.
-        let msg = rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the worker always sends exactly one ExportDone");
-        match msg {
-            crate::app::Msg::ExportDone { scope, .. } => assert_eq!(scope,
-                ExportScope::MarkedBlock,
-                "T13a: a default-substituting message construction reads WholeDocument"),
-            other => panic!("expected ExportDone, got {other:?}"),
+    fn do_export_dispatches_and_the_message_carries_the_scope() {
+        for scope in [ExportScope::MarkedBlock, ExportScope::WholeDocument] {
+            let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+            let id = e.active().id;
+            if scope == ExportScope::MarkedBlock {
+                e.active_mut().marked_block =
+                    Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let d = crate::test_support::scratch_dir("a22-t5-control");
+            let dispatched = do_export(&mut e, "html", &d.join("out.html"), &tx, false,
+                scope, id, crate::test_support::test_fs());
+            assert!(dispatched, "{scope:?}: conjuncts all hold, must dispatch");
+            // BOUNDED receive (the file_browser_commit/e2e precedent): guarded_export
+            // guarantees a spawned worker sends exactly one ExportDone, pandoc or no pandoc.
+            let msg = rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the worker always sends exactly one ExportDone");
+            match msg {
+                crate::app::Msg::ExportDone { scope: got, .. } => assert_eq!(got, scope,
+                    "T13a: a construction hardcoding the other scope fails this iteration"),
+                other => panic!("expected ExportDone, got {other:?}"),
+            }
         }
     }
 
@@ -191,7 +201,7 @@ existing seed test):
         let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(0));
         assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id),
             Ok("world".to_owned()),
-            "a stored-offsets design still slices [6,11) and returns 'orld\\n'-shifted bytes");
+            "a stored-offsets design still slices [6,11) of 'pre hello world\\n' = 'llo w'");
     }
 ```
 
@@ -771,8 +781,10 @@ purpose is `Export { ext: "docx", scope: MarkedBlock, origin }` and:
 ```
 
 T9 (rendered): extend `each_picker_mode_is_titled_for_what_it_actually_does`'s case table —
-the two Export rows replace the current one (`origin` from a throwaway
-`Editor::new_from_text`-constructed id is fine; the painter never reads it):
+the two Export rows replace the current one, so the array type annotation changes from
+`[(BrowseMode, &str, &str); 5]` to `[(BrowseMode, &str, &str); 6]` (the fixed length is part
+of the type; leaving it at 5 does not compile). `origin` from the test's editor id is fine —
+the painter never reads it:
 
 ```rust
             (BrowseMode::Destination { purpose: DestinationPurpose::Export { ext: "pdf".into(),
@@ -1097,28 +1109,37 @@ T13c (`prompts.rs` tests — the second delivery site, under an open modal; ctx 
 
 ```rust
     // T13c — the prompts-intercept ExportDone arm is the SECOND delivery site; it could
-    // substitute WholeDocument while reduce_dispatch is correct, and only this test fails.
+    // substitute either scope while reduce_dispatch is correct, and only this test fails.
+    // BOTH values exercised (the round-1 plan-gate rule): a carriage claim tested at one
+    // value is passed by an implementation that hardcodes that value.
     #[test]
     fn prompt_intercept_forwards_export_done_scope_to_the_status() {
         let d = crate::test_support::scratch_dir("a22-t13c");
-        let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
-        e.open_prompt(crate::prompt::Prompt::save_overwrite(std::path::Path::new("/x")));
-        let reg = crate::registry::Registry::builtins();
-        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ex = crate::jobs::InlineExecutor::default();
-        let clk = crate::test_support::TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let fs = crate::test_support::test_fs();
-        let ctx = crate::overlays::DispatchCtx {
-            reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
-        let target = d.join("out.html");
-        let _ = std::fs::remove_file(&target);
-        let buffer_id = e.active().id;
-        let msg = crate::app::Msg::ExportDone { buffer_id, target: target.clone(),
-            result: Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())),
-            overwrite_confirmed: true, scope: crate::export::ExportScope::MarkedBlock };
-        let _ = crate::prompts::intercept(msg, &mut e, &ctx);
-        assert_eq!(e.status_text(), format!("exported block to {}", target.display()));
+        for (scope, want) in [
+            (crate::export::ExportScope::MarkedBlock, "exported block to "),
+            (crate::export::ExportScope::WholeDocument, "exported "),
+        ] {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+            e.open_prompt(crate::prompt::Prompt::save_overwrite(std::path::Path::new("/x")));
+            let reg = crate::registry::Registry::builtins();
+            let (km, _) =
+                crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+            let ex = crate::jobs::InlineExecutor::default();
+            let clk = crate::test_support::TestClock(0);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let fs = crate::test_support::test_fs();
+            let ctx = crate::overlays::DispatchCtx {
+                reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+            let target = d.join("out.html");
+            let _ = std::fs::remove_file(&target);
+            let buffer_id = e.active().id;
+            let msg = crate::app::Msg::ExportDone { buffer_id, target: target.clone(),
+                result: Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())),
+                overwrite_confirmed: true, scope };
+            let _ = crate::prompts::intercept(msg, &mut e, &ctx);
+            assert_eq!(e.status_text(), format!("{want}{}", target.display()),
+                "an intercept arm hardcoding the other scope fails this case");
+        }
     }
 ```
 
@@ -1194,6 +1215,11 @@ hand-offs every endpoint test leaves free).
 
     // T12a — scope hand-off, no-overwrite path. A commit arm hardcoding WholeDocument
     // into the do_export call DISPATCHES here (no refusal status) and fails the equality.
+    // NOTE the channel: the fixture's pickers send LISTING messages through the same tx,
+    // so a bare `recv().is_err()` fails on a CORRECT implementation — drain to disconnect
+    // and assert no ExportDone specifically (still deterministic: our tx is dropped, and
+    // the only other senders — listing threads, plus a wrongly-spawned worker — each send
+    // and drop in bounded time).
     #[test]
     fn export_commit_arm_forwards_the_carried_block_scope() {
         let (mut e, fs, ex, clk, tx, rx, _origin, d) = redirected_block_export("a22-t12a");
@@ -1202,7 +1228,8 @@ hand-offs every endpoint test leaves free).
             &mut e, &fs, &ex, &clk, &tx, || true); // Enter on "report.html", non-existing
         assert_eq!(e.status_text(), "no marked block — export cancelled");
         drop(tx);
-        assert!(rx.recv().is_err(), "no worker may have been dispatched");
+        assert!(!rx.iter().any(|m| matches!(m, crate::app::Msg::ExportDone { .. })),
+            "no worker may have been dispatched (listing messages are expected; ExportDone is not)");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1219,7 +1246,49 @@ hand-offs every endpoint test leaves free).
         assert_eq!(e.status_text(), "buffer changed — export cancelled",
             "re-derivation reads 'no marked block — export cancelled' instead");
         drop(tx);
-        assert!(rx.recv().is_err());
+        assert!(!rx.iter().any(|m| matches!(m, crate::app::Msg::ExportDone { .. })));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T12's OPPOSITE scope value, no-overwrite path, is covered by the MIGRATED
+    // `export_commits_end_to_end_from_enter_through`: a commit arm hardcoding MarkedBlock
+    // would refuse that WholeDocument flow (no mark exists) and its bounded ExportDone
+    // receive would time out. The overwrite-path opposite needs its own case:
+
+    // T12d — WholeDocument overwrite construction. A construction hardcoding MarkedBlock
+    // fails the whole-value equality; its confirm leg would then refuse where dispatch is
+    // required, so the bounded receive doubles the discrimination.
+    #[test]
+    fn export_commit_arm_builds_whole_document_pending_export_too() {
+        let d = tmp("a22-t12d");
+        let mut e = crate::editor::Editor::new_from_text("AAA\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        std::fs::write(d.join("out.html"), b"OLD").expect("existing target");
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
+            d.clone(), "out.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        let resolved = crate::fsx::resolve_write_destination(&*fs, &d.join("out.html"))
+            .expect("the scratch target resolves");
+        assert_eq!(e.pending_export, Some(crate::export::PendingExport {
+            ext: "html".into(), target: resolved,
+            scope: crate::export::ExportScope::WholeDocument, origin }),
+            "a MarkedBlock-hardcoding construction fails the whole-value equality");
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &clk, &tx, &crate::test_support::test_fs());
+        drop(tx); // rx.iter() runs to channel disconnect — it would deadlock while the
+                  // test still held a sender.
+        assert!(rx.iter().any(|m| matches!(m,
+            crate::app::Msg::ExportDone { scope: crate::export::ExportScope::WholeDocument, .. })),
+            "the confirmed whole-document export must dispatch; a MarkedBlock-carrying \
+             pending would refuse (no mark exists in this fixture)");
         let _ = std::fs::remove_dir_all(&d);
     }
 
