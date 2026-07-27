@@ -609,18 +609,31 @@ the subprocess.
 - **T4 — probe gate, two fixtures (the ordering conjunct needs its own):**
   - *Flow survival (WriteBlock):* same setup as T2 with `|| false` → status exactly
     `"pandoc not found — install it to export"`, `editor.file_browser` still `Some` with mode
-    still `WriteBlock` and the field intact, no Export picker. The exact-status assertion also
-    constrains gate-before-reason ordering: an implementation that set the redirect `reason`
-    before probing would read the Warning wording instead. (No drain assertion here — the
-    drain-abort is SaveAs-gated and a WriteBlock fixture cannot constrain it either way.)
-  - *Gate-precedes-drain-abort (SaveAs, SEEDED):* seed `editor.quit_drain = Some(..)` and
-    `editor.pending_save_as = Some(..)` — the state the assertion is about — open a SaveAs
-    picker, type `report.docx`, Enter via `commit_destination_with_probe(.., || false)` →
-    the pandoc refusal status, picker still `Some`/SaveAs, AND `quit_drain`/`pending_save_as`
-    **still `Some`**. Discriminating because seeded non-default: **on an implementation where
-    the pandoc gate runs after the drain-abort (§5.2 steps reversed), both fields read `None`
-    and the assertion fails**; with nothing seeded it would read the same either way — the
-    exact vacuity this fixture exists to avoid.
+    still `WriteBlock` and the field intact, no Export picker. What each assertion rules out:
+    the exact status rules out an implementation with no gate (final status would be the
+    redirect Warning wording) — and, because the entire commit is one synchronous dispatch
+    with no frame painted between status writes, the final status IS the only status the
+    writer can ever see; the mode/field assertions rule out an implementation that refuses but
+    still reopens the picker as Export (mode would read `Export { .. }`). **Deliberately NOT
+    claimed:** that the redirect `reason` was never *transiently* set before the refusal — a
+    single terminal status read cannot distinguish "never set" from "set then overwritten",
+    and since no render interleaves, the transient is not user-observable either. §5.2 step
+    1's gate-first sequence therefore stands as prescribed code order for implementation and
+    review; the TESTS constrain its observable consequences (this fixture and the next), not
+    the internal write sequence.
+  - *Gate-precedes-drain-abort (SaveAs, all three fields SEEDED):* seed
+    `editor.quit_drain = Some(..)`, `editor.pending_save_as = Some(..)`, AND
+    `editor.quit_drain_advance = true` — the complete field set `redirect_to_export`'s
+    SaveAs arm clears together (`pending_save_as`/`quit_drain`/`quit_drain_advance`;
+    `quit_drain_advance` is a `bool` defaulting `false`, so it MUST be seeded `true` or a
+    wrong clear is indistinguishable from untouched). Open a SaveAs picker, type
+    `report.docx`, Enter via `commit_destination_with_probe(.., || false)` → the pandoc
+    refusal status, picker still `Some`/SaveAs, and `quit_drain` still `Some`,
+    `pending_save_as` still `Some`, `quit_drain_advance` still `true`. Each seeded-non-default
+    read rules out an implementation that clears THAT field before (or despite) the gate: on a
+    gate-after-drain-abort implementation the three read `None`/`None`/`false` and each
+    equality fails; with defaults unseeded, every one of them would read the same on correct
+    and wrong implementations alike.
 - **T5 — dispatch refusals through `do_export`:** MarkedBlock scope with no mark →
   `do_export(..) == false` AND status `"no marked block — export cancelled"`; origin-mismatch
   twin → `false` + `"buffer changed — export cancelled"`. Both observables are synchronous and
