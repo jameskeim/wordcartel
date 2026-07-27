@@ -3,7 +3,7 @@
 
 # Backlog
 
-**35 open · 86 shipped · 4 dropped**
+**36 open · 86 shipped · 4 dropped**
 
 Blocking Effort P: **0**
 
@@ -11,6 +11,7 @@ Blocking Effort P: **0**
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
+| A25 | Destination-commit refusal on a non-writable highlight says 'empty path' | triage | bug | S |  | The destination picker refuses a highlight it cannot write to by blaming the FIELD: arrow onto a broken symlink / fifo / socket / device / stat-failed row with an empty field and classify_destination_enter falls through Row 1 (needs Dir) and Row 2 (needs File) into `_ => CommitOutcome::Nothing`, which emits 'save-as: empty path'. The emptiness is a precondition of reaching that arm, not the reason for refusal — the entry is not a writable regular file. Select mode ALREADY has per-kind refusal wording (file_browser::classify_enter); classify_destination_enter never inherited it. Reachability verified, not assumed: fsx::kind_of returns Other for fifo/socket/device, classify_entry returns Unknown for stat failure + broken symlinks, filter_and_rank exempts e.broken from the type filter unconditionally, and recents sets Unknown deliberately. Surfaced 2026-07-27 by the Batch T grounding (fable-grounding.md §1.2 Route B) while settling H28's reachability; filed OUT of Batch T by decision D3 because the fix changes a user-visible string and Batch T's premise is that nothing in it changes shipped behavior. Fix: mirror select mode's per-kind wording on the destination-commit path. Anchors: file_browser_commit::classify_destination_enter, file_browser::classify_enter, fsx::{kind_of, classify_entry}. |
 | H25 | compose::face_to_ratatui is add-only — can't express modifier subtraction | triage | debt | S |  | compose only ADDS modifiers (no sub_modifier path), so a face's dim can't clear a DIM an underlay wrote; B7 worked around it at the ChromeStyles cache seam |
 | H38 | classify_spell_heuristic's spell-substring branch is pinned by no test | triage | debt | S |  | PRE-EXISTING coverage hole surfaced 2026-07-26 by the vale-ls removal review; NOT caused by it. lsp_client::classify_spell_heuristic has a branch testing the rule code for a `spell` substring; mutating it reddens NO test, and did not before the removal either. It LOOKED covered: the deleted vale_ls.rs test classify_spelling_checks_by_name_else_heuristic appeared to exercise it, but ValeEngine::classify short-circuited on its own "Spelling" check and never reached the shared branch — the test passed for a reason unrelated to its name. The recurring class in pure form: the asserted outcome was also the outcome of a path that never ran, and no fixture distinguished the engine short-circuit from the shared fallback because both give the same answer for vale inputs. Fix: a fixture whose engine classify returns undecided for a code containing `spell`, asserted Spelling, with the kill condition stated (deleting the branch must redden it). Anchors: lsp_client::{classify_spell_heuristic, LspEngine::classify}. |
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |

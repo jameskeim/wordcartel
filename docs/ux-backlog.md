@@ -1194,3 +1194,45 @@ behaviour — so it wants its own deliberation, not a merge-gate patch.
 appears with no further work. [[A22]]'s adopted orderings test for this path pins the current
 behaviour and names this item, so it will fail loudly and point here once the law changes.
 Related: [[A17]], [[A22]]. ~S.
+
+### A25 — Destination-commit refusal on a non-writable highlight says 'empty path'
+<!-- item: A25 -->
+
+The destination picker refuses a highlight it cannot write to by blaming the **field**, not the
+highlight — and the field is not why it refused.
+
+Arrow onto a broken symlink (or a fifo, socket, device, or a row whose `stat` failed) in a Save-As
+or Write-Block picker, leave the field empty, press Enter. `classify_destination_enter` tries Row 1
+(requires `EntryKind::Dir`), tries Row 2 (commits only on `EntryKind::File`), and falls through its
+`_ => CommitOutcome::Nothing` arm — which emits the Sticky Warning *"save-as: empty path"* (or the
+Write-Block twin). The field's emptiness is a **precondition** of reaching that arm, not the reason
+for the refusal: the entry simply is not a writable regular file. A writer who reads the message is
+told to fix something that is not broken.
+
+**Select mode already solves this and the destination path does not inherit it.**
+`file_browser::classify_enter` carries per-kind `EnterOutcome::Refuse` wording that distinguishes a
+broken symlink from an `Other` special file. `classify_destination_enter` has no counterpart —
+every non-Dir/non-File kind collapses into the same empty-path string.
+
+**Reachability is verified, not assumed.** Production listings really do carry these rows:
+`fsx::kind_of` returns `Other` for fifo/socket/device; `classify_entry` returns `Unknown` for a
+`stat` failure and for broken symlinks (built into entries by `file_browser_listing`). They survive
+into destination-mode `entries` — `filter_and_rank` exempts `e.broken` from the type filter
+unconditionally, and an extensionless fifo passes `is_document` ("extensionless files are plausibly
+prose"). `recents` sets `Unknown` deliberately so Enter refuses those rows.
+
+**Provenance:** surfaced 2026-07-27 by the Batch T grounding pass
+(`scratchpad/batch-t/fable-grounding.md` §1.2, "Route B") while settling whether [[H28]]'s empty-path
+warning is reachable in production at all. It is — and this is the residual defect that reachability
+exposes. **Deliberately filed OUT of Batch T** (decision D3): the fix changes a user-visible status
+string, and Batch T's governing premise is that nothing in it changes shipped behavior — the premise
+that licenses reviewing its 98-site sweep as safe volume. Fixing a wording nit there would spend it.
+
+**Fix shape:** give the destination-commit path the per-kind refusal wording select mode already
+has, rather than letting every unusable kind collapse to "empty path". Note the `_ =>` catch-all is
+the same arm [[H28]] adds a pin to, so the pin and this fix meet in one place — check that the pin
+still constrains the intended behaviour after the wording splits.
+
+Anchors: `file_browser_commit::classify_destination_enter` (the `_ => CommitOutcome::Nothing` arm),
+`file_browser::classify_enter` (the wording to mirror), `fsx::{kind_of, classify_entry}`.
+Related: [[H28]], [[C5]]. ~S.
