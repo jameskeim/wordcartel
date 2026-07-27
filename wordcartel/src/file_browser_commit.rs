@@ -260,7 +260,8 @@ pub(crate) fn copy_name_into_field(field: &mut String, field_cursor: &mut usize,
 ///
 /// Shared by the two refusals that have somewhere to go: the typed-text `ExtVerdict::Redirect`
 /// (F4) and Row 2's `HighlightVerdict::ExportInstead`. `fallback_dir` is used only when `path`
-/// has no parent.
+/// has no parent. `pandoc_available` gates the whole redirect (A22 D4-ii): with no pandoc there
+/// is nothing to redirect TO, so it refuses before any flow-abandoning side effect.
 // The full write-refusal context: everything `commit_destination` would otherwise inline twice.
 #[allow(clippy::too_many_arguments)]
 fn redirect_to_export(
@@ -272,7 +273,17 @@ fn redirect_to_export(
     ext: String,
     reason: &str,
     fallback_dir: PathBuf,
+    pandoc_available: &dyn Fn() -> bool,
 ) {
+    // A22 D4-ii: no point choosing an Export destination for an export that cannot run —
+    // and the gate must run before ANY flow-abandoning side effect (status, drain-abort,
+    // picker replacement), so a refusal leaves the writer exactly where they were.
+    if !pandoc_available() {
+        editor.set_status_full(crate::status::StatusKind::Error,
+            "pandoc not found \u{2014} install it to export".to_owned(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        return;
+    }
     editor.set_status_full(crate::status::StatusKind::Warning, reason.to_owned(),
         crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     // A redirect IS an abandoned save — the write did not happen, and the writer is being
@@ -303,18 +314,33 @@ fn redirect_to_export(
 }
 
 /// Execute a destination-mode Enter. THE single place a picker commit becomes a write.
-///
-/// Dispatches on `DestinationPurpose`, so adding a future destination consumer is one arm
-/// the compiler demands rather than a new branch somewhere else.
-#[allow(clippy::too_many_lines)] // a flat, exhaustive commit-outcome × purpose dispatch — the
-// highest-risk logic in C5 (the module doc comment), kept in ONE function on purpose so the
-// whole write decision is auditable in one place rather than split across call sites.
+/// Production probe = `probe_pandoc` (OnceLock-cached); the seam exists because the merge
+/// gate runs on machines WITHOUT pandoc — tests inject (the run_export_with_probe pattern).
 pub(crate) fn commit_destination(
     editor: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     executor: &dyn crate::jobs::Executor,
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    commit_destination_with_probe(editor, fs, executor, clock, msg_tx,
+        crate::export::probe_pandoc)
+}
+
+/// `commit_destination` with an INJECTABLE pandoc probe — see that wrapper for why.
+///
+/// Dispatches on `DestinationPurpose`, so adding a future destination consumer is one arm
+/// the compiler demands rather than a new branch somewhere else.
+#[allow(clippy::too_many_lines)] // a flat, exhaustive commit-outcome × purpose dispatch — the
+// highest-risk logic in C5 (the module doc comment), kept in ONE function on purpose so the
+// whole write decision is auditable in one place rather than split across call sites.
+pub(crate) fn commit_destination_with_probe(
+    editor: &mut crate::editor::Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    executor: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    pandoc_available: impl Fn() -> bool,
 ) {
     let Some(fb) = editor.file_browser.as_ref() else { return };
     let crate::file_browser::BrowseMode::Destination { purpose, field, .. } = &fb.mode
@@ -368,7 +394,8 @@ pub(crate) fn commit_destination(
                         let reason = format!(
                             "{} is a {ext} file \u{2014} opening Export instead",
                             raw.display());
-                        redirect_to_export(editor, fs, msg_tx, &purpose, &raw, ext, &reason, dir);
+                        redirect_to_export(editor, fs, msg_tx, &purpose, &raw, ext, &reason, dir,
+                            &pandoc_available);
                         return;
                     }
                     HighlightVerdict::Foreign(ext) => {
@@ -387,7 +414,8 @@ pub(crate) fn commit_destination(
                         // export destination picker — advice with somewhere to go.
                         let reason =
                             format!("{ext} is an export format \u{2014} opening Export instead");
-                        redirect_to_export(editor, fs, msg_tx, &purpose, &path, ext, &reason, dir);
+                        redirect_to_export(editor, fs, msg_tx, &purpose, &path, ext, &reason, dir,
+                            &pandoc_available);
                         return;
                     }
                     ExtVerdict::Refused(path) => {
@@ -817,7 +845,14 @@ mod tests {
             assert_eq!(fb.mode.filter_text(&fb.query), "",
                 "precondition: the field is empty — this is Row 2, not Row 4");
         }
-        crate::test_support::press_enter_fb(&mut e, &fs, &tx);
+        // Committed via the probe seam rather than the Enter intercept: the intercept cannot
+        // inject, and these fixtures reach the redirect arm — on a pandoc-less machine the
+        // production probe would refuse and the assertions would fail for the environment,
+        // not the code. Enter-through coverage lives in the non-redirect commit tests.
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
         (e, fs)
     }
 
@@ -1379,7 +1414,10 @@ mod tests {
         e.quit_drain = Some(crate::editor::QuitDrain {
             queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
 
-        press_enter(&mut e, &fs, &ex, &clk, &tx);
+        // Through the probe seam, not the intercept: this flow reaches the redirect arm, whose
+        // A22 gate would refuse on a pandoc-less machine (see `row2_enter_onto`).
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
 
         assert!(e.pending_save_as.is_none(),
             "a Redirect abandons the save — the armed post-save action must not survive");
@@ -1550,7 +1588,8 @@ mod tests {
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::WriteBlock { origin },
             d.clone(), "report.html".into());
-        crate::file_browser_commit::commit_destination(&mut e, &fs, &ex, &clk, &tx);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
         match &e.file_browser.as_ref().expect("redirect reopens as Export").mode {
             crate::file_browser::BrowseMode::Destination { purpose, .. } => assert_eq!(
                 purpose, &crate::file_browser::DestinationPurpose::Export {
@@ -1580,7 +1619,8 @@ mod tests {
             d.clone(), "report.html".into());
         crate::workspace::new_empty_buffer(&mut e); // the pump-vector stand-in
         assert_ne!(e.active().id, origin, "fixture: carried and re-derived must differ");
-        crate::file_browser_commit::commit_destination(&mut e, &fs, &ex, &clk, &tx);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
         match &e.file_browser.as_ref().expect("redirect proceeds — verify is at dispatch").mode {
             crate::file_browser::BrowseMode::Destination { purpose, .. } => match purpose {
                 crate::file_browser::DestinationPurpose::Export { origin: o, .. } =>
@@ -1590,6 +1630,75 @@ mod tests {
             },
             other => panic!("expected destination mode, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T4 flow-survival. Assertions and what each rules out (spec §11): exact status rules
+    // out a gate-less implementation (final status would be the redirect Warning — and no
+    // frame paints between same-dispatch status writes, so final IS the only observable);
+    // mode/field rule out refuse-but-reopen-as-Export. Deliberately NOT claimed: that the
+    // reason was never transiently set (terminal reads cannot distinguish set-then-
+    // overwritten; §5.2's gate-first order is a REVIEW check, below).
+    #[test]
+    fn probe_refusal_keeps_the_original_writeblock_picker_alive() {
+        let d = tmp("a22-t4-wb");
+        let mut e = crate::editor::Editor::new_from_text("body\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || false);
+        assert_eq!(e.status_text(), "pandoc not found \u{2014} install it to export");
+        assert_eq!(e.status().expect("a refusal is never silent").kind(),
+            crate::status::StatusKind::Error);
+        match &e.file_browser.as_ref().expect("original picker survives the refusal").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, field, .. } => {
+                assert!(matches!(purpose,
+                    crate::file_browser::DestinationPurpose::WriteBlock { .. }),
+                    "a refuse-but-still-redirect implementation reopens as Export");
+                assert_eq!(field, "report.html", "the writer's typed name is intact");
+            }
+            other => panic!("expected destination mode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // T4 gate-precedes-drain-abort. ALL THREE drain fields seeded non-default —
+    // quit_drain_advance is a bool defaulting false, so unseeded it reads the same on a
+    // correct and a wrong implementation (spec-gate round 4). On a gate-after-drain-abort
+    // implementation the three read None/None/false and each equality fails.
+    #[test]
+    fn probe_gate_runs_before_the_saveas_drain_abort() {
+        let d = tmp("a22-t4-drain");
+        let mut e = crate::editor::Editor::new_from_text("unsaved\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "report.docx".into());
+        e.pending_save_as = Some(crate::editor::PostSaveAction::Quit);
+        e.quit_drain = Some(crate::editor::QuitDrain {
+            queue: std::collections::VecDeque::new(),
+            mode: crate::editor::QuitMode::SaveAll });
+        e.quit_drain_advance = true;
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || false);
+        assert_eq!(e.status_text(), "pandoc not found \u{2014} install it to export");
+        assert!(e.quit_drain.is_some(), "gate must precede the drain-abort");
+        assert!(e.pending_save_as.is_some(), "the armed post-save action survives");
+        assert!(e.quit_drain_advance, "seeded true; a wrong clear reads false");
+        assert!(e.file_browser.as_ref().is_some_and(|fb| matches!(&fb.mode,
+            crate::file_browser::BrowseMode::Destination {
+                purpose: crate::file_browser::DestinationPurpose::SaveAs, .. })),
+            "the SaveAs picker survives; no Export picker opened");
         let _ = std::fs::remove_dir_all(&d);
     }
 
