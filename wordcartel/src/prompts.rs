@@ -50,8 +50,8 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
-        Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, &**ctx.fs);
+        Msg::ExportDone { target, result, overwrite_confirmed, scope, .. } => {
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed, scope, &**ctx.fs);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, ctx.clock);
@@ -1202,5 +1202,39 @@ mod tests {
             "Save-As destination picker must open for unnamed buffer");
         assert!(matches!(e.pending_save_as, Some(PostSaveAction::CloseBuffer { .. })),
             "pending_save_as must carry CloseBuffer");
+    }
+
+    // T13c — the prompts-intercept ExportDone arm is the SECOND delivery site; it could
+    // substitute either scope while reduce_dispatch is correct, and only this test fails.
+    // BOTH values exercised (the round-1 plan-gate rule): a carriage claim tested at one
+    // value is passed by an implementation that hardcodes that value.
+    #[test]
+    fn prompt_intercept_forwards_export_done_scope_to_the_status() {
+        let d = crate::test_support::scratch_dir("a22-t13c");
+        for (scope, want) in [
+            (crate::export::ExportScope::MarkedBlock, "exported block to "),
+            (crate::export::ExportScope::WholeDocument, "exported "),
+        ] {
+            let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+            e.open_prompt(crate::prompt::Prompt::save_overwrite(std::path::Path::new("/x")));
+            let reg = crate::registry::Registry::builtins();
+            let (km, _) =
+                crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+            let ex = crate::jobs::InlineExecutor::default();
+            let clk = crate::test_support::TestClock(0);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let fs = crate::test_support::test_fs();
+            let ctx = crate::overlays::DispatchCtx {
+                reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx, fs: &fs };
+            let target = d.join("out.html");
+            let _ = std::fs::remove_file(&target);
+            let buffer_id = e.active().id;
+            let msg = crate::app::Msg::ExportDone { buffer_id, target: target.clone(),
+                result: Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())),
+                overwrite_confirmed: true, scope };
+            let _ = crate::prompts::intercept(msg, &mut e, &ctx);
+            assert_eq!(e.status_text(), format!("{want}{}", target.display()),
+                "an intercept arm hardcoding the other scope fails this case");
+        }
     }
 }
