@@ -570,8 +570,32 @@ assertion whose expected value is also the fixture's default/untouched state is 
 **C5:** render the screen, don't assert the struct — chrome surfaces are asserted on painted
 frames / user-visible strings, not on enum fields.
 
-A third rule governs every refusal assertion, because `do_export` spawns a thread: **absence is
-scheduling-weak on the export path.** An immediate `try_recv()`/file-existence check after a
+A third rule (spec-gate round 5): **sweep for carriage, not just vacuity.** `scope` and
+`origin` are THREADED values; a test suite that pins both endpoints of a chain while leaving a
+hand-off free is passed by an implementation that substitutes a default or **re-derives the
+value locally** at that hand-off — and a re-deriving implementation produces correct-looking
+output on every fixture where the re-derived value happens to equal the carried one, which is
+every fixture that does not deliberately make them differ. Per hand-off, one test must fail if
+THAT hand-off substitutes or re-derives. The carriage map below assigns each hand-off its
+discriminating test — or says plainly where a hand-off is unconstrained and why that is sound.
+
+| Hand-off | Discriminated by |
+|---|---|
+| flow start → purpose (^KW / palette) | T2 baseline; T7 |
+| redirect → Export purpose (scope; carried origin) | T2 (+ its carried-origin fixture), T3 |
+| Export purpose → commit arm → `do_export` (scope) | T12a |
+| Export purpose → commit arm → `do_export` (origin) | T12b |
+| commit arm → `PendingExport` (scope, origin) | T12c struct equality (switched-buffer variant for origin) |
+| `PendingExport` → `do_export` (confirm) | T6 (seeded side) + T12c confirm leg |
+| `do_export` → `Msg::ExportDone` (scope) | T5 positive control's scope assertion (T13a) |
+| `Msg::ExportDone` → `apply_export_done`, via `reduce_dispatch` | T13b |
+| `Msg::ExportDone` → `apply_export_done`, via `prompts::intercept` | T13c |
+| WriteBlock purpose → commit-arm verify | T8 |
+| commit arm → `PendingWriteBlock` (origin) | **unconstrained, and soundly so:** construction runs immediately AFTER the commit-arm origin verify, so `active().id == origin` there BY CONSTRUCTION — a re-deriving implementation is extensionally identical at this site, not merely untested. The site that matters is the confirm-time check, which T8's twin discriminates. |
+| `PendingWriteBlock` → `OverwriteWriteBlock` verify | T8 twin |
+
+A fourth rule governs every refusal assertion, because `do_export` spawns a thread: **absence
+is scheduling-weak on the export path.** An immediate `try_recv()`/file-existence check after a
 call that *might* have spawned a worker proves nothing — a wrongly-spawned worker may simply
 not have finished, and the assertion reads the same either way (the E11 vacuity class: the
 asserted state is also the not-done-yet state). The tree already encodes this:
@@ -647,7 +671,10 @@ the subprocess.
   `Err(spawn)`, and `guarded_export` guarantees a spawned worker always sends exactly one
   message), demonstrating that `true`/message-arrival is what dispatch actually looks like —
   the refusal cases' `false` is therefore a discriminating reading, not a value that every
-  execution produces.
+  execution produces. The received message's `scope` field must equal the dispatched
+  `MarkedBlock` — this is the carriage map's `do_export → Msg::ExportDone` hand-off (T13a):
+  an implementation that constructs the message with a default `WholeDocument` fails here and
+  nowhere else.
 - **T6 — confirm-boundary scope carriage (the D2 post-confirm moment):** seed
   `pending_export = Some(PendingExport { scope: MarkedBlock, origin, .. })` with the mark then
   CLEARED, fire `PromptAction::OverwriteExport` → **the load-bearing assertion is the status**,
@@ -660,15 +687,28 @@ the subprocess.
   yields an `ExportDone`, proving the confirm path dispatches when it should.
 - **T7 — palette invariant:** extend the existing `run_export_with_probe` picker-seed test to
   assert the purpose equals `Export { ext: "html", scope: WholeDocument, origin: active id }`.
-- **T8 — Write-Block origin verify, both moments:** open ^KW picker on buffer A, switch to a
-  buffer B that has NO mark, commit → status exactly
-  `"buffer changed — write block cancelled"` AND the target file does not exist; twin through
-  `PendingWriteBlock`/`OverwriteWriteBlock`. The absence check is sound HERE (unlike T5/T6):
-  `perform_block_write` writes synchronously on the main thread, so a wrong implementation has
-  already created the file by the time the assertion runs (§11 preamble). B-has-no-mark makes
-  the EXACT status also constrain refusal ordering (§5.3 step 1 before step 2): an
-  implementation that read the mark before verifying origin would read `"no marked block"`
-  instead and fail the equality.
+- **T8 — Write-Block origin verify, both moments:**
+  - *B unmarked:* open ^KW picker on buffer A, switch to a buffer B that has NO mark, commit →
+    status exactly `"buffer changed — write block cancelled"`. **The exact status is the SOLE
+    discriminator in this fixture** (corrected per round 5): an implementation missing the
+    origin verify falls through to the mark re-read, ALSO refuses (`"no marked block"`), and
+    ALSO leaves the target absent — so a file-absence assertion here reads the same on correct
+    and verify-missing implementations and is corroborative only. B-has-no-mark additionally
+    makes the exact status constrain refusal ordering (§5.3 step 1 before step 2): a
+    mark-first implementation reads `"no marked block"` and fails the equality.
+  - *B MARKED (the write-suppression discriminator):* same flow but B carries its own mark →
+    correct implementation still refuses `"buffer changed — write block cancelled"` and the
+    target does not exist; **an implementation missing the origin verify passes the mark
+    re-read and synchronously writes B's block bytes to the target** — the absence assertion
+    fails, and it is sound here because `perform_block_write` writes on the main thread
+    (§11 preamble), no scheduling involved.
+  - *Confirm twin:* commit on A with an EXISTING target (verify passes; `PendingWriteBlock {
+    target, origin: A }` raised), switch to unmarked B, fire `OverwriteWriteBlock` → status
+    exactly `"buffer changed — write block cancelled"`. Discriminates a confirm-site
+    re-derivation (`origin := active().id`): that implementation passes its own check, hits
+    the mark re-read on B, and reads `"no marked block"` — the equality fails. (Re-derivation
+    at `PendingWriteBlock` CONSTRUCTION is unconstrained and soundly so — see the carriage
+    map: post-verify, `active().id == origin` by construction.)
 - **T9 — chrome, rendered (C5):** paint the file browser (`TestBackend`, the existing
   `render_overlays.rs` destination-title fixture pattern) with a `MarkedBlock` Export purpose →
   the title row contains `" Export .pdf (marked block) to:"`; the `WholeDocument` twin renders
@@ -681,12 +721,54 @@ the subprocess.
   the ExportDone finalization test asserts only `status_text().contains("exported")` — that
   substring passes under BOTH wordings and under a scope-dropped regression, so it constrains
   the write happening at all, and nothing about scope. It stays (it guards the write); T10
-  carries the scope discrimination with exact-match assertions.
+  carries the scope discrimination with exact-match assertions. T10 pins the
+  `apply_export_done` ENDPOINT only — carriage INTO it, through the message and both reducers,
+  is T13's job (round 5: any of those sites could substitute `WholeDocument` and T10 would
+  still pass).
 - **T11 — mid-flow edit remap (the reason scope is a flag):** mark a block, apply an edit
   through the funnel that shifts it (insert before `start`), then assert
   `resolve_export_input(e, MarkedBlock, id)` returns the block's CURRENT (post-remap) text —
   the observable is the seam's returned `String`, synchronous, no pandoc involved. This is the
   fixture that fails under the rejected stored-offsets design and passes under re-read.
+- **T12 — Export commit-arm carriage (round 5; the hand-off `purpose → commit arm →
+  do_export/PendingExport`).** All three cases drive Enter through
+  `commit_destination_with_probe(.., || true)` on an Export picker REACHED VIA THE REAL
+  REDIRECT from a ^KW flow on buffer A (purpose `Export { ext, scope: MarkedBlock,
+  origin: A }`), so the value under test is the carried one, never a hand-seeded one:
+  - *(a) scope, no-overwrite path:* CLEAR the mark (`block_clear`), Enter onto a
+    non-existing target → status exactly `"no marked block — export cancelled"`. **A commit
+    arm that hardcodes `WholeDocument` into the `do_export` call dispatches instead** — no
+    refusal status is set, the equality fails. (This is the fixture the round-5 finding named:
+    every earlier scope test either called `do_export`/`resolve_export_input` directly or
+    seeded `PendingExport` by hand, leaving this arm free to substitute.)
+  - *(b) origin, no-overwrite path:* mark intact on A, switch active to an UNMARKED buffer B
+    (the Export arm has no commit-time verify — verification is `do_export`'s), Enter onto a
+    non-existing target → status exactly `"buffer changed — export cancelled"`. **A commit arm
+    that re-derives `origin := active().id` launders the switch:** verification then passes
+    against B and the mark re-read refuses with `"no marked block — export cancelled"` — a
+    DIFFERENT exact string, so the equality discriminates re-derivation, not just omission.
+  - *(c) PendingExport construction, overwrite path:* switch active to B, Enter onto an
+    EXISTING target → assert
+    `editor.pending_export == Some(PendingExport { ext, target, scope: MarkedBlock, origin: A })`
+    by direct struct equality — a construction that substitutes `WholeDocument` or re-derives
+    `origin` (which reads B here, because the switch made carried and re-derived differ)
+    fails the equality. Then fire `OverwriteExport` → status exactly
+    `"buffer changed — export cancelled"` (the confirm leg, complementing T6's seeded side).
+    State assertions, not chrome — C5's render-the-screen rule governs user-facing surfaces;
+    carriage is state and is asserted as state.
+- **T13 — scope carriage through the message layer (round 5; the hand-offs
+  `do_export → Msg::ExportDone → reducers → apply_export_done`).**
+  - *(a)* T5's positive control asserts the received `Msg::ExportDone.scope ==
+    MarkedBlock` — pins the worker-side construction in `do_export`.
+  - *(b)* Construct `Msg::ExportDone { scope: MarkedBlock, result: Ok(Bytes(..)), .. }` and
+    drive it through the REAL `app::reduce` (the existing `app.rs` ExportDone-test pattern) →
+    status exactly `"exported block to {target}"`. **A `reduce_dispatch` arm that forwards a
+    default instead of the bound `scope` produces `"exported {target}"`** and fails the
+    equality. `WholeDocument` twin → exactly `"exported {target}"` (rules out the opposite
+    substitution).
+  - *(c)* Same message pair delivered through `prompts::intercept` with a modal prompt open
+    (the second delivery site) → same exact-status pair. Either reducer substituting
+    `WholeDocument` is caught by its own case; T10's direct calls would catch neither.
 
 Suites ride where their subjects live (`export.rs`, `file_browser_commit.rs`, `prompts.rs`,
 `render_overlays.rs`, `jobs_apply.rs`); no new test infrastructure. Existing suites must pass
