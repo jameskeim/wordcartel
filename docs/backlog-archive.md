@@ -2865,3 +2865,50 @@ Prior art / context: E10 (the ltex + vale providers), E11 (the viewing/action la
 record: `scratchpad/e11/decisions.md` D6. ~S.
 
 **DROPPED 2026-07-26 — FOLDED INTO [[E14]], not rejected.** E13 and E14 are one effort: both push suppression state into an engine through the settings channel, both need the same answer to *where does this persist*, and both need the same delivery plumbing and test surface. Filed apart, the persistence argument gets had twice and the plumbing gets built twice. The dictionary half also does not stand alone — on its own it buys correctness-at-the-source and invisible saved work against a real sync obligation — but as a rider on E14's rule half, where the plumbing and the persistence decision already exist, it is nearly free. The grounding below is preserved in full; E14 carries the live version.
+
+### A22 — Write-Block Redirect exports the whole document, not the marked block
+<!-- item: A22 -->
+
+In Write-Block mode, choosing a destination whose extension pandoc can produce (`excerpt.html`,
+`report.docx`) redirects into the Export flow — and Export then exports the **whole document**, not
+the marked block the writer was working with.
+
+Pre-existing for a *typed* destination; C5's Row-2 format protection now also reaches it when the
+writer highlights an existing foreign-format file. It is not silent — the picker title changes to
+"Export" — so a writer who is reading has a cue. But the mode they started in promised a block
+operation, and what they get is a whole-document one.
+
+Two candidate resolutions, and the choice is a product call: either Export honours the marked block
+when the flow was entered from Write-Block, or the redirect states plainly that it is leaving block
+scope. Related: a Row-2 confirm onto a `.docx` target does not currently say the write would be
+plain markdown.
+
+**RE-KINDED 2026-07-27: `feature` → `bug`.** The filing described this accurately but classed it as
+a missing capability. It is a shipped feature producing a wrong artifact — the writer's cue (the
+picker title changing to "Export") is real but easy to read past, and the outcome is the wrong file
+with no error. `docs/design/backlog-sequence.md` sequences it **first** among all open work: it is
+the only open item a writer can hit today and walk away with a wrong result, and it is small.
+
+**SHIPPED 2026-07-27** (merge `85d9128`). Resolved as decision D1: Export honours the marked
+block when the flow was entered from Write-Block, with the disclosure chrome folded in — the
+redirect status, the picker footer, the picker title and the completion status each name the
+scope. Scope is a FLAG re-read at dispatch, never stored offsets: background merges legally edit
+buffers while the picker is open and the `Buffer::apply` funnel remaps the mark, so snapshotted
+offsets would go stale. D2 refuses at BOTH dispatch moments when the mark is gone rather than
+falling back to whole-document — a fallback would be this same bug one layer down.
+
+Folded in per D4: the pandoc probe at the redirect site, the `cancel_destination`
+`pending_export` sweep, and `BufferId` capture-at-open / verify-at-dispatch. The last was not
+theoretical — before it, a buffer switch under an open picker wrote the WRONG buffer's bytes to
+disk (reproduced by the Task 4 fixture and independently by its reviewer).
+
+The command-surface question (law 10) was answered on evidence rather than by adding commands or
+amending the contract: `block_write` is already a registered command, and the four `export_*`
+commands do not give plugins parameterized export either, so block-scoped and whole-document
+export are equally plugin-reachable.
+
+**Filed out:** [[A23]] — typed foreign extensions are written as markdown under the foreign name
+while a highlighted one is refused. [[A24]] — the completion status cannot display in the
+redirect flow, because A17 Q1 keeps the redirect's Sticky Warning over the completion Info; the
+human's call was to ship and file, since the fix amends status law beyond this case.
+

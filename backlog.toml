@@ -1400,13 +1400,15 @@ shipped_commit = "b30f5aa"
 [[item]]
 id = "A22"
 title = "Write-Block Redirect exports the whole document, not the marked block"
-status = "triage"
+status = "shipped"
 kind = "bug"
-size = "TBD"
+size = "M"
 theme = "A"
 hook = "DEFECT, not a feature (re-kinded 2026-07-27): Write-Block Redirect promises a block operation and silently exports the WHOLE DOCUMENT. A writer marks a block, exports, and walks away with the wrong file — a silent wrong result in a shipped feature. Small fix plus one product fork (honor the marked block vs state the scope change honestly). Sequenced FIRST in docs/design/backlog-sequence.md: the only open item a writer can hit today and get a wrong artifact from."
-doc = "ux-backlog.md#a22"
+doc = "backlog-archive.md#a22"
 created = "2026-07-19"
+shipped_date = "2026-07-27"
+shipped_commit = "85d9128"
 
 [[item]]
 id = "H30"

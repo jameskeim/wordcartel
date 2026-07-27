@@ -759,29 +759,6 @@ with the dead branch — not "made to pump." **Making them pump would delete the
 appearing to fix it**, which is the exact defect class both efforts spent their review rounds
 catching (eight instances in effort ① alone).
 
-### A22 — Write-Block Redirect exports the whole document, not the marked block
-<!-- item: A22 -->
-
-In Write-Block mode, choosing a destination whose extension pandoc can produce (`excerpt.html`,
-`report.docx`) redirects into the Export flow — and Export then exports the **whole document**, not
-the marked block the writer was working with.
-
-Pre-existing for a *typed* destination; C5's Row-2 format protection now also reaches it when the
-writer highlights an existing foreign-format file. It is not silent — the picker title changes to
-"Export" — so a writer who is reading has a cue. But the mode they started in promised a block
-operation, and what they get is a whole-document one.
-
-Two candidate resolutions, and the choice is a product call: either Export honours the marked block
-when the flow was entered from Write-Block, or the redirect states plainly that it is leaving block
-scope. Related: a Row-2 confirm onto a `.docx` target does not currently say the write would be
-plain markdown.
-
-**RE-KINDED 2026-07-27: `feature` → `bug`.** The filing described this accurately but classed it as
-a missing capability. It is a shipped feature producing a wrong artifact — the writer's cue (the
-picker title changing to "Export") is real but easy to read past, and the outcome is the wrong file
-with no error. `docs/design/backlog-sequence.md` sequences it **first** among all open work: it is
-the only open item a writer can hit today and walk away with a wrong result, and it is small.
-
 ### H30 — subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes
 <!-- item: H30 -->
 
