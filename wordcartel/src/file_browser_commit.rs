@@ -927,8 +927,11 @@ mod tests {
         assert!(matches!(&fb.mode, crate::file_browser::BrowseMode::Destination {
             purpose: crate::file_browser::DestinationPurpose::Export { ext, .. }, .. }
             if ext == "docx"), "the refusal hands the writer the Export flow for that format");
-        assert!(e.status().map_or("", |s| s.text()).contains("docx"),
-            "and says why — no silent UI: {:?}", e.status().map_or("", |s| s.text()));
+        // Behavioural only: a status was raised at all. `.contains("docx")` used to stand
+        // here and could not fail — the FILENAME carries "docx", so any reason string, or a
+        // garbled one, satisfied it. The wording itself is pinned byte-for-byte by
+        // `row2_from_a_save_as_picker_keeps_the_unscoped_redirect_wording` below.
+        assert!(!e.status_text().is_empty(), "and says why — no silent UI");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -968,6 +971,27 @@ mod tests {
             "{} is a docx file \u{2014} opening Export for the marked block",
             d.join("report.docx").display()),
             "surface 1 Row-2: scope-blind wording says 'opening Export instead'");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A22 T3, the fourth cell of the 2-call-site × 2-scope wording matrix: Row 2 reached from
+    /// a whole-document flow (Save-As). The other three cells are pinned byte-for-byte — the
+    /// typed path's two arms and Row 2's block arm above — while this one was only ever seen
+    /// through `.contains("docx")`, which the FILENAME satisfies on its own. The scope note is
+    /// added for the block flow ONLY: this string must stay unchanged (spec §6.1, §7.4).
+    ///
+    /// FAIL-VERIFY: reword the `ExportInstead` arm's whole-document `format!`, watch this
+    /// fail — nothing else in the suite does.
+    #[test]
+    fn row2_from_a_save_as_picker_keeps_the_unscoped_redirect_wording() {
+        let d = tmp("row2-docx-sa");
+        std::fs::write(d.join("report.docx"), b"PK\x03\x04 not really a docx\n").expect("seed");
+        let (e, _fs) = row2_enter_onto(&d, "report.docx", crate::config::FileTypeFilter::Documents);
+        // Exact, path included, and the SaveAs purpose is what selects this arm — a
+        // `contains` here would be satisfied by the seeded filename alone.
+        assert_eq!(e.status_text(), format!(
+            "{} is a docx file \u{2014} opening Export instead", d.join("report.docx").display()),
+            "surface 1 Row-2 whole-document: the scope note must never leak onto this string");
         let _ = std::fs::remove_dir_all(&d);
     }
 
