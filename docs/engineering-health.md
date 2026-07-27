@@ -108,3 +108,15 @@ healthy, not debt; after A17 and H21 land, Editor's residual size is expected fi
 M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority.
 
 *(H22 shipped 2026-07-16 — triage prose moved to `backlog-archive.md#h22`.)*
+
+**EFFECTIVELY CLOSED — correction 2026-07-27** (`docs/design/backlog-sequence.md`). The ~12 fields
+this audit identified as *real* debt have both shipped: the `status` field became the typed routed
+messaging of **A17**, and the eleven overlay `Option`s whose dispatch was hand-parallel became the
+`OVERLAYS` table of **H21**. What remains is the one DRY nit the audit itself named — collapsing the
+four `pending_*` prompt-payload fields into `Option<PromptPayload>` — which can ride any
+Editor-touching effort rather than motivating its own.
+
+The headline "75-field god-object" now actively misleads a reader of the open list: the audit's own
+conclusion was that ~46 of those fields are legitimately distinct state, healthy rather than debt.
+Recommend closing this item; the nit rides opportunistically.
+

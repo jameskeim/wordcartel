@@ -413,6 +413,16 @@ precedent: the cost lands in the summoned view).
 > **predate** its merge of this item, so E8's constraint did **not** reach its design. What follows is
 > what the code actually does, not what E8 asked for.
 
+**GATE SATISFIED (2026-07-27).** "Stays gated on S6/S8" is stale — S6 shipped 2026-07-13 and S8
+2026-07-18. **E8 is unblocked.** `docs/design/backlog-sequence.md` sequences it early on the
+early-decisions-price-later criterion: its model prices everything view-shaped after it (S9, S10,
+PE's lens exemplar, PA's proof-case slice), and every deferral adds another unreconciled surface.
+
+**One scope fork to settle deliberately, because it prices [[E12]]:** does E8 stay a *product model*
+(one layout lens × N style lenses, unifying the toggle surfaces), or become a *registry* where
+Effort-P plugins can register a lens? The registry fork builds the plugin-contribution seam E12 is
+blocked on. Model-only leaves E12 where it is.
+
 ### The real problem, stated from the code: FOUR toggle surfaces, no model
 
 "How do I see my prose" is already answered four different ways, each with its own shape:
@@ -510,6 +520,18 @@ Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed en
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
 
+**CORRECTIONS 2026-07-27** (`docs/design/backlog-sequence.md`):
+- **The filed "Needs wc.async (PD)" was always wrong.** An LSP client is a Rust worker thread — a
+  Lua LSP client is a non-starter by design-space §3 — so PD has no part in this item.
+- **The real blockers are two:** the plugin-dynamic-menu widening (`MenuRowAction::Plugin`), which
+  is **unfiled**, and an actual demand signal — no plugin-authored engine exists or has been asked
+  for.
+- **PARKED** for those reasons. Anything sooner is speculative seam-building — the exact class E11's
+  D8 cut when it dropped the executeCommand relay for having no consumer.
+- **[[E8]] may absorb the hard part.** If E8 takes the registry fork (plugins register a lens), it
+  builds the plugin-contribution seam this item needs, and E12 shrinks to applying it to engines.
+  Re-price E12 after E8 settles that fork.
+
 ### PD — wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain
 <!-- item: PD -->
 
@@ -538,12 +560,28 @@ Forward-only drafting mode — toggle that disables deletion (Write-or-Die style
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
 
+**CORE, NOT A PLUGIN — grounded 2026-07-27.** [[PE]]'s candidate list named this as a bundled-plugin
+candidate; that is **mechanically impossible**. The Effort-P on-edit hook is **observer-tier**: a
+plugin is notified of an edit, it cannot veto one. Forward-only mode must gate the delete/cut
+command paths in **core**, which is what this item's own design already describes. A20 has been
+removed from PE's candidate set accordingly, and sequences separately.
+
 ### PE — Bundled example plugins — full-featured writer plugins + authoring tutorials (each with a README)
 <!-- item: PE -->
 
 Bundled example plugins — full-featured writer plugins + authoring tutorials (each with a README)
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+**CORRECTIONS 2026-07-27** (`docs/design/backlog-sequence.md`):
+- **A20 is removed from the candidate set.** The P on-edit hook is observer-tier — a plugin cannot
+  veto a deletion — so forward-only drafting must gate the delete/cut paths in core. See [[A20]].
+- **PE CONTAINS [[A18]] and [[A19]] as one effort.** Filed apart, each would re-open the bundling
+  question; that is a shared *decision*, not merely a shared mechanism. A18 has the shipped P1 edit
+  surface (`submit_transaction`) and A19 the observer hook plus the shipped timer API, so both are
+  genuinely plugin-shaped — unlike A20.
+- **The bundled-plugin mechanism is verified absent** (only `[plugins] dir`; the demos live under
+  `tests/fixtures/plugins`). It is PE's real first deliverable, as this item's own hook suspected.
 
 ### S9 — In-lens editing feel — refine caret/motion/reflow inside the ventilate lens
 <!-- item: S9 -->
@@ -738,6 +776,12 @@ when the flow was entered from Write-Block, or the redirect states plainly that 
 scope. Related: a Row-2 confirm onto a `.docx` target does not currently say the write would be
 plain markdown.
 
+**RE-KINDED 2026-07-27: `feature` → `bug`.** The filing described this accurately but classed it as
+a missing capability. It is a shipped feature producing a wrong artifact — the writer's cue (the
+picker title changing to "Export") is real but easy to read past, and the outcome is the wrong file
+with no error. `docs/design/backlog-sequence.md` sequences it **first** among all open work: it is
+the only open item a writer can hit today and walk away with a wrong result, and it is small.
+
 ### H30 — subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes
 <!-- item: H30 -->
 
@@ -762,14 +806,22 @@ T5/T6/T7 are the first to hold a child alive long enough for the inheritance to 
 
 **Why effort ① did not fix it.** The leak is *into other spawn sites*, so it cannot be fixed inside
 `run_subprocess`; it needs a process-global spawn lock covering all four sites, or a patched/forked
-crate. That is a design effort in its own right, and it is **Effort-P adjacent** — `wc.async` (PD)
-adds more spawn sites and would inherit the same hazard. Effort ① serialized its own tests instead
+crate. That is a design effort in its own right. (The filing named `wc.async` (PD) as the thing that would
+add more spawn sites; **corrected 2026-07-27** — PD is parked, and the item that actually multiplies
+them is [[E16]], which spawns `vale` per check through `filter::run_subprocess`.) Effort ① serialized its own tests instead
 (the proportionate local fix) and filed this.
 
 **Candidate resolutions:** (1) a process-global spawn mutex every spawn site takes — simple, but
 easy for a new site to forget, so it wants the same registration-seam treatment as other invariants
 here; (2) replace `subprocess` with a `pipe2(O_CLOEXEC)`-based spawn; (3) patch/vendor the crate.
 Note `cargo deny` already tracks the dependency.
+
+**PRIORITY IS COUPLED TO [[E16]] (2026-07-27).** The race needs a *concurrent* spawn window, and
+today spawns are rare — a filter, an export, the LSP children at session start. E16 adds a one-shot
+spawn **per vale check**, i.e. per debounced edit, turning a rare window into a routine one. The
+long-lived `harper-ls`/`ltex-ls-plus` children that make the consequence durable are exactly what
+would be holding foreign fds. `docs/design/backlog-sequence.md` therefore sequences this
+**immediately before E16**: fixing an fd race after multiplying its windows is the wrong order.
 
 ### H34 — cursor_style restore_caret_if_written_gated_by_latch flake — 1/30 observed
 <!-- item: H34 -->
@@ -1040,9 +1092,15 @@ params). That is everything a `Diagnostic` plus its `Suggestion` list needs, and
 we hand it, giving vale the SAME live semantics as harper and ltex.
 
 **What this needs.**
-- The one-shot subprocess primitive — item [[PD]] (`wc.async`), whose hook already names vale-CLI as
-  its proof case. Alternatively a narrower internal spawn if PD stays deferred; that is the first
-  design fork.
+- **CORRECTION 2026-07-27 — this does NOT need [[PD]], and E16 is UNBLOCKED TODAY.**
+  `filter::run_subprocess` is the SHIPPED one-shot subprocess core: argv, shell flag, **stdin as a
+  `String`**, timeout, output cap, cancel flag, `ReapGuard` cleanup, run off-thread on the jobs
+  substrate — and `export.rs` (~:211, ~:227) already drives pandoc through it. E16 is a **core Rust
+  provider** and calls it directly. PD is the **plugin-facing** primitive (Lua marshaling, `!Send`
+  pump-drain, security caps), none of which a core provider needs. What was filed as "fork 1" is not
+  a fork. *How the error arose, because it generalizes:* the dependency was written into this item's
+  hook on 2026-07-26 from the design-space framing where vale-CLI was imagined as a **plugin**
+  driver; when it became a core provider the dependency evaporated and the prose did not.
 - A JSON→`Diagnostic` mapping (not the LSP path). `Span` is a byte range within `Line`; the
   `Action` object maps to our `Suggestion` variants. `Link` populates `href` when the style author
   supplied one.
