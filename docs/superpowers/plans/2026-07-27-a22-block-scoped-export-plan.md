@@ -353,7 +353,9 @@ pub(crate) fn resolve_export_input(
 
 ```rust
 /// Stored on `Editor` while waiting for an `OverwriteExport` confirmation.
-#[derive(Debug, Clone)]
+// PartialEq, Eq ADDED (spec §4.3): T12c asserts whole-value equality on
+// Option<PendingExport>, which does not compile without them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingExport {
     pub ext: String,
     pub target: PathBuf,
@@ -1223,9 +1225,10 @@ hand-offs every endpoint test leaves free).
 
     // T12c — PendingExport construction, overwrite path. The switch makes carried and
     // re-derived origins DIFFER at construction time (the Export arm has no commit-time
-    // verify), so the field equalities catch both substitution and re-derivation. Field-
-    // wise asserts (not whole-struct) so a symlinked temp dir's resolved target cannot
-    // fail the wrong thing.
+    // verify). WHOLE-VALUE equality per spec §4.3: a field-wise assertion would silently
+    // stop constraining any field a future change adds. The expected `target` is computed
+    // by the SAME production resolver the commit path uses, so a symlinked scratch dir
+    // cannot fail the path axis for a non-carriage reason.
     #[test]
     fn export_commit_arm_builds_pending_export_from_the_carried_purpose() {
         let (mut e, fs, ex, clk, tx, _rx, origin, d) = redirected_block_export("a22-t12c");
@@ -1233,12 +1236,14 @@ hand-offs every endpoint test leaves free).
         crate::workspace::new_empty_buffer(&mut e);
         crate::file_browser_commit::commit_destination_with_probe(
             &mut e, &fs, &ex, &clk, &tx, || true);
-        let pe = e.pending_export.as_ref().expect("existing target raises the confirm");
-        assert_eq!(pe.ext, "html");
-        assert_eq!(pe.scope, crate::export::ExportScope::MarkedBlock,
-            "a WholeDocument-substituting construction fails here");
-        assert_eq!(pe.origin, origin, "a re-deriving construction stores B");
-        assert_eq!(pe.target.file_name().and_then(|n| n.to_str()), Some("report.html"));
+        let resolved = crate::fsx::resolve_write_destination(&*fs, &d.join("report.html"))
+            .expect("the scratch target resolves");
+        assert_eq!(e.pending_export, Some(crate::export::PendingExport {
+            ext: "html".into(), target: resolved,
+            scope: crate::export::ExportScope::MarkedBlock, origin }),
+            "a WholeDocument-substituting construction fails on scope; a re-deriving one \
+             fails on origin (it stores B); a future field lands in this literal by \
+             compiler force and is constrained from day one");
         // The confirm leg (complements T6's seeded side): dispatch refuses on the switch.
         let (tx2, _rx2) = std::sync::mpsc::channel();
         crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
