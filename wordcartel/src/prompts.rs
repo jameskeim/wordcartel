@@ -975,6 +975,10 @@ mod tests {
     // The happy path THROUGH the confirm: the block's bytes must replace the old artifact.
     #[test]
     fn block_export_confirm_writes_the_block_over_the_old_artifact() {
+        // The arming check is a precondition every other confirm ordering re-establishes, so
+        // nothing survives here without pandoc: the claim IS the bytes that replace "OLD".
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_writes_the_block_over_the_old_artifact") { return; }
         let mut f = crate::test_support::start_block_export_flow("a22-o2", "out.html");
         std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
         f.commit(); // existing -> PendingExport + the overwrite prompt
@@ -1042,6 +1046,10 @@ mod tests {
     // abandoned; a gate that re-derived the origin would accept for the wrong reason.
     #[test]
     fn block_export_confirm_survives_a_switch_away_and_back() {
+        // A latching or re-deriving gate is only distinguishable by what lands on disk — an
+        // acceptance with no bytes to read proves nothing — so this test skips whole.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_survives_a_switch_away_and_back") { return; }
         let mut f = crate::test_support::start_block_export_flow("a22-o8", "out.html");
         std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
         f.commit();
@@ -1060,6 +1068,10 @@ mod tests {
     // confirm, so a mark cleared and then re-drawn elsewhere exports the NEW block.
     #[test]
     fn block_export_confirm_exports_a_mark_redrawn_after_the_commit() {
+        // FLAG-vs-stored-offsets is a claim about WHICH block reaches the artifact: only the
+        // bytes separate the two designs, so the test skips whole rather than weaken to that.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_exports_a_mark_redrawn_after_the_commit") { return; }
         let mut f = crate::test_support::start_block_export_flow("a22-o9", "out.html");
         std::fs::write(f.dir.join("out.html"), b"OLD").expect("existing target");
         f.commit();
@@ -1088,6 +1100,15 @@ mod tests {
         assert!(f.editor.pending_export.is_none());
         f.confirm_export(); // a second confirm must be a no-op
         assert_eq!(f.artifact("out.html"), "OLD");
+        // The double-fire half above is this test's alone (o5 pins the taken pending, never a
+        // repeat) and needs no pandoc — it reads the pre-seeded "OLD" — so the guard sits HERE:
+        // only the retry leg below, whose claim is the overwriting bytes, needs the binary.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_confirm_refusal_is_inert_on_a_repeat_then_a_restart_succeeds \
+             (the restart leg)") {
+            let _ = std::fs::remove_dir_all(&f.dir);
+            return;
+        }
         // Retry from the top, back on A.
         f.editor.switch_to_index(0);
         f.restart_from_write_block("out.html");

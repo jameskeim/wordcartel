@@ -333,8 +333,35 @@ pub(crate) fn scratch_dir(label: &str) -> PathBuf {
 // Everything is the REAL apparatus — real redirect, real picker, real prompt resolution, real
 // pandoc worker, real reducer — so the artifact BYTES are the assertion of record. Nothing
 // here hand-seeds `PendingExport`; the whole point is that the carried scope/origin survive
-// the sequence.
+// the sequence. The one part of that which the host can veto is pandoc itself — hence
+// `pandoc_present_or_skip`, which every byte-asserting leg passes through.
 // ---------------------------------------------------------------------------
+
+/// Portability guard for the legs of the orderings that assert the artifact's BYTES: `true` to
+/// proceed, `false` — after naming the skip on stderr — when this machine has no pandoc.
+///
+/// The fixture injects the commit-arm probe as PRESENT so the WIRING under test never depends on
+/// the host; bytes on disk, though, can only come from a real pandoc. `run_export_with_probe`
+/// states the law ("the merge gate runs on machines without pandoc: a test that depends on the
+/// host having it is an environment assumption that fails the gate rather than the code"), and
+/// `e2e.rs`'s export journey obeys it by asserting the DISPATCH instead. These orderings KEEP the
+/// byte assertions — a block-scoped export writing `BBB` and never `AAA`/`CCC` is the whole point
+/// of A22, and a dispatch-only claim cannot see it — and skip on a machine that cannot run the
+/// check, in the shape `harper_ls_integration.rs` established.
+///
+/// # Examples
+/// ```ignore
+/// if !crate::test_support::pandoc_present_or_skip("block_export_commit_end_to_end") { return; }
+/// ```
+// The skip line prints to stderr and the workspace denies clippy::print_stderr, so allow it here
+// (item-local, house-style exception — a skip message is legitimate test output). Holding the
+// print in ONE helper keeps that to ONE allow instead of one per gated test.
+#[allow(clippy::print_stderr)]
+pub(crate) fn pandoc_present_or_skip(what: &str) -> bool {
+    if crate::export::probe_pandoc() { return true; }
+    eprintln!("skip: {what} \u{2014} no pandoc on PATH (this leg asserts the exported BYTES)");
+    false
+}
 
 /// A ^KW Write-Block flow on buffer A that has already been redirected, leaving the Export
 /// picker open with `scope: MarkedBlock` and `origin: A`. See `start_block_export_flow`.

@@ -2178,6 +2178,10 @@ mod tests {
     // redirect (palette exports hardcode WholeDocument), so nothing else pins these bytes.
     #[test]
     fn block_export_commit_writes_only_the_marked_block_end_to_end() {
+        // Every assertion below reads a SUCCESSFUL export's output, so the whole test skips
+        // without pandoc rather than degrading to a dispatch-only claim that cannot see bytes.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_commit_writes_only_the_marked_block_end_to_end") { return; }
         let mut f = crate::test_support::start_block_export_flow("a22-o1", "out.html");
         f.commit(); // non-existing target -> immediate dispatch
         f.finish_export();
@@ -2247,6 +2251,14 @@ mod tests {
         assert_eq!(f.editor.status_text(), "no marked block \u{2014} export cancelled");
         assert!(f.editor.file_browser.is_none(),
             "the refusal leaves the flow dead — D2's accepted cost");
+        // The refusal half above needs no pandoc and is this test's alone (o3 pins the status
+        // and the absent artifact, not the dead flow), so the guard sits HERE rather than at the
+        // top: only the retry leg, whose whole claim is the retried bytes, needs the binary.
+        if !crate::test_support::pandoc_present_or_skip(
+            "block_export_commit_refusal_then_a_full_restart_succeeds (the restart leg)") {
+            let _ = std::fs::remove_dir_all(&f.dir);
+            return;
+        }
         f.editor.active_mut().marked_block =
             Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
         f.restart_from_write_block("out.html");
