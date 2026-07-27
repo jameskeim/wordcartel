@@ -422,4 +422,44 @@ mod tests {
         assert_eq!(e.active().document.selection, before, "selection unchanged with no block");
         assert!(!e.status_text().is_empty());
     }
+
+    // --- A22: the ^KW origin capture ---
+
+    /// A22 §5.2: `block_write` is where the Write-Block flow's originating buffer is
+    /// captured, and it is the ONLY producer of that value — the redirect carries it and
+    /// dispatch verifies it, so a wrong capture here refuses every downstream block-scoped
+    /// export and write-block with "buffer changed". Drives the real ^KW entry point (not a
+    /// hand-constructed purpose), in a buffer that is deliberately NOT the first, so a
+    /// capture of a constant or of `buffers[0]` is caught as well as an off-by-one.
+    /// FAIL-VERIFY: replace the capture with `BufferId(9999)` — both assertions fail.
+    #[test]
+    fn block_write_captures_the_buffer_the_block_is_marked_in() {
+        let dir = crate::test_support::scratch_dir("a22-kw-origin");
+        let path = dir.join("second.md");
+        std::fs::write(&path, "AAA\nBBB\nCCC\n").expect("fixture file");
+        let mut e = Editor::new_from_text("first buffer body\n", None, (80, 24));
+        let fs = crate::test_support::test_fs();
+        let first = e.active().id;
+        crate::workspace::open_as_new_buffer(&mut e, &*fs, &path);
+        let origin = e.active().id;
+        assert_ne!(origin, first, "fixture: ^KW fires in a buffer that is not the first");
+        e.active_mut().marked_block = Some(MarkedBlock { start: 4, end: 8, hidden: false });
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::blocks_marked::block_write(&mut e, &fs, &tx);
+        let purpose = match &e.file_browser.as_ref().expect("^KW opens the picker").mode {
+            crate::file_browser::BrowseMode::Destination { purpose, .. } => purpose.clone(),
+            other => panic!("expected a destination picker, got {other:?}"),
+        };
+        assert_eq!(purpose, crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            "the captured origin must be the buffer the block is marked in");
+        // …and the captured value must be USABLE, not merely well-typed: feed it to the
+        // dispatch-side reader the redirect will hand it to.
+        let crate::file_browser::DestinationPurpose::WriteBlock { origin: captured } = purpose
+            else { panic!("^KW must seed a WriteBlock purpose") };
+        assert_eq!(
+            crate::export::resolve_export_input(&e, crate::export::ExportScope::MarkedBlock,
+                captured),
+            Ok("BBB\n".to_owned()),
+            "a wrongly-captured origin resolves to Err(BufferChanged) instead");
+    }
 }

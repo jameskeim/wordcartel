@@ -1152,8 +1152,8 @@ mod tests {
     #[test]
     fn each_picker_mode_is_titled_for_what_it_actually_does() {
         let dir = std::env::temp_dir().join(format!("wc-render-title-{}", std::process::id()));
-        // The table is built BEFORE the per-case editor exists, and the title match reads
-        // neither `origin` nor `scope` — a synthetic id is the honest stand-in here.
+        // The table is built BEFORE the per-case editor exists, so no real buffer id is in
+        // hand — a synthetic one is inert here: the title never reads `origin`.
         let origin = crate::editor::BufferId(0);
         let cases: [(BrowseMode, &str, &str); 5] = [
             (BrowseMode::Select, "Open:", "Save"),

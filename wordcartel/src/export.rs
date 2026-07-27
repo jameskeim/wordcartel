@@ -203,7 +203,7 @@ fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<
 /// already set). The refusal tests assert on this return — "no worker was spawned" is
 /// otherwise unprovable without racing the scheduler. Production callers discard it
 /// (deliberately NOT #[must_use] — the refusal has already surfaced its status).
-#[allow(clippy::too_many_arguments)] // the full dispatch context in one place — mirrors redirect_to_export's allow
+#[allow(clippy::too_many_arguments)] // full dispatch context in one place — as redirect_to_export
 pub(crate) fn do_export(
     editor: &mut crate::editor::Editor,
     ext: &str,
@@ -591,8 +591,6 @@ mod tests {
     // T11 — the reason scope is a FLAG: the read follows the funnel's remap.
     #[test]
     fn resolve_export_input_reads_the_remapped_mark_not_stored_offsets() {
-        struct TestClock(u64);
-        impl wordcartel_core::history::Clock for TestClock { fn now_ms(&self) -> u64 { self.0 } }
         let mut e = crate::editor::Editor::new_from_text("hello world\n", None, (40, 10));
         let id = e.active().id;
         e.active_mut().marked_block =
@@ -601,7 +599,8 @@ mod tests {
         let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "pre ".into())], doc_len);
         let txn = wordcartel_core::history::Transaction::new(cs)
             .with_selection(wordcartel_core::selection::Selection::single(0));
-        let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(0));
+        let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other,
+            &crate::test_support::TestClock(0));
         assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id),
             Ok("world".to_owned()),
             "a stored-offsets design still slices [6,11) of 'pre hello world\\n' = 'llo w'");
