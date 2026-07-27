@@ -1916,13 +1916,39 @@ mod tests {
         (e, fs, ex, clk, tx, rx, origin, d)
     }
 
+    /// A22 T12 — a BOUNDED drain to channel disconnect; reports whether any message matched
+    /// `pred`. Bounded on purpose, twice over: the fixture's pickers send LISTING messages
+    /// through the same `tx`, so a bare `recv()`/`try_recv()` misreads a CORRECT
+    /// implementation and the drain has to run to disconnect — but an UNBOUNDED drain would
+    /// HANG rather than fail if a future path ever leaked a `Sender<Msg>` clone into
+    /// something long-lived, and a hang in CI is worse than a red assertion. Callers do no
+    /// work once the drain begins, so `DEADLINE` is unreachable on any machine that is not
+    /// already broken.
+    fn drained_any(rx: &std::sync::mpsc::Receiver<crate::app::Msg>,
+        pred: impl Fn(&crate::app::Msg) -> bool) -> bool
+    {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        let stop = std::time::Instant::now() + DEADLINE;
+        let mut hit = false;
+        loop {
+            let left = stop.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(m) => hit |= pred(&m),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return hit,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "the Msg channel never disconnected within {DEADLINE:?} \u{2014} a \
+                     Sender<Msg> clone outlived the flow; this drain must go RED, not hang"),
+            }
+        }
+    }
+
     // A22 T12a — scope hand-off, no-overwrite path. A commit arm hardcoding WholeDocument
     // into the do_export call DISPATCHES here (no refusal status) and fails the equality.
-    // NOTE the channel: the fixture's pickers send LISTING messages through the same tx,
-    // so a bare `recv().is_err()` fails on a CORRECT implementation — drain to disconnect
-    // and assert no ExportDone specifically (still deterministic: our tx is dropped, and
-    // the only other senders — listing threads, plus a wrongly-spawned worker — each send
-    // and drop in bounded time).
+    // NOTE the channel: the fixture's pickers send LISTING messages through the same tx, so
+    // a bare `recv().is_err()` fails on a CORRECT implementation — drain (bounded, see
+    // `drained_any`) and assert no ExportDone specifically. Still deterministic: our tx is
+    // dropped, and the only other senders — listing threads, plus a wrongly-spawned worker
+    // — each send and drop in bounded time.
     #[test]
     fn export_commit_arm_forwards_the_carried_block_scope() {
         let (mut e, fs, ex, clk, tx, rx, _origin, d) = redirected_block_export("a22-t12a");
@@ -1931,8 +1957,9 @@ mod tests {
             &mut e, &fs, &ex, &clk, &tx, || true); // Enter on "report.html", non-existing
         assert_eq!(e.status_text(), "no marked block \u{2014} export cancelled");
         drop(tx);
-        assert!(!rx.iter().any(|m| matches!(m, crate::app::Msg::ExportDone { .. })),
-            "no worker may have been dispatched (listing messages are expected; ExportDone is not)");
+        assert!(!drained_any(&rx, |m| matches!(m, crate::app::Msg::ExportDone { .. })),
+            "no worker may have been dispatched (listing messages are expected; \
+             ExportDone is not)");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1949,7 +1976,8 @@ mod tests {
         assert_eq!(e.status_text(), "buffer changed \u{2014} export cancelled",
             "re-derivation reads 'no marked block — export cancelled' instead");
         drop(tx);
-        assert!(!rx.iter().any(|m| matches!(m, crate::app::Msg::ExportDone { .. })));
+        assert!(!drained_any(&rx, |m| matches!(m, crate::app::Msg::ExportDone { .. })),
+            "no worker may have been dispatched");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1986,9 +2014,9 @@ mod tests {
             "a MarkedBlock-hardcoding construction fails the whole-value equality");
         crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
             &ex, &clk, &tx, &crate::test_support::test_fs());
-        drop(tx); // rx.iter() runs to channel disconnect — it would deadlock while the
-                  // test still held a sender.
-        assert!(rx.iter().any(|m| matches!(m,
+        drop(tx); // the drain runs to channel disconnect — it would stall out against its
+                  // deadline while the test still held a sender.
+        assert!(drained_any(&rx, |m| matches!(m,
             crate::app::Msg::ExportDone { scope: crate::export::ExportScope::WholeDocument, .. })),
             "the confirmed whole-document export must dispatch; a MarkedBlock-carrying \
              pending would refuse (no mark exists in this fixture)");
