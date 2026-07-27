@@ -122,7 +122,7 @@ field types satisfy them.
 ### 4.3 `PendingExport` — `wordcartel/src/export.rs`
 
 ```rust
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingExport {
     pub ext: String,
     pub target: PathBuf,
@@ -130,6 +130,13 @@ pub struct PendingExport {
     pub origin: crate::editor::BufferId,
 }
 ```
+
+`PartialEq, Eq` are ADDED to the existing `Debug, Clone` (spec gate round 6): T12c asserts
+whole-value equality on `Option<PendingExport>`, which does not compile without them. All four
+field types satisfy both (`String`, `PathBuf`, `ExportScope` per §4.1, and `BufferId`, whose
+derives already include `PartialEq, Eq`). Whole-value equality is preferred over four
+field-by-field assertions because T12c's purpose is to prove the commit arm forwards the WHOLE
+struct — a field-wise assertion would silently stop constraining any field a future change adds.
 
 Set at one production site (`commit_destination`'s Export arm), consumed at one
 (`PromptAction::OverwriteExport`). The existing whole-value clears (`Esc` in
