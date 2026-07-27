@@ -1874,6 +1874,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // ---- A22 T12 — the Export commit arm's scope/origin CARRIAGE ------------------
+    //
+    // Every other export test leaves the `purpose -> commit arm -> do_export/PendingExport`
+    // hand-off free: an arm that hardcoded `WholeDocument`, or that re-captured
+    // `active().id` instead of carrying `origin`, would stay green while exporting the
+    // wrong bytes or laundering a buffer switch. These four cases are the discriminator.
+
+    /// `(editor, fs, ex, clk, tx, rx, origin, dir)` — the whole apparatus a commit needs.
+    /// Aliased to preempt `clippy::type_complexity` under the deny gate (no `#[allow]`),
+    /// the same way `editor::FoldViewCache` is.
+    type RedirectedExport = (crate::editor::Editor,
+        std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+        crate::jobs::InlineExecutor, crate::test_support::TestClock,
+        std::sync::mpsc::Sender<crate::app::Msg>,
+        std::sync::mpsc::Receiver<crate::app::Msg>,
+        crate::editor::BufferId, std::path::PathBuf);
+
+    /// A22 T12 shared fixture: a REAL redirect from a ^KW flow on buffer A — the value under
+    /// test is the carried one, never hand-seeded. The Export picker is left open with field
+    /// "report.html"; see `RedirectedExport` for what comes back.
+    fn redirected_block_export(name: &str) -> RedirectedExport {
+        let d = tmp(name);
+        let mut e = crate::editor::Editor::new_from_text("AAA\nBBB\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false });
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            d.clone(), "report.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true); // the redirect
+        assert!(matches!(&e.file_browser.as_ref().expect("export picker").mode,
+            crate::file_browser::BrowseMode::Destination { purpose:
+                crate::file_browser::DestinationPurpose::Export { .. }, .. }));
+        (e, fs, ex, clk, tx, rx, origin, d)
+    }
+
+    // A22 T12a — scope hand-off, no-overwrite path. A commit arm hardcoding WholeDocument
+    // into the do_export call DISPATCHES here (no refusal status) and fails the equality.
+    // NOTE the channel: the fixture's pickers send LISTING messages through the same tx,
+    // so a bare `recv().is_err()` fails on a CORRECT implementation — drain to disconnect
+    // and assert no ExportDone specifically (still deterministic: our tx is dropped, and
+    // the only other senders — listing threads, plus a wrongly-spawned worker — each send
+    // and drop in bounded time).
+    #[test]
+    fn export_commit_arm_forwards_the_carried_block_scope() {
+        let (mut e, fs, ex, clk, tx, rx, _origin, d) = redirected_block_export("a22-t12a");
+        crate::blocks_marked::block_clear(&mut e); // flip the mark-present conjunct
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true); // Enter on "report.html", non-existing
+        assert_eq!(e.status_text(), "no marked block \u{2014} export cancelled");
+        drop(tx);
+        assert!(!rx.iter().any(|m| matches!(m, crate::app::Msg::ExportDone { .. })),
+            "no worker may have been dispatched (listing messages are expected; ExportDone is not)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A22 T12b — origin hand-off, no-overwrite path. A re-deriving commit arm (origin :=
+    // active().id) LAUNDERS the switch: verification passes against B, the mark re-read
+    // refuses "no marked block — export cancelled" — a DIFFERENT exact string.
+    #[test]
+    fn export_commit_arm_forwards_the_carried_origin() {
+        let (mut e, fs, ex, clk, tx, rx, origin, d) = redirected_block_export("a22-t12b");
+        crate::workspace::new_empty_buffer(&mut e); // switch to unmarked B
+        assert_ne!(e.active().id, origin);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        assert_eq!(e.status_text(), "buffer changed \u{2014} export cancelled",
+            "re-derivation reads 'no marked block — export cancelled' instead");
+        drop(tx);
+        assert!(!rx.iter().any(|m| matches!(m, crate::app::Msg::ExportDone { .. })));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A22 T12's OPPOSITE scope value, no-overwrite path, is covered by the MIGRATED
+    // `export_commits_end_to_end_from_enter_through` below: a commit arm hardcoding
+    // MarkedBlock would refuse that WholeDocument flow (no mark exists) and its bounded
+    // ExportDone receive would time out. The overwrite-path opposite needs its own case:
+
+    // A22 T12d — WholeDocument overwrite construction. A construction hardcoding MarkedBlock
+    // fails the whole-value equality; its confirm leg would then refuse where dispatch is
+    // required, so the bounded receive doubles the discrimination.
+    #[test]
+    fn export_commit_arm_builds_whole_document_pending_export_too() {
+        let d = tmp("a22-t12d");
+        let mut e = crate::editor::Editor::new_from_text("AAA\n", None, (80, 24));
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = crate::test_support::TestClock(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+            std::sync::Arc::new(crate::fsx::RealFs);
+        let origin = e.active().id;
+        std::fs::write(d.join("out.html"), b"OLD").expect("existing target");
+        e.open_destination_picker(&fs, &tx,
+            crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                scope: crate::export::ExportScope::WholeDocument, origin },
+            d.clone(), "out.html".into());
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        let resolved = crate::fsx::resolve_write_destination(&*fs, &d.join("out.html"))
+            .expect("the scratch target resolves");
+        assert_eq!(e.pending_export, Some(crate::export::PendingExport {
+            ext: "html".into(), target: resolved,
+            scope: crate::export::ExportScope::WholeDocument, origin }),
+            "a MarkedBlock-hardcoding construction fails the whole-value equality");
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &clk, &tx, &crate::test_support::test_fs());
+        drop(tx); // rx.iter() runs to channel disconnect — it would deadlock while the
+                  // test still held a sender.
+        assert!(rx.iter().any(|m| matches!(m,
+            crate::app::Msg::ExportDone { scope: crate::export::ExportScope::WholeDocument, .. })),
+            "the confirmed whole-document export must dispatch; a MarkedBlock-carrying \
+             pending would refuse (no mark exists in this fixture)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A22 T12c — PendingExport construction, overwrite path. The switch makes carried and
+    // re-derived origins DIFFER at construction time (the Export arm has no commit-time
+    // verify). WHOLE-VALUE equality per spec §4.3: a field-wise assertion would silently
+    // stop constraining any field a future change adds. The expected `target` is computed
+    // by the SAME production resolver the commit path uses, so a symlinked scratch dir
+    // cannot fail the path axis for a non-carriage reason.
+    #[test]
+    fn export_commit_arm_builds_pending_export_from_the_carried_purpose() {
+        let (mut e, fs, ex, clk, tx, _rx, origin, d) = redirected_block_export("a22-t12c");
+        std::fs::write(d.join("report.html"), b"OLD").expect("existing target");
+        crate::workspace::new_empty_buffer(&mut e);
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut e, &fs, &ex, &clk, &tx, || true);
+        let resolved = crate::fsx::resolve_write_destination(&*fs, &d.join("report.html"))
+            .expect("the scratch target resolves");
+        assert_eq!(e.pending_export, Some(crate::export::PendingExport {
+            ext: "html".into(), target: resolved,
+            scope: crate::export::ExportScope::MarkedBlock, origin }),
+            "a WholeDocument-substituting construction fails on scope; a re-deriving one \
+             fails on origin (it stores B); a future field lands in this literal by \
+             compiler force and is constrained from day one");
+        // The confirm leg (complements T6's seeded side): dispatch refuses on the switch.
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
+            &ex, &clk, &tx2, &crate::test_support::test_fs());
+        assert_eq!(e.status_text(), "buffer changed \u{2014} export cancelled");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn export_commits_end_to_end_from_enter_through() {
         // Decision 4: a bare Enter on the PRE-SEEDED picker must reproduce today's
