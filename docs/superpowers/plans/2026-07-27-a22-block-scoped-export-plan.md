@@ -245,7 +245,10 @@ In `prompts.rs` tests (T6):
         let ex = crate::jobs::InlineExecutor::default();
         crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport, &mut e,
             &ex, &crate::test_support::TestClock(0), &tx, &crate::test_support::test_fs());
-        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        // matches!, not is_ok: the requirement is "yields an ExportDone", not "yields
+        // some message" (no picker is open here, but assert the class, not the count).
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(crate::app::Msg::ExportDone { .. })),
             "the confirm path must dispatch when scope's conjuncts all hold");
     }
 ```
@@ -775,9 +778,12 @@ a WriteBlock twin — same `row2_enter_onto`-style fixture but the picker opened
 purpose is `Export { ext: "docx", scope: MarkedBlock, origin }` and:
 
 ```rust
-        assert!(e.status_text().ends_with("is a docx file — opening Export for the marked block"),
-            "surface 1 Row-2: scope-blind wording says 'opening Export instead': {:?}",
-            e.status_text());
+        // Exact, path included (spec §6.1 — ends_with would tolerate a mangled path
+        // prefix). `raw` at the Row-2 site is dir.join(name), pre-resolution.
+        assert_eq!(e.status_text(), format!(
+            "{} is a docx file — opening Export for the marked block",
+            d.join("report.docx").display()),
+            "surface 1 Row-2: scope-blind wording says 'opening Export instead'");
 ```
 
 T9 (rendered): extend `each_picker_mode_is_titled_for_what_it_actually_does`'s case table —
@@ -797,8 +803,57 @@ the painter never reads it:
 
 (The WholeDocument row's `forbidden` string `"(marked block)"` rules out an implementation
 that stamps the marker on every export title; the MarkedBlock row rules out one that never
-stamps it.) Plus a footer paint test in the same module, using the module's harness
-(`empty_destination_fb` / `paint_file_browser` / `row_text`):
+stamps it.)
+
+The table's contains-checks are WEAKER than the spec's byte-for-byte requirement on the
+WholeDocument title (plan-gate round 2) — so add a dedicated exact-ROW test beside it, both
+scopes, whole painted row (border glyphs, title, fill, and the cells outside the box):
+
+```rust
+    // Spec §6.1 surface 3 EXACTLY: the WholeDocument title byte-for-byte (any drift —
+    // wording, dir text, stray marker — fails), and the MarkedBlock title likewise. The
+    // expected row is CONSTRUCTED (corner + title + fill + corner, per Borders::ALL),
+    // so this asserts the whole screen row, not a fragment.
+    #[test]
+    fn export_titles_render_byte_for_byte_per_scope() {
+        let dir = std::env::temp_dir().join(format!("wc-a22-title-{}", std::process::id()));
+        let origin = crate::editor::BufferId(1); // tuple field is pub; the painter never reads it
+        for (scope, title_fmt) in [
+            (crate::export::ExportScope::WholeDocument,
+                format!(" Export .pdf to: {} ", dir.display())),
+            (crate::export::ExportScope::MarkedBlock,
+                format!(" Export .pdf (marked block) to: {} ", dir.display())),
+        ] {
+            let mut e = Editor::new_from_text("x\n", None, (80, 24));
+            let mut fb = empty_destination_fb(dir.clone(), "");
+            fb.mode = BrowseMode::Destination { purpose: DestinationPurpose::Export {
+                ext: "pdf".into(), scope, origin }, field: String::new(), field_cursor: 0 };
+            e.file_browser = Some(fb);
+            crate::derive::rebuild(&mut e);
+            let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
+            let r = drawn_box_rect(&term);
+            let fill = (r.width as usize).saturating_sub(2 + title_fmt.chars().count());
+            let expected = format!("{}\u{250c}{title_fmt}{}\u{2510}{}",
+                " ".repeat(r.x as usize),
+                "\u{2500}".repeat(fill),
+                " ".repeat(80usize.saturating_sub(r.x as usize + r.width as usize)));
+            assert_eq!(row_text(&term, r.y), expected,
+                "{scope:?}: the whole painted title row must match byte-for-byte");
+        }
+    }
+```
+
+(If the drawn corners/fill differ from the plain `┌ ─ ┐` set — a themed border — read the
+glyphs the harness's other exact assertions use and substitute; the STRUCTURE of the
+assertion, whole-row equality against a constructed expectation, is the requirement.)
+
+Plus a footer test in the same module, using the module's harness (`empty_destination_fb` /
+`paint_file_browser` / `row_text`). Two layers per the spec: the STRING is asserted exactly
+at its single source (`footer_target` — spec §6.1 surface 2's full wording, path included),
+and the frame check proves it reaches the screen (the spec's own stated frame assertion is
+`contains` — the painted footer may be shared with disclosure lines):
 
 ```rust
     // T9 footer — the pre-commit surface reaches the SCREEN (C5: render, don't assert the
@@ -816,6 +871,16 @@ stamps it.) Plus a footer paint test in the same module, using the module's harn
         e.file_browser = Some(fb);
         crate::derive::rebuild(&mut e);
         let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        // Layer 1 — the STRING, exact at its single source (spec §6.1 surface 2, full
+        // wording, path included): substring drift anywhere in the note fails here.
+        let footer = crate::file_browser::footer_target(&crate::fsx::RealFs,
+            e.file_browser.as_ref().unwrap());
+        assert_eq!(footer.as_deref(), Some(format!(
+            "\u{2192} {} \u{2014} html is an export format (exports the marked block)",
+            dir.join("notes.html").display()).as_str()));
+        // Layer 2 — it reaches the SCREEN (C5; the spec's frame assertion is contains —
+        // the footer row is shared real estate with disclosure lines and may elide a
+        // long path's left end).
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
         term.draw(|f| paint_file_browser(f, &mut e, &cs)).expect("draw");
         let all: String = (0..24).map(|y| row_text(&term, y)).collect::<Vec<_>>().join("\n");
