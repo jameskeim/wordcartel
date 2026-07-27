@@ -477,13 +477,44 @@ surface**, argued rather than asserted:
   therefore does not attach; there is nothing to set.
 - Palette (law 3), menu (law 4), keybindings/hints (law 7): membership and hints are untouched.
   ^KW's binding to `block_write` is unchanged.
-- **The law-10 shadow, stated openly:** after this effort, a block-scoped export exists as a
-  capability reachable by NO command — only via the ^KW → redirect path. That is not a
-  violation (the laws govern commands and options that exist; law 10's test is "should a plugin
-  ever be able to do this?", and answering yes would mean *adding* `export_*_block` commands or
-  a post-P parameterized export). Making block-scoped export plugin-reachable is a deliberate
-  future act with full contract consequences (laws 3, 4, 8, 10) — out of A22-as-bug, and
-  recorded here so the contract's history is not surprised by it later.
+
+### 9.1 Law 10 — answered directly, not deferred
+
+Law 10's test is *"should a plugin ever be able to do this?"* — and for block-scoped export the
+answer is **yes, and it already can.** No new command is required to make that true.
+
+**The governing fact:** `block_write` is a registered command —
+`registry.rs`: `r.register("block_write", "Write Block to File…", Some(MenuCategory::Block), …)`,
+also bound to ^KW. A plugin dispatches it through `Registry::dispatch` exactly as it dispatches
+any other command; that opens the Write-Block destination picker, and a pandoc-producible
+extension in that picker is precisely the path this effort makes block-scoped.
+
+**The parity that settles it:** the four `export_*` commands do **not** give a plugin a
+parameterized export either. `export::run_export` opens the Export destination picker; the
+destination is chosen interactively. Commands are nullary today (law 10 says so explicitly:
+"Commands stay **nullary** today; parameterized set-value commands … are an Effort-P concern").
+So whole-document export's plugin reachability is *"dispatch a command, a picker opens"* — and
+after this effort block-scoped export's plugin reachability is the same sentence with a
+different command name. The two capabilities are equally reachable, by construction.
+
+**Therefore this effort adds no capability that lacks a command.** It changes what an existing
+command's flow *produces* (a block-scoped artifact rather than a whole-document one when the
+writer redirects), not what surface exists to invoke it. `block_write` is the command; it was
+registered before this effort and is unmodified by it.
+
+**What would be a law-10 event, and is deliberately not in this effort:** a *parameterized*
+block export — a plugin naming both the scope and the destination without a picker. That is the
+same post-P parameterization law 10 already contemplates for set-value commands, and it applies
+equally to `export_html` today. If it is ever built, it is built for whole-document and
+block-scoped export together, as one deliberate act with full contract consequences (laws 3, 4,
+8, 10). Recorded here so the contract's History is not surprised by it later.
+
+**Review note (spec gate round 1).** Codex read the earlier draft of this section as conceding
+"a capability reachable by NO command" and correctly called that a law-10 violation. The
+concession was the draft's error, not the design's: it was written without `registry.rs:435` in
+view. The corrected reading above is the human-adjudicated resolution (decision D5) — Codex's
+finding is accepted as valid against the text it reviewed, and answered on the evidence rather
+than by adding commands (which would be the excluded Option E) or by amending the contract.
 
 ---
 
