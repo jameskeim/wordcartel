@@ -2162,6 +2162,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // ---- A22 ORDERINGS — the COMMIT dispatch moment, end to end -------------------
+    //
+    // Adopted from the whole-branch gate's orderings probes: the sequences that cross the
+    // TWO dispatch moments (this commit arm; the overwrite confirm) and the TWO invalidation
+    // vectors (the mark cleared; the active buffer switched) — which no single task's tests
+    // could reach. Each drives the REAL flow: ^KW picker -> real redirect -> real Export
+    // picker -> real commit -> real pandoc -> `Msg::ExportDone` through the REAL reducer ->
+    // bytes read back off disk. The confirm-moment half lives in `prompts.rs` beside the
+    // overwrite-confirm tests it exercises; the shared fixture is
+    // `test_support::BlockExportFlow`.
+
+    // The PRIMARY flow the block scope exists for: no invalidation, non-existing target,
+    // dispatch straight off the commit arm. MarkedBlock scope is producible ONLY via this
+    // redirect (palette exports hardcode WholeDocument), so nothing else pins these bytes.
+    #[test]
+    fn block_export_commit_writes_only_the_marked_block_end_to_end() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o1", "out.html");
+        f.commit(); // non-existing target -> immediate dispatch
+        f.finish_export();
+        // The durable truth: a successful block export produces the scope-keyed completion
+        // wording. A whole-document-degrading dispatch reads "exported {target}" instead.
+        assert!(f.editor.status_history().entries().iter()
+            .any(|s| s.text().starts_with("exported block to ")),
+            "the scope-keyed completion status must be produced by a successful block export");
+        // KNOWN BEHAVIOUR, PINNED — NOT the behaviour we want. Backlog item A24: a Sticky
+        // Warning that OPENS a flow is never retired when that flow succeeds, so A17's Q1
+        // rule (a Warning occupant holds the slot against a later Info candidate) leaves the
+        // redirect's warning on screen and the completion Info lands in history only. The
+        // wording above is therefore unreachable in the live app today. Whoever fixes the A24
+        // status law lands HERE: swap this expectation for the completion wording.
+        assert_eq!(f.editor.status_text(),
+            "html is an export format \u{2014} opening Export for the marked block",
+            "A24: the redirect's Sticky Warning still occupies the slot after success");
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB"), "the marked block must be in the artifact: {html}");
+        assert!(!html.contains("AAA") && !html.contains("CCC"),
+            "whole-document bytes leaked into a block-scoped export: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // Invalidation vector 1 before the FIRST dispatch moment. Unlike the T12a twin (which
+    // asserts the same refusal off a hand-driven commit), this one also proves the negative
+    // on DISK: a scope-degrading dispatch would have written a whole-document artifact.
+    #[test]
+    fn block_export_commit_refuses_when_the_mark_was_cleared() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o3", "out.html");
+        crate::blocks_marked::block_clear(&mut f.editor);
+        f.commit();
+        assert_eq!(f.editor.status_text(), "no marked block \u{2014} export cancelled");
+        assert!(!f.dir.join("out.html").exists(), "a refusal must write nothing");
+        let dir = f.dir.clone();
+        f.assert_no_export_done();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Invalidation vector 2 before the FIRST dispatch moment, with B MARKED — the wrong-bytes
+    // discriminator. An origin-skipping dispatch passes the mark re-read against B and
+    // exports B's block; only the exact status and the absent artifact catch it.
+    #[test]
+    fn block_export_commit_refuses_on_a_buffer_switch_even_when_b_is_marked() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o4", "out.html");
+        crate::workspace::new_empty_buffer(&mut f.editor);
+        f.editor.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        f.commit();
+        assert_eq!(f.editor.status_text(), "buffer changed \u{2014} export cancelled",
+            "an origin-skipping dispatch would have exported B's block");
+        assert!(!f.dir.join("out.html").exists());
+        let dir = f.dir.clone();
+        f.assert_no_export_done();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Refusal-then-retry. D2's accepted cost is that a refusal kills the flow outright, so
+    // the retry has to start over from the ^KW shape — pinned here so a future change that
+    // makes the refusal survivable (or that leaves stale carried state behind) is noticed by
+    // whichever half of this test stops holding.
+    #[test]
+    fn block_export_commit_refusal_then_a_full_restart_succeeds() {
+        let mut f = crate::test_support::start_block_export_flow("a22-o10", "out.html");
+        crate::blocks_marked::block_clear(&mut f.editor);
+        f.commit(); // refusal #1
+        assert_eq!(f.editor.status_text(), "no marked block \u{2014} export cancelled");
+        assert!(f.editor.file_browser.is_none(),
+            "the refusal leaves the flow dead — D2's accepted cost");
+        f.editor.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
+        f.restart_from_write_block("out.html");
+        f.commit(); // the redirect, again
+        f.commit(); // Enter on the Export picker -> dispatch
+        f.finish_export();
+        // (The A24 slot suppression documented above applies here too — assert the bytes.)
+        let html = f.artifact("out.html");
+        assert!(html.contains("BBB") && !html.contains("AAA"),
+            "the retried flow must still be block-scoped: {html}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     #[test]
     fn an_empty_field_with_no_highlight_commits_nothing() {
         let d = tmp("nothing");

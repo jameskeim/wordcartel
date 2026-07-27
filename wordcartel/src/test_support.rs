@@ -319,6 +319,150 @@ pub(crate) fn scratch_dir(label: &str) -> PathBuf {
     d
 }
 
+// ---------------------------------------------------------------------------
+// A22 — the block-scoped export flow, mid-flight: the ORDERINGS fixture.
+//
+// The ^KW -> redirect -> Export flow has TWO dispatch moments living in TWO modules — the
+// commit arm (`file_browser_commit`) and the overwrite confirm (`prompts`) — and two ways to
+// invalidate the captured context between them (the mark cleared, the active buffer
+// switched). The orderings ACROSS those moments are what no single task's tests could reach,
+// so they are driven from both modules through this one shared fixture. It lives here rather
+// than in either `mod tests` for the reason `press_key_fb` does: a helper inside a
+// `#[cfg(test)] mod tests` is unreachable from another module's tests.
+//
+// Everything is the REAL apparatus — real redirect, real picker, real prompt resolution, real
+// pandoc worker, real reducer — so the artifact BYTES are the assertion of record. Nothing
+// here hand-seeds `PendingExport`; the whole point is that the carried scope/origin survive
+// the sequence.
+// ---------------------------------------------------------------------------
+
+/// A ^KW Write-Block flow on buffer A that has already been redirected, leaving the Export
+/// picker open with `scope: MarkedBlock` and `origin: A`. See `start_block_export_flow`.
+pub(crate) struct BlockExportFlow {
+    pub(crate) editor: crate::editor::Editor,
+    pub(crate) fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    pub(crate) ex: crate::jobs::InlineExecutor,
+    pub(crate) clk: TestClock,
+    pub(crate) tx: std::sync::mpsc::Sender<crate::app::Msg>,
+    pub(crate) rx: std::sync::mpsc::Receiver<crate::app::Msg>,
+    /// Buffer A's id — the origin captured at ^KW and carried through the redirect.
+    pub(crate) origin: crate::editor::BufferId,
+    /// The scratch directory the picker points at. Callers remove it when done, per the
+    /// house cleanup convention (a failing test then keeps its artifacts for inspection).
+    pub(crate) dir: std::path::PathBuf,
+}
+
+/// Open a ^KW Write-Block picker on buffer A — text `"AAA\nBBB\nCCC\n"` with `"BBB\n"`
+/// marked — into a fresh scratch dir with `field` typed, then commit ONCE so the export-format
+/// extension redirects into the Export picker. `field` must name an export format (e.g.
+/// `"out.html"`), which is what makes the commit redirect rather than write.
+///
+/// # Examples
+/// ```ignore
+/// let mut f = crate::test_support::start_block_export_flow("o1", "out.html");
+/// f.commit();              // non-existing target -> immediate dispatch
+/// f.finish_export();
+/// assert!(f.artifact("out.html").contains("BBB"));
+/// ```
+pub(crate) fn start_block_export_flow(label: &str, field: &str) -> BlockExportFlow {
+    let dir = scratch_dir(label);
+    let mut editor = crate::editor::Editor::new_from_text("AAA\nBBB\nCCC\n", None, (80, 24));
+    let ex = crate::jobs::InlineExecutor::default();
+    let clk = TestClock(0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
+        std::sync::Arc::new(crate::fsx::RealFs);
+    let origin = editor.active().id;
+    editor.active_mut().marked_block =
+        Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
+    editor.open_destination_picker(&fs, &tx,
+        crate::file_browser::DestinationPurpose::WriteBlock { origin },
+        dir.clone(), field.to_owned());
+    // Enter on e.g. "out.html" -> ExtVerdict::Redirect -> the real `redirect_to_export`.
+    crate::file_browser_commit::commit_destination_with_probe(
+        &mut editor, &fs, &ex, &clk, &tx, || true);
+    match &editor.file_browser.as_ref().expect("the redirect reopens as Export").mode {
+        crate::file_browser::BrowseMode::Destination { purpose, .. } => assert_eq!(purpose,
+            &crate::file_browser::DestinationPurpose::Export { ext: "html".into(),
+                scope: crate::export::ExportScope::MarkedBlock, origin },
+            "precondition: the redirect carried scope+origin"),
+        other => panic!("expected destination mode, got {other:?}"),
+    }
+    BlockExportFlow { editor, fs, ex, clk, tx, rx, origin, dir }
+}
+
+impl BlockExportFlow {
+    /// Enter on the open picker, pandoc injected PRESENT so the gate machine's real pandoc
+    /// (or its absence) never decides the outcome of the wiring under test.
+    pub(crate) fn commit(&mut self) {
+        crate::file_browser_commit::commit_destination_with_probe(
+            &mut self.editor, &self.fs, &self.ex, &self.clk, &self.tx, || true);
+    }
+
+    /// [O]verwrite on the export overwrite-confirm modal — the SECOND dispatch moment.
+    pub(crate) fn confirm_export(&mut self) {
+        crate::prompts::resolve_prompt(crate::prompt::PromptAction::OverwriteExport,
+            &mut self.editor, &self.ex, &self.clk, &self.tx, &self.fs);
+    }
+
+    /// Re-open the ^KW Write-Block picker on the SAME origin — the restart leg of the
+    /// refusal-then-retry orderings, which begin again from the ^KW shape.
+    pub(crate) fn restart_from_write_block(&mut self, field: &str) {
+        let origin = self.origin;
+        self.editor.open_destination_picker(&self.fs, &self.tx,
+            crate::file_browser::DestinationPurpose::WriteBlock { origin },
+            self.dir.clone(), field.to_owned());
+    }
+
+    /// Wait for the worker's `Msg::ExportDone` (skipping the pickers' listing traffic on the
+    /// same channel), then feed it through the REAL reducer so `apply_export_done` writes and
+    /// renames the artifact. Bounded: a lost message fails, never hangs.
+    pub(crate) fn finish_export(&mut self) {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+        let stop = std::time::Instant::now() + DEADLINE;
+        loop {
+            let left = stop.saturating_duration_since(std::time::Instant::now());
+            let msg = self.rx.recv_timeout(left)
+                .expect("an ExportDone must arrive within the deadline");
+            if matches!(msg, crate::app::Msg::ExportDone { .. }) {
+                let reg = crate::registry::Registry::builtins();
+                let (km, _) =
+                    crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+                crate::app::reduce(msg, &mut self.editor, &reg, &km, &self.ex, &self.clk,
+                    &self.tx, &self.fs);
+                return;
+            }
+        }
+    }
+
+    /// Consume the flow, dropping its sender and draining to disconnect: asserts that NO
+    /// worker was ever dispatched. Bounded for the reason `drained_any` documents — an
+    /// unbounded drain would HANG rather than fail if a `Sender<Msg>` clone ever outlived
+    /// the flow, and a hang in CI is worse than a red assertion.
+    pub(crate) fn assert_no_export_done(self) {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+        drop(self.tx);
+        let stop = std::time::Instant::now() + DEADLINE;
+        loop {
+            let left = stop.saturating_duration_since(std::time::Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(m) => assert!(!matches!(m, crate::app::Msg::ExportDone { .. }),
+                    "a worker was dispatched on a refused ordering"),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "the Msg channel never disconnected within {DEADLINE:?} \u{2014} a \
+                     Sender<Msg> clone outlived the flow; this drain must go RED, not hang"),
+            }
+        }
+    }
+
+    /// The bytes pandoc actually put on disk, read back out of the flow's scratch dir.
+    pub(crate) fn artifact(&self, name: &str) -> String {
+        String::from_utf8(std::fs::read(self.dir.join(name)).expect("the artifact exists"))
+            .expect("pandoc writes utf8")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

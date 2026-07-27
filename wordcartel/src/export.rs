@@ -513,6 +513,21 @@ mod tests {
              with NoMarkedBlock (or slices the wrong buffer) instead");
     }
 
+    // A22 ORDERINGS (adopted from the whole-branch gate) — the degenerate mark at dispatch.
+    // A collapsed, zero-width mark satisfies "mark present", so the seam must slice it rather
+    // than refuse or panic: an implementation that asserted `start < end`, or that treated an
+    // empty slice as "no block", turns a harmless no-op export into a crash or a wrong
+    // refusal. Empty input is pandoc's problem, not the seam's.
+    #[test]
+    fn resolve_export_input_slices_a_collapsed_mark_to_the_empty_string() {
+        let mut e = crate::editor::Editor::new_from_text("AAA\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().marked_block =
+            Some(crate::editor::MarkedBlock { start: 2, end: 2, hidden: false });
+        assert_eq!(resolve_export_input(&e, ExportScope::MarkedBlock, id), Ok(String::new()),
+            "a whole-document fallback returns Ok(\"AAA\\n\") and a start<end assert panics");
+    }
+
     // T5 — dispatch refusals. The bool return is the scheduling-free discriminator: a
     // wrongly-dispatching implementation returns true and fails HERE, before any race.
     #[test]
