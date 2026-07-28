@@ -2222,7 +2222,7 @@ mod tests {
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         use crate::prompt::PromptAction;
-        let p = std::env::temp_dir().join(format!("wc-savequit-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("savequit.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
@@ -2259,9 +2259,9 @@ mod tests {
     #[test]
     fn open_as_new_buffer_is_additive_never_replaces() {
         use crate::editor::Editor;
-        let target = std::env::temp_dir().join(format!("wc-clobber-open-{}.md", std::process::id()));
+        let target = crate::test_support::scratch_path("clobber-open.md");
         std::fs::write(&target, "OPEN TARGET\n").unwrap();
-        let named = std::env::temp_dir().join(format!("wc-clobber-named-{}.md", std::process::id()));
+        let named = crate::test_support::scratch_path("clobber-named.md");
         std::fs::write(&named, "v1 content\n").unwrap();
         let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
         let id = e.active().id;
@@ -2279,7 +2279,7 @@ mod tests {
     #[test]
     fn new_empty_buffer_leaves_dirty_buffer_intact() {
         use crate::editor::Editor;
-        let named = std::env::temp_dir().join(format!("wc-clobber-new-{}.md", std::process::id()));
+        let named = crate::test_support::scratch_path("clobber-new.md");
         std::fs::write(&named, "v1 content\n").unwrap();
         let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
         let id = e.active().id;
@@ -2298,9 +2298,9 @@ mod tests {
     #[test]
     fn open_as_new_buffer_switches_to_opened_file() {
         use crate::editor::Editor;
-        let target = std::env::temp_dir().join(format!("wc-clean-open-{}.md", std::process::id()));
+        let target = crate::test_support::scratch_path("clean-open.md");
         std::fs::write(&target, "OPEN TARGET\n").unwrap();
-        let named = std::env::temp_dir().join(format!("wc-clean-named-{}.md", std::process::id()));
+        let named = crate::test_support::scratch_path("clean-named.md");
         std::fs::write(&named, "v1 content\n").unwrap();
         let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
         crate::workspace::open_as_new_buffer(&mut e, &crate::fsx::RealFs, &target);
@@ -2340,7 +2340,7 @@ mod tests {
     #[test]
     fn new_empty_buffer_adds_untitled_and_switches() {
         use crate::editor::Editor;
-        let named = std::env::temp_dir().join(format!("wc-clean-new-{}.md", std::process::id()));
+        let named = crate::test_support::scratch_path("clean-new.md");
         std::fs::write(&named, "v1 content\n").unwrap();
         let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
         let id = e.active().id;
@@ -4250,8 +4250,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         // Create a tempdir with 24 subdirectories → 25 entries (.., d00..d23).
-        let dir = std::env::temp_dir().join(format!("wc-a6-fb-nav-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("a6-fb-nav");
         for i in 0..24usize {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
@@ -4332,8 +4331,7 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         // 25 subdirs (d00..d24) at the top; two small files INSIDE d14 so it's non-empty
         // but the browser list from d14 is smaller (just ".." + 2 files = 3 entries).
-        let parent = std::env::temp_dir().join(format!("wc-a6-descend-{}", std::process::id()));
-        std::fs::create_dir_all(&parent).unwrap();
+        let parent = crate::test_support::scratch_dir("a6-descend");
         for i in 0..25usize {
             std::fs::create_dir(parent.join(format!("d{i:02}"))).unwrap();
         }
@@ -4548,7 +4546,7 @@ mod tests {
         // pending_after_save is None BEFORE the quit prompt raises; cancel the
         // quit → still None. Repeat with pending_save_as = Some(CloseBuffer{X}).
         use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
-        let p = std::env::temp_dir().join(format!("wc-c4t2-quit-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("c4t2-quit.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("dirty\n", Some(p.clone()), (80, 24));
         e.active_mut().document.version = 1;
@@ -4603,7 +4601,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-        let p = std::env::temp_dir().join(format!("wc-c4t2-esc-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("c4t2-esc.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("dirty\n", Some(p.clone()), (80, 24));
         e.active_mut().document.version = 1;
