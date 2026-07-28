@@ -715,11 +715,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
-            std::env::temp_dir(), p.to_str().unwrap().to_string());
+            crate::test_support::scratch_dir("saveas-ow-seed"), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches. The
-        // typed field is a non-empty ABSOLUTE path, so `FileBrowser::highlight_is_navigated()`
-        // gates Row 1 off regardless of whatever `temp_dir()` happens to sort first (very
-        // possibly a directory, in a shared system temp dir full of other tests' leftovers).
+        // seed dir is a fresh scratch_dir, so the listing is HERMETIC (a ".." row and
+        // nothing else); and the typed field is a non-empty ABSOLUTE path, so
+        // `FileBrowser::highlight_is_navigated()` gates Row 1 off regardless of highlight.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert!(e.prompt.is_some(), "existing target → confirm modal");
@@ -795,7 +795,7 @@ mod tests {
         let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::WriteBlock { origin },
-            std::env::temp_dir(), target.to_str().unwrap().to_string());
+            crate::test_support::scratch_dir("blkw-fail-seed"), target.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
@@ -819,7 +819,7 @@ mod tests {
         let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::WriteBlock { origin },
-            std::env::temp_dir(), p.to_str().unwrap().to_string());
+            crate::test_support::scratch_dir("blkw-ow-seed"), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
