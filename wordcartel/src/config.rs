@@ -1546,8 +1546,7 @@ idle_shutdown_min = 0
         // Config-class reads acquire a cap. An over-cap config must warn and fall back to
         // defaults — the SAME degradation an unreadable file already gets — never panic and
         // never silently apply a truncated parse.
-        let d = std::env::temp_dir().join(format!("wc-cfg-cap-{}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("cfg-cap");
         let p = d.join("config.toml");
         std::fs::write(&p, vec![b'#'; (crate::limits::MAX_CONFIG_BYTES + 1) as usize])
             .expect("seed oversized");

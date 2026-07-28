@@ -701,8 +701,7 @@ mod tests {
         // Use a POSIX shell to emulate a clipboard: set writes to a temp file, get reads it.
         // Skips cleanly where /bin/sh is unavailable (non-unix CI).
         if !std::path::Path::new("/bin/sh").exists() { return; }
-        let dir = std::env::temp_dir().join(format!("wcartel-clip-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::test_support::scratch_dir("clip-test");
         let slot = dir.join("slot");
         let slot_s = slot.to_string_lossy().to_string();
         let mut b = CommandBackend {

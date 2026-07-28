@@ -577,8 +577,7 @@ mod tests {
         // The promotion guard: FaultFs must live in test_support so other modules' tests can
         // inject it. A rename/move back into this file's private test mod breaks this line.
         let fs = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Rename);
-        let dir = std::env::temp_dir().join(format!("wc-faultfs-promo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create dir");
+        let dir = crate::test_support::scratch_dir("faultfs-promo");
         let target = dir.join("t.txt");
         let err = atomic_replace(&fs, &target, b"x", WriteOpts {
             mode: ModePolicy::Fixed(0o600), dir_fsync: false,

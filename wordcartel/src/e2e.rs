@@ -3084,9 +3084,7 @@ mod e2e_bench {
 /// another thread (§6.3) — an unpumped picker is empty, a state real usage never reaches.
 #[test]
 fn journey_open_save_export_saveas_reopen() {
-    let d = std::env::temp_dir().join(format!("wc-c5-journey-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("dir");
+    let d = crate::test_support::scratch_dir("c5-journey");
     std::fs::write(d.join("existing.md"), b"already here\n").expect("seed");
 
     let mut h = Harness::new("first draft\n", None, (100, 30));
