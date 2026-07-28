@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn open_into_current_replaces_with_fresh_id_and_clean() {
         use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-oic-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("oic.md");
         std::fs::write(&p, "opened\n").unwrap();
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
         let old_id = e.active().id;
@@ -351,8 +351,7 @@ mod tests {
     #[test]
     fn open_into_current_failure_is_a_sticky_error_that_survives_a_later_info() {
         use crate::editor::Editor;
-        let dir = std::env::temp_dir().join(format!("wc-oic-isdir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("oic-isdir");
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
         open_into_current(&mut e, &crate::fsx::RealFs, &dir);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
@@ -365,8 +364,7 @@ mod tests {
     #[test]
     fn file_browser_enter_on_file_opens_it_when_clean() {
         use crate::editor::Editor;
-        let dir = std::env::temp_dir().join(format!("wc-fbopen-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("fbopen");
         std::fs::write(dir.join("note.md"), "loaded\n").unwrap();
         let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -535,7 +533,7 @@ mod tests {
     #[test]
     fn persist_session_stamps_the_active_documents_id() {
         // FAIL-VERIFY: remove the `id:` assignment in `persist_session`, watch this fail.
-        let p = std::env::temp_dir().join(format!("wc-idstamp-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("idstamp.md");
         std::fs::write(&p, b"x\n").expect("seed");
         let e = crate::editor::Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
         let expected = e.active().document.id.to_hex();
