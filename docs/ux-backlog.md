@@ -1197,3 +1197,152 @@ is the same family of defect from the other direction.
 Anchors: `prompts.rs::the_clean_recovery_modal_names_kept_recoverable_files`,
 `test_support::scratch_name`, the clean-recovery modal's rendering in `render_overlays`.
 Related: [[B19]], [[H31]], [[H36]]. ~S.
+
+### C7 — Positional clear-mark — clear the mark at the caret, no prompt
+<!-- item: C7 -->
+
+**The workflow, in the reporter's words (2026-07-28):** *"A writer/user might jump to a mark and
+clear it."* Jump-then-clear is a natural pair, and the jump half already exists
+(`jump_to_mark`, and `jump_bookmark_0`-`9` on `^Q0`-`^Q9`). The clear half does not: today
+`clear_mark` is **interactive**, prompting for the mark CHARACTER, and `clear_marks` is
+all-or-nothing. To drop the mark you are standing on you must remember which character it was.
+
+**Provenance.** Surfaced 2026-07-28 when the reporter tried exactly this and read the prompt as a
+failure. That was investigated and found NOT to be a bug — `clear_mark`'s palette label carries
+the trailing ellipsis (`Clear Mark…`) that is this app's convention for "this will prompt," and
+its sibling `Clear All Marks` correctly has none. The affordance is signposted; it simply is not
+the command the workflow wants. So this is a genuine gap, not a fix.
+
+### The grounding that matters, because it defeats the naive implementation
+
+**The caret after a jump is NOT reliably the stored byte.** `marks::jump_char_mark` reads the raw
+offset, then puts it through `nav::clamp_snap(editor, raw)` and
+`place_caret_visible(editor, off, CaretPlace::UnfoldTo)` before setting the selection. Snapping
+and unfolding can move it. So a positional clear implemented as *"clear the mark whose stored
+offset equals the caret offset"* would fail in exactly the jump-then-clear case that motivates the
+feature — the worst possible failure mode, since it would look like the clear silently did nothing.
+
+Any implementation must therefore be written against the same normalization the jump uses, or use
+a tolerance, and its test must **jump first and then clear** rather than setting the caret
+directly to the stored offset. A test that positions the caret by hand would pass while the real
+workflow fails.
+
+### Design forks for whoever picks this up
+
+1. **Match semantics.** Exact stored-offset equality (fragile, per above) · same normalized
+   position after `clamp_snap` · same LINE · nearest mark within N bytes. Same-line is probably
+   the most forgiving without being surprising, but it is a real product call.
+2. **Ambiguity.** `Buffer::marks` is `BTreeMap<char, usize>`, so several marks may share one
+   offset. Clear all at that position, clear the lowest character, or refuse and fall back to the
+   prompt?
+3. **Feedback.** The status should name WHICH mark went (`mark 'a' cleared`), because the writer
+   may not remember what was there — that is the whole point of the command. And when nothing is
+   at the caret it must say so rather than failing silently.
+4. **Surface.** A new registry command (contract law: a user-reachable capability IS a command),
+   palette-reachable, plus a binding. Whether it replaces, shadows, or sits beside `clear_mark` is
+   open — note `clear_mark` still earns its place for clearing a mark you are NOT standing on.
+
+Anchors: `marks::{clear_mark, set_char_mark, jump_char_mark}`, `Buffer::marks`,
+`nav::{head, clamp_snap}`, `place_caret_visible`, `registry.rs`. Related: [[C2]] (the marks
+lifecycle this extends), [[B18]]. ~S.
+
+### B21 — Marked-block tint sets no fg, so body text can vanish into it (phosphor, blue jeans) — reads as redaction
+<!-- item: B21 -->
+
+**Reported 2026-07-28 (user, from live use).** In the phosphor and forever-blue-jeans themes, a
+marked block's highlight and its text sit so close in colour that the text is *"illegible at best
+and invisible at worst — it gives the visual appearance that the text has been intentionally
+redacted."*
+
+**Reproduced from the theme definitions; this is not a rendering accident, it is what the faces
+specify.** `marked_block` sets a **background only** and never an `fg`, so the body text keeps
+whatever colour it already had and nothing reconciles the two:
+
+```rust
+marked_block: Face { bg: Some(r.mark_bg), ..Face::default() },   // blue jeans
+marked_block: Face { bg: Some(shade(hue, 2)), ..Face::default() }, // phosphor
+```
+
+- **forever-blue-jeans-dark**: body `fg` is `#F2E9DA` (cream), `mark_bg` is `#D5B05C` (gold) —
+  a contrast ratio of roughly **1.6:1** against a 4.5 legibility target. Dusk is the same pairing
+  one step lighter (`#EFE4D3` on `#DDBB6B`).
+- **phosphor** is the sharper case and explains "redacted" exactly: the theme is a single-hue
+  ramp, body `fg = shade(hue, 3)`, and `marked_block bg = shade(hue, 2)` — **the rung directly
+  below the text**. On a monochrome ramp, adjacent rungs are as close as two colours can get.
+
+### The reporter's follow-up localises the worst case — and it settles fork 1
+
+*"Especially apparent when I set a block over a bunch of unordered list items, which have a
+different color than regular text."* Measured against `forever-blue-jeans-dark`'s `mark_bg`
+(`#D5B05C`), every in-text foreground that can appear under the tint:
+
+| foreground under the tint | colour | contrast vs `mark_bg` |
+|---|---|---|
+| `thematic_break` | `#3A4654` | **4.67:1** — passes |
+| body text (`base_fg`) | `#F2E9DA` | 1.71:1 |
+| `comment` | `#87919D` | 1.55:1 |
+| **`list_marker`** | `#C79A44` | **1.25:1** — brass on gold, the worst |
+
+Dusk is the same shape (`list_marker` 1.27:1, body 1.47:1). The reporter is right that lists are
+where it is most obvious: `list_marker` is the *closest* colour to the mark tint in the whole
+palette, so a marked block over a list is very nearly a solid bar.
+
+**The decisive consequence: contrast under one tint ranges from 1.25:1 to 4.67:1 depending on
+which face the glyph carries.** So there is no single foreground that could be baked into
+`marked_block` at theme-construction time to fix this — the fg underneath is not knowable until
+the glyph is composed. Fork 1 therefore resolves toward **composition-time enforcement**, where
+both the actual fg and the actual tint bg are in hand. Construction-time derivation can only fix
+the body-text case and would leave list markers, comments, links and code exactly as broken —
+i.e. it would fix the least-bad case and miss the worst one.
+
+This also reshapes the invariant (fork 4): it is not one assertion per theme but a **matrix** —
+every face that can appear in body text × every in-text tint background, each clearing the floor.
+`thematic_break` passing while `list_marker` fails at 1.25:1 is precisely the spread a matrix
+catches and a single spot-check does not.
+
+**The same theme already knows how to do this correctly, one line away.** phosphor's `selection`
+manages its own contrast explicitly — `Face { fg: Some(shade(hue, 5)), reverse: Some(true),
+underline: Some(true) }` — it lifts the fg and adds two non-colour cues. `marked_block` does
+none of that.
+
+### The fix has existing, tested machinery — it was simply never pointed here
+
+`theme.rs` already carries a legibility floor: `contrast_ratio`, `FG_FLOOR = 4.5`, and a
+`derive_fg` that walks a seed colour toward a pole until it clears the floor against its panel
+(pole-capped so it always terminates). That apparatus is applied to **chrome** faces via the
+elevation ladder. It is not applied to **in-text background tints**, which is the whole of this
+bug. Reusing it is likely a small change; inventing a second contrast mechanism would be the
+wrong move.
+
+**Scope is wider than the marked block — check before fixing narrowly.** The same
+bg-without-fg shape appears at eight face definitions, including `selection` in three themes and
+`marked_block` in five. In blue jeans, `search_bg` is the *identical* colour as `mark_bg`
+(`#D5B05C`), so search highlight almost certainly shares the defect and should be verified in the
+same pass. Fixing only the marked block would leave visibly inconsistent siblings.
+
+### Forks for whoever takes it
+
+1. **Where the floor is enforced — LIKELY SETTLED toward composition time** by the list-marker
+   measurement above: a derived `fg` baked into each theme's face at construction cannot work,
+   because the foreground under the tint varies per glyph (1.25:1 to 4.67:1 in one theme). It
+   would fix body text and leave list markers, comments and links broken. Composition-time
+   enforcement sees the real fg and the real bg, and covers user themes and future faces for
+   free — at the cost of work in a hot path, so it needs a cache-seam design rather than a
+   per-glyph contrast computation. [[B7]] resolved its sibling defect at exactly that cache seam
+   and is the precedent to read; [[H25]] notes `compose::face_to_ratatui` is add-only and cannot
+   express modifier subtraction, which constrains what the seam can do.
+2. **What "legible" means for a tint** — full `FG_FLOOR` (4.5) may over-brighten and destroy the
+   quiet, receding look a marked block is supposed to have; a lower floor may not be enough.
+   Note effort ④ deliberately made the interior *quiet* so the boundary reads.
+3. **Colour vs non-colour cues** — phosphor's `selection` also uses reverse + underline. On a
+   monochrome ramp, a non-colour cue may be the only honest answer, and the `no-color` and
+   `terminal-plain` themes cannot use colour at all.
+4. **The invariant to add** — this class should end with a test, not a fix. A per-theme assertion
+   that every in-text tint clears a stated contrast floor against the body fg would have caught
+   it at authoring time. Note `render.rs` already has per-theme face invariants (e.g.
+   `ProseLensMatch != MarkedBlock`), so there is a home for it.
+
+Anchors: `theme.rs::{phosphor, blue_jeans, ThemeFaces::marked_block, contrast_ratio, derive_fg,
+FG_FLOOR}`, `block_paint::patch`, `compose::face_to_ratatui`, `render.rs`'s theme invariants.
+Related: [[B7]] (selected-menu-text washout — same family, resolved at the cache seam), [[H25]],
+[[E5]]. ~S-SM depending on fork 1.
