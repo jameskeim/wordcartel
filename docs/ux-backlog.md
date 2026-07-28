@@ -719,45 +719,6 @@ it is not merely "write a better scanner."
 
 Also relevant: **there is no CI.** The scanner runs only because a human or agent follows CLAUDE.md.
 
-### H28 — Un-pumped picker tests assert unreachable states
-<!-- item: H28 -->
-
-Two tests — `save_as_empty_path_is_a_sticky_warning` and its Write-Block twin — pass only because
-they act on the picker **before pumping the async directory listing**. Once a listing lands on any
-non-root directory the warning they assert becomes unreachable, so they assert a state real usage
-never reaches.
-
-This is the class that hid a Critical through the whole C5 effort: every picker test pressed Enter
-without pumping, so a bug that **descended into the parent instead of saving** survived ten
-plan-gate rounds and twenty task reviews. The convention is now "pump the listing, drive the real
-intercept" — these two are the last holdouts.
-
-Either make them reachable (assert the warning in a state a writer can actually be in) or retire
-them. A test that passes for the wrong reason is worse than no test: it reports coverage of a path
-nobody is checking.
-
-
----
-
-**Re-grounded 2026-07-19 during effort ①, which DEFERRED it — and the finding changes what this item
-is.** Read this before acting on the description above.
-
-- **The convention was applied far more completely than the filing implies.** Of the 20 tests that
-  press Enter at a Destination picker, **18 already pump** and **all 20 drive the real intercept**.
-  Two others carry doc comments recording that they were *fixed* from unpumped to pumped. This is a
-  two-test remainder, not a systemic gap.
-- **Pumping was already tried on these two, and reverted** — their doc comments say so.
-- **The mechanism is verified, and it is why.** Before a listing lands, `entries` is empty, so
-  `highlighted` is `None` and the commit falls through to `Nothing` — the warning fires. Once
-  `apply_listing_done` runs, `rederive` puts `".."` at `entries[0]`, `selected` stays 0, and Row 1's
-  guard becomes true purely off `trimmed.is_empty()` → `Descend`. **The empty-path warning is
-  genuinely unreachable once a listing lands.**
-
-**So the real question is behavioural, not test hygiene: is that warning reachable in production at
-all?** If it is not, the tests are asserting a state no writer can reach and should be retired along
-with the dead branch — not "made to pump." **Making them pump would delete the assertion while
-appearing to fix it**, which is the exact defect class both efforts spent their review rounds
-catching (eight instances in effort ① alone).
 
 ### H30 — subprocess pipes are non-CLOEXEC — concurrent spawn can inherit another child's pipes
 <!-- item: H30 -->
@@ -879,30 +840,6 @@ Position-space newtypes to tag confusable byte spaces
 
 *(Captured 2026-07-20 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
 
-### H36 — Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam
-<!-- item: H36 -->
-
-The explicit follow-on to H32. H32 consolidates the **15 named** test scratch-path *helpers* onto a
-single `test_support` seam (`scratch_path`/`scratch_dir`). It deliberately leaves the larger, looser
-population untouched: the H32 grounding (Fable, 2026-07-25) found **~105 inline `temp_dir()`
-scratch-path constructions across ~30 files** that build a path directly at the call site without
-even a local helper (heaviest: `file_browser.rs` ~17, `app.rs` ~15, `prompts.rs` ~14, `jobs_apply.rs`
-~10, `swap.rs` ~10, `render_overlays.rs` ~7). This item is a tracked home for sweeping those onto the
-H32 seam so "get a scratch path" truly has exactly one answer everywhere.
-
-**Deferred out of H32 deliberately** (2026-07-25): the ~105 sites are individually correct today
-(pid-unique, one label per test — not the H31 collision class), so they have no decay; sweeping them
-is ~30 files of mechanical churn whose review blast radius dwarfs the value on a no-decay item. H32
-declared them out of scope on the record and filed this item so the decision is tracked rather than
-forgotten. Two integration-test sites (`tests/harper_ls_probe.rs`, `tests/harper_ls_integration.rs`)
-are a separate crate and cannot reach a `#[cfg(test)] pub(crate)` seam at all — out of scope here too.
-
-**Do NOT answer this with a textual scanner** banning raw `temp_dir().join(...)` — same reasoning as
-H32 (H31 fork 3 / effort ① D5): the `fs_chokepoint` scanner was measured to leave 5 of 6 evasion
-routes uncaught; a second scanner is self-defeating. The work is mechanical delegation onto the H32
-seam, not a new gate. Prerequisite: H32 shipped (the seam must exist first).
-
-*(Captured 2026-07-25 via `scripts/backlog add`, as the H32 grounding's out-of-scope follow-up.)*
 
 ### E14 — Engine-side suppression — persist disabled rules AND the personal dictionary, delivered through the engines' settings channels
 <!-- item: E14 -->
@@ -1096,31 +1033,6 @@ the archive.
 Prior art / context: E10 (shipped the vale-ls provider), E11 (shipped the mapping + disabled it by
 default), [[E15]] (dropped — superseded by this). ~M.
 
-### H38 — classify_spell_heuristic's spell-substring branch is pinned by no test
-<!-- item: H38 -->
-
-**A pre-existing coverage hole, surfaced 2026-07-26 by the review of the vale-ls removal** — it
-predates that branch and is not caused by it.
-
-`lsp_client`'s shared `classify_spell_heuristic` decides whether a diagnostic is a spelling issue
-when the engine's own naming does not settle it; one of its branches tests the rule code for a
-`spell` substring. **Mutating that branch reddens no test — and did not before the removal either.**
-The reason it looked covered: the deleted `vale_ls.rs` test `classify_spelling_checks_by_name_else_heuristic`
-appeared to exercise it, but `ValeEngine::classify` short-circuited on its own `"Spelling"` check and
-so never reached the shared heuristic's substring branch at all. The test passed for a reason
-unrelated to what its name claimed.
-
-This is the effort's recurring defect class in its purest form: **the asserted outcome was also the
-outcome of a path that never ran.** It survived because the engine-specific short-circuit and the
-shared fallback produce the same answer for vale's inputs, so no fixture ever distinguished them.
-
-**Fix shape:** a fixture whose rule code reaches the shared heuristic — i.e. an engine (or a
-`TestEngine`) whose own `classify` returns "undecided" for a code containing `spell` — asserted to
-classify as Spelling, with the kill condition stated: deleting the substring branch must redden it.
-Cheap; the value is closing a branch that currently has no pin at all.
-
-Anchors: `lsp_client::classify_spell_heuristic`, `LspEngine::classify`. Related: the removal that
-surfaced it (`chore-drop-vale-ls-provider`), [[E16]]. ~S.
 
 ### A23 — Typed foreign extension is written as markdown; a highlighted one is refused
 <!-- item: A23 -->

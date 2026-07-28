@@ -2912,3 +2912,135 @@ while a highlighted one is refused. [[A24]] — the completion status cannot dis
 redirect flow, because A17 Q1 keeps the redirect's Sticky Warning over the completion Info; the
 human's call was to ship and file, since the fix amends status law beyond this case.
 
+### H38 — classify_spell_heuristic's spell-substring branch is pinned by no test
+<!-- item: H38 -->
+
+**A pre-existing coverage hole, surfaced 2026-07-26 by the review of the vale-ls removal** — it
+predates that branch and is not caused by it.
+
+`lsp_client`'s shared `classify_spell_heuristic` decides whether a diagnostic is a spelling issue
+when the engine's own naming does not settle it; one of its branches tests the rule code for a
+`spell` substring. **Mutating that branch reddens no test — and did not before the removal either.**
+The reason it looked covered: the deleted `vale_ls.rs` test `classify_spelling_checks_by_name_else_heuristic`
+appeared to exercise it, but `ValeEngine::classify` short-circuited on its own `"Spelling"` check and
+so never reached the shared heuristic's substring branch at all. The test passed for a reason
+unrelated to what its name claimed.
+
+This is the effort's recurring defect class in its purest form: **the asserted outcome was also the
+outcome of a path that never ran.** It survived because the engine-specific short-circuit and the
+shared fallback produce the same answer for vale's inputs, so no fixture ever distinguished them.
+
+**Fix shape:** a fixture whose rule code reaches the shared heuristic — i.e. an engine (or a
+`TestEngine`) whose own `classify` returns "undecided" for a code containing `spell` — asserted to
+classify as Spelling, with the kill condition stated: deleting the substring branch must redden it.
+Cheap; the value is closing a branch that currently has no pin at all.
+
+Anchors: `lsp_client::classify_spell_heuristic`, `LspEngine::classify`. Related: the removal that
+surfaced it (`chore-drop-vale-ls-provider`), [[E16]]. ~S.
+
+### H28 — Un-pumped picker tests assert unreachable states
+<!-- item: H28 -->
+
+> **SHIPPED CORRECTION (Batch T, 2026-07-27).** This item's TITLE and its central mechanism
+> claim are **DISPROVEN**. The two tests do not assert an unreachable state: they assert the
+> **pre-listing async window**, which is production-reachable by design (`open_destination_picker`
+> sets `entries: Vec::new()` and lists on a detached thread; the Enter intercept has no
+> pending-listing guard, so a writer who presses Enter before the listing lands is in exactly
+> the state these tests construct). A **second** route was missed by both this filing and its
+> 2026-07-19 re-grounding: with a fully LANDED listing, arrowing onto an `EntryKind::Other` or
+> `Unknown` entry — a fifo, socket, device, broken symlink, or stat failure, all of which
+> production listings really carry — falls through Row 1 (needs `Dir`) and Row 2 (commits only
+> on `File`) into the same `_ => CommitOutcome::Nothing` arm. The prose's analysis only ever
+> modeled the default `".."` highlight.
+>
+> So the filed fix — retire the tests and the "dead" branch — would have deleted a
+> production-reachable warning **and** the in-progress quit-drain abort that rides in the same
+> arm, changing quit semantics. Shipped instead: both tests KEPT, both doc comments rewritten to
+> the verified story, and the genuinely-missing kind-based pin added (the `None`-highlight path
+> was already pinned; the kind-based fall-through had no pin at all). The residual wording
+> defect that Route B exposes — the refusal says "empty path" when the field's emptiness is not
+> why it refused — was filed out as **[[A25]]**, deliberately, because fixing it would change a
+> user-visible string and Batch T's premise was that nothing in it changes shipped behavior.
+
+
+Two tests — `save_as_empty_path_is_a_sticky_warning` and its Write-Block twin — pass only because
+they act on the picker **before pumping the async directory listing**. Once a listing lands on any
+non-root directory the warning they assert becomes unreachable, so they assert a state real usage
+never reaches.
+
+This is the class that hid a Critical through the whole C5 effort: every picker test pressed Enter
+without pumping, so a bug that **descended into the parent instead of saving** survived ten
+plan-gate rounds and twenty task reviews. The convention is now "pump the listing, drive the real
+intercept" — these two are the last holdouts.
+
+Either make them reachable (assert the warning in a state a writer can actually be in) or retire
+them. A test that passes for the wrong reason is worse than no test: it reports coverage of a path
+nobody is checking.
+
+
+---
+
+**Re-grounded 2026-07-19 during effort ①, which DEFERRED it — and the finding changes what this item
+is.** Read this before acting on the description above.
+
+- **The convention was applied far more completely than the filing implies.** Of the 20 tests that
+  press Enter at a Destination picker, **18 already pump** and **all 20 drive the real intercept**.
+  Two others carry doc comments recording that they were *fixed* from unpumped to pumped. This is a
+  two-test remainder, not a systemic gap.
+- **Pumping was already tried on these two, and reverted** — their doc comments say so.
+- **The mechanism is verified, and it is why.** Before a listing lands, `entries` is empty, so
+  `highlighted` is `None` and the commit falls through to `Nothing` — the warning fires. Once
+  `apply_listing_done` runs, `rederive` puts `".."` at `entries[0]`, `selected` stays 0, and Row 1's
+  guard becomes true purely off `trimmed.is_empty()` → `Descend`. **The empty-path warning is
+  genuinely unreachable once a listing lands.**
+
+**So the real question is behavioural, not test hygiene: is that warning reachable in production at
+all?** If it is not, the tests are asserting a state no writer can reach and should be retired along
+with the dead branch — not "made to pump." **Making them pump would delete the assertion while
+appearing to fix it**, which is the exact defect class both efforts spent their review rounds
+catching (eight instances in effort ① alone).
+
+### H36 — Sweep the ~105 inline temp_dir() scratch-path constructions onto the test_support seam
+<!-- item: H36 -->
+
+> **SHIPPED CORRECTION (Batch T, 2026-07-27).** The counts in this filing were stale and its
+> in-scope/out-of-scope split needed one refinement. Measured at `6d3a213`: **116** `temp_dir()`
+> hits across **29** files (not "~105 across ~30"), partitioning exactly as
+> `97 swept joins + 4 excluded joins + 12 bare code uses + 3 comment lines`. The sweep touched
+> **25** files. The population is not homogeneous: the 12 **bare** `temp_dir()` uses pass the
+> directory itself as the subject, so substituting the seam there is a semantic change, not a
+> delegation — they were excluded, except three PUMPED picker seeds migrated deliberately as
+> their own semantic commit (decision D5). Four joins were binding exclusions: `swap.rs`'s
+> `state_dir()` `#[cfg(test)]` branch (a PRODUCTION function whose test branch needs a stable
+> per-process path — the counter-based seam returns a different path per call), the seam's own
+> implementation, and two out-of-crate integration sites.
+>
+> The filing's "no decay, individually correct today" premise held — verified pid-unique with
+> zero duplicate labels — so the sweep bought uniformity, not correctness. One site was NOT
+> mechanical: `prompts.rs`'s `recovered-*.md` filenames are load-bearing, because production
+> `swap.rs` accepts a recovery dump only when the name starts `recovered-` and ends `.md`; a
+> plain seam basename begins `wc-scratch-` and the confirm would have refused. The one property
+> no per-site read could evaluate — path LENGTH — is filed as **[[H39]]**.
+
+
+The explicit follow-on to H32. H32 consolidates the **15 named** test scratch-path *helpers* onto a
+single `test_support` seam (`scratch_path`/`scratch_dir`). It deliberately leaves the larger, looser
+population untouched: the H32 grounding (Fable, 2026-07-25) found **~105 inline `temp_dir()`
+scratch-path constructions across ~30 files** that build a path directly at the call site without
+even a local helper (heaviest: `file_browser.rs` ~17, `app.rs` ~15, `prompts.rs` ~14, `jobs_apply.rs`
+~10, `swap.rs` ~10, `render_overlays.rs` ~7). This item is a tracked home for sweeping those onto the
+H32 seam so "get a scratch path" truly has exactly one answer everywhere.
+
+**Deferred out of H32 deliberately** (2026-07-25): the ~105 sites are individually correct today
+(pid-unique, one label per test — not the H31 collision class), so they have no decay; sweeping them
+is ~30 files of mechanical churn whose review blast radius dwarfs the value on a no-decay item. H32
+declared them out of scope on the record and filed this item so the decision is tracked rather than
+forgotten. Two integration-test sites (`tests/harper_ls_probe.rs`, `tests/harper_ls_integration.rs`)
+are a separate crate and cannot reach a `#[cfg(test)] pub(crate)` seam at all — out of scope here too.
+
+**Do NOT answer this with a textual scanner** banning raw `temp_dir().join(...)` — same reasoning as
+H32 (H31 fork 3 / effort ① D5): the `fs_chokepoint` scanner was measured to leave 5 of 6 evasion
+routes uncaught; a second scanner is self-defeating. The work is mechanical delegation onto the H32
+seam, not a new gate. Prerequisite: H32 shipped (the seam must exist first).
+
+*(Captured 2026-07-25 via `scripts/backlog add`, as the H32 grounding's out-of-scope follow-up.)*
