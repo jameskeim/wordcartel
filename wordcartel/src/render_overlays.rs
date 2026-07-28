@@ -1091,9 +1091,7 @@ mod tests {
     /// prefix) instead of 7. Both confirmed, then reverted.
     #[test]
     fn the_destination_field_and_its_caret_are_painted_in_the_query_row() {
-        let d = std::env::temp_dir().join(format!("wc-render-field-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("fixture dir");
+        let d = crate::test_support::scratch_dir("render-field");
         let mut e = Editor::new_from_text("body\n", None, (80, 24));
         let (tx, rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =
@@ -1158,7 +1156,7 @@ mod tests {
     /// case but Select fails. Confirmed, then reverted.
     #[test]
     fn each_picker_mode_is_titled_for_what_it_actually_does() {
-        let dir = std::env::temp_dir().join(format!("wc-render-title-{}", std::process::id()));
+        let dir = crate::test_support::scratch_path("render-title");
         // The table is built BEFORE the per-case editor exists, so no real buffer id is in
         // hand — a synthetic one is inert here: the title never reads `origin`.
         let origin = crate::editor::BufferId(0);
@@ -1293,9 +1291,7 @@ mod tests {
     /// Confirmed, then reverted.
     #[test]
     fn the_withholding_disclosure_is_painted() {
-        let d = std::env::temp_dir().join(format!("wc-render-c2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("fixture dir");
+        let d = crate::test_support::scratch_dir("render-c2");
         // Two withheld by the CLUTTER toggle, three by the TYPE toggle, one shown.
         for n in [".hidden-a", ".hidden-b"] { std::fs::write(d.join(n), "x").expect("seed"); }
         for n in ["a.bin", "b.o", "c.zip"] { std::fs::write(d.join(n), "x").expect("seed"); }
@@ -1338,7 +1334,7 @@ mod tests {
     /// counts vanish behind an ellipsis and this fails. Confirmed, then reverted.
     #[test]
     fn the_cramped_title_fallback_truncates_a_disclosure_heading_from_the_right() {
-        let dir = std::env::temp_dir().join(format!("wc-render-mr2-{}", std::process::id()));
+        let dir = crate::test_support::scratch_path("render-mr2");
         let mut e = Editor::new_from_text("x\n", None, (34, 4));
         let mut fb = empty_destination_fb(dir, "");
         fb.mode = BrowseMode::Select;           // no resolved-target line: line 0 is the disclosure
@@ -1385,7 +1381,7 @@ mod tests {
     /// then reverted.
     #[test]
     fn a_two_entry_destination_listing_shows_both_entries_alongside_the_footer() {
-        let dir = std::env::temp_dir().join(format!("wc-render-m5-{}", std::process::id()));
+        let dir = crate::test_support::scratch_path("render-m5");
         let mut e = Editor::new_from_text("x\n", None, (100, 30));
         let mut fb = empty_destination_fb(dir, "chapter");
         fb.entries = ["chapter-one.md", "chapter-two.md"].iter().map(|n| {
@@ -1427,7 +1423,7 @@ mod tests {
         // where `raw_list_h = list_window::list_h_for(fb.entries.len(), h)` (the pre-fix
         // form), watch this fail — the footer text lands in the title row instead of its own
         // dedicated row. Confirmed, then restored.
-        let dir = std::env::temp_dir().join(format!("wc-render-empty-{}", std::process::id()));
+        let dir = crate::test_support::scratch_path("render-empty");
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.file_browser = Some(empty_destination_fb(dir.clone(), "new-chapter"));
         crate::derive::rebuild(&mut e);
@@ -1612,7 +1608,7 @@ mod tests {
         // `palette_overlay_rect(area, fb.entries.len())` — the empty case fails on height.
         // Then instead inset it by one column (`ov_rect.x + 1`) — both cases fail on x.
         // Confirmed for both, then restored.
-        let dir = std::env::temp_dir().join(format!("wc-render-rect-{}", std::process::id()));
+        let dir = crate::test_support::scratch_path("render-rect");
         let area = Rect::new(0, 0, 80, 24);
 
         let mut empty = Editor::new_from_text("x\n", None, (80, 24));
