@@ -437,7 +437,7 @@ mod tests {
         // PromptAction::SaveAndQuit path (proves the DRY factor).
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
-        let p = std::env::temp_dir().join(format!("wc-savequit-cmd-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("savequit-cmd.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
@@ -460,7 +460,7 @@ mod tests {
     fn save_and_quit_arms_pending_after_save_quit_and_exits() {
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
-        let p = std::env::temp_dir().join(format!("wc-pas-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("pas.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
@@ -484,7 +484,7 @@ mod tests {
         // the buffer is dirty again. The app must NOT quit and must not lose those edits.
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{JobResult, JobKind, ResultClass};
-        let p = std::env::temp_dir().join(format!("wc-sqflight-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("sqflight.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         let id = e.active().id;
@@ -963,7 +963,7 @@ mod tests {
         use crate::editor::Editor;
         // A target whose parent is a regular FILE (not a dir) → save_atomic_bytes fails
         // (ENOTDIR), driving apply_export_done's Bytes/Err(e) "export write failed" arm.
-        let parent = std::env::temp_dir().join(format!("wc-c4-exportwrite-{}.md", std::process::id()));
+        let parent = crate::test_support::scratch_path("c4-exportwrite.md");
         std::fs::write(&parent, "i am a file\n").unwrap();
         let target = parent.join("out.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn apply_export_done_bytes_write_is_fault_injectable() {
         use crate::editor::Editor;
-        let target = std::env::temp_dir().join(format!("wc-c4-exportbytes-fault-{}.html", std::process::id()));
+        let target = crate::test_support::scratch_path("c4-exportbytes-fault.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         // Inject a create failure via FaultFs: the write will fail before touching disk.
         let ff = crate::test_support::FaultFs::new(crate::test_support::FaultAt::Create);
@@ -997,8 +997,8 @@ mod tests {
         use crate::editor::Editor;
         // TempReady names a tmp file that does not exist → std::fs::rename fails,
         // driving apply_export_done's TempReady/Err(e) "export rename failed" arm.
-        let missing_tmp = std::env::temp_dir().join(format!("wc-c4-exportrename-missing-{}.tmp", std::process::id()));
-        let target = std::env::temp_dir().join(format!("wc-c4-exportrename-target-{}.html", std::process::id()));
+        let missing_tmp = crate::test_support::scratch_path("c4-exportrename-missing.tmp");
+        let target = crate::test_support::scratch_path("c4-exportrename-target.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true,
             crate::export::ExportScope::WholeDocument, &crate::fsx::RealFs);
@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn apply_export_done_pandoc_failure_is_a_sticky_error() {
         use crate::editor::Editor;
-        let target = std::env::temp_dir().join(format!("wc-c4-exportpandoc-{}.html", std::process::id()));
+        let target = crate::test_support::scratch_path("c4-exportpandoc.html");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true,
             crate::export::ExportScope::WholeDocument, &crate::fsx::RealFs);
@@ -1022,7 +1022,7 @@ mod tests {
     #[test]
     fn apply_export_done_toctou_target_appeared_is_a_sticky_warning() {
         use crate::editor::Editor;
-        let target = std::env::temp_dir().join(format!("wc-c4-exporttoctou-{}.html", std::process::id()));
+        let target = crate::test_support::scratch_path("c4-exporttoctou.html");
         std::fs::write(&target, "existing\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false,
