@@ -608,7 +608,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::prompt::PromptAction;
         // An orphan swap file on disk + a buffer staged for recovery.
-        let p = std::env::temp_dir().join(format!("wc-recover-orphan-{}.swp", std::process::id()));
+        let p = crate::test_support::scratch_path("recover-orphan.swp");
         std::fs::write(&p, "stub").unwrap();
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         e.active_mut().pending_swap_body = Some("recovered body\n".into());
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn save_as_existing_target_raises_overwrite_prompt() {
         use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("ow.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", None, (80, 24));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn block_write_failure_is_a_sticky_error_that_survives_a_later_info() {
         use crate::editor::Editor;
-        let parent = std::env::temp_dir().join(format!("wc-blkw-fail-{}.md", std::process::id()));
+        let parent = crate::test_support::scratch_path("blkw-fail.md");
         std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
         let target = parent.join("out.txt"); // target "inside" a regular file → ENOTDIR
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn block_write_existing_target_raises_overwrite() {
         use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-blkw-ow-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("blkw-ow.md");
         std::fs::write(&p, "old").unwrap();
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
@@ -1149,7 +1149,7 @@ mod tests {
         // CloseSave for a named dirty buffer → pending_after_save armed with CloseBuffer{id}.
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::InlineExecutor;
-        let p = std::env::temp_dir().join(format!("wc-close-save-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("close-save.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.version = 1;
@@ -1173,7 +1173,7 @@ mod tests {
         // Decision 1 pin: Discard closes the buffer immediately, leaving the swap file intact.
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let p = std::env::temp_dir().join(format!("wc-close-discard-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("close-discard.md");
         std::fs::write(&p, "on disk\n").unwrap();
         let sp = crate::swap::swap_path(Some(p.as_path())).expect("swap path ok");
         crate::swap::write_atomic(&sp, "stub swap content").expect("write stub swap");
@@ -1227,9 +1227,9 @@ mod tests {
         // test isolates the FORWARD-TOCTOU invariant from the inverse-TOCTOU content check.)
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let a = std::env::temp_dir().join(format!("recovered-wc-h5-snap-a-{}.md", std::process::id()));
-        let b = std::env::temp_dir().join(format!("recovered-wc-h5-snap-b-{}.md", std::process::id()));
-        let latecomer = std::env::temp_dir().join(format!("recovered-wc-h5-snap-late-{}.md", std::process::id()));
+        let a = crate::test_support::scratch_dir("h5-snap-a").join("recovered-a.md");
+        let b = crate::test_support::scratch_dir("h5-snap-b").join("recovered-b.md");
+        let latecomer = crate::test_support::scratch_dir("h5-snap-late").join("recovered-late.md");
         std::fs::write(&a, "a").unwrap();
         std::fs::write(&b, "b").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
@@ -1264,8 +1264,7 @@ mod tests {
         // Build a doc on disk + its CANONICAL swap whose header hash = fnv1a64(swap_body); a dead
         // pid and swap_body == on-disk bytes make `assess` return DiscardSilently (cleanable).
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
-            let doc = std::env::temp_dir()
-                .join(format!("wc-h5-inv-{}-{}-{}.txt", std::process::id(), tag, TestClock(0).0));
+            let doc = crate::test_support::scratch_path(&format!("h5-inv-{}-{}.txt", tag, TestClock(0).0));
             std::fs::write(&doc, saved).unwrap();
             let real = std::fs::canonicalize(&doc).unwrap();
             let h = SwapHeader {
@@ -1314,7 +1313,7 @@ mod tests {
     fn clean_recovery_cancel_deletes_nothing_and_clears_snapshot() {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let a = std::env::temp_dir().join(format!("wc-h5-cancel-{}.swp", std::process::id()));
+        let a = crate::test_support::scratch_path("h5-cancel.swp");
         std::fs::write(&a, "keep me").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone()];
@@ -1332,7 +1331,7 @@ mod tests {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-        let a = std::env::temp_dir().join(format!("wc-h5-esc-{}.swp", std::process::id()));
+        let a = crate::test_support::scratch_path("h5-esc.swp");
         std::fs::write(&a, "keep me").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone()];
@@ -1384,8 +1383,7 @@ mod tests {
         // realistic case.
         let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
-            let doc = std::env::temp_dir()
-                .join(format!("wc-kept-{}-{}.txt", std::process::id(), tag));
+            let doc = crate::test_support::scratch_path(&format!("kept-{}.txt", tag));
             std::fs::write(&doc, saved).expect("seed doc");
             let real = std::fs::canonicalize(&doc).expect("canon");
             let h = SwapHeader {
