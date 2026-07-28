@@ -479,19 +479,21 @@ mod tests {
     /// REAL intercept, not `commit_destination` directly (see the commit-arm's own
     /// end-to-end tests in `file_browser_commit.rs` for why).
     ///
-    /// DELIBERATELY does NOT pump the async listing (unlike the audit applied elsewhere —
-    /// see the parent-row-highlight task report). This is a SEPARATE, pre-existing property
-    /// of Row 1, not the defect that audit fixed: Row 1 fires on ANY highlighted directory
-    /// whenever the field is EMPTY, by design — `FileBrowser::highlight_navigated`'s gate is
-    /// `navigated || trimmed.is_empty()`, and a bare Enter on an untouched highlight with
-    /// nothing typed is treated as an ordinary browse gesture. Since `std::env::temp_dir()`
-    /// is never filesystem root, its listing always carries a ".." row, so IF this test
-    /// pumped that listing, Enter would descend into the parent directory instead of
-    /// reaching `CommitOutcome::Nothing` — the "empty path" warning would never fire once a
-    /// real listing has landed. Confirmed live (pump added, ran, status came back empty
-    /// instead of "save-as: empty path"; reverted) — reported as a FINDING in the task
-    /// report, not fixed here: whether Row 1 should ever cede to Row 2 on an untouched
-    /// directory highlight with an empty field is a design question, not a mechanical one.
+    /// DELIBERATELY does NOT pump the async listing — the non-pump is CORRECT and
+    /// load-bearing, not an oversight (Batch T re-grounding, 2026-07-27). This test pins the
+    /// PRE-LISTING WINDOW, a real production state by design: `open_save_as` seeds an EMPTY
+    /// field, `open_destination_picker` starts with `entries` empty and lists off-thread
+    /// (there is no synchronous listing path), and the Enter intercept has no
+    /// pending-listing guard — a writer pressing Enter before the listing lands (slow disk,
+    /// network fs) reaches EXACTLY this state: no highlight, empty field,
+    /// `CommitOutcome::Nothing`, this Sticky Warning. Pumping would move the fixture into a
+    /// DIFFERENT, already-covered state — with a landed listing the untouched `".."` row is
+    /// highlighted and a bare Enter descends (Row 1), a path the pumped destination tests
+    /// own — deleting this assertion while appearing to fix it. The kind-based companion
+    /// state (a landed listing, a navigated `Other`/`Unknown` highlight, same `Nothing`) is
+    /// pinned in `file_browser_commit.rs`; its refusal-WORDING defect is filed as A25. (A
+    /// pump experiment was once tried here and reverted; the reachability grounding above is
+    /// what settles it.)
     #[test]
     fn save_as_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
@@ -507,8 +509,10 @@ mod tests {
     }
 
     /// A17 T5: an empty Write-Block path refusal is a Sticky Warning. Migrated (Task 21)
-    /// from the retired `block_write_submit` — see the Save-As twin above, INCLUDING the
-    /// same deliberate non-pump: confirmed to break identically if pumped (same finding).
+    /// from the retired `block_write_submit`. See the Save-As twin above — the SAME
+    /// deliberate, load-bearing non-pump: this pins the pre-listing window for the
+    /// Write-Block purpose (production `block_write` also seeds an empty field), and
+    /// pumping would likewise land the listing and descend instead of refusing.
     #[test]
     fn block_write_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
@@ -604,7 +608,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::prompt::PromptAction;
         // An orphan swap file on disk + a buffer staged for recovery.
-        let p = std::env::temp_dir().join(format!("wc-recover-orphan-{}.swp", std::process::id()));
+        let p = crate::test_support::scratch_path("recover-orphan.swp");
         std::fs::write(&p, "stub").unwrap();
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         e.active_mut().pending_swap_body = Some("recovered body\n".into());
@@ -705,17 +709,17 @@ mod tests {
     #[test]
     fn save_as_existing_target_raises_overwrite_prompt() {
         use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("ow.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", None, (80, 24));
         let (tx, rx) = std::sync::mpsc::channel();
         let fs = crate::test_support::test_fs();
         e.open_destination_picker(&fs, &tx, crate::file_browser::DestinationPurpose::SaveAs,
-            std::env::temp_dir(), p.to_str().unwrap().to_string());
+            crate::test_support::scratch_dir("saveas-ow-seed"), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches. The
-        // typed field is a non-empty ABSOLUTE path, so `FileBrowser::highlight_is_navigated()`
-        // gates Row 1 off regardless of whatever `temp_dir()` happens to sort first (very
-        // possibly a directory, in a shared system temp dir full of other tests' leftovers).
+        // seed dir is a fresh scratch_dir, so the listing is HERMETIC (a ".." row and
+        // nothing else); and the typed field is a non-empty ABSOLUTE path, so
+        // `FileBrowser::highlight_is_navigated()` gates Row 1 off regardless of highlight.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
         assert!(e.prompt.is_some(), "existing target → confirm modal");
@@ -781,7 +785,7 @@ mod tests {
     #[test]
     fn block_write_failure_is_a_sticky_error_that_survives_a_later_info() {
         use crate::editor::Editor;
-        let parent = std::env::temp_dir().join(format!("wc-blkw-fail-{}.md", std::process::id()));
+        let parent = crate::test_support::scratch_path("blkw-fail.md");
         std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
         let target = parent.join("out.txt"); // target "inside" a regular file → ENOTDIR
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
@@ -791,7 +795,7 @@ mod tests {
         let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::WriteBlock { origin },
-            std::env::temp_dir(), target.to_str().unwrap().to_string());
+            crate::test_support::scratch_dir("blkw-fail-seed"), target.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
@@ -806,7 +810,7 @@ mod tests {
     #[test]
     fn block_write_existing_target_raises_overwrite() {
         use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-blkw-ow-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("blkw-ow.md");
         std::fs::write(&p, "old").unwrap();
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
@@ -815,7 +819,7 @@ mod tests {
         let origin = e.active().id;
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::WriteBlock { origin },
-            std::env::temp_dir(), p.to_str().unwrap().to_string());
+            crate::test_support::scratch_dir("blkw-ow-seed"), p.to_str().unwrap().to_string());
         // Pump the async listing to completion — the state real usage actually reaches.
         crate::test_support::pump_listing(&mut e, &rx);
         crate::test_support::press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Enter);
@@ -1145,7 +1149,7 @@ mod tests {
         // CloseSave for a named dirty buffer → pending_after_save armed with CloseBuffer{id}.
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::InlineExecutor;
-        let p = std::env::temp_dir().join(format!("wc-close-save-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("close-save.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.version = 1;
@@ -1169,7 +1173,7 @@ mod tests {
         // Decision 1 pin: Discard closes the buffer immediately, leaving the swap file intact.
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let p = std::env::temp_dir().join(format!("wc-close-discard-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("close-discard.md");
         std::fs::write(&p, "on disk\n").unwrap();
         let sp = crate::swap::swap_path(Some(p.as_path())).expect("swap path ok");
         crate::swap::write_atomic(&sp, "stub swap content").expect("write stub swap");
@@ -1223,9 +1227,9 @@ mod tests {
         // test isolates the FORWARD-TOCTOU invariant from the inverse-TOCTOU content check.)
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let a = std::env::temp_dir().join(format!("recovered-wc-h5-snap-a-{}.md", std::process::id()));
-        let b = std::env::temp_dir().join(format!("recovered-wc-h5-snap-b-{}.md", std::process::id()));
-        let latecomer = std::env::temp_dir().join(format!("recovered-wc-h5-snap-late-{}.md", std::process::id()));
+        let a = crate::test_support::scratch_dir("h5-snap-a").join("recovered-a.md");
+        let b = crate::test_support::scratch_dir("h5-snap-b").join("recovered-b.md");
+        let latecomer = crate::test_support::scratch_dir("h5-snap-late").join("recovered-late.md");
         std::fs::write(&a, "a").unwrap();
         std::fs::write(&b, "b").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
@@ -1260,8 +1264,7 @@ mod tests {
         // Build a doc on disk + its CANONICAL swap whose header hash = fnv1a64(swap_body); a dead
         // pid and swap_body == on-disk bytes make `assess` return DiscardSilently (cleanable).
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
-            let doc = std::env::temp_dir()
-                .join(format!("wc-h5-inv-{}-{}-{}.txt", std::process::id(), tag, TestClock(0).0));
+            let doc = crate::test_support::scratch_path(&format!("h5-inv-{tag}.txt"));
             std::fs::write(&doc, saved).unwrap();
             let real = std::fs::canonicalize(&doc).unwrap();
             let h = SwapHeader {
@@ -1310,7 +1313,7 @@ mod tests {
     fn clean_recovery_cancel_deletes_nothing_and_clears_snapshot() {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let a = std::env::temp_dir().join(format!("wc-h5-cancel-{}.swp", std::process::id()));
+        let a = crate::test_support::scratch_path("h5-cancel.swp");
         std::fs::write(&a, "keep me").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone()];
@@ -1328,7 +1331,7 @@ mod tests {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-        let a = std::env::temp_dir().join(format!("wc-h5-esc-{}.swp", std::process::id()));
+        let a = crate::test_support::scratch_path("h5-esc.swp");
         std::fs::write(&a, "keep me").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.pending_clean = vec![a.clone()];
@@ -1361,6 +1364,9 @@ mod tests {
     /// FAIL-VERIFY: drop the `kept` block from `Prompt::clean_recovery`, or make
     /// `render_overlays::paint_prompt_detail` return before painting — watch the realpath
     /// assertion fail. Confirmed, then restored.
+    // The TMPDIR-length skip prints its reason to stderr; the workspace denies
+    // `clippy::print_stderr` by default (mirrors `test_support::pandoc_present_or_skip`).
+    #[allow(clippy::print_stderr)]
     #[test]
     fn the_clean_recovery_modal_names_kept_recoverable_files() {
         use crate::editor::Editor;
@@ -1379,9 +1385,12 @@ mod tests {
         // fail on same-run litter rather than on this behaviour. A just-written swap is also the
         // realistic case.
         let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
+        // Batch T declared deviation (human-authorized after the whole-branch gate, I1): the
+        // label is `k-{tag}.txt`, not the pre-sweep `kept-{tag}.txt` — 3 fewer characters,
+        // recovering part of the margin the seam's longer `wc-scratch-{pid}-{seq}-` prefix
+        // (test_support.rs, out of scope here) took from the box-interior budget below.
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
-            let doc = std::env::temp_dir()
-                .join(format!("wc-kept-{}-{}.txt", std::process::id(), tag));
+            let doc = crate::test_support::scratch_path(&format!("k-{}.txt", tag));
             std::fs::write(&doc, saved).expect("seed doc");
             let real = std::fs::canonicalize(&doc).expect("canon");
             let h = SwapHeader {
@@ -1403,10 +1412,36 @@ mod tests {
         assert!(e.prompt.is_some(), "a confirm prompt is raised");
         let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
 
-        // Render the REAL frame and read the disclosure off the cell grid. 120 columns keeps
-        // the box interior (the `palette_overlay_rect` width ladder caps at 80, so 78 columns
-        // of text) wider than this fixture's path, so an assertion failure means the
-        // disclosure is missing — not merely elided.
+        // Precondition: the disclosure line must fit the 120-column frame's box interior
+        // UNELIDED, or a failure below would blame the modal for what is really this fixture's
+        // TMPDIR-length-dependent path being too long. Derived, not magic — `inner_w` is the
+        // SAME call production makes (`paint_prompt_detail` in render_overlays.rs sizes off
+        // `prompt_detail_rect`, whose width is `palette_overlay_rect(area, _).width`, in
+        // chrome_geom.rs; that width does not depend on the row count, so any `lines` argument
+        // here reads the real ladder for this frame). `composed` mirrors the exact line
+        // `Prompt::clean_recovery` builds (prompt.rs: `format!("  {} (written {})", realpath,
+        // format_age(now_ms, ts_ms))`) — `age` is deterministically "just now" in THIS test
+        // because `open_clean_recovery` above was driven with `TestClock(0)`, so the modal's
+        // `now_ms` is 0 and `format_age`'s `now_ms.saturating_sub(ts_ms)` floors at 0 for any
+        // positive `ts_ms`. A TMPDIR long enough to blow this budget is an environment fact,
+        // not a code defect — skip rather than fail (the `pandoc_present_or_skip` house
+        // pattern: name the skip on stderr and return, don't turn an environment limit into a
+        // false-red assertion).
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let inner_w =
+            crate::chrome_geom::palette_overlay_rect(frame_area, 1).width.saturating_sub(2) as usize;
+        let composed = format!("  {real_bad} (written just now)");
+        if composed.chars().count() > inner_w {
+            eprintln!(
+                "skip: the_clean_recovery_modal_names_kept_recoverable_files \u{2014} TMPDIR too \
+                 long for the fixture path to fit the box interior unelided ({} > {inner_w} \
+                 columns): {real_bad}",
+                composed.chars().count());
+            for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
+            return;
+        }
+
+        // Render the REAL frame and read the disclosure off the cell grid.
         crate::derive::rebuild(&mut e);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
             .expect("test terminal");
@@ -1417,8 +1452,6 @@ mod tests {
                 .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
                 .collect::<Vec<_>>().join("\n")
         };
-        assert!(real_bad.chars().count() + 20 < 78,
-            "test fixture precondition: the path must fit the box interior unelided: {real_bad}");
         assert!(screen.contains(&real_bad),
             "the modal must NAME the kept file by its recorded realpath, ON SCREEN:\n{screen}");
         assert!(screen.to_lowercase().contains("unsaved work"),

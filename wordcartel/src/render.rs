@@ -3321,8 +3321,7 @@ mod tests {
     #[test]
     fn file_browser_windowed_slice_and_indicator() {
         // 20 directories → 21 entries (.., d00..d19).
-        let dir = std::env::temp_dir().join(format!("wc-a6-fbrender-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("a6-fbrender");
         for i in 0..20usize {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
@@ -3351,8 +3350,7 @@ mod tests {
         assert!(bottom_text.contains(&format!(" {}/", selected + 1)),
             "file browser: indicator must show {}/{total}, got: {bottom_text:?}", selected + 1);
         // Non-scrollable: just 2 entries — no indicator.
-        let small_dir = std::env::temp_dir().join(format!("wc-a6-fbrender-small-{}", std::process::id()));
-        std::fs::create_dir_all(&small_dir).unwrap();
+        let small_dir = crate::test_support::scratch_dir("a6-fbrender-small");
         std::fs::write(small_dir.join("foo.md"), "x").unwrap();
         let mut e2 = Editor::new_from_text("x\n", None, (80, 24));
         let _rx2 = crate::test_support::open_and_pump(&mut e2, small_dir.clone());

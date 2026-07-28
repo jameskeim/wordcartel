@@ -1054,8 +1054,7 @@ mod tests {
         // `stat` SUCCEEDS for a broken link (broken == true) — so the caller must map
         // broken -> None explicitly. Without that mapping this returns Some with zeroed
         // fields and silently corrupts the external-mod comparison.
-        let d = std::env::temp_dir().join(format!("wc-fp-broken-{}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("fp-broken");
         let link = d.join("dangling.md");
         std::os::unix::fs::symlink(d.join("gone.md"), &link).expect("symlink");
         assert!(fingerprint_with_fs(&crate::fsx::RealFs, &link).is_none(),

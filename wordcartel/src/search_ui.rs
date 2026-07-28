@@ -652,7 +652,7 @@ mod tests {
     /// `append_word_to_dict`'s `create_dir_all` fails) must land Sticky/Error (Q1).
     #[test]
     fn diag_apply_selected_add_dict_failure_is_a_sticky_error() {
-        let parent = std::env::temp_dir().join(format!("wc-adddict-fail-{}.md", std::process::id()));
+        let parent = crate::test_support::scratch_path("adddict-fail.md");
         std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
         let dict_path = parent.join("dictionary.txt"); // parent "inside" a regular file
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));

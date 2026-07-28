@@ -345,8 +345,7 @@ seq = 1
         // resume state, or matches a genuinely empty file.
         //
         // FAIL-VERIFY: delete the `if st.broken` line, watch this fail, then revert.
-        let d = std::env::temp_dir().join(format!("wc-fid-broken-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("fid-broken");
         let link = d.join("dangling.md");
         std::os::unix::fs::symlink(d.join("gone.md"), &link).expect("symlink");
         assert!(file_identity_with_fs(&crate::fsx::RealFs, &link).is_none(),

@@ -153,9 +153,7 @@ mod tests {
 
     #[test]
     fn rows_are_seq_ranked_and_missing_files_stay_visible_but_unavailable() {
-        let d = std::env::temp_dir().join(format!("wc-recents-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("recents");
         let live = d.join("live.md");
         std::fs::write(&live, b"x").expect("seed");
         let gone = d.join("gone.md");

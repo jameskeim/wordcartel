@@ -1082,8 +1082,7 @@ mod tests {
 
     #[test]
     fn save_as_commits_end_to_end_from_enter() {
-        let d = std::env::temp_dir().join(format!("wc-saveas-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("saveas-e2e");
         let mut e = crate::editor::Editor::new_from_text("chapter body\n", None, (80, 24));
         e.active_mut().document.version = 1;
         let ex = crate::jobs::InlineExecutor::default();
@@ -1382,8 +1381,7 @@ mod tests {
     /// Esc arm, watch the `chosen_survives` assertion fail, then restore it.
     #[test]
     fn cancelling_the_overwrite_modal_clears_both_paired_fields() {
-        let d = std::env::temp_dir().join(format!("wc-saveas-cancel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("saveas-cancel");
         std::fs::write(d.join("taken.md"), b"already here\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
@@ -1656,8 +1654,7 @@ mod tests {
 
     #[test]
     fn write_block_commits_end_to_end_from_enter() {
-        let d = std::env::temp_dir().join(format!("wc-wb-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("wb-e2e");
         let mut e = crate::editor::Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
         e.active_mut().marked_block =
             Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
@@ -2056,8 +2053,7 @@ mod tests {
     fn export_commits_end_to_end_from_enter_through() {
         // Decision 4: a bare Enter on the PRE-SEEDED picker must reproduce today's
         // zero-decision export. Export had no Enter-through commit test at all.
-        let d = std::env::temp_dir().join(format!("wc-exp-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("exp-e2e");
         let src = d.join("notes.md");
         std::fs::write(&src, b"# hi\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src), (80, 24));
@@ -2113,8 +2109,7 @@ mod tests {
         // intercept — through the actual production entry point, with the expected value
         // COMPUTED from `derived_export_path` rather than typed twice, so it cannot pass by
         // coincidence of two literals agreeing.
-        let d = std::env::temp_dir().join(format!("wc-exp-seam-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("exp-seam-e2e");
         let src = d.join("notes.md");
         std::fs::write(&src, b"# hi\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src.clone()), (80, 24));
@@ -2279,6 +2274,42 @@ mod tests {
             CommitOutcome::Nothing, "no field, no highlight — Enter is inert, never a write");
         assert_eq!(classify_destination_enter(&crate::fsx::RealFs, &d, "   ", None, false),
             CommitOutcome::Nothing, "a whitespace-only field is empty");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Batch T / H28 Route B (D2-2): an empty field with a highlighted entry that is NEITHER
+    /// a directory NOR a regular file refuses — `Other`/`Unknown` are not commit targets (we
+    /// do not know they are writable regular files), and both occur in production listings
+    /// (fifos/devices; stat failures and broken symlinks). The `None`-highlight leg is
+    /// pinned by the neighbour above; THIS is the kind-based leg, previously pinned nowhere.
+    /// `navigated` is looped to pin that Row 2 does not consult it when the field is empty.
+    /// KILL: widen Row 2's guard from `Some(e) if matches!(e.kind, EntryKind::File)` to
+    /// `Some(e)` — the Other/Unknown legs read `Commit` and THIS test reddens while the
+    /// `None`-highlight neighbour stays green (the discrimination this coverage adds).
+    #[test]
+    fn an_empty_field_with_a_non_writable_highlight_commits_nothing() {
+        let d = tmp("nothing-kind");
+        for navigated in [false, true] {
+            for kind in [EntryKind::Dir, EntryKind::File, EntryKind::Other, EntryKind::Unknown] {
+                let e = fe("entry", kind);
+                let got = classify_destination_enter(&crate::fsx::RealFs, &d, "", Some(&e), navigated);
+                // EXHAUSTIVE over EntryKind, no wildcard: a fifth variant fails to COMPILE
+                // here, forcing its Enter fate to be decided rather than silently absorbed
+                // by the production `_ => Nothing`. (The iteration array above is not
+                // compiler-checked — pair any new match arm with a new array entry.)
+                match kind {
+                    EntryKind::Dir => assert!(matches!(got, CommitOutcome::Descend(_)),
+                        "empty field on a highlighted dir descends (Row 1), navigated={navigated}"),
+                    EntryKind::File => assert!(matches!(got,
+                        CommitOutcome::Commit { from_highlight: true, .. }),
+                        "empty field on a highlighted file commits (Row 2), navigated={navigated}"),
+                    EntryKind::Other | EntryKind::Unknown => assert_eq!(got,
+                        CommitOutcome::Nothing,
+                        "{kind:?} is not a writable regular file — never a commit target \
+                         (navigated={navigated})"),
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

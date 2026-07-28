@@ -1733,7 +1733,7 @@ mod tests {
 
     #[test]
     fn buffer_from_file_ok_named_clean() {
-        let p = std::env::temp_dir().join(format!("wc-fromfile-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("fromfile.md");
         std::fs::write(&p, "hello\nworld\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (40, 10)); // host editor for ids
         let id = e.alloc_id();
@@ -1747,8 +1747,7 @@ mod tests {
 
     #[test]
     fn buffer_from_file_not_found_is_named_new_file() {
-        let p = std::env::temp_dir().join(format!("wc-missing-{}.md", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        let p = crate::test_support::scratch_path("missing.md");
         let mut e = Editor::new_from_text("\n", None, (40, 10));
         let id = e.alloc_id();
         let b = Buffer::from_file(id, &crate::fsx::RealFs, &p, (40, 10)).expect("NotFound → named empty buffer, not Err");
@@ -1758,7 +1757,7 @@ mod tests {
 
     #[test]
     fn buffer_from_file_binary_is_err() {
-        let p = std::env::temp_dir().join(format!("wc-bin-{}.bin", std::process::id()));
+        let p = crate::test_support::scratch_path("bin.bin");
         std::fs::write(&p, [0u8, 159, 146, 150]).unwrap(); // invalid UTF-8 / NUL
         let mut e = Editor::new_from_text("\n", None, (40, 10));
         let id = e.alloc_id();

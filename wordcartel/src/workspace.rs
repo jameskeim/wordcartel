@@ -426,7 +426,7 @@ mod tests {
         let mut e = Editor::new_from_text("\n", None, (40, 10)); // throwaway launch buffer
         e.install_scratch();
         assert_eq!(e.buffers.len(), 2);
-        let tmp = std::env::temp_dir().join(format!("wc-open-{}.md", std::process::id()));
+        let tmp = crate::test_support::scratch_path("open.md");
         std::fs::write(&tmp, "file body\n").unwrap();
         open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp);
         assert_eq!(e.buffers.len(), 2, "throwaway reused, not added");
@@ -438,7 +438,7 @@ mod tests {
     /// Before the fix: old throwaway id remained in MRU as a ghost; new id was absent.
     #[test]
     fn open_into_current_updates_mru_no_ghost() {
-        let tmp = std::env::temp_dir().join(format!("wc-oic-mru-{}.md", std::process::id()));
+        let tmp = crate::test_support::scratch_path("oic-mru.md");
         std::fs::write(&tmp, "content\n").unwrap();
         let mut e = Editor::new_from_text("\n", None, (40, 10)); // clean empty untitled throwaway
         e.install_scratch(); // seeds MRU as [doc, scratch]
@@ -461,8 +461,7 @@ mod tests {
     fn open_failure_is_a_sticky_error_that_survives_a_later_info() {
         let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
         e.install_scratch(); // active is real (non-throwaway) → open_as_new_buffer's own Err arm fires
-        let dir = std::env::temp_dir().join(format!("wc-open-isdir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("open-isdir");
         open_as_new_buffer(&mut e, &crate::fsx::RealFs, &dir);
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
         assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
@@ -475,7 +474,7 @@ mod tests {
     fn open_adds_buffer_when_active_is_real() {
         let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
         e.install_scratch();
-        let tmp = std::env::temp_dir().join(format!("wc-open2-{}.md", std::process::id()));
+        let tmp = crate::test_support::scratch_path("open2.md");
         std::fs::write(&tmp, "second\n").unwrap();
         open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp);
         assert_eq!(e.buffers.len(), 3, "added a new buffer");
@@ -529,7 +528,7 @@ mod tests {
     fn close_selects_same_index_neighbor() {
         let mut e = Editor::new_from_text("first\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
         e.install_scratch();
-        let tmp = std::env::temp_dir().join(format!("wc-c-{}.md", std::process::id()));
+        let tmp = crate::test_support::scratch_path("c.md");
         std::fs::write(&tmp, "second\n").unwrap();
         open_as_new_buffer(&mut e, &crate::fsx::RealFs, &tmp); // [a.md(0), scratch(1), second(2)] active=2
         switch_to(&mut e, 0); // active a.md

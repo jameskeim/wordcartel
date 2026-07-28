@@ -400,9 +400,7 @@ mod tests {
         // ENTER-THROUGH (decision 4). Export is zero-decision today; adding a mandatory
         // dialog would be a regression dressed as a feature. Pre-seeding means a bare Enter
         // reproduces today's behaviour byte-for-byte, with the target VISIBLE while doing so.
-        let d = std::env::temp_dir().join(format!("wc-exp-seed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("exp-seed");
         let src = d.join("notes.md");
         std::fs::write(&src, b"# hi\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src.clone()), (80, 24));
@@ -434,9 +432,7 @@ mod tests {
         // The merge gate runs on machines with no pandoc. `run_export` probes
         // `pandoc --version` before anything else, so an environment assumption here would
         // fail the gate rather than the code. The probe is injected, not detected.
-        let d = std::env::temp_dir().join(format!("wc-exp-nopandoc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("exp-nopandoc");
         let src = d.join("notes.md");
         std::fs::write(&src, b"# hi\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src), (80, 24));

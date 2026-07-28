@@ -819,14 +819,14 @@ mod tests {
     #[test]
     fn recovery_no_swap_opens_normally() {
         // A doc path whose swap file does not exist.
-        let p = std::env::temp_dir().join(format!("wc-norec-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("norec.md");
         let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
         assert!(matches!(assess(&crate::fsx::RealFs, Some(&p), Some(b"abc\n")), RecoveryDecision::OpenNormally));
     }
 
     #[test]
     fn recovery_hash_equal_discards_silently() {
-        let p = std::env::temp_dir().join(format!("wc-eq-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("eq.md");
         let body = "same\n";
         let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(body.as_bytes()), version: 1, ts_ms: 1, pid: 1, ..Default::default() };
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn recovery_diverged_prompts() {
-        let p = std::env::temp_dir().join(format!("wc-div-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("div.md");
         let body = "swap version\n";
         let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
             content_hash: fnv1a64(body.as_bytes()), version: 9, ts_ms: 1, pid: 1, ..Default::default() };

@@ -1631,8 +1631,7 @@ mod tests {
     #[test]
     fn fb_wheel_scroll_moves_selection() {
         // 20 directories → 21 entries (.., d00..d19).
-        let dir = std::env::temp_dir().join(format!("wc-a6-fbwheel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("a6-fbwheel");
         for i in 0..20usize {
             std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
         }
@@ -2296,8 +2295,7 @@ mod tests {
     /// A click on a directory entry in the file browser descends into that directory.
     #[test]
     fn click_dir_enters() {
-        let dir = std::env::temp_dir().join(format!("wc-t10-fbclick-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("t10-fbclick");
         let sub = dir.join("subdir");
         std::fs::create_dir(&sub).unwrap();
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
@@ -2347,9 +2345,7 @@ mod tests {
     /// opens, the exact dead affordance Adjudication 2 diagnosed.
     #[test]
     fn click_on_an_available_recents_row_opens_it_like_enter() {
-        let d = std::env::temp_dir().join(format!("wc-t24-recents-open-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_support::scratch_dir("t24-recents-open");
         let live = d.join("live.md");
         std::fs::write(&live, "loaded\n").unwrap();
 
@@ -2384,8 +2380,7 @@ mod tests {
     /// exists.
     #[test]
     fn click_on_an_unavailable_recents_row_refuses_like_enter() {
-        let d = std::env::temp_dir().join(format!("wc-t24-recents-refuse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = crate::test_support::scratch_path("t24-recents-refuse");
         let gone = d.join("gone.md"); // deliberately never created
 
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));

@@ -1194,3 +1194,94 @@ behaviour — so it wants its own deliberation, not a merge-gate patch.
 appears with no further work. [[A22]]'s adopted orderings test for this path pins the current
 behaviour and names this item, so it will fail loudly and point here once the law changes.
 Related: [[A17]], [[A22]]. ~S.
+
+### A25 — Destination-commit refusal on a non-writable highlight says 'empty path'
+<!-- item: A25 -->
+
+The destination picker refuses a highlight it cannot write to by blaming the **field**, not the
+highlight — and the field is not why it refused.
+
+Arrow onto a broken symlink (or a fifo, socket, device, or a row whose `stat` failed) in a Save-As
+or Write-Block picker, leave the field empty, press Enter. `classify_destination_enter` tries Row 1
+(requires `EntryKind::Dir`), tries Row 2 (commits only on `EntryKind::File`), and falls through its
+`_ => CommitOutcome::Nothing` arm — which emits the Sticky Warning *"save-as: empty path"* (or the
+Write-Block twin). The field's emptiness is a **precondition** of reaching that arm, not the reason
+for the refusal: the entry simply is not a writable regular file. A writer who reads the message is
+told to fix something that is not broken.
+
+**Select mode already solves this and the destination path does not inherit it.**
+`file_browser::classify_enter` carries per-kind `EnterOutcome::Refuse` wording that distinguishes a
+broken symlink from an `Other` special file. `classify_destination_enter` has no counterpart —
+every non-Dir/non-File kind collapses into the same empty-path string.
+
+**Reachability is verified, not assumed.** Production listings really do carry these rows:
+`fsx::kind_of` returns `Other` for fifo/socket/device; `classify_entry` returns `Unknown` for a
+`stat` failure and for broken symlinks (built into entries by `file_browser_listing`). They survive
+into destination-mode `entries` — `filter_and_rank` exempts `e.broken` from the type filter
+unconditionally, and an extensionless fifo passes `is_document` ("extensionless files are plausibly
+prose"). `recents` sets `Unknown` deliberately so Enter refuses those rows.
+
+**Provenance:** surfaced 2026-07-27 by the Batch T grounding pass
+(`scratchpad/batch-t/fable-grounding.md` §1.2, "Route B") while settling whether [[H28]]'s empty-path
+warning is reachable in production at all. It is — and this is the residual defect that reachability
+exposes. **Deliberately filed OUT of Batch T** (decision D3): the fix changes a user-visible status
+string, and Batch T's governing premise is that nothing in it changes shipped behavior — the premise
+that licenses reviewing its 98-site sweep as safe volume. Fixing a wording nit there would spend it.
+
+**Fix shape:** give the destination-commit path the per-kind refusal wording select mode already
+has, rather than letting every unusable kind collapse to "empty path". Note the `_ =>` catch-all is
+the same arm [[H28]] adds a pin to, so the pin and this fix meet in one place — check that the pin
+still constrains the intended behaviour after the wording splits.
+
+Anchors: `file_browser_commit::classify_destination_enter` (the `_ => CommitOutcome::Nothing` arm),
+`file_browser::classify_enter` (the wording to mirror), `fsx::{kind_of, classify_entry}`.
+Related: [[H28]], [[C5]]. ~S.
+
+### H39 — Display-budget tests can't verify under a long TMPDIR; the suite only ever runs at one temp-path length
+<!-- item: H39 -->
+
+**The whole test suite has only ever been run at one temp-directory path length**, so every
+assertion whose outcome depends on how much of a path fits on screen is unverified everywhere else.
+
+`prompts.rs::the_clean_recovery_modal_names_kept_recoverable_files` asserts the clean-recovery
+modal NAMES a kept file — i.e. that the path is not elided. Whether it fits depends on the
+system temp directory's length, which varies by platform: `/dev/shm` and `/tmp` are 8 and 4
+characters, macOS's `/var/folders/…/T` is around 45. The test therefore verifies real behaviour
+on short-temp machines and, on long-temp machines, verifies nothing.
+
+**Found 2026-07-27 by the [[Batch T]] whole-branch gate**, which was the first thing in the
+project's history to run the suite under a deliberately long `TMPDIR`. Every other layer —
+2465 tests, seven verification instruments, both merge gates, and every task review — ran at
+`TMPDIR=/dev/shm`, where there is ample room. The sensitivity is invisible at 8 characters.
+
+**Two things were fixed there; this is the residue.** Batch T corrected the fixture's
+precondition guard (it used the wrong constants, admitting paths up to 58 characters when the
+budget is 51, so an over-long path failed the *render* assertion with a message blaming the
+modal) and shortened a label to win back 3 characters. The guard now SKIPS honestly instead of
+failing. But skipping is not verifying: on macOS this test does not run at all, and it was
+already not passing there before Batch T — the branch narrowed the margin, it did not create
+the exposure.
+
+**Why the margin cannot simply be widened:** the dominant cost is the shared seam's own
+`wc-scratch-{pid}-{seq}-` prefix (`test_support::scratch_name`), which every scratch path in the
+suite carries. Shortening it for one test's benefit would be a change to shared test
+infrastructure driven by one fixture — the wrong trade at that scale, which is why Batch T
+deliberately left it alone.
+
+**The general question, which is the reason to file rather than shrug:** how should a test assert
+a display budget it does not control? Candidate shapes, none obviously right — inject the path
+rather than deriving it from `TMPDIR` (needs the modal to accept a path the fixture chose, and
+the point is to test real recorded realpaths); assert the elision BEHAVIOUR rather than the
+literal name at both budget sides; give the seam an opt-in short-name mode for the handful of
+length-sensitive fixtures; or run one CI leg under a deliberately long `TMPDIR` so the class is
+exercised somewhere. That last one is the cheapest and would have caught this.
+
+**Worth a census before fixing:** this was found because a sweep disturbed it. Other tests may
+carry hand-written display-budget constants with the same miscalibration and the same silent
+platform-dependence — nobody has looked. `render_overlays`'s fitters are the obvious place to
+start, and note [[B19]] already records that they count chars rather than display columns, which
+is the same family of defect from the other direction.
+
+Anchors: `prompts.rs::the_clean_recovery_modal_names_kept_recoverable_files`,
+`test_support::scratch_name`, the clean-recovery modal's rendering in `render_overlays`.
+Related: [[B19]], [[H31]], [[H36]]. ~S.
