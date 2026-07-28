@@ -1264,7 +1264,7 @@ mod tests {
         // Build a doc on disk + its CANONICAL swap whose header hash = fnv1a64(swap_body); a dead
         // pid and swap_body == on-disk bytes make `assess` return DiscardSilently (cleanable).
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
-            let doc = crate::test_support::scratch_path(&format!("h5-inv-{}-{}.txt", tag, TestClock(0).0));
+            let doc = crate::test_support::scratch_path(&format!("h5-inv-{tag}.txt"));
             std::fs::write(&doc, saved).unwrap();
             let real = std::fs::canonicalize(&doc).unwrap();
             let h = SwapHeader {
@@ -1364,6 +1364,9 @@ mod tests {
     /// FAIL-VERIFY: drop the `kept` block from `Prompt::clean_recovery`, or make
     /// `render_overlays::paint_prompt_detail` return before painting — watch the realpath
     /// assertion fail. Confirmed, then restored.
+    // The TMPDIR-length skip prints its reason to stderr; the workspace denies
+    // `clippy::print_stderr` by default (mirrors `test_support::pandoc_present_or_skip`).
+    #[allow(clippy::print_stderr)]
     #[test]
     fn the_clean_recovery_modal_names_kept_recoverable_files() {
         use crate::editor::Editor;
@@ -1382,8 +1385,12 @@ mod tests {
         // fail on same-run litter rather than on this behaviour. A just-written swap is also the
         // realistic case.
         let now_ms = { use wordcartel_core::history::Clock; crate::app::SystemClock.now_ms() };
+        // Batch T declared deviation (human-authorized after the whole-branch gate, I1): the
+        // label is `k-{tag}.txt`, not the pre-sweep `kept-{tag}.txt` — 3 fewer characters,
+        // recovering part of the margin the seam's longer `wc-scratch-{pid}-{seq}-` prefix
+        // (test_support.rs, out of scope here) took from the box-interior budget below.
         let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
-            let doc = crate::test_support::scratch_path(&format!("kept-{}.txt", tag));
+            let doc = crate::test_support::scratch_path(&format!("k-{}.txt", tag));
             std::fs::write(&doc, saved).expect("seed doc");
             let real = std::fs::canonicalize(&doc).expect("canon");
             let h = SwapHeader {
@@ -1405,10 +1412,36 @@ mod tests {
         assert!(e.prompt.is_some(), "a confirm prompt is raised");
         let real_bad = std::fs::canonicalize(&p_bad).expect("canon").display().to_string();
 
-        // Render the REAL frame and read the disclosure off the cell grid. 120 columns keeps
-        // the box interior (the `palette_overlay_rect` width ladder caps at 80, so 78 columns
-        // of text) wider than this fixture's path, so an assertion failure means the
-        // disclosure is missing — not merely elided.
+        // Precondition: the disclosure line must fit the 120-column frame's box interior
+        // UNELIDED, or a failure below would blame the modal for what is really this fixture's
+        // TMPDIR-length-dependent path being too long. Derived, not magic — `inner_w` is the
+        // SAME call production makes (`paint_prompt_detail` in render_overlays.rs sizes off
+        // `prompt_detail_rect`, whose width is `palette_overlay_rect(area, _).width`, in
+        // chrome_geom.rs; that width does not depend on the row count, so any `lines` argument
+        // here reads the real ladder for this frame). `composed` mirrors the exact line
+        // `Prompt::clean_recovery` builds (prompt.rs: `format!("  {} (written {})", realpath,
+        // format_age(now_ms, ts_ms))`) — `age` is deterministically "just now" in THIS test
+        // because `open_clean_recovery` above was driven with `TestClock(0)`, so the modal's
+        // `now_ms` is 0 and `format_age`'s `now_ms.saturating_sub(ts_ms)` floors at 0 for any
+        // positive `ts_ms`. A TMPDIR long enough to blow this budget is an environment fact,
+        // not a code defect — skip rather than fail (the `pandoc_present_or_skip` house
+        // pattern: name the skip on stderr and return, don't turn an environment limit into a
+        // false-red assertion).
+        let frame_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let inner_w =
+            crate::chrome_geom::palette_overlay_rect(frame_area, 1).width.saturating_sub(2) as usize;
+        let composed = format!("  {real_bad} (written just now)");
+        if composed.chars().count() > inner_w {
+            eprintln!(
+                "skip: the_clean_recovery_modal_names_kept_recoverable_files \u{2014} TMPDIR too \
+                 long for the fixture path to fit the box interior unelided ({} > {inner_w} \
+                 columns): {real_bad}",
+                composed.chars().count());
+            for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
+            return;
+        }
+
+        // Render the REAL frame and read the disclosure off the cell grid.
         crate::derive::rebuild(&mut e);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
             .expect("test terminal");
@@ -1419,8 +1452,6 @@ mod tests {
                 .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
                 .collect::<Vec<_>>().join("\n")
         };
-        assert!(real_bad.chars().count() + 20 < 78,
-            "test fixture precondition: the path must fit the box interior unelided: {real_bad}");
         assert!(screen.contains(&real_bad),
             "the modal must NAME the kept file by its recorded realpath, ON SCREEN:\n{screen}");
         assert!(screen.to_lowercase().contains("unsaved work"),
