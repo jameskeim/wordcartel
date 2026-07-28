@@ -1082,8 +1082,7 @@ mod tests {
 
     #[test]
     fn save_as_commits_end_to_end_from_enter() {
-        let d = std::env::temp_dir().join(format!("wc-saveas-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("saveas-e2e");
         let mut e = crate::editor::Editor::new_from_text("chapter body\n", None, (80, 24));
         e.active_mut().document.version = 1;
         let ex = crate::jobs::InlineExecutor::default();
@@ -1382,8 +1381,7 @@ mod tests {
     /// Esc arm, watch the `chosen_survives` assertion fail, then restore it.
     #[test]
     fn cancelling_the_overwrite_modal_clears_both_paired_fields() {
-        let d = std::env::temp_dir().join(format!("wc-saveas-cancel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("saveas-cancel");
         std::fs::write(d.join("taken.md"), b"already here\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("new body\n", None, (80, 24));
         let ex = crate::jobs::InlineExecutor::default();
@@ -1656,8 +1654,7 @@ mod tests {
 
     #[test]
     fn write_block_commits_end_to_end_from_enter() {
-        let d = std::env::temp_dir().join(format!("wc-wb-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("wb-e2e");
         let mut e = crate::editor::Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
         e.active_mut().marked_block =
             Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
@@ -2056,8 +2053,7 @@ mod tests {
     fn export_commits_end_to_end_from_enter_through() {
         // Decision 4: a bare Enter on the PRE-SEEDED picker must reproduce today's
         // zero-decision export. Export had no Enter-through commit test at all.
-        let d = std::env::temp_dir().join(format!("wc-exp-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("exp-e2e");
         let src = d.join("notes.md");
         std::fs::write(&src, b"# hi\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src), (80, 24));
@@ -2113,8 +2109,7 @@ mod tests {
         // intercept — through the actual production entry point, with the expected value
         // COMPUTED from `derived_export_path` rather than typed twice, so it cannot pass by
         // coincidence of two literals agreeing.
-        let d = std::env::temp_dir().join(format!("wc-exp-seam-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("exp-seam-e2e");
         let src = d.join("notes.md");
         std::fs::write(&src, b"# hi\n").expect("seed");
         let mut e = crate::editor::Editor::new_from_text("# hi\n", Some(src.clone()), (80, 24));
