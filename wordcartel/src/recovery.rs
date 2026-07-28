@@ -144,9 +144,7 @@ mod tests {
     #[test]
     fn dump_all_dirty_does_not_collide_for_two_pathless_buffers() {
         use crate::editor::Editor;
-        let dir = std::env::temp_dir().join(format!("wcartel-collisiontest-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("recovery-collisiontest");
 
         // Two PATH-LESS dirty buffers (untitled + scratch) — both derive the "scratch" name.
         let mut e = Editor::new_from_text("aaa\n", None, (80, 24)); // buffer 0, path-less
@@ -169,9 +167,7 @@ mod tests {
         use crate::editor::{Buffer, Editor};
         use std::path::PathBuf;
 
-        let dir = std::env::temp_dir().join(format!("wcartel-dumptest-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("recovery-dumptest");
 
         // buffer 0: a CLEAN file buffer (path, never edited → version == saved_version).
         let mut e = Editor::new_from_text("clean\n", Some(PathBuf::from("/tmp/clean.md")), (80, 24));

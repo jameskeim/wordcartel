@@ -384,8 +384,7 @@ mod tests {
         //
         // FAIL-VERIFY: make `rederive` filter on `fb.query` instead of
         // `fb.mode.filter_text(...)`, watch this fail, then revert.
-        let d = std::env::temp_dir().join(format!("wc-destfilter-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("destfilter");
         for n in ["chapter-one.md", "chapter-two.md", "notes.md", "outline.md"] {
             std::fs::write(d.join(n), b"x").expect("seed");
         }
@@ -448,8 +447,7 @@ mod tests {
         // `Editor::open_file_browser` entry point.
         //
         // FAIL-VERIFY: hardcode `destination: false` inside `rederive`, watch this fail, revert.
-        let d = std::env::temp_dir().join(format!("wc-destsibling-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("destsibling");
         std::fs::write(d.join("chapter.md"), b"x").expect("seed md");
         std::fs::write(d.join("chapter.docx"), b"x").expect("seed docx");
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =

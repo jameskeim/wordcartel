@@ -767,9 +767,8 @@ mod tests {
     fn append_word_to_dict_is_atomic_and_preserves_existing_words() {
         // The append becomes read -> append in memory -> atomic_replace, so a torn write
         // is impossible. Existing content must survive verbatim.
-        let d = std::env::temp_dir().join(format!("wc-dict-atomic-{}", std::process::id()));
+        let d = crate::test_support::scratch_path("dict-atomic");
         let p = d.join("dictionary.txt");
-        let _ = std::fs::remove_dir_all(&d);
         append_word_to_dict_with_fs(&crate::fsx::RealFs, &p, "alpha").expect("first append");
         append_word_to_dict_with_fs(&crate::fsx::RealFs, &p, "beta").expect("second append");
         let got = std::fs::read_to_string(&p).expect("read back");
@@ -797,8 +796,7 @@ mod tests {
     fn append_word_to_dict_refuses_a_symlinked_dictionary() {
         // The append gains the symlink guard every other durable write has. Writing through
         // the link would replace it with a regular file and destroy the link.
-        let d = std::env::temp_dir().join(format!("wc-dict-link-{}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("dict-link");
         let real = d.join("real.txt");
         let link = d.join("dict.txt");
         std::fs::write(&real, "existing\n").expect("seed");
