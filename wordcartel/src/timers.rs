@@ -266,7 +266,7 @@ mod tests {
         // Also pins the extraction is faithful: a Quit-variant pending re-raises
         // quit_confirm through the same helper.
         use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
-        let p = std::env::temp_dir().join(format!("wc-c4t2-timeout-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("c4t2-timeout.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.version = 1;
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn quit_drain_save_timeout_cancels_with_sticky_warning() {
         use crate::editor::{Editor, PostSaveAction, PendingAfterSave, QuitDrain, QuitMode};
-        let p = std::env::temp_dir().join(format!("wc-c4t2-drain-timeout-{}.md", std::process::id()));
+        let p = crate::test_support::scratch_path("c4t2-drain-timeout.md");
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         let id = e.active().id;
