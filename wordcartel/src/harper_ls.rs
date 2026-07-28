@@ -533,6 +533,27 @@ mod tests {
         assert_eq!(classify_lsp(&json!({"message":"style"})), DiagnosticKind::Grammar);
     }
 
+    /// Batch T / H38 (D1-3): the shared `lsp_client::classify_spell_heuristic` and harper's
+    /// private duplicate `classify_lsp` are documented as "intentionally identical" — this
+    /// matrix makes divergence a failure in either direction, retiring the untested claim.
+    /// One fixture per path: code-with-spell / non-string code / source / message / neither.
+    /// KILL (either direction): edit EITHER body's code branch alone — the matrix reads
+    /// unequal on the code-with-spell fixture and reddens.
+    #[test]
+    fn classify_lsp_agrees_with_the_shared_heuristic() {
+        let fixtures = [
+            json!({"code":"FR_SPELLING_RULE","message":"x"}),
+            json!({"code":7,"message":"x"}),
+            json!({"source":"cspell","message":"x"}),
+            json!({"message":"Possible spelling mistake"}),
+            json!({"message":"style"}),
+        ];
+        for d in &fixtures {
+            assert_eq!(classify_lsp(d), crate::lsp_client::classify_spell_heuristic(d),
+                "the two bodies must agree — diverged on {d}");
+        }
+    }
+
     #[test]
     fn grammar_gate_drops_grammar_diagnostics_when_disabled() {
         let mut st = running(false); // grammar off

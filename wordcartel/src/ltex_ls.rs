@@ -158,6 +158,17 @@ mod tests {
             DiagnosticKind::Grammar);
         assert_eq!(LtexEngine::classify(&json!({"message":"Possible spelling mistake"})),
             DiagnosticKind::Spelling, "falls through to the shared heuristic");
+        // Batch T / H38 (D1-2): jar-verified LT 6.8 rule ids that contain SPELL yet miss all
+        // three engine short-circuits (MORFOLOGIK/HUNSPELL/SPELLER) — they reach the SHARED
+        // heuristic's code branch. Messages lack "spell" so the code branch alone decides.
+        // (Ids are jar-grounded; their arrival as LSP `code` strings is inferred from the
+        // protocol handling and probe history — spec §1's evidence boundary.)
+        assert_eq!(LtexEngine::classify(&json!({"code":"FR_SPELLING_RULE","message":"x"})),
+            DiagnosticKind::Spelling,
+            "the French speller's id: misses the short-circuits, exercises the shared code branch");
+        assert_eq!(LtexEngine::classify(&json!({"code":"EN_CONTRACTION_SPELLING","message":"x"})),
+            DiagnosticKind::Spelling,
+            "an English id — the code branch matters for en-US configs too");
     }
 
     #[test]

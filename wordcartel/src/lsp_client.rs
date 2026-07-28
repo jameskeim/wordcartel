@@ -59,7 +59,8 @@ pub(crate) trait LspEngine: std::fmt::Debug + Send + 'static {
 /// The shared spelling-vs-grammar fallback heuristic (E10 §7/§8): a lowercase "spell"
 /// substring across code/source/message. Engine classifiers try their own rule-id tables
 /// first and fall through to this. (harper's `classify_lsp` keeps its original private copy —
-/// the T1 pin; the two bodies are intentionally identical.)
+/// the T1 pin; the two bodies are intentionally identical — pinned by
+/// `harper_ls::tests::classify_lsp_agrees_with_the_shared_heuristic`.)
 pub(crate) fn classify_spell_heuristic(d: &Value) -> DiagnosticKind {
     let code = match d.get("code") {
         Some(Value::String(s)) => s.clone(),
@@ -1882,5 +1883,27 @@ mod tests {
             }
             _ => panic!("expected exactly one Cmd::RequestFixes on the wire"),
         }
+    }
+
+    // ── classification / grammar gate ───────────────────────────────────────────────────────
+
+    /// Batch T / H38 (D1-1): the code-substring branch of the SHARED heuristic, pinned
+    /// directly. `FR_SPELLING_RULE` is a real LanguageTool 6.8 rule id (jar-verified —
+    /// `MorfologikFrenchSpellerRule`'s own id); its message deliberately lacks "spell" so
+    /// nothing rescues a deleted code branch. KILL: delete the
+    /// `if code.to_lowercase().contains("spell")` early return in
+    /// `classify_spell_heuristic` — the first assertion reads Grammar and reddens.
+    #[test]
+    fn classify_spell_heuristic_code_branch_pins_spelling() {
+        assert_eq!(classify_spell_heuristic(&json!({"code":"FR_SPELLING_RULE","message":"x"})),
+            DiagnosticKind::Spelling, "the code branch alone must decide this");
+        assert_eq!(classify_spell_heuristic(&json!({"code":7,"message":"x"})),
+            DiagnosticKind::Grammar, "a non-string code stringifies and falls through");
+        assert_eq!(classify_spell_heuristic(&json!({"source":"cspell","message":"x"})),
+            DiagnosticKind::Spelling, "the source half of the message path");
+        assert_eq!(classify_spell_heuristic(&json!({"message":"Possible spelling mistake"})),
+            DiagnosticKind::Spelling, "the message half");
+        assert_eq!(classify_spell_heuristic(&json!({"message":"style"})),
+            DiagnosticKind::Grammar, "the fall-through");
     }
 }
