@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn refetch_dirs_first_with_dotdot_and_query_filter() {
-        let dir = std::env::temp_dir().join(format!("wc-fb-{}", std::process::id()));
+        let dir = crate::test_support::scratch_dir("fb");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("alpha.md"), "x").unwrap();
         std::fs::write(dir.join("beta.txt"), "x").unwrap();
@@ -667,7 +667,7 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         use std::os::unix::fs::PermissionsExt;
 
-        let parent = std::env::temp_dir().join(format!("wc-fb-unreadable-{}", std::process::id()));
+        let parent = crate::test_support::scratch_dir("fb-unreadable");
         let secret = parent.join("secret");
         std::fs::create_dir_all(&secret).unwrap();
         // chmod 000: read_dir will fail
@@ -742,8 +742,7 @@ mod tests {
         // trailing '/', and Enter routed it to file::open, which returned "is a directory".
         // The entry was UNUSABLE, not merely mis-sorted. Routing through the resolving
         // list_dir fixes all three consumers at once.
-        let dir = std::env::temp_dir().join(format!("wc-fb-symdir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::scratch_dir("fb-symdir");
         std::fs::create_dir_all(dir.join("real_sub")).expect("seed dir");
         std::fs::write(dir.join("plain.md"), b"x").expect("seed file");
         std::os::unix::fs::symlink(dir.join("real_sub"), dir.join("link_sub")).expect("symlink");
@@ -788,9 +787,7 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!("wc-fb-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_support::scratch_dir("fb-cache");
         for n in ["alpha.md", "beta.md", "gamma.md"] {
             std::fs::write(dir.join(n), b"x").expect("seed");
         }
@@ -829,9 +826,8 @@ mod tests {
         // Fast listings hide this: the window only opens when a listing OUTLIVES the picker
         // that started it, which is exactly the hung-mount case the thread exists for.
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
-        let dir_a = std::env::temp_dir().join(format!("wc-aba-a-{}", std::process::id()));
-        let dir_b = std::env::temp_dir().join(format!("wc-aba-b-{}", std::process::id()));
-        for d in [&dir_a, &dir_b] { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).expect("dir"); }
+        let dir_a = crate::test_support::scratch_dir("aba-a");
+        let dir_b = crate::test_support::scratch_dir("aba-b");
         std::fs::write(dir_a.join("from_a.md"), b"x").expect("seed");
         std::fs::write(dir_b.join("from_b.md"), b"x").expect("seed");
 
@@ -877,9 +873,7 @@ mod tests {
         // listing for the target SUCCEEDS. So an unreadable target costs the writer nothing:
         // not their directory, not their query, not their selection.
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
-        let dir = std::env::temp_dir().join(format!("wc-faildescend-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_support::scratch_dir("faildescend");
         std::fs::write(dir.join("keep.md"), b"x").expect("seed");
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -924,9 +918,7 @@ mod tests {
     #[test]
     fn footer_shows_the_post_policy_absolute_target() {
         // The .md that policy appends must be visible BEFORE commit, not discovered after.
-        let d = std::env::temp_dir().join(format!("wc-footer-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("footer");
         let mut fb = FileBrowser {
             dir: d.clone(), query: String::new(),
             mode: BrowseMode::Destination {
@@ -982,8 +974,7 @@ mod tests {
         // `file_browser_commit::classify_destination_enter` (so Row 4 always wins), rerun —
         // this fails, asserting the confidently-false `.../chapter-one.md` write target
         // instead. Confirmed, then restored.
-        let d = std::env::temp_dir().join(format!("wc-footer-descend-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = crate::test_support::scratch_dir("footer-descend");
         std::fs::create_dir_all(d.join("chapter-one")).expect("seed dir");
         let fb = FileBrowser {
             dir: d.clone(), query: String::new(),
@@ -1007,9 +998,7 @@ mod tests {
     #[test]
     fn footer_shows_the_redirect_note_for_an_output_extension() {
         // IMPORTANT 3 — the `Redirect` branch had no assertion; the reviewer hand-verified it.
-        let d = std::env::temp_dir().join(format!("wc-footer-redirect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("footer-redirect");
         let fb = FileBrowser {
             dir: d.clone(), query: String::new(),
             mode: BrowseMode::Destination {
@@ -1032,9 +1021,7 @@ mod tests {
         // IMPORTANT 3 — the `Refused` branch had no assertion; the reviewer hand-verified it.
         // No directory named `sub` actually exists here, so Row 3 does not intercept this —
         // it falls through to Row 4 and `apply_extension_policy` sees the trailing separator.
-        let d = std::env::temp_dir().join(format!("wc-footer-refused-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("footer-refused");
         let fb = FileBrowser {
             dir: d.clone(), query: String::new(),
             mode: BrowseMode::Destination {
@@ -1057,9 +1044,7 @@ mod tests {
         // IMPORTANT 3 — the `BrokenSymlink` branch had no assertion; the reviewer
         // hand-verified it. The target of `dangling.md` never exists, so `resolve_write_destination`
         // must refuse rather than silently offer to write through it.
-        let d = std::env::temp_dir().join(format!("wc-footer-broken-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("dir");
+        let d = crate::test_support::scratch_dir("footer-broken");
         std::os::unix::fs::symlink(d.join("nowhere.md"), d.join("dangling.md")).expect("symlink");
         let fb = FileBrowser {
             dir: d.clone(), query: String::new(),
@@ -1134,9 +1119,7 @@ mod tests {
         //
         // FAIL-VERIFY: restore `open_as_new_buffer(editor, &path)` (RealFs internally) — the
         // real, readable file opens, no error status is set, and both assertions below fail.
-        let dir = std::env::temp_dir().join(format!("wc-fbfault-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_support::scratch_dir("fbfault");
         std::fs::write(dir.join("note.md"), b"real content\n").expect("seed a genuinely readable file");
 
         let mut e = crate::editor::Editor::new_from_text("scratch\n", None, (80, 24));
