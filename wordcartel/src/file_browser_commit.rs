@@ -2282,6 +2282,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Batch T / H28 Route B (D2-2): an empty field with a highlighted entry that is NEITHER
+    /// a directory NOR a regular file refuses — `Other`/`Unknown` are not commit targets (we
+    /// do not know they are writable regular files), and both occur in production listings
+    /// (fifos/devices; stat failures and broken symlinks). The `None`-highlight leg is
+    /// pinned by the neighbour above; THIS is the kind-based leg, previously pinned nowhere.
+    /// `navigated` is looped to pin that Row 2 does not consult it when the field is empty.
+    /// KILL: widen Row 2's guard from `Some(e) if matches!(e.kind, EntryKind::File)` to
+    /// `Some(e)` — the Other/Unknown legs read `Commit` and THIS test reddens while the
+    /// `None`-highlight neighbour stays green (the discrimination this coverage adds).
+    #[test]
+    fn an_empty_field_with_a_non_writable_highlight_commits_nothing() {
+        let d = tmp("nothing-kind");
+        for navigated in [false, true] {
+            for kind in [EntryKind::Dir, EntryKind::File, EntryKind::Other, EntryKind::Unknown] {
+                let e = fe("entry", kind);
+                let got = classify_destination_enter(&crate::fsx::RealFs, &d, "", Some(&e), navigated);
+                // EXHAUSTIVE over EntryKind, no wildcard: a fifth variant fails to COMPILE
+                // here, forcing its Enter fate to be decided rather than silently absorbed
+                // by the production `_ => Nothing`. (The iteration array above is not
+                // compiler-checked — pair any new match arm with a new array entry.)
+                match kind {
+                    EntryKind::Dir => assert!(matches!(got, CommitOutcome::Descend(_)),
+                        "empty field on a highlighted dir descends (Row 1), navigated={navigated}"),
+                    EntryKind::File => assert!(matches!(got,
+                        CommitOutcome::Commit { from_highlight: true, .. }),
+                        "empty field on a highlighted file commits (Row 2), navigated={navigated}"),
+                    EntryKind::Other | EntryKind::Unknown => assert_eq!(got,
+                        CommitOutcome::Nothing,
+                        "{kind:?} is not a writable regular file — never a commit target \
+                         (navigated={navigated})"),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     // ---- The extension policy (F4 default-and-redirect) ---------------------------
 
     #[test]

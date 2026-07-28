@@ -479,19 +479,21 @@ mod tests {
     /// REAL intercept, not `commit_destination` directly (see the commit-arm's own
     /// end-to-end tests in `file_browser_commit.rs` for why).
     ///
-    /// DELIBERATELY does NOT pump the async listing (unlike the audit applied elsewhere —
-    /// see the parent-row-highlight task report). This is a SEPARATE, pre-existing property
-    /// of Row 1, not the defect that audit fixed: Row 1 fires on ANY highlighted directory
-    /// whenever the field is EMPTY, by design — `FileBrowser::highlight_navigated`'s gate is
-    /// `navigated || trimmed.is_empty()`, and a bare Enter on an untouched highlight with
-    /// nothing typed is treated as an ordinary browse gesture. Since `std::env::temp_dir()`
-    /// is never filesystem root, its listing always carries a ".." row, so IF this test
-    /// pumped that listing, Enter would descend into the parent directory instead of
-    /// reaching `CommitOutcome::Nothing` — the "empty path" warning would never fire once a
-    /// real listing has landed. Confirmed live (pump added, ran, status came back empty
-    /// instead of "save-as: empty path"; reverted) — reported as a FINDING in the task
-    /// report, not fixed here: whether Row 1 should ever cede to Row 2 on an untouched
-    /// directory highlight with an empty field is a design question, not a mechanical one.
+    /// DELIBERATELY does NOT pump the async listing — the non-pump is CORRECT and
+    /// load-bearing, not an oversight (Batch T re-grounding, 2026-07-27). This test pins the
+    /// PRE-LISTING WINDOW, a real production state by design: `open_save_as` seeds an EMPTY
+    /// field, `open_destination_picker` starts with `entries` empty and lists off-thread
+    /// (there is no synchronous listing path), and the Enter intercept has no
+    /// pending-listing guard — a writer pressing Enter before the listing lands (slow disk,
+    /// network fs) reaches EXACTLY this state: no highlight, empty field,
+    /// `CommitOutcome::Nothing`, this Sticky Warning. Pumping would move the fixture into a
+    /// DIFFERENT, already-covered state — with a landed listing the untouched `".."` row is
+    /// highlighted and a bare Enter descends (Row 1), a path the pumped destination tests
+    /// own — deleting this assertion while appearing to fix it. The kind-based companion
+    /// state (a landed listing, a navigated `Other`/`Unknown` highlight, same `Nothing`) is
+    /// pinned in `file_browser_commit.rs`; its refusal-WORDING defect is filed as A25. (A
+    /// pump experiment was once tried here and reverted; the reachability grounding above is
+    /// what settles it.)
     #[test]
     fn save_as_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
@@ -507,8 +509,10 @@ mod tests {
     }
 
     /// A17 T5: an empty Write-Block path refusal is a Sticky Warning. Migrated (Task 21)
-    /// from the retired `block_write_submit` — see the Save-As twin above, INCLUDING the
-    /// same deliberate non-pump: confirmed to break identically if pumped (same finding).
+    /// from the retired `block_write_submit`. See the Save-As twin above — the SAME
+    /// deliberate, load-bearing non-pump: this pins the pre-listing window for the
+    /// Write-Block purpose (production `block_write` also seeds an empty field), and
+    /// pumping would likewise land the listing and descend instead of refusing.
     #[test]
     fn block_write_empty_path_is_a_sticky_warning() {
         use crate::editor::Editor;
