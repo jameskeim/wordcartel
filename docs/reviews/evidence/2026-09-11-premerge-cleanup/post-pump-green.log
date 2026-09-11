@@ -1,0 +1,9 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.14s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 1 test
+test e2e::quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2033 filtered out; finished in 0.01s
+

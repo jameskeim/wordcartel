@@ -69,6 +69,17 @@ fn fingerprint_with_limit(fs: &dyn crate::fsx::Fs, path: &Path, limit: u64)
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SaveMode { Normal, SaveAs }
 
+/// Identifies one save dispatch, even when several writes share a buffer version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SaveRequest { id: u64 }
+
+impl SaveRequest {
+    pub(crate) fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+    }
+}
+
 /// The two paths a save needs, kept apart because a symlinked destination makes them differ.
 ///
 /// A struct rather than two positional `PathBuf`s ON PURPOSE: same-typed positional
@@ -97,7 +108,9 @@ impl SaveTarget {
 /// here with `SaveMode::Normal`; Save-As enters with `SaveMode::SaveAs` and the
 /// re-key `target`. Called by `dispatch_save`/`overwrite_save` (Normal) and
 /// `perform_save_as` (SaveAs).
-pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
+pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) -> SaveRequest {
+    let request = SaveRequest::new();
+    ctx.editor.saves_in_flight.insert(request);
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
@@ -116,6 +129,7 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
     ctx.editor.set_progress(crate::status::StatusTopic::Save(buffer_id, v), "Saving\u{2026}");
 
     ctx.executor.dispatch(Job {
+        save_request: Some(request),
         buffer_id,
         class: ResultClass::Durability,
         version: v,
@@ -166,6 +180,7 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                     // Err payload — a genuine SaveError (IO/symlink) must land Sticky/Error so it
                     // survives the next keystroke, unlike the ordinary Info completion messages.
                     let is_save_error = outcome.is_err();
+                    let mut changed_destination = false;
                     let mut status = String::new();
                     // Hoisted out of the `by_id_mut` block (local-then-assign, mirrors
                     // `status`/`fire_save`): the session-migration queue push below needs
@@ -173,6 +188,15 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                     let mut migrate_from: Option<PathBuf> = None;
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
+                            Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged)
+                                if matches!(mode, SaveMode::Normal)
+                                    && b.document.path.as_ref() != Some(&chosen_path) => {
+                                // The write completed, but a preceding Save As changed this buffer's
+                                // destination. It proves nothing about the current path's saved state.
+                                changed_destination = true;
+                                status = format!("Saved to {} — current document was not saved",
+                                    status_target.display());
+                            }
                             Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
                                 // MERGE-TIME capture. The dispatch-time `prior_key` is stale
                                 // for a second Save-As dispatched before this merge landed;
@@ -248,8 +272,13 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
                     // this completion collapses exactly its own "Saving…" lineage (§4.2). `buffer_id`
                     // and `v` are the same values the JobResult carries as `r.buffer_id`/`r.version`.
                     let topic = crate::status::StatusTopic::Save(buffer_id, v);
+                    let cancelled_wait = crate::quit::save_finished(editor, request, !is_save_error && !changed_destination);
+                    finish_save_action(editor, buffer_id, v, request, !is_save_error && !changed_destination);
+                    if cancelled_wait { status.push_str(" — quit cancelled"); }
                     if is_save_error {
                         editor.finish_topic(topic, crate::status::StatusKind::Error, status);
+                    } else if changed_destination {
+                        editor.finish_topic(topic, crate::status::StatusKind::Warning, status);
                     } else {
                         editor.finish_topic(topic, crate::status::StatusKind::Info, status);
                     }
@@ -263,11 +292,27 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) {
             }
         }),
     });
+    request
+}
+
+/// Only the exact awaited save can authorize its action. In particular, an earlier
+/// same-version Save As must not satisfy an action waiting for a later ordinary save.
+fn finish_save_action(editor: &mut crate::editor::Editor, id: crate::editor::BufferId,
+    version: u64, request: SaveRequest, succeeded: bool) {
+    let Some(pending) = editor.pending_after_save.as_mut().filter(|p|
+        p.buffer_id == id && p.version == version
+            && p.save_request.is_none_or(|r| r == request)) else { return; };
+    if succeeded {
+        pending.completed = true;
+    } else {
+        editor.pending_after_save = None;
+        crate::quit::cancel(editor);
+    }
 }
 
 /// Internal: dispatch a Normal save of the document's own path (no external-mod
 /// check). Called by `dispatch_save` (after the check) and `overwrite_save`.
-fn do_save(ctx: &mut Ctx) {
+fn do_save(ctx: &mut Ctx) -> Option<SaveRequest> {
     let path = ctx.editor.active().document.path.clone().expect("do_save called without a path");
     // A plain Save resolves its own destination too — the document's path can itself be a
     // symlink (that is §4.10: openable but unsaveable).
@@ -277,29 +322,37 @@ fn do_save(ctx: &mut Ctx) {
             ctx.editor.set_status_full(crate::status::StatusKind::Warning,
                 format!("{}: destination symlink cannot be resolved", path.display()),
                 crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-            return;
+            return None;
         }
     };
-    do_save_to(ctx, SaveTarget { chosen: path, resolved }, SaveMode::Normal);
+    Some(do_save_to(ctx, SaveTarget { chosen: path, resolved }, SaveMode::Normal))
 }
 
 /// Registry `"save"` handler — unchanged public shape.
 pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
-    dispatch_save_reporting(ctx);
+    dispatch_save_reporting(ctx, false);
     CommandResult::Handled
 }
 
-/// The same work, RETURNING whether it opened a Save-As destination picker.
-///
-/// This return value is what replaces `dispatch_save_then`'s old
-/// `minibuffer.kind == SaveAs` sniff. Inferring control flow from which overlay happens to
-/// be up is what made that coupling silently breakable; the fact is now produced by the
-/// function that knows it.
-fn dispatch_save_reporting(ctx: &mut Ctx) -> bool {
+/// Dispatch facts, rather than overlay state, determine whether a post-save action can wait.
+enum SaveDispatch {
+    /// A worker owns the snapshot; the action may wait on this request.
+    Queued(SaveRequest),
+    /// The filename picker owns the next step; no write has been dispatched.
+    Picker,
+    /// External modifications require a user decision; the attempted quit aborts.
+    Conflict,
+    /// No job or picker was started; the failure has already been displayed.
+    Rejected,
+}
+
+fn dispatch_save_reporting(ctx: &mut Ctx, for_quit: bool) -> SaveDispatch {
     let path = match &ctx.editor.active().document.path {
         None => {
-            let opened = crate::prompts::open_save_as(ctx.editor, &ctx.fs, &ctx.msg_tx);
-            return opened;
+            let opened = if for_quit {
+                crate::prompts::open_save_as_for_quit(ctx.editor, &ctx.fs, &ctx.msg_tx)
+            } else { crate::prompts::open_save_as(ctx.editor, &ctx.fs, &ctx.msg_tx) };
+            return if opened { SaveDispatch::Picker } else { SaveDispatch::Rejected };
         }
         Some(p) => p.clone(),
     };
@@ -311,10 +364,12 @@ fn dispatch_save_reporting(ctx: &mut Ctx) -> bool {
         ctx.editor.set_status_full(crate::status::StatusKind::Warning,
             "File changed on disk \u{2014} choose [R]eload or [O]verwrite",
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-        return false;
+        return SaveDispatch::Conflict;
     }
-    do_save(ctx);
-    false
+    match do_save(ctx) {
+        Some(request) => SaveDispatch::Queued(request),
+        None => SaveDispatch::Rejected,
+    }
 }
 
 /// The unified "save, then do `action`" entry. Goes through `dispatch_save_reporting`
@@ -326,24 +381,27 @@ fn dispatch_save_reporting(ctx: &mut Ctx) -> bool {
 ///   `pending_save_as` so it fires after the Save-As write completes. Gated on the RETURN
 ///   VALUE, not on inspecting which overlay is up — see the module-level hazard note.
 pub(crate) fn dispatch_save_then(ctx: &mut crate::registry::Ctx, action: crate::editor::PostSaveAction) {
-    let was_unnamed = ctx.editor.active().document.path.is_none();
     let buffer_id = ctx.editor.active().id;
     let v = ctx.editor.active().document.version;
-    let opened_save_as = dispatch_save_reporting(ctx);
-    if was_unnamed {
-        if opened_save_as {
-            ctx.editor.pending_save_as = Some(action);
+    match dispatch_save_reporting(ctx, matches!(action, crate::editor::PostSaveAction::ContinueQuitDrain)) {
+        SaveDispatch::Picker => ctx.editor.pending_save_as = Some(action),
+        SaveDispatch::Queued(request) => {
+            ctx.editor.pending_after_save = Some(crate::editor::PendingAfterSave {
+                buffer_id, version: v, action, at_ms: ctx.clock.now_ms(),
+                save_request: Some(request), completed: false,
+            });
         }
-    } else if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
-        ctx.editor.pending_after_save = Some(crate::editor::PendingAfterSave {
-            buffer_id, version: v, action, at_ms: ctx.clock.now_ms(),
-        });
+        SaveDispatch::Conflict | SaveDispatch::Rejected => {
+            if matches!(action, crate::editor::PostSaveAction::ContinueQuitDrain) {
+                crate::quit::cancel(ctx.editor);
+            }
+        }
     }
 }
 
-/// Save, then quit once the save completes. Delegates to `dispatch_save_then`.
+/// Save the active document, then save every remaining dirty ordinary document and quit.
 pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
-    dispatch_save_then(ctx, crate::editor::PostSaveAction::Quit);
+    crate::quit::save_and_quit(ctx);
 }
 
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
@@ -353,7 +411,7 @@ pub fn overwrite_save(ctx: &mut Ctx) {
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
-    do_save(ctx); // no stat check
+    let _ = do_save(ctx); // no stat check
 }
 
 /// [R]eload: discard in-memory edits, reload F from disk. Destructive — only
@@ -1106,13 +1164,13 @@ mod tests {
         e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
         let id = e.active().id;
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
-            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0 });
+            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::ContinueQuitDrain, save_request: None, completed: false, at_ms: 0 });
         // An active quit drain must be ABORTED (not stranded) when the awaited save panics.
-        e.quit_drain = Some(crate::editor::QuitDrain {
-            queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
+        e.quit_drain = Some(crate::editor::QuitDrain::new(std::collections::VecDeque::new(), crate::editor::QuitMode::SaveAll));
         e.quit_drain_advance = true;
         crate::jobs_apply::apply_outcome(
             crate::jobs::JobOutcome::Panicked {
+                save_request: None,
                 buffer_id: id, version: 1, kind: crate::jobs::JobKind::Save, msg: "boom".into() },
             &mut e);
         assert!(e.active().document.dirty(), "panicked save keeps the buffer dirty");
@@ -1239,11 +1297,11 @@ mod tests {
                 editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(),
                 fs: std::sync::Arc::new(crate::fsx::RealFs),
             };
-            dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::Quit);
+            dispatch_save_and_quit(&mut ctx);
         }
         assert!(e.file_browser.as_ref().is_some_and(|fb| fb.mode.is_destination()),
             "an unnamed buffer opens the DESTINATION picker, not a minibuffer");
-        assert_eq!(e.pending_save_as, Some(crate::editor::PostSaveAction::Quit),
+        assert_eq!(e.pending_save_as, Some(crate::editor::PostSaveAction::ContinueQuitDrain),
             "and the post-save action is armed — this is what the minibuffer sniff used to do");
     }
 
@@ -1252,9 +1310,7 @@ mod tests {
         // The Effort-6 Codex-C2 fix, carried to the new path. Without it, backing out leaves
         // quit_drain Some-but-inert: stranded with no in-flight save and nothing to re-drive.
         let mut e = Editor::new_from_text("unsaved\n", None, (80, 24));
-        e.quit_drain = Some(crate::editor::QuitDrain {
-            queue: std::collections::VecDeque::new(),
-            mode: crate::editor::QuitMode::SaveAll });
+        e.quit_drain = Some(crate::editor::QuitDrain::new(std::collections::VecDeque::new(), crate::editor::QuitMode::SaveAll));
         e.pending_save_as = Some(crate::editor::PostSaveAction::ContinueQuitDrain);
         let (tx, _rx) = std::sync::mpsc::channel();
         let fs: std::sync::Arc<dyn crate::fsx::Fs + Send + Sync> =

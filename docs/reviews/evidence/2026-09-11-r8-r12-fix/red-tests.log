@@ -1,0 +1,36 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.93s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 3 tests
+test durability_regressions::save_all_quit_includes_buffers_dirtied_after_it_started ... FAILED
+test durability_regressions::save_and_quit_does_not_exit_with_other_dirty_buffers ... FAILED
+test durability_regressions::late_save_to_old_path_does_not_mark_current_path_clean ... FAILED
+
+failures:
+
+---- durability_regressions::save_all_quit_includes_buffers_dirtied_after_it_started stdout ----
+
+thread 'durability_regressions::save_all_quit_includes_buffers_dirtied_after_it_started' (298) panicked at wordcartel/src/durability_regressions.rs:109:5:
+newly dirty B has not been saved or reviewed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- durability_regressions::save_and_quit_does_not_exit_with_other_dirty_buffers stdout ----
+
+thread 'durability_regressions::save_and_quit_does_not_exit_with_other_dirty_buffers' (299) panicked at wordcartel/src/durability_regressions.rs:87:5:
+exit would discard the other document without consent
+
+---- durability_regressions::late_save_to_old_path_does_not_mark_current_path_clean stdout ----
+
+thread 'durability_regressions::late_save_to_old_path_does_not_mark_current_path_clean' (297) panicked at wordcartel/src/durability_regressions.rs:65:5:
+B still lacks the second edit
+
+
+failures:
+    durability_regressions::late_save_to_old_path_does_not_mark_current_path_clean
+    durability_regressions::save_all_quit_includes_buffers_dirtied_after_it_started
+    durability_regressions::save_and_quit_does_not_exit_with_other_dirty_buffers
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2006 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

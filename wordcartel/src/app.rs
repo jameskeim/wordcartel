@@ -487,6 +487,17 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     }
 }
 
+/// Shared production/harness exit barrier after plugin callbacks, before rendering/persistence.
+pub(crate) fn finish_iteration(editor: &mut Editor, ex: &dyn crate::jobs::Executor,
+    clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) -> bool {
+    if !editor.quit { return true; }
+    let mut ctx = crate::registry::Ctx {
+        editor, executor: ex, clock, msg_tx: msg_tx.clone(), fs: fs.clone(),
+    };
+    crate::quit::after_callbacks(&mut ctx)
+}
+
 /// Prepare the editor for the FIRST frame drawn OUTSIDE the reduce loop (startup /
 /// session-resume): pin the caret's viewport, then rebuild so the layout cache matches
 /// the possibly-moved scroll. The reduce loop's `advance` does this per keystroke; the
@@ -838,7 +849,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             exit_reason = ExitReason::InputLost;
             break;
         }
-        let keep = { reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx, &fs) };
+        // reduce's exit indication is provisional until plugin callbacks have run.
+        let _ = reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx, &fs);
         // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): runs AFTER
         // reduce's borrow scope has dropped, holding NO outer borrow — a queued plugin
         // command's Lua callback re-borrows the editor itself (via the bridge's wc.*
@@ -887,6 +899,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             crate::chrome::reconcile_mouse_capture(&mut e, guard.terminal().backend_mut(), &mut applied_mouse);
             crate::cursor_style::reconcile_cursor_style(&e, guard.terminal().backend_mut(), &mut applied_caret);
         }
+        let keep = finish_iteration(&mut editor.borrow_mut(), &executor, &clock, &msg_tx, &fs);
         { advance(&mut editor.borrow_mut(), &clock); }
         {
             let mut e = editor.borrow_mut();
@@ -977,7 +990,7 @@ mod tests {
     // Brief's required failing test (Task 12 step 1)
     // -------------------------------------------------------------------------
 
-    /// Feed "hi" then Ctrl+Q (modal) then 'q' (QuitAnyway); confirm the buffer holds "hi\n" and quit.
+    /// Feed "hi" then Ctrl+Q (modal) then review/discard; confirm the buffer holds "hi\n" and quit.
     #[test]
     fn step_processes_typing_and_quit() {
         use crate::registry::Registry;
@@ -1587,7 +1600,7 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
         let id = e.active().id;
         let v = e.active().document.version;
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.prompt = Some(crate::prompt::Prompt::quit_multi(1));
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(5_000);
@@ -1728,7 +1741,7 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
         let id = e.active().id;
         let v = e.active().document.version;
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.prompt = Some(crate::prompt::Prompt::quit_multi(1));
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(5_500);
@@ -2101,6 +2114,7 @@ mod tests {
             guard += 1; assert!(guard < 16, "drain did not converge");
         }
         assert!(e.quit, "Save-All drains both dirty buffers then quits");
+        assert!(!crate::app::finish_iteration(&mut e, &ex, &clk, &tx, &crate::test_support::test_fs()));
         assert!(e.quit_drain.is_none(), "drain consumed");
         assert_eq!(std::fs::read_to_string(&p0).unwrap(), "new0\n");
         assert_eq!(std::fs::read_to_string(&p1).unwrap(), "new1\n");
@@ -2229,10 +2243,10 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::prompts::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
-        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
+        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::ContinueQuitDrain, .. })));
         assert!(!e.quit, "not yet — waiting for the save result");
-        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs()); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
@@ -2563,7 +2577,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", Some(source.clone()), (80, 24));
         e.active_mut().document.version = 1; // dirty → prompt would normally be up
         // Manually raise a prompt to simulate the overlay scenario.
-        e.open_prompt(crate::prompt::Prompt::quit_confirm());
+        e.open_prompt(crate::prompt::Prompt::quit_multi(1));
 
         let buffer_id = e.active().id;
         let reg = Registry::builtins();
@@ -3053,7 +3067,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::Event;
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
-        e.open_prompt(crate::prompt::Prompt::quit_confirm());
+        e.open_prompt(crate::prompt::Prompt::quit_multi(1));
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
@@ -4559,7 +4573,7 @@ mod tests {
         e.pending_after_save = Some(PendingAfterSave {
             buffer_id: id, version: 1,
             action: PostSaveAction::CloseBuffer { id },
-            at_ms: 0,
+            save_request: None, completed: false, at_ms: 0,
         });
         // Dispatch Quit — the quit-supersedes clear runs at the top of Command::Quit.
         let r = crate::commands::run(crate::commands::Command::Quit, &mut e, &clk);

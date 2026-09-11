@@ -1,0 +1,42 @@
+--- wordcartel/src/durability_regressions.rs (Fable I1 snapshot)
++++ wordcartel/src/durability_regressions.rs (current)
+@@ -744,4 +744,28 @@
+         assert!(e.status_text().contains("current document was not saved"));
+         assert_eq!(e.active().document.path.as_deref(), Some(b.as_path()));
+     }
++
++    #[test]
++    fn mouse_click_away_cancels_a_quit_owned_filename_request() {
++        let mut e = Editor::new_from_text("body", None, (80, 24));
++        insert(&mut e, "new ");
++        let ex = DeferredExecutor::default();
++        command(&mut e, &ex, "save_and_quit");
++        crate::derive::rebuild(&mut e);
++        let reg = Registry::builtins();
++        let (keys, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
++        let (tx, _rx) = std::sync::mpsc::channel();
++        let mouse = crossterm::event::MouseEvent {
++            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
++            column: 0, row: 0, modifiers: crossterm::event::KeyModifiers::NONE,
++        };
++        crate::app::reduce(crate::app::Msg::Input(crossterm::event::Event::Mouse(mouse)),
++            &mut e, &reg, &keys, &ex, &TestClock(1), &tx, &test_fs());
++        assert!(e.file_browser.is_none());
++        assert!(e.pending_save_as.is_none(), "mouse cancellation must not orphan the filename request");
++        assert!(e.quit_drain.is_none());
++        assert!(!e.quit);
++        command(&mut e, &ex, "save_as");
++        assert!(e.file_browser.is_some(), "ordinary saving remains available after cancellation");
++    }
+ }
+--- wordcartel/src/mouse.rs (Fable I1 snapshot)
++++ wordcartel/src/mouse.rs (current)
+@@ -533,7 +533,7 @@
+                 crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
+             }
+         } else if !inside {
+-            editor.file_browser = None; // click-away closes
++            crate::file_browser::close_overlay(editor); // match registry closure for quit-owned pickers
+         }
+     }
+ }

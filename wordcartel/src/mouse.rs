@@ -533,7 +533,7 @@ pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: rata
                 crate::file_browser::file_browser_enter(editor, ctx.fs, ctx.msg_tx);
             }
         } else if !inside {
-            editor.file_browser = None; // click-away closes
+            crate::file_browser::close_overlay(editor); // match registry closure for quit-owned pickers
         }
     }
 }
@@ -1485,7 +1485,7 @@ mod tests {
             mode: crate::file_browser::BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         }); }).is_none(), "file_browser open must block arming");
         assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
             "dropdown open must block arming");
@@ -1716,7 +1716,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn dwell_never_arms_under_any_modal() {
         let modal_setups: Vec<(&str, fn(&mut Editor))> = vec![
-            ("prompt", |e| e.prompt = Some(crate::prompt::Prompt::quit_confirm())),
+            ("prompt", |e| e.prompt = Some(crate::prompt::Prompt::quit_multi(1))),
             ("minibuffer", |e| e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter)),
             ("search", |e| e.search = Some(crate::search_overlay::SearchState::open(
                 crate::search_overlay::Phase::Find, 0, crate::editor::BufferId(1)))),
@@ -1747,7 +1747,7 @@ mod tests {
     fn click_under_prompt_is_consumed_not_leaked_to_editor() {
         let mut e = Editor::new_from_text("abcdef\n", None, (40, 8));
         crate::derive::rebuild(&mut e);
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.prompt = Some(crate::prompt::Prompt::quit_multi(1));
         let (reg, ex, clk, tx, km) = ctx();
         handle_flat(&mut e, down(3, 4), &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert_eq!(crate::nav::head(&e), 0, "click must not move the caret while a prompt is open");
@@ -2178,24 +2178,25 @@ mod tests {
     #[test]
     fn click_prompt_choice_dispatches_action() {
         let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        e.active_mut().document.version = 1; // a real review requires unsaved work
         crate::derive::rebuild(&mut e);
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.prompt = Some(crate::prompt::Prompt::quit_multi(1));
         let area = ratatui::layout::Rect::new(0, 0, 80, 8);
-        // Locate the `[Q]` marker by counting CHARS, not bytes. quit_confirm contains
-        // `·` (U+00B7, 2 UTF-8 bytes, 1 terminal column) before `[Q]`, so the byte
+        // Locate the `[R]` marker by counting CHARS, not bytes. quit_multi contains
+        // `·` (U+00B7, 2 UTF-8 bytes, 1 terminal column) before `[R]`, so the byte
         // offset overestimates the column by 1. Using char index = column (width-1)
         // ensures clicking exactly ON the `[` glyph, catching a byte-vs-column regression.
         let msg = e.prompt.as_ref().unwrap().message.clone();
         let chars: Vec<char> = msg.chars().collect();
-        let q_col = chars.windows(3)
-            .position(|w| w[0] == '[' && w[1] == 'Q' && w[2] == ']')
+        let review_col = chars.windows(3)
+            .position(|w| w[0] == '[' && w[1] == 'R' && w[2] == ']')
             .expect("quit marker present") as u16;
         let status_row = area.y + area.height - 1; // = 7 for this geometry
         let (reg, ex, clk, tx, km) = ctx();
-        // Click at q_col + 1 — the `Q` glyph, inside the [Q]uit span.
-        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: q_col + 1, row: status_row, modifiers: KeyModifiers::NONE };
+        // Click at review_col + 1 — the `R` glyph, inside the [R]uit span.
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: review_col + 1, row: status_row, modifiers: KeyModifiers::NONE };
         handle_flat(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
-        assert!(e.quit, "clicking [Q]uit anyway must trigger the QuitAnyway action");
+        assert!(e.quit_drain.as_ref().is_some_and(|d| d.mode == crate::editor::QuitMode::ReviewEach), "clicking [R]eview each must trigger the ReviewEach action");
     }
 
     /// transform_chooser uses lowercase markers `[r]/[u]/[v]` and double-space
@@ -2237,12 +2238,12 @@ mod tests {
     fn click_off_marker_keeps_prompt_open() {
         let mut e = Editor::new_from_text("abc\n", None, (80, 8));
         crate::derive::rebuild(&mut e);
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.prompt = Some(crate::prompt::Prompt::quit_multi(1));
         let caret_before = crate::nav::head(&e);
         let area = ratatui::layout::Rect::new(0, 0, 80, 8);
         let status_row = area.y + area.height - 1;
         let (reg, ex, clk, tx, km) = ctx();
-        // Column 0 is before all marker spans in quit_confirm → no-op click.
+        // Column 0 is before all marker spans in quit_multi → no-op click.
         let d = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 0,
@@ -2258,38 +2259,39 @@ mod tests {
     /// `·` (U+00B7) is 2 UTF-8 bytes but 1 terminal column. The old byte-offset
     /// hit-test introduced a 1-column dead zone after each separator. This test pins
     /// the char-based (width-1) fix: clicking at the CHAR column of `[Q]` (34) must
-    /// fire QuitAnyway, while the BYTE offset (35) differs — proving the regression
+    /// open Review Each, while the BYTE offset differs — proving the regression
     /// would be caught if byte offsets crept back in.
     #[test]
     fn click_prompt_choice_with_dot_separator_second_choice() {
         let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        e.active_mut().document.version = 1; // a real review requires unsaved work
         crate::derive::rebuild(&mut e);
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.prompt = Some(crate::prompt::Prompt::quit_multi(1));
         let area = ratatui::layout::Rect::new(0, 0, 80, 8);
         let msg = e.prompt.as_ref().unwrap().message.clone();
-        // Char-column of `[Q]` (34 for this message; byte offset is 35 due to `·`).
+        // Char-column of `[R]` (34 for this message; byte offset is 35 due to `·`).
         let chars: Vec<char> = msg.chars().collect();
-        let q_char_col = chars.windows(3)
-            .position(|w| w[0] == '[' && w[1] == 'Q' && w[2] == ']')
-            .expect("must find [Q] in quit_confirm message") as u16;
-        let q_byte_col = msg.find("[Q]").expect("must find [Q] by str::find") as u16;
+        let review_char_col = chars.windows(3)
+            .position(|w| w[0] == '[' && w[1] == 'R' && w[2] == ']')
+            .expect("must find [R] in quit_multi message") as u16;
+        let review_byte_col = msg.find("[R]").expect("must find [R] by str::find") as u16;
         // Precondition: `·` makes the byte offset exceed the char column.
-        assert!(q_byte_col > q_char_col,
-            "precondition: byte offset ({q_byte_col}) must exceed char col ({q_char_col}) — \
-             `·` before [Q] is 2 bytes but 1 column");
+        assert!(review_byte_col > review_char_col,
+            "precondition: byte offset ({review_byte_col}) must exceed char col ({review_char_col}) — \
+             `·` before [R] is 2 bytes but 1 column");
         let status_row = area.y + area.height - 1;
         let (reg, ex, clk, tx, km) = ctx();
-        // Click at the true char column — must hit [Q]uit anyway.
+        // Click at the true char column — must hit [R]eview each.
         let d = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: q_char_col,
+            column: review_char_col,
             row: status_row,
             modifiers: KeyModifiers::NONE,
         };
         handle_flat(&mut e, d, &reg, &km, &ex, &clk, &tx, &crate::test_support::test_fs());
-        assert!(e.quit,
-            "clicking at char col of [Q] (col {q_char_col}) must trigger QuitAnyway; \
-             byte-offset col ({q_byte_col}) would miss the span start");
+        assert!(e.quit_drain.as_ref().is_some_and(|d| d.mode == crate::editor::QuitMode::ReviewEach),
+            "clicking at char col of [R] (col {review_char_col}) must trigger ReviewEach; \
+             byte-offset col ({review_byte_col}) would miss the span start");
     }
 
     /// A click on a directory entry in the file browser descends into that directory.

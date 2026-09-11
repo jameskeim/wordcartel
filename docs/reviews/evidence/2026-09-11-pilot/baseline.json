@@ -1,0 +1,7 @@
+{
+  "revision": "d3aea924988f60702529f6c68a0e332e64d44f1d",
+  "branch": "main",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "initial_status": "?? docs/reviews/\n?? scratchpad/a22/codex-spec-round2.md\n?? scratchpad/a22/codex-spec-round3.md\n?? scratchpad/a22/codex-spec-round5.md\n?? scratchpad/a22/fable-grounding.md\n?? scratchpad/a22/fable-orderings-probe.rs\n?? scratchpad/a22/fable-whole-branch-review.md\n?? scratchpad/a22/grounding-brief.md\n?? scratchpad/b18/\n?? scratchpad/backlog-sequence/\n?? scratchpad/batch-t/baseline-test-names.txt\n?? scratchpad/batch-t/baseline.md\n?? scratchpad/batch-t/codex-plan-round1.md\n?? scratchpad/batch-t/codex-spec-round1.md\n?? scratchpad/batch-t/codex-spec-round8.md\n?? scratchpad/batch-t/endpoints.txt\n?? scratchpad/batch-t/fable-probe/\n?? scratchpad/batch-t/fable-whole-branch-review.md\n?? scratchpad/batch-t/verify/\n?? scratchpad/e11/\n?? scratchpad/e15/\n?? scratchpad/effort2-grounding/\n?? scratchpad/group3/\n?? scratchpad/group4/\n?? scratchpad/h27/\n?? scratchpad/h32h33/\n?? scratchpad/lens-linting-arc/"
+}

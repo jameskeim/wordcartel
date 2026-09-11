@@ -1,0 +1,19 @@
+FAIL s1
+  s1| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s2
+  s2| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s3
+  s3| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s4
+  s4| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s5
+  s5| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s6
+  s6| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s7
+  s7| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s8
+  s8| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+FAIL s9
+  s9| error connecting to /tmp/tmux-1000/wcartel-smoke-2 (Operation not permitted)
+smoke: FAIL s1 — advisory (0/9 passed)

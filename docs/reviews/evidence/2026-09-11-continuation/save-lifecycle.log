@@ -1,0 +1,21 @@
+Command: cargo test -p wordcartel --lib review_probes -- --test-threads=1
+Source SHA256: 2410705d928de48fe5c562121c8a24698502ab40e939a00bf11662b27987084a
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.82s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 11 tests
+test swap::review_probes::failed_checkpoint_immediately_rearms ... ok
+test swap::review_probes::inactive_dirty_buffer_has_no_checkpoint_deadline ... ok
+test swap::review_probes::named_buffers_share_checkpoint_and_saving_one_removes_the_other ... ok
+test swap::review_probes::normal_save_queued_after_save_as_marks_wrong_path_clean ... ok
+test swap::review_probes::opening_during_session_skips_recovery_and_save_deletes_carrier ... ok
+test swap::review_probes::queued_save_overwrites_external_edit_after_foreground_check ... ok
+test swap::review_probes::recovering_unnamed_work_deletes_carrier_without_arming_checkpoint ... ok
+test swap::review_probes::save_as_of_one_unnamed_buffer_deletes_anothers_checkpoint ... ok
+test swap::review_probes::save_failure_matrix_preserves_dirty_state_and_original_before_rename ... ok
+test swap::review_probes::uninterrupted_typing_never_creates_first_checkpoint ... ok
+test swap::review_probes::untitled_checkpoints_collide ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 2006 filtered out; finished in 0.11s
+

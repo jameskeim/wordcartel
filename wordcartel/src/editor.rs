@@ -11,11 +11,10 @@ use wordcartel_core::selection::Selection;
 pub struct BufferId(pub u64);
 
 /// What to do once a pending save completes successfully.
-/// `Quit` is the single-buffer save-then-quit; `ContinueQuitDrain` advances the
-/// multi-buffer quit state machine (Effort 6) after each buffer's save lands.
+/// `ContinueQuitDrain` advances the session-wide quit flow after each save lands.
 /// `CloseBuffer { id }` closes the target buffer (C4 close-confirm path).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PostSaveAction { Quit, ContinueQuitDrain, CloseBuffer { id: BufferId } }
+pub enum PostSaveAction { ContinueQuitDrain, CloseBuffer { id: BufferId } }
 
 /// Effort 6 multi-buffer quit: how the drain disposes of each dirty buffer.
 /// `Copy` so `let mode = drain.mode;` copies out without holding a borrow on
@@ -29,6 +28,20 @@ pub enum QuitMode { SaveAll, ReviewEach }
 pub struct QuitDrain {
     pub queue: std::collections::VecDeque<BufferId>,
     pub mode: QuitMode,
+    /// Last version of each buffer explicitly discarded during this quit attempt.
+    pub(crate) discarded_versions: std::collections::HashMap<BufferId, u64>,
+    /// Identity and version displayed by the current per-buffer review prompt.
+    pub(crate) reviewing: Option<(BufferId, u64)>,
+    /// Timeout origin while awaiting already-dispatched saves after the queue empties.
+    pub(crate) waiting_since: Option<u64>,
+}
+
+impl QuitDrain {
+    /// Start a quit flow with no discard decisions carried from an earlier attempt.
+    pub fn new(queue: std::collections::VecDeque<BufferId>, mode: QuitMode) -> Self {
+        Self { queue, mode, discarded_versions: std::collections::HashMap::new(),
+            reviewing: None, waiting_since: None }
+    }
 }
 
 /// An in-flight "save, then act" request. Armed by `dispatch_save_then`;
@@ -39,6 +52,10 @@ pub struct PendingAfterSave {
     pub version: u64,
     pub action: PostSaveAction,
     pub at_ms: u64,
+    /// Exact dispatched save; None is reserved for synthetic result tests.
+    pub(crate) save_request: Option<crate::save::SaveRequest>,
+    /// Completion belongs to this waiting action, never to a copy of its request ID.
+    pub(crate) completed: bool,
 }
 
 /// State crossing the write-block overwrite confirm: the resolved target plus the
@@ -544,6 +561,8 @@ pub struct Editor {
     pub prompt: Option<crate::prompt::Prompt>,
     /// Armed by `dispatch_save_then`; consumed by `apply_result` when the save lands.
     pub pending_after_save: Option<PendingAfterSave>,
+    /// Dispatched saves whose result has not yet merged on the foreground.
+    pub(crate) saves_in_flight: std::collections::HashSet<crate::save::SaveRequest>,
     /// Carry the post-save action across an unnamed buffer's Save-As flow (Task 3).
     pub pending_save_as: Option<PostSaveAction>,
     /// The target awaiting an OverwriteSaveAs confirmation (existing-file Save-As). (Task 3)
@@ -746,6 +765,7 @@ impl Editor {
             plugin_inventory: Vec::new(),
             parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
+            saves_in_flight: std::collections::HashSet::new(),
             pending_save_as_chosen: None,
             pending_write_block: None, pending_clean: Vec::new(),
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
@@ -1027,7 +1047,7 @@ impl Editor {
             dir: dir.clone(), query: String::new(), mode: crate::file_browser::BrowseMode::Select,
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         crate::file_browser::start_listing(&mut fb, dir, fs, msg_tx);
         self.file_browser = Some(fb);
@@ -1053,7 +1073,7 @@ impl Editor {
             mode: crate::file_browser::BrowseMode::Destination { purpose, field, field_cursor },
             listing: Vec::new(), total_seen: 0, unreadable: 0, entries: Vec::new(),
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         // ASYNC, exactly like `open_file_browser`. A synchronous `refetch` here would block
         // the input loop on the directory read and undo Task 13 for every destination
@@ -1113,7 +1133,7 @@ impl Editor {
             mode: crate::file_browser::BrowseMode::Recents,
             listing, total_seen: total, unreadable: 0,
             entries, disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         });
     }
 

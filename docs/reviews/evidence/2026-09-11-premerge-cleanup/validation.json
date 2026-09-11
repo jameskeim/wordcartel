@@ -1,0 +1,25 @@
+{
+  "snapshot_sha256": "1543814ee1ecfd22c18f8900f0692a0de70b0a52609cb6e8f7aca5b5d3c42181",
+  "commands": [
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets",
+    "cargo build --workspace",
+    "cargo test --workspace --no-run",
+    "scripts/smoke/run.sh"
+  ],
+  "tests": {
+    "passed": 2499,
+    "failed": 0,
+    "ignored": 6
+  },
+  "smoke": "smoke: 9/9 PASS",
+  "codex_review": "codex-review-round4.md",
+  "source_files": 26,
+  "environment": "Isolated XDG state/config/cache; workspace tests and smoke permitted outside sandbox for socket/tmux fixtures.",
+  "source_hashes_verified": true,
+  "fable_review": "fable-review.md",
+  "review_verdicts": {
+    "codex": "GO",
+    "fable": "GO"
+  }
+}

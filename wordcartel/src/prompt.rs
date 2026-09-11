@@ -43,8 +43,6 @@ fn format_age(now_ms: u64, ts_ms: u64) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PromptAction {
     Cancel,
-    QuitAnyway,
-    SaveAndQuit,
     Reload,
     Overwrite,
     OverwriteExport,
@@ -107,17 +105,6 @@ impl Prompt {
             .map(|c| c.action)
     }
 
-    pub fn quit_confirm() -> Prompt {
-        Prompt {
-            message: "Unsaved changes: [S]ave & quit · [Q]uit anyway · [C]ancel".into(),
-            detail: Vec::new(),
-            choices: vec![
-                Choice { key: 's', label: "Save & quit", action: PromptAction::SaveAndQuit },
-                Choice { key: 'q', label: "Quit anyway", action: PromptAction::QuitAnyway },
-                Choice { key: 'c', label: "Cancel",      action: PromptAction::Cancel },
-            ],
-        }
-    }
 
     /// Effort 6 top-level multi-buffer quit prompt: N buffers have unsaved work.
     pub fn quit_multi(n: usize) -> Prompt {
@@ -280,10 +267,10 @@ mod tests {
     }
 
     #[test]
-    fn quit_confirm_routes_keys_case_insensitively() {
-        let p = Prompt::quit_confirm();
-        assert_eq!(p.action_for('s'), Some(PromptAction::SaveAndQuit));
-        assert_eq!(p.action_for('Q'), Some(PromptAction::QuitAnyway));
+    fn quit_multi_routes_keys_case_insensitively() {
+        let p = Prompt::quit_multi(1);
+        assert_eq!(p.action_for('a'), Some(PromptAction::QuitSaveAll));
+        assert_eq!(p.action_for('R'), Some(PromptAction::QuitReviewEach));
         assert_eq!(p.action_for('c'), Some(PromptAction::Cancel));
         assert_eq!(p.action_for('z'), None, "unmapped key returns None");
     }

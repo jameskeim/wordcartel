@@ -35,10 +35,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 // by drive_quit_drain) must abort the quit drain, just like Cancel does.
                 // Without this, quit_drain stays Some-but-inert: the drain is
                 // stranded with no in-flight save and no re-drive pending.
-                if editor.quit_drain.is_some() {
-                    editor.quit_drain = None;
-                    editor.quit_drain_advance = false;
-                }
+                crate::quit::cancel(editor);
             } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                 if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                     resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx, ctx.fs);
@@ -84,12 +81,32 @@ pub fn open_save_as(editor: &mut crate::editor::Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> bool
 {
+    if !crate::quit::allow_manual_save_as(editor) { return false; }
+    open_save_as_picker(editor, fs, msg_tx, None)
+}
+
+/// A quit-owned filename request can proceed while manual Save As is blocked.
+pub(crate) fn open_save_as_for_quit(editor: &mut Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<Msg>) -> bool {
+    let id = editor.active().id;
+    if editor.quit_drain.as_ref().is_none_or(|d| d.queue.front() != Some(&id)) { return false; }
+    open_save_as_picker(editor, fs, msg_tx, Some(id))
+}
+
+fn open_save_as_picker(editor: &mut Editor,
+    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
+    msg_tx: &std::sync::mpsc::Sender<Msg>, owner: Option<crate::editor::BufferId>) -> bool {
     let dir = editor.active().document.path.as_ref()
         .and_then(|p| p.parent())
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    editor.open_destination_picker(fs, msg_tx,
-        crate::file_browser::DestinationPurpose::SaveAs, dir, String::new())
+    let opened = editor.open_destination_picker(fs, msg_tx,
+        crate::file_browser::DestinationPurpose::SaveAs, dir, String::new());
+    if opened {
+        if let Some(fb) = editor.file_browser.as_mut() { fb.quit_save_owner = owner; }
+    }
+    opened
 }
 
 /// H5 `clean_recovery` command entry: enumerate the provably-valueless recovery files ONCE,
@@ -176,18 +193,20 @@ pub(crate) fn perform_save_as(editor: &mut crate::editor::Editor, chosen: std::p
                    // unreachable by an injected `FaultFs`, silently undoing the seam at the
                    // one place it matters most. Every caller already holds `ctx.fs`.
                    fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
+    if !crate::quit::allow_save_as_write(editor) { return; }
     let v = editor.active().document.version;
     let buffer_id = editor.active().id;
-    {
+    let request = {
         let mut ctx = crate::registry::Ctx {
             editor, clock, executor, msg_tx: msg_tx.clone(),
             fs: std::sync::Arc::clone(fs),
         };
         crate::save::do_save_to(&mut ctx,
-            crate::save::SaveTarget { chosen, resolved }, crate::save::SaveMode::SaveAs);
-    }
+            crate::save::SaveTarget { chosen, resolved }, crate::save::SaveMode::SaveAs)
+    };
     if let Some(action) = editor.pending_save_as.take() {
-        editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
+        editor.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id, version: v, action, at_ms: clock.now_ms(), save_request: Some(request), completed: false });
     }
 }
 
@@ -221,27 +240,25 @@ pub fn resolve_prompt(
             editor.pending_clean.clear(); // H5: Cancel abandons the snapshot; delete nothing
             // Effort 6: abort an in-progress multi-buffer quit (no data loss; the
             // user backed out). Leave `quit` false.
-            editor.quit_drain = None;
-            editor.quit_drain_advance = false;
+            crate::quit::cancel(editor);
         }
         PromptAction::QuitSaveAll | PromptAction::QuitReviewEach => {
             editor.prompt = None;
             let mode = if matches!(action, PromptAction::QuitSaveAll) { crate::editor::QuitMode::SaveAll } else { crate::editor::QuitMode::ReviewEach };
-            let queue: std::collections::VecDeque<_> = editor.buffers.iter().filter(|b| editor.is_dirty(b.id)).map(|b| b.id).collect();
-            editor.quit_drain = Some(crate::editor::QuitDrain { queue, mode });
-            crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx, fs);
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
+            crate::quit::start(&mut ctx, mode);
             return;
         }
         PromptAction::ReviewSave => {
             editor.prompt = None;
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
-            crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
+            crate::quit::review_save(&mut ctx);
             return;
         }
         PromptAction::ReviewDiscard => {
             editor.prompt = None;
-            if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
-            crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx, fs);
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
+            crate::quit::review_discard(&mut ctx);
             return;
         }
         PromptAction::CloseSave { id } => {
@@ -254,13 +271,6 @@ pub fn resolve_prompt(
             editor.prompt = None;
             crate::workspace::close_buffer_now(editor, id);
             return;
-        }
-        PromptAction::QuitAnyway => { editor.quit = true; }
-        PromptAction::SaveAndQuit => {
-            editor.prompt = None; // dismiss the quit-confirm modal first
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
-            crate::save::dispatch_save_and_quit(&mut ctx);
-            return; // prompt handled; must NOT clear an external-mod modal
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
@@ -597,7 +607,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
+        resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_after_save.is_none(), "no job dispatched → do not arm pending_after_save");
         assert!(!e.quit);
     }

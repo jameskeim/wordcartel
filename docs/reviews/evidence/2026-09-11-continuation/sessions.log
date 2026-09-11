@@ -1,0 +1,4 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.97s
+
+CONFIRMED: two distinct live processes used the same named swap; B replaced A.

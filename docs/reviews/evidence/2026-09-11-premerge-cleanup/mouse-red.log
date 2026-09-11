@@ -1,0 +1,22 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.78s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 1 test
+test durability_regressions::tests::mouse_click_away_cancels_a_quit_owned_filename_request ... FAILED
+
+failures:
+
+---- durability_regressions::tests::mouse_click_away_cancels_a_quit_owned_filename_request stdout ----
+
+thread 'durability_regressions::tests::mouse_click_away_cancels_a_quit_owned_filename_request' (296) panicked at wordcartel/src/durability_regressions.rs:765:9:
+mouse cancellation must not orphan the filename request
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    durability_regressions::tests::mouse_click_away_cancels_a_quit_owned_filename_request
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2039 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

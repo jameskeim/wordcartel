@@ -1070,8 +1070,8 @@ mod tests {
     #[test]
     fn renders_active_prompt_on_status_row() {
         let mut e = Editor::new_from_text("hello\n", None, (40, 6));
-        e.active_mut().document.version = 1; // dirty so quit_confirm is realistic
-        e.open_prompt(crate::prompt::Prompt::quit_confirm());
+        e.active_mut().document.version = 1; // dirty so the quit summary is realistic
+        e.open_prompt(crate::prompt::Prompt::quit_multi(1));
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
         term.draw(|f| render(f, &mut e)).unwrap();
@@ -1080,10 +1080,9 @@ mod tests {
         let status_row: String = (0u16..40)
             .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
             .collect();
-        // The quit_confirm message starts with "Unsaved changes: [S]ave & quit …"
-        // At terminal width 40 the truncation leaves "Unsaved changes: [S]ave & quit · [Q]uit "
+        // The real quit summary must remain visible even when truncated to 40 columns.
         assert!(
-            status_row.contains("Unsaved changes") || status_row.contains("[S]ave"),
+            status_row.contains("buffer(s) unsaved"),
             "status row must show prompt message, got: {:?}",
             status_row
         );
@@ -1164,7 +1163,7 @@ mod tests {
         // so a zero-line box paints, watch the row-equality fail.
         let mut with = Editor::new_from_text("hello\nworld\n", None, (60, 10));
         with.active_mut().document.version = 1;
-        with.open_prompt(crate::prompt::Prompt::quit_confirm());
+        with.open_prompt(crate::prompt::Prompt::quit_multi(1));
         derive::rebuild(&mut with);
         let mut without = Editor::new_from_text("hello\nworld\n", None, (60, 10));
         without.active_mut().document.version = 1;
@@ -1180,7 +1179,7 @@ mod tests {
             "precondition: the prompt IS live and did change the status row");
         // And every constructor in the app agrees it has nothing to disclose.
         for p in [
-            crate::prompt::Prompt::quit_confirm(),
+            crate::prompt::Prompt::quit_multi(1),
             crate::prompt::Prompt::quit_multi(2),
             crate::prompt::Prompt::quit_review_buffer("draft.md"),
             crate::prompt::Prompt::external_mod(),

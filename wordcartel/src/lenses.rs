@@ -219,6 +219,7 @@ pub fn dispatch_pos_sweep(editor: &mut Editor, ex: &dyn Executor) {
     editor.active_mut().pos.due_at = None;
 
     let job = Job {
+        save_request: None,
         buffer_id, class: ResultClass::BufferLocal, version, kind: JobKind::PosSweep,
         run: Box::new(move || {
             let mut adverbs = Vec::new(); let mut adjectives = Vec::new();

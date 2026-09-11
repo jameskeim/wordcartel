@@ -1040,7 +1040,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         }
     }
 
