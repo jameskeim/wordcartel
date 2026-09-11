@@ -149,7 +149,7 @@ impl Harness {
     /// state-orthogonal for the seed journeys). A clipboard/mouse journey must add them.
     fn step(&mut self, msg: Msg) -> bool {
         let clock = TestClock(self.now);
-        let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx, &self.fs) };
+        let _ = reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx, &self.fs);
         // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): mirrors run()'s
         // choreography — runs AFTER reduce's borrow scope has dropped, holding NO outer borrow,
         // so a dispatched plugin command's Lua callback can re-borrow the editor via the
@@ -166,6 +166,7 @@ impl Harness {
             self.keymap = t;
         }
         self.editor.borrow_mut().surface_undo_eviction();
+        let keep = app::finish_iteration(&mut self.editor.borrow_mut(), &self.ex, &clock, &self.tx, &self.fs);
         { app::advance(&mut self.editor.borrow_mut(), &clock); }
         self.render();
         keep
@@ -195,6 +196,7 @@ impl Harness {
         }
         self.editor.borrow_mut().surface_undo_eviction();
         let t1 = std::time::Instant::now();
+        let _keep = app::finish_iteration(&mut self.editor.borrow_mut(), &self.ex, &clock, &self.tx, &self.fs);
         { app::advance(&mut self.editor.borrow_mut(), &clock); }
         let t_advance = t1.elapsed();
         let spans = crate::derive::bench_spans::drain();
@@ -527,6 +529,63 @@ fn plugin_command_dispatches_via_palette_same_frame() {
     assert_eq!(h.doc_text(), "Xdoc\n",
         "the plugin's wc.insert must land via the same-frame pump, no extra step");
     assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
+}
+
+#[test]
+fn quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("late.md");
+    std::fs::write(&path, "body").unwrap();
+    let src = "wc.register_command{ name='late', label='Late Plugin Edit', fn=function() wc.insert('late ') end }";
+    let mut h = Harness::new_with_plugin("body", &[("late", src)]);
+    {
+        let mut e = h.editor.borrow_mut();
+        e.active_mut().document.path = Some(path.clone());
+        e.active_mut().document.stored_fp = crate::save::fingerprint(&path);
+    }
+    h.ctrl('p');
+    h.type_str("Late Plugin Edit");
+    {
+        let mut e = h.editor.borrow_mut();
+        h.reg.dispatch(crate::registry::CommandId("save_and_quit"), &mut crate::registry::Ctx {
+            editor: &mut e, executor: &h.ex, clock: &TestClock(0), msg_tx: h.tx.clone(), fs: h.fs.clone(),
+        });
+    } // save is ready to merge, but the next input queues the plugin command first
+    let keep = h.step(press(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(h.doc_text(), "late body", "the real plugin callback ran");
+    assert!(keep, "a pre-pump quit decision cannot discard the callback's edit");
+    assert!(!h.editor.borrow().quit);
+    assert!(!h.step(Msg::Tick), "exit after the additional save has merged");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "late body");
+    assert!(!h.editor.borrow().active().document.dirty());
+}
+
+#[test]
+fn quit_rechecks_plugin_dispatched_saves_and_blocks_late_save_as() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("late-save.md");
+    std::fs::write(&path, "body").unwrap();
+    let src = "wc.register_command{ name='late', label='Late Plugin Save', fn=function() wc.command('save'); wc.command('save_as') end }";
+    let mut h = Harness::new_with_plugin("body", &[("late", src)]);
+    {
+        let mut e = h.editor.borrow_mut();
+        e.active_mut().document.path = Some(path.clone());
+        e.active_mut().document.stored_fp = crate::save::fingerprint(&path);
+    }
+    h.ctrl('p');
+    h.type_str("Late Plugin Save");
+    {
+        let mut e = h.editor.borrow_mut();
+        h.reg.dispatch(crate::registry::CommandId("save_and_quit"), &mut crate::registry::Ctx {
+            editor: &mut e, executor: &h.ex, clock: &TestClock(0), msg_tx: h.tx.clone(), fs: h.fs.clone(),
+        });
+    }
+    assert!(h.step(press(KeyCode::Enter, KeyModifiers::NONE)), "wait for the callback's save merge");
+    assert_eq!(h.editor.borrow().saves_in_flight.len(), 1);
+    assert!(h.editor.borrow().file_browser.is_none(), "late manual Save As is still blocked");
+    assert!(!h.step(Msg::Tick));
+    assert!(h.editor.borrow().saves_in_flight.is_empty());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "body");
 }
 
 /// Borrow-safety regression (spec §11's load-bearing invariant): a `step` that dispatches a

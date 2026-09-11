@@ -1,0 +1,10 @@
+{
+  "revision": "d3aea924988f60702529f6c68a0e332e64d44f1d",
+  "tracked_diff_empty": true,
+  "original_swap_source_sha256": "2410705d928de48fe5c562121c8a24698502ab40e939a00bf11662b27987084a",
+  "review_probe_tests_passed": 16,
+  "cross_process_probe": "confirmed",
+  "smoke": "smoke: 9/9 PASS",
+  "temporary_sources_removed": true,
+  "scope": "Pass 0 mapping and Pass 1 durability/lifecycle only; see reports for coverage limits"
+}

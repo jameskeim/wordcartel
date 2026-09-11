@@ -1,0 +1,195 @@
+--- wordcartel/src/durability_regressions.rs (previous Fable snapshot)
++++ wordcartel/src/durability_regressions.rs (current)
+@@ -563,6 +563,7 @@
+             assert!(!e.quit);
+             assert!(e.quit_drain.is_none());
+             assert!(e.saves_in_flight.is_empty());
++            if !timeout { assert!(e.status_text().contains("quit cancelled")); }
+         }
+     }
+ 
+@@ -707,4 +708,40 @@
+         assert!(finish_iteration(&mut e, &ex));
+         assert!(!e.quit);
+     }
++
++    #[test]
++    fn replacing_quit_owned_picker_with_palette_cancels_its_ownership() {
++        let mut e = Editor::new_from_text("body", None, (80, 24));
++        insert(&mut e, "new ");
++        let ex = DeferredExecutor::default();
++        command(&mut e, &ex, "save_and_quit");
++        assert!(e.file_browser.is_some());
++        e.open_palette();
++        assert!(e.file_browser.is_none());
++        assert!(e.pending_save_as.is_none(), "closing through the overlay registry must cancel ownership");
++        assert!(e.quit_drain.is_none());
++        assert!(!e.quit);
++        command(&mut e, &ex, "save_as");
++        assert!(e.file_browser.is_some(), "manual saving must not remain blocked");
++    }
++
++    #[test]
++    fn changed_destination_explains_cancellation_of_a_plain_quit_wait() {
++        let dir = tempfile::tempdir().unwrap();
++        let a = dir.path().join("a.md");
++        let b = dir.path().join("b.md");
++        std::fs::write(&a, "body").unwrap();
++        let mut e = Editor::new_from_text("body", Some(a), (80, 24));
++        let ex = DeferredExecutor::default();
++        let (tx, _rx) = std::sync::mpsc::channel();
++        crate::prompts::perform_save_as(&mut e, b.clone(), b.clone(), &ex, &TestClock(0), &tx, &test_fs());
++        command(&mut e, &ex, "save");
++        command(&mut e, &ex, "quit");
++        ex.complete_next(&mut e);
++        ex.complete_next(&mut e);
++        assert!(!e.quit);
++        assert!(e.status_text().contains("quit cancelled"));
++        assert!(e.status_text().contains("current document was not saved"));
++        assert_eq!(e.active().document.path.as_deref(), Some(b.as_path()));
++    }
+ }
+--- wordcartel/src/file_browser.rs (previous Fable snapshot)
++++ wordcartel/src/file_browser.rs (current)
+@@ -396,6 +396,15 @@
+     crate::quit::cancel(editor);
+ }
+ 
++/// Replacing a quit-owned picker abandons that filename request, just like Esc.
++/// Successful commits remove the picker before opening their next prompt, so this
++/// does not cancel an intentional transition to overwrite confirmation.
++pub(crate) fn close_overlay(editor: &mut crate::editor::Editor) {
++    if editor.file_browser.as_ref().is_some_and(|fb| fb.quit_save_owner.is_some()) {
++        cancel_destination(editor);
++    } else { editor.file_browser = None; }
++}
++
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ /// Monotonic listing epoch, PROCESS-GLOBAL by design.
+--- wordcartel/src/file_browser_commit.rs (previous Fable snapshot)
++++ wordcartel/src/file_browser_commit.rs (current)
+@@ -289,7 +289,7 @@
+     // A redirect IS an abandoned save — the write did not happen, and the writer is being
+     // offered a different feature. Same rule the `CommitOutcome::Nothing` empty-path arm
+     // applies: abandoning a save-then must abort the drain, or a LATER save could `.take()`
+-    // this stale action and fire a `Quit` the writer no longer wants (Critical-1, Task 21).
++    // this stale action and trigger an unwanted quit (Critical-1, Task 21).
+     if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
+         editor.pending_save_as = None;
+         crate::quit::cancel(editor);
+--- wordcartel/src/jobs_apply.rs (previous Fable snapshot)
++++ wordcartel/src/jobs_apply.rs (current)
+@@ -49,8 +49,7 @@
+                     } else {
+                         // Save failed (Codex 8d): abort the drain so it can't linger with no
+                         // in-flight save and no re-drive. The merge's error status stands.
+-                        editor.quit_drain = None;
+-                        editor.quit_drain_advance = false;
++                        crate::quit::cancel(editor);
+                     }
+                 }
+                 crate::editor::PostSaveAction::CloseBuffer { id } => {
+@@ -107,7 +106,7 @@
+     use crate::jobs::JobKind;
+     match kind {
+         JobKind::Save => {
+-            if let Some(request) = save_request { crate::quit::save_finished(editor, request, false); }
++            let cancelled_wait = save_request.is_some_and(|request| crate::quit::save_finished(editor, request, false));
+             // The merge never ran, so saved_version is untouched (buffer stays dirty). A panicked
+             // save must NOT quit/strand. Only its exact awaited request may be cancelled.
+             let awaited = editor.pending_after_save.as_ref()
+@@ -115,14 +114,14 @@
+                     && p.save_request == save_request).unwrap_or(false);
+             if awaited {
+                 editor.pending_after_save = None;
+-                editor.quit_drain = None;
+-                editor.quit_drain_advance = false;
++                crate::quit::cancel(editor);
+             }
+             // A panic is a failed Save completion: collapse the same Save(buffer_id, version) start
+             // this job posted (the merge never ran, but the "Saving…" progress entry is live). The
+             // `buffer_id`/`version` in hand reconstruct the identical topic key.
++            let suffix = if cancelled_wait { " — quit cancelled" } else { "" };
+             editor.finish_topic(crate::status::StatusTopic::Save(buffer_id, version),
+-                crate::status::StatusKind::Error, format!("save failed (internal error: {msg})"));
++                crate::status::StatusKind::Error, format!("save failed (internal error: {msg}){suffix}"));
+             crate::quit::wake_if_waiting(editor);
+         }
+         JobKind::SwapWrite => {
+@@ -187,7 +186,7 @@
+             .or_else(|| crate::quit::refill(editor));
+         let Some(id) = front else {
+             if !editor.saves_in_flight.is_empty() {
+-                editor.quit_drain.as_mut().unwrap().waiting_since.get_or_insert(clock.now_ms());
++                editor.quit_drain.as_mut().expect("quit flow checked above").waiting_since.get_or_insert(clock.now_ms());
+                 return; // await writes AND their merges
+             }
+             // Keep reviewed discard versions until the runtime's post-callback exit barrier.
+@@ -195,7 +194,7 @@
+             return;
+         };
+         let gone = editor.buffers.iter().all(|b| b.id != id);
+-        editor.quit_drain.as_mut().unwrap().waiting_since = None;
++        editor.quit_drain.as_mut().expect("quit flow checked above").waiting_since = None;
+         if gone || !editor.is_dirty(id) {
+             if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
+             continue;
+--- wordcartel/src/overlays.rs (previous Fable snapshot)
++++ wordcartel/src/overlays.rs (current)
+@@ -139,7 +139,7 @@
+         intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None, mouse: crate::mouse::mouse_cursor_picker,
+         render: RenderSite::Frame(crate::render_overlays::paint_cursor_picker) },
+     OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
+-        intercept: crate::file_browser_intercept::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser,
++        intercept: crate::file_browser_intercept::intercept, close: crate::file_browser::close_overlay, mouse: crate::mouse::mouse_file_browser,
+         render: RenderSite::Frame(crate::render_overlays::paint_file_browser) },
+     OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
+         intercept: crate::prompts::intercept, close: |e| e.prompt = None, mouse: crate::mouse::mouse_prompt,
+--- wordcartel/src/quit.rs (previous Fable snapshot)
++++ wordcartel/src/quit.rs (current)
+@@ -150,14 +150,17 @@
+     true
+ }
+ 
+-/// Mark a dispatched save terminal before deciding whether any waiting quit can advance.
+-pub(crate) fn save_finished(editor: &mut Editor, request: crate::save::SaveRequest, succeeded: bool) {
++/// Mark a save terminal; return whether its failure cancelled a plain-Quit wait so
++/// the completion can explain that cancellation alongside the underlying error.
++pub(crate) fn save_finished(editor: &mut Editor, request: crate::save::SaveRequest, succeeded: bool) -> bool {
+     let tracked = editor.saves_in_flight.remove(&request);
+     if tracked && !succeeded && waiting(editor) {
+         // An ordinary Quit waiting for background saves must not exit on their error.
+         // An explicitly awaited different request remains protected from this failure.
+         cancel(editor);
++        return true;
+     }
++    false
+ }
+ 
+ fn waiting(editor: &Editor) -> bool {
+--- wordcartel/src/save.rs (previous Fable snapshot)
++++ wordcartel/src/save.rs (current)
+@@ -272,8 +272,9 @@
+                     // this completion collapses exactly its own "Saving…" lineage (§4.2). `buffer_id`
+                     // and `v` are the same values the JobResult carries as `r.buffer_id`/`r.version`.
+                     let topic = crate::status::StatusTopic::Save(buffer_id, v);
+-                    crate::quit::save_finished(editor, request, !is_save_error && !changed_destination);
++                    let cancelled_wait = crate::quit::save_finished(editor, request, !is_save_error && !changed_destination);
+                     finish_save_action(editor, buffer_id, v, request, !is_save_error && !changed_destination);
++                    if cancelled_wait { status.push_str(" — quit cancelled"); }
+                     if is_save_error {
+                         editor.finish_topic(topic, crate::status::StatusKind::Error, status);
+                     } else if changed_destination {
+--- wordcartel/src/timers.rs (previous Fable snapshot)
++++ wordcartel/src/timers.rs (current)
+@@ -40,8 +40,7 @@
+                 crate::editor::PostSaveAction::ContinueQuitDrain => {
+                     // Codex C3: a stranded drain (no in-flight save, no re-drive) would
+                     // hang the quit. Abort the whole quit rather than silently clearing.
+-                    editor.quit_drain = None;
+-                    editor.quit_drain_advance = false;
++                    crate::quit::cancel(editor);
+                     editor.set_status_full(crate::status::StatusKind::Warning, "save timed out — quit cancelled",
+                         crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+                 }

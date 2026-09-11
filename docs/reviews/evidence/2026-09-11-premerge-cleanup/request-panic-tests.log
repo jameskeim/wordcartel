@@ -1,0 +1,25 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.09s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 17 tests
+test durability_regressions::tests::review_discard_is_honored_for_unchanged_versions ... ok
+test durability_regressions::tests::failed_save_of_previously_clean_version_cannot_authorize_quit ... ok
+test durability_regressions::tests::rejected_save_does_not_arm_an_action_or_strand_quit ... ok
+test durability_regressions::tests::save_and_quit_preserves_clean_unnamed_save_as_and_cancel ... ok
+test durability_regressions::tests::overlapping_quit_requests_do_not_replace_pending_work ... ok
+test durability_regressions::tests::new_document_opened_during_quit_is_saved_too ... ok
+test durability_regressions::tests::stale_review_save_requests_a_fresh_decision ... ok
+test durability_regressions::tests::save_all_quit_includes_buffers_dirtied_after_it_started ... ok
+test durability_regressions::tests::own_edits_during_quit_are_resaved_before_exit ... ok
+test durability_regressions::tests::wrong_destination_completion_cancels_close_even_if_version_was_saved ... ok
+test durability_regressions::tests::save_and_quit_does_not_exit_with_other_dirty_buffers ... ok
+test durability_regressions::tests::conflict_cancels_quit_without_stranding_the_drain ... ok
+test durability_regressions::tests::edits_invalidate_discard_and_review_targets_are_pinned ... ok
+test durability_regressions::tests::cancellation_and_timeout_do_not_quit_on_late_save_completion ... ok
+test durability_regressions::tests::late_save_to_old_path_does_not_mark_current_path_clean ... ok
+test durability_regressions::tests::sequential_save_as_and_same_path_stale_saves_remain_valid ... ok
+test durability_regressions::tests::panic_cancels_only_its_own_save_request_in_both_executors ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 2005 filtered out; finished in 0.00s
+

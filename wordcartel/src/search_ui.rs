@@ -625,7 +625,7 @@ mod tests {
         let mut e = Editor::new_from_text("ab\n", None, (40, 10));
         e.open_diag(grammar_no_sugg());
         assert!(e.diag.is_some(), "precondition: the overlay is up");
-        e.open_prompt(crate::prompt::Prompt::quit_confirm());
+        e.open_prompt(crate::prompt::Prompt::quit_multi(1));
         assert!(e.diag.is_none(), "raising a modal prompt closes the quick-fix overlay");
     }
 

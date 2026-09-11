@@ -1,0 +1,18 @@
+{
+  "snapshot_sha256": "4ebac901ced500badeba3e4bab3363392e151abbee1ee6844134d95d3fad2f08",
+  "commands": [
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets",
+    "cargo build --workspace",
+    "cargo test --workspace --no-run",
+    "scripts/smoke/run.sh"
+  ],
+  "tests": {
+    "passed": 2498,
+    "failed": 0,
+    "ignored": 6
+  },
+  "smoke": "smoke: 9/9 PASS",
+  "codex_review": "codex-review-round3.md",
+  "source_files": 26
+}

@@ -530,8 +530,8 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 editor.open_prompt(crate::prompt::Prompt::quit_multi(n));
                 CommandResult::Handled
             } else {
-                editor.quit = true;
-                CommandResult::Quit
+                if crate::quit::wait_for_saves(editor, clock.now_ms()) { CommandResult::Handled }
+                else { editor.quit = true; CommandResult::Quit }
             }
         }
 

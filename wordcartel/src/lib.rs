@@ -26,6 +26,7 @@ pub mod fsx;
 pub mod jobs;
 pub mod jobs_apply;
 pub mod save;
+mod quit;
 pub mod app;   // App::run + the testable App::step (Task 12)
 pub mod startup;   // config → fresh Editor seeding, lifted out of app::run
 pub mod swap;
@@ -84,3 +85,4 @@ pub mod recents;
 pub(crate) mod list_window;
 #[cfg(test)] pub(crate) mod test_support;
 #[cfg(test)] mod e2e;
+#[cfg(test)] mod durability_regressions;

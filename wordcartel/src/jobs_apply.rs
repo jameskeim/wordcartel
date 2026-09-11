@@ -22,34 +22,23 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
     );
     (r.merge)(editor);
     // Post-save dispatch: fire the pending action when its awaited save lands.
-    // Only Quit remains — Open/New are now additive (no save-then-act needed).
+    // Open/New are additive; only quit/close wait on a save completion.
     if kind == crate::jobs::JobKind::Save {
         let fire = editor.pending_after_save.as_ref()
-            .map(|p| p.buffer_id == buffer_id && p.version == version)
+            .map(|p| p.buffer_id == buffer_id && p.version == version
+                && (p.save_request.is_none() || p.completed))
             .unwrap_or(false);
         if fire {
             let action = editor.pending_after_save.as_ref().unwrap().action.clone();
             let saved_this = editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version));
             match action {
-                crate::editor::PostSaveAction::Quit => {
-                    if saved_this {
-                        editor.pending_after_save = None;
-                        if !editor.is_dirty(buffer_id) {
-                            editor.quit = true;
-                        } else {
-                            // Saved, but the user typed during the in-flight save → buffer
-                            // dirty again. Do NOT quit (would lose those edits). User
-                            // re-issues quit when ready.
-                            editor.set_status_full(crate::status::StatusKind::Warning, "edited during save — quit cancelled",
-                                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-                        }
-                    }
-                }
                 crate::editor::PostSaveAction::ContinueQuitDrain => {
                     editor.pending_after_save = None;
                     if saved_this && !editor.is_dirty(buffer_id) {
                         // Saved clean: drop this buffer from the queue and advance.
-                        if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
+                        if let Some(d) = editor.quit_drain.as_mut() {
+                            if d.queue.front() == Some(&buffer_id) { d.queue.pop_front(); }
+                        }
                         editor.quit_drain_advance = true; // apply_job_result re-drives with ctx
                     } else if saved_this {
                         // Codex C-new: the user typed DURING the in-flight save → this buffer
@@ -60,8 +49,7 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                     } else {
                         // Save failed (Codex 8d): abort the drain so it can't linger with no
                         // in-flight save and no re-drive. The merge's error status stands.
-                        editor.quit_drain = None;
-                        editor.quit_drain_advance = false;
+                        crate::quit::cancel(editor);
                     }
                 }
                 crate::editor::PostSaveAction::CloseBuffer { id } => {
@@ -80,13 +68,14 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                     }
                     // !saved_this: no close; the merge's own status stands (error
                     // text, or empty for a vanished target) — mirrors
-                    // ContinueQuitDrain's abort, NOT Quit's leave-armed (an armed
+                    // ContinueQuitDrain's abort (an armed
                     // close would fire on the user's next manual save). (The
                     // saved-branch's "saved — closed" harmlessly shadows the
                     // vanished-id status — unreachable for the pending's own id.)
                 }
             }
         }
+        crate::quit::wake_if_waiting(editor);
     }
 }
 
@@ -107,30 +96,33 @@ pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, cl
 pub fn apply_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor) {
     match outcome {
         crate::jobs::JobOutcome::Done(r) => apply_result(r, editor),
-        crate::jobs::JobOutcome::Panicked { buffer_id, version, kind, msg } =>
-            apply_panic(buffer_id, version, kind, &msg, editor),
+        crate::jobs::JobOutcome::Panicked { buffer_id, version, kind, save_request, msg } =>
+            apply_panic(buffer_id, version, kind, save_request, &msg, editor),
     }
 }
 
-fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jobs::JobKind, msg: &str, editor: &mut Editor) {
+fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jobs::JobKind,
+    save_request: Option<crate::save::SaveRequest>, msg: &str, editor: &mut Editor) {
     use crate::jobs::JobKind;
     match kind {
         JobKind::Save => {
+            let cancelled_wait = save_request.is_some_and(|request| crate::quit::save_finished(editor, request, false));
             // The merge never ran, so saved_version is untouched (buffer stays dirty). A panicked
-            // save must NOT quit/strand: clear any awaited-quit state explicitly (the failed-save
-            // Quit path leaves pending_after_save armed — we must not).
+            // save must NOT quit/strand. Only its exact awaited request may be cancelled.
             let awaited = editor.pending_after_save.as_ref()
-                .map(|p| p.buffer_id == buffer_id && p.version == version).unwrap_or(false);
+                .map(|p| p.buffer_id == buffer_id && p.version == version
+                    && p.save_request == save_request).unwrap_or(false);
             if awaited {
                 editor.pending_after_save = None;
-                editor.quit_drain = None;
-                editor.quit_drain_advance = false;
+                crate::quit::cancel(editor);
             }
             // A panic is a failed Save completion: collapse the same Save(buffer_id, version) start
             // this job posted (the merge never ran, but the "Saving…" progress entry is live). The
             // `buffer_id`/`version` in hand reconstruct the identical topic key.
+            let suffix = if cancelled_wait { " — quit cancelled" } else { "" };
             editor.finish_topic(crate::status::StatusTopic::Save(buffer_id, version),
-                crate::status::StatusKind::Error, format!("save failed (internal error: {msg})"));
+                crate::status::StatusKind::Error, format!("save failed (internal error: {msg}){suffix}"));
+            crate::quit::wake_if_waiting(editor);
         }
         JobKind::SwapWrite => {
             if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
@@ -179,7 +171,8 @@ pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, 
 
 /// Advance the quit drain by one step: pick the next dirty buffer, switch to it,
 /// and either dispatch its save (SaveAll) or raise the per-buffer review prompt
-/// (ReviewEach). When the queue is empty, quit. Re-driven by save completion
+/// (ReviewEach). Recheck the live dirty set when the queue empties before quitting.
+/// Re-driven by save completion
 /// (apply_result sets `quit_drain_advance`) and by review-prompt resolution.
 pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
@@ -189,13 +182,19 @@ pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Cloc
         // SHORT immutable borrow to read the front id (Codex I-new-1: never hold a
         // `quit_drain` borrow across an `editor.is_dirty`/`switch_to`/method call),
         // then mutates the queue in a SEPARATE borrow.
-        let front = editor.quit_drain.as_ref().and_then(|d| d.queue.front().copied());
+        let front = editor.quit_drain.as_ref().and_then(|d| d.queue.front().copied())
+            .or_else(|| crate::quit::refill(editor));
         let Some(id) = front else {
-            editor.quit_drain = None;
+            if !editor.saves_in_flight.is_empty() {
+                editor.quit_drain.as_mut().expect("quit flow checked above").waiting_since.get_or_insert(clock.now_ms());
+                return; // await writes AND their merges
+            }
+            // Keep reviewed discard versions until the runtime's post-callback exit barrier.
             editor.quit = true;
             return;
         };
         let gone = editor.buffers.iter().all(|b| b.id != id);
+        editor.quit_drain.as_mut().expect("quit flow checked above").waiting_since = None;
         if gone || !editor.is_dirty(id) {
             if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
             continue;
@@ -210,8 +209,7 @@ pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Cloc
                 return; // wait for the save (named) or Save-As (unnamed) to complete
             }
             crate::editor::QuitMode::ReviewEach => {
-                let name = crate::workspace::buffer_display_name(editor, id);
-                editor.open_prompt(crate::prompt::Prompt::quit_review_buffer(&name));
+                crate::quit::show_review(editor, id);
                 return; // wait for ReviewSave/ReviewDiscard/Cancel
             }
         }
@@ -434,7 +432,7 @@ mod tests {
     #[test]
     fn save_and_quit_command_arms_pending_after_save_like_prompt() {
         // The save_and_quit registry command must reach the SAME armed state as the
-        // PromptAction::SaveAndQuit path (proves the DRY factor).
+        // PromptAction::QuitSaveAll path (proves the DRY factor).
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         let p = crate::test_support::scratch_path("savequit-cmd.md");
@@ -448,16 +446,16 @@ mod tests {
             let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
-        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
-            "command path arms pending_after_save{{Quit}}");
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::ContinueQuitDrain, .. })),
+            "command path arms pending_after_save{{ContinueQuitDrain}}");
         assert!(!e.quit, "not yet — waiting for the save result");
-        for o in ex.drain() { apply_outcome(o, &mut e); }
+        for o in ex.drain() { apply_job_outcome(o, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs()); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn save_and_quit_arms_pending_after_save_quit_and_exits() {
+    fn save_and_quit_uses_session_drain_and_exits() {
         use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         let p = crate::test_support::scratch_path("pas.md");
@@ -471,57 +469,12 @@ mod tests {
             let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
-        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
-        for o in ex.drain() { apply_outcome(o, &mut e); }
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::ContinueQuitDrain, .. })));
+        for o in ex.drain() { apply_job_outcome(o, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs()); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
 
-    #[test]
-    fn quit_after_save_cancelled_when_edited_during_flight() {
-        // Regression (Codex gate Finding 1): if the user types DURING a single-buffer
-        // save-and-quit's in-flight save, the save result fires (saved_this=true) but
-        // the buffer is dirty again. The app must NOT quit and must not lose those edits.
-        use crate::editor::{Editor, PostSaveAction};
-        use crate::jobs::{JobResult, JobKind, ResultClass};
-        let p = crate::test_support::scratch_path("sqflight.md");
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        let id = e.active().id;
-        // Arm pending_after_save{Quit} at version=1 (what dispatch_save_and_quit would set).
-        e.active_mut().document.version = 1;
-        e.active_mut().document.saved_version = None; // dirty
-        e.pending_after_save = Some(crate::editor::PendingAfterSave {
-            buffer_id: id,
-            version: 1,
-            action: PostSaveAction::Quit,
-            at_ms: 0,
-        });
-        // Simulate typing during the in-flight save: version advances to 2, buffer dirty.
-        e.active_mut().document.version = 2;
-        // Deliver the in-flight save result for version=1. The merge sets
-        // saved_version=Some(1), but document.version==2 → still dirty.
-        let save_result = JobResult {
-            buffer_id: id,
-            class: ResultClass::Durability,
-            version: 1,
-            kind: JobKind::Save,
-            merge: Box::new(move |editor: &mut Editor| {
-                if let Some(b) = editor.by_id_mut(id) {
-                    b.document.saved_version = Some(1);
-                }
-            }),
-        };
-        apply_result(save_result, &mut e);
-        assert!(!e.quit, "must NOT quit — buffer is dirty again from edits typed during the save");
-        assert!(e.active().document.dirty(), "buffer still holds the newer edits");
-        assert!(e.pending_after_save.is_none(), "pending_after_save consumed on save match");
-        // A17 T5 (F4 Warning table): "edited during save — quit cancelled" is a Sticky Warning.
-        assert_eq!(e.status_text(), "edited during save — quit cancelled");
-        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
-        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
-        let _ = std::fs::remove_file(&p);
-    }
 
     #[test]
     fn apply_result_merges_fresh_and_drops_stale() {
@@ -635,7 +588,7 @@ mod tests {
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
             buffer_id: id, version: 1,
             action: PostSaveAction::CloseBuffer { id },
-            at_ms: 0,
+            save_request: None, completed: false, at_ms: 0,
         });
         // Simulate edit during the in-flight save: version advances
         e.active_mut().document.version = 2;
@@ -711,7 +664,7 @@ mod tests {
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
             buffer_id: a_id, version: 1,
             action: PostSaveAction::CloseBuffer { id: a_id },
-            at_ms: 0,
+            save_request: None, completed: false, at_ms: 0,
         });
         // Deliver a save result for B (not A) at version 1
         let save_result = JobResult {
@@ -749,7 +702,7 @@ mod tests {
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
             buffer_id: x_id, version: 1,
             action: PostSaveAction::CloseBuffer { id: x_id },
-            at_ms: 0,
+            save_request: None, completed: false, at_ms: 0,
         });
         // Switch to scratch during the in-flight save (C1 scenario)
         crate::workspace::goto_scratch(&mut e);
@@ -801,7 +754,7 @@ mod tests {
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
             buffer_id: x_id, version: 1,
             action: PostSaveAction::CloseBuffer { id: x_id },
-            at_ms: 0,
+            save_request: None, completed: false, at_ms: 0,
         });
         // Close Y during the flight (Y is clean)
         crate::workspace::close_buffer_now(&mut e, y_id);
@@ -879,6 +832,7 @@ mod tests {
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         let id = e.active().id;
         apply_outcome(crate::jobs::JobOutcome::Panicked {
+            save_request: None,
             buffer_id: id, version: 0, kind: crate::jobs::JobKind::Save, msg: "boom".into(),
         }, &mut e);
         assert!(e.status_text().contains("save failed"));
@@ -891,6 +845,7 @@ mod tests {
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         let id = e.active().id;
         apply_outcome(crate::jobs::JobOutcome::Panicked {
+            save_request: None,
             buffer_id: id, version: 0, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into(),
         }, &mut e);
         assert!(e.status_text().contains("swap failed"));
@@ -924,6 +879,7 @@ mod tests {
 
         // Simulate the worker panic through the REAL panic-cleanup path.
         apply_outcome(crate::jobs::JobOutcome::Panicked {
+            save_request: None,
             buffer_id: id, version: v, kind: crate::jobs::JobKind::PosSweep, msg: "boom".into(),
         }, &mut e);
         assert!(e.active().pos.in_flight_version.is_none(), "panic clears in-flight");
@@ -952,6 +908,7 @@ mod tests {
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         let id = e.active().id;
         apply_outcome(crate::jobs::JobOutcome::Panicked {
+            save_request: None,
             buffer_id: id, version: 0, kind: crate::jobs::JobKind::CoalesceProbe, msg: "boom".into(),
         }, &mut e);
         assert!(e.status_text().contains("job failed"));

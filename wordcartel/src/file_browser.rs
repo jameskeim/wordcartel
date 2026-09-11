@@ -140,6 +140,8 @@ pub struct FileBrowser {
     ///    be forgotten, because staleness is impossible to observe — the check is never made
     ///    against a snapshot, only against the live entry.
     pub(crate) navigated_name: Option<String>,
+    /// Quit-owned filename request, distinct from a manual Save As picker.
+    pub(crate) quit_save_owner: Option<crate::editor::BufferId>,
 }
 
 impl FileBrowser {
@@ -391,10 +393,16 @@ pub(crate) fn cancel_destination(editor: &mut crate::editor::Editor) {
     // `pending_write_block` above) — cleared for the same symmetry: every place that
     // abandons a destination flow sweeps the same pending set.
     editor.pending_export = None;
-    if editor.quit_drain.is_some() {
-        editor.quit_drain = None;
-        editor.quit_drain_advance = false;
-    }
+    crate::quit::cancel(editor);
+}
+
+/// Replacing a quit-owned picker abandons that filename request, just like Esc.
+/// Successful commits remove the picker before opening their next prompt, so this
+/// does not cancel an intentional transition to overwrite confirmation.
+pub(crate) fn close_overlay(editor: &mut crate::editor::Editor) {
+    if editor.file_browser.as_ref().is_some_and(|fb| fb.quit_save_owner.is_some()) {
+        cancel_destination(editor);
+    } else { editor.file_browser = None; }
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -510,7 +518,7 @@ mod tests {
             dir, query: String::new(), mode: BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0,
             entries: vec![], disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         }
     }
 
@@ -927,7 +935,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
         assert!(line.contains(&d.join("chapter one.md").display().to_string()),
@@ -984,7 +992,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("destination mode has a footer");
         assert!(line.contains(&d.join("chapter-one").display().to_string()),
@@ -1007,7 +1015,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains(&d.join("book.docx").display().to_string()),
@@ -1030,7 +1038,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains("sub"), "names the field as typed: {line}");
@@ -1054,7 +1062,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         let line = footer_target(&crate::fsx::RealFs, &fb).expect("footer");
         assert!(line.contains(&d.join("dangling.md").display().to_string()),
@@ -1074,7 +1082,7 @@ mod tests {
             },
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(),
             "a whitespace-only field is empty, and names no target");
@@ -1086,7 +1094,7 @@ mod tests {
             dir: std::env::temp_dir(), query: "q".into(), mode: BrowseMode::Select,
             listing: vec![], total_seen: 0, unreadable: 0, entries: vec![],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         };
         assert!(footer_target(&crate::fsx::RealFs, &fb).is_none(), "select mode names no target");
         fb.mode = BrowseMode::Destination {

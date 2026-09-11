@@ -289,11 +289,10 @@ fn redirect_to_export(
     // A redirect IS an abandoned save — the write did not happen, and the writer is being
     // offered a different feature. Same rule the `CommitOutcome::Nothing` empty-path arm
     // applies: abandoning a save-then must abort the drain, or a LATER save could `.take()`
-    // this stale action and fire a `Quit` the writer no longer wants (Critical-1, Task 21).
+    // this stale action and trigger an unwanted quit (Critical-1, Task 21).
     if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
         editor.pending_save_as = None;
-        editor.quit_drain = None;
-        editor.quit_drain_advance = false;
+        crate::quit::cancel(editor);
     }
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(fallback_dir);
     let field = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -346,11 +345,17 @@ pub(crate) fn commit_destination_with_probe(
     let crate::file_browser::BrowseMode::Destination { purpose, field, .. } = &fb.mode
         else { return };
     let purpose = purpose.clone();
+    let quit_save_owner = fb.quit_save_owner;
     let dir = fb.dir.clone();
     let highlighted = fb.entries.get(fb.selected).cloned();
     let highlight_navigated = fb.highlight_is_navigated();
+    // The check is at submission as well as opening: an old manual picker cannot
+    // start a new save after a quit flow has taken ownership of the workspace.
+    let field = field.clone();
+    if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs)
+        && !crate::quit::allow_save_as_picker(editor, quit_save_owner) { return; }
 
-    match classify_destination_enter(&**fs, &dir, field, highlighted.as_ref(), highlight_navigated) {
+    match classify_destination_enter(&**fs, &dir, &field, highlighted.as_ref(), highlight_navigated) {
         // Rows 1 and 3 — navigate, do not write. The listing lands asynchronously and
         // `apply_listing_done` commits `fb.dir` only on success.
         CommitOutcome::Descend(target) => {
@@ -372,8 +377,7 @@ pub(crate) fn commit_destination_with_probe(
             // Backing out of a drain's Save-As aborts the quit (Effort-6 Codex C2).
             if matches!(purpose, crate::file_browser::DestinationPurpose::SaveAs) {
                 editor.pending_save_as = None;
-                editor.quit_drain = None;
-                editor.quit_drain_advance = false;
+                crate::quit::cancel(editor);
             }
         }
         CommitOutcome::Commit { path: raw, from_highlight } => {
@@ -673,7 +677,7 @@ mod tests {
             entries: vec![FileEntry { name: "existing.md".into(), kind: EntryKind::File,
                 is_symlink: false, broken: false }],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         });
 
         press_key_fb(&mut e, &fs, &tx, crossterm::event::KeyCode::Tab);
@@ -718,7 +722,7 @@ mod tests {
             entries: vec![FileEntry {
                 name: "victim.md".into(), kind: EntryKind::File, is_symlink: false, broken: false }],
             disclosure: Default::default(), selected: 0, scroll_top: 0,
-            awaiting_epoch: 0, pending_dir: None, navigated_name: None,
+            awaiting_epoch: 0, pending_dir: None, navigated_name: None, quit_save_owner: None,
         });
 
         // A REAL left-click on the row the painter drew, routed through the overlay mouse
@@ -1512,9 +1516,9 @@ mod tests {
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "notes.html".into());
         crate::test_support::pump_listing(&mut e, &rx);
-        e.pending_save_as = Some(crate::editor::PostSaveAction::Quit);
-        e.quit_drain = Some(crate::editor::QuitDrain {
-            queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
+        e.pending_save_as = Some(crate::editor::PostSaveAction::ContinueQuitDrain);
+        e.quit_drain = Some(crate::editor::QuitDrain::new([e.active().id].into(), crate::editor::QuitMode::SaveAll));
+        e.file_browser.as_mut().unwrap().quit_save_owner = Some(e.active().id);
 
         // Through the probe seam, not the intercept: this flow reaches the redirect arm, whose
         // A22 gate would refuse on a pandoc-less machine (see `row2_enter_onto`).
@@ -1794,10 +1798,9 @@ mod tests {
             std::sync::Arc::new(crate::fsx::RealFs);
         e.open_destination_picker(&fs, &tx,
             crate::file_browser::DestinationPurpose::SaveAs, d.clone(), "report.docx".into());
-        e.pending_save_as = Some(crate::editor::PostSaveAction::Quit);
-        e.quit_drain = Some(crate::editor::QuitDrain {
-            queue: std::collections::VecDeque::new(),
-            mode: crate::editor::QuitMode::SaveAll });
+        e.pending_save_as = Some(crate::editor::PostSaveAction::ContinueQuitDrain);
+        e.quit_drain = Some(crate::editor::QuitDrain::new([e.active().id].into(), crate::editor::QuitMode::SaveAll));
+        e.file_browser.as_mut().unwrap().quit_save_owner = Some(e.active().id);
         e.quit_drain_advance = true;
         crate::file_browser_commit::commit_destination_with_probe(
             &mut e, &fs, &ex, &clk, &tx, || false);

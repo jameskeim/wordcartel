@@ -32,6 +32,9 @@ pub struct Job {
     pub class: ResultClass,
     pub version: u64,
     pub kind: JobKind,
+    /// Save identity survives a panic before the job can return its merge closure.
+    /// Non-save jobs carry None.
+    pub save_request: Option<crate::save::SaveRequest>,
     /// Runs on the worker thread; must not touch the Editor directly.
     pub run: Box<dyn FnOnce() -> JobResult + Send>,
 }
@@ -54,7 +57,20 @@ pub struct JobResult {
 /// needed for per-kind cleanup (buffer stays dirty, swap_in_flight cleared, etc.).
 pub enum JobOutcome {
     Done(JobResult),
-    Panicked { buffer_id: crate::editor::BufferId, version: u64, kind: JobKind, msg: String },
+    Panicked { buffer_id: crate::editor::BufferId, version: u64, kind: JobKind,
+        save_request: Option<crate::save::SaveRequest>, msg: String },
+}
+
+impl Job {
+    /// Shared panic boundary for inline and threaded execution, retaining request identity.
+    pub(crate) fn execute(self) -> JobOutcome {
+        let (buffer_id, version, kind, save_request) =
+            (self.buffer_id, self.version, self.kind, self.save_request);
+        match crate::panicx::catch(self.run) {
+            Ok(result) => JobOutcome::Done(result),
+            Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, save_request, msg },
+        }
+    }
 }
 
 /// Staleness now consults the result class + whether the buffer still exists.
@@ -92,12 +108,7 @@ pub struct InlineExecutor {
 
 impl Executor for InlineExecutor {
     fn dispatch(&self, job: Job) {
-        let (buffer_id, version, kind) = (job.buffer_id, job.version, job.kind);
-        let outcome = match crate::panicx::catch(job.run) {
-            Ok(result) => JobOutcome::Done(result),
-            Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, msg },
-        };
-        self.pending.borrow_mut().push(outcome);
+        self.pending.borrow_mut().push(job.execute());
     }
     fn drain(&self) -> Vec<JobOutcome> {
         self.pending.borrow_mut().drain(..).collect()
@@ -122,11 +133,7 @@ impl ThreadExecutor {
             .spawn(move || {
                 // FIFO: process jobs in dispatch order. Exit when job_tx drops.
                 while let Ok(job) = job_rx.recv() {
-                    let (buffer_id, version, kind) = (job.buffer_id, job.version, job.kind);
-                    let outcome = match crate::panicx::catch(job.run) {
-                        Ok(result) => JobOutcome::Done(result),
-                        Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, msg },
-                    };
+                    let outcome = job.execute();
                     if result_tx.send(outcome).is_err() { break; }
                     let _ = wake.send(()); // nudge the loop to drain
                 }
@@ -175,6 +182,7 @@ mod tests {
         let (wake_tx, _wake_rx) = mpsc::channel::<()>();
         let ex = ThreadExecutor::new(wake_tx);
         ex.dispatch(Job {
+            save_request: None,
             buffer_id: BufferId(0),
             class: ResultClass::Durability,
             version: 7,
@@ -199,6 +207,7 @@ mod tests {
     fn inline_executor_runs_on_dispatch_and_buffers_for_drain() {
         let ex = InlineExecutor::default();
         ex.dispatch(Job {
+            save_request: None,
             buffer_id: BufferId(0),
             class: ResultClass::Durability,
             version: 1,
@@ -225,6 +234,7 @@ mod tests {
     fn inline_executor_emits_panicked_outcome() {
         let ex = InlineExecutor::default();
         ex.dispatch(Job {
+            save_request: None,
             buffer_id: BufferId(1), class: ResultClass::BufferLocal, version: 1, kind: JobKind::Save,
             run: Box::new(|| panic!("boom")),
         });
@@ -270,6 +280,7 @@ mod tests {
 
         // First job: panics immediately.
         ex.dispatch(Job {
+            save_request: None,
             buffer_id: BufferId(0),
             class: ResultClass::Durability,
             version: 1,
@@ -280,6 +291,7 @@ mod tests {
         // Second job: signals completion and returns a result.
         let (done_tx, done_rx) = mpsc::channel::<u64>();
         ex.dispatch(Job {
+            save_request: None,
             buffer_id: BufferId(0),
             class: ResultClass::Durability,
             version: 2,

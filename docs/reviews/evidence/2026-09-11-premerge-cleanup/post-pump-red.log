@@ -1,0 +1,22 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.54s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 1 test
+test e2e::quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge ... FAILED
+
+failures:
+
+---- e2e::quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge stdout ----
+
+thread 'e2e::quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge' (296) panicked at wordcartel/src/e2e.rs:554:5:
+a pre-pump quit decision cannot discard the callback's edit
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    e2e::quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2033 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

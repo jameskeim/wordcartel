@@ -46,6 +46,7 @@ pub fn dispatch_reconcile(editor: &mut Editor, ex: &dyn Executor) {
     editor.active_mut().reconcile.due_at = None;
 
     let job = Job {
+        save_request: None,
         buffer_id,
         class: ResultClass::BufferLocal,
         version,
@@ -143,6 +144,7 @@ mod tests {
 
         // Synthesise a Panicked outcome — no real panic required.
         let outcome = crate::jobs::JobOutcome::Panicked {
+            save_request: None,
             buffer_id: bid,
             version: v,
             kind: crate::jobs::JobKind::Reparse,

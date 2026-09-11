@@ -266,7 +266,7 @@ mod tests {
         e.active_mut().document.saved_version = None;
         let id = e.active().id;
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
-            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0,
+            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::ContinueQuitDrain, save_request: None, completed: false, at_ms: 0,
         });
         close_buffer(&mut e);
         assert_eq!(e.status_text(), "another save or quit is in progress — try again");
@@ -588,7 +588,7 @@ mod tests {
         let txn = wordcartel_core::history::Transaction::new(cs).with_selection(wordcartel_core::selection::Selection::single(1));
         e.by_id_mut(aid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
-            buffer_id: aid, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0,
+            buffer_id: aid, version: 1, action: crate::editor::PostSaveAction::ContinueQuitDrain, save_request: None, completed: false, at_ms: 0,
         });
         close_buffer(&mut e);
         assert!(e.prompt.is_none(), "busy guard: no prompt over pending state");

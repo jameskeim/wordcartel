@@ -544,6 +544,7 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
     let buffer_id = ctx.editor.active().id;
     let fs = std::sync::Arc::clone(&ctx.fs);   // owned — the closure is 'static + Send
     ctx.executor.dispatch(Job {
+        save_request: None,
         buffer_id,
         class: ResultClass::Durability,
         version,
@@ -1034,6 +1035,7 @@ mod tests {
         e.active_mut().swap_in_flight = true;
         crate::jobs_apply::apply_outcome(
             crate::jobs::JobOutcome::Panicked {
+                save_request: None,
                 buffer_id: id, version: 1, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into() },
             &mut e);
         assert!(!e.active().swap_in_flight, "panicked swap must clear swap_in_flight");
