@@ -1,0 +1,25 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.68s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test recovery_regressions::save_integration::recovery_save_cleanup_panic_does_not_turn_successful_write_into_failed_save ... FAILED
+
+failures:
+
+---- recovery_regressions::save_integration::recovery_save_cleanup_panic_does_not_turn_successful_write_into_failed_save stdout ----
+
+thread 'recovery_regressions::save_integration::recovery_save_cleanup_panic_does_not_turn_successful_write_into_failed_save' (305) panicked at wordcartel/src/recovery_regressions.rs:356:95:
+cleanup probe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'recovery_regressions::save_integration::recovery_save_cleanup_panic_does_not_turn_successful_write_into_failed_save' (305) panicked at wordcartel/src/recovery_regressions.rs:385:9:
+cleanup failure is not save failure
+
+
+failures:
+    recovery_regressions::save_integration::recovery_save_cleanup_panic_does_not_turn_successful_write_into_failed_save
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2107 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

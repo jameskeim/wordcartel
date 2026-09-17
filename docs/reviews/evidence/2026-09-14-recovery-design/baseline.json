@@ -1,0 +1,21 @@
+{
+  "head": "9e409c0f09d9683c40e84dbd2499c9f9e6e32ded",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "source_sha256": {
+    "wordcartel/src/swap.rs": "198ac8f00ab787d7d4caf7a926043c6689419233584f9957419f335c24cf8e6f",
+    "wordcartel/src/save.rs": "0dfe1caf6a9ff092cf02db1bcb460f659fbedf105d1fe06bc303e0690cb39c60",
+    "wordcartel/src/prompts.rs": "85ee6ab3718f4d0ccc44a383628c5f18a380f885ac1d84826ae32f01dc0ba760",
+    "wordcartel/src/jobs.rs": "1726619ea2f7cd5bb28abde7eedb2a8b1357d7550dc1cb67962e12f7efa5260f",
+    "wordcartel/src/jobs_apply.rs": "85e352de83e0fd4c7c05054c9efde228cd1d39223ace568fc08b3f85b271f046",
+    "wordcartel/src/app.rs": "5d92cef6d77468cedd5d75f31db92bd3ffee25dbcc4d51a8943f88932a4f8a0e",
+    "wordcartel/src/workspace.rs": "8432fe1f2dfa884646646edd31abbe23e79d8d257bf470d07913771f4a382a3a",
+    "wordcartel/src/session_restore.rs": "9c90caeb3666f271260679640b4459104d43ea150329a3d870478698f19f2250",
+    "wordcartel/src/fsx.rs": "61b8f2fd41ff4d09dfeec094534fe3daa46df67401ebd8905450f2017ecea765",
+    "wordcartel/src/quit.rs": "a1237503ce12a554a55bdf50c66373c985dcd38e51ecc6b3cfac713e00b2829a"
+  },
+  "defect_probes": {
+    "passed": 5,
+    "meaning": "Confirms existing defects, not fixed behavior"
+  },
+  "lock_probe": "Linux local filesystem only; contention/release/directory sync"
+}

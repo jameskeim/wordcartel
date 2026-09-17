@@ -33,7 +33,7 @@ pub(crate) struct DispatchCtx<'a> {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum OverlayId {
     Splash, Menu, Palette, ThemePicker, CursorPicker, FileBrowser,
-    Prompt, Minibuffer, Search, Diag, Outline,
+    Prompt, Minibuffer, Search, Diag, Outline, Recovery,
 }
 
 impl OverlayId {
@@ -43,7 +43,7 @@ impl OverlayId {
     pub(crate) const ALL: &'static [OverlayId] = &[
         OverlayId::Splash, OverlayId::Menu, OverlayId::Palette, OverlayId::ThemePicker,
         OverlayId::CursorPicker, OverlayId::FileBrowser, OverlayId::Prompt,
-        OverlayId::Minibuffer, OverlayId::Search, OverlayId::Diag, OverlayId::Outline,
+        OverlayId::Minibuffer, OverlayId::Search, OverlayId::Diag, OverlayId::Outline, OverlayId::Recovery,
     ];
 
     /// The table row for this id. EXHAUSTIVE match — a new variant fails to compile until it
@@ -62,6 +62,7 @@ impl OverlayId {
             OverlayId::Search       => &OVERLAYS[8],
             OverlayId::Diag         => &OVERLAYS[9],
             OverlayId::Outline      => &OVERLAYS[10],
+            OverlayId::Recovery     => &OVERLAYS[11],
         }
     }
 }
@@ -90,7 +91,7 @@ pub(crate) enum RenderSite {
 /// only the dropdown is the `Menu` row's Frame painter — spec §2.3.1/§2.3.2.)
 pub(crate) static RENDER_ORDER: &[OverlayId] = &[
     OverlayId::Splash, OverlayId::Palette, OverlayId::Outline, OverlayId::ThemePicker,
-    OverlayId::CursorPicker, OverlayId::FileBrowser, OverlayId::Menu, OverlayId::Diag,
+    OverlayId::CursorPicker, OverlayId::FileBrowser, OverlayId::Menu, OverlayId::Diag, OverlayId::Recovery,
 ];
 
 /// One overlay's routing slots. Fields grow as H21 folds each axis (is_active → intercept →
@@ -156,6 +157,9 @@ pub(crate) static OVERLAYS: &[OverlayRow] = &[
     OverlayRow { name: "outline",       id: OverlayId::Outline,      is_active: |e| e.outline.is_some(),
         intercept: crate::outline_overlay::intercept, close: |e| e.outline = None, mouse: crate::mouse::mouse_outline,
         render: RenderSite::Frame(crate::render_overlays::paint_outline) },
+    OverlayRow { name: "recovery", id: OverlayId::Recovery, is_active: |e| e.recovery_picker.is_some(),
+        intercept: crate::recovery_picker::intercept, close: crate::recovery_picker::close, mouse: crate::recovery_picker::mouse,
+        render: RenderSite::Frame(crate::recovery_picker::paint) },
 ];
 
 /// True iff any input overlay owns the screen — the single source for both
@@ -351,10 +355,11 @@ mod tests {
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
             ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
-            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
+            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::external_mod()))),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
             ("menu",          Box::new(|e: &mut Editor| { e.menu = Some(crate::menu::empty()); })),
+            ("recovery",      Box::new(|e: &mut Editor| { e.recovery_picker = Some(crate::recovery_picker::RecoveryPicker::ready(Vec::new())); })),
             ("splash",        Box::new(|e: &mut Editor| { e.splash = Some(crate::splash::Splash::new(
                 &crate::keymap::KeyTrie::default(), "0.0.0")); })),
         ];
@@ -418,10 +423,11 @@ mod tests {
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
             ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
-            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
+            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::external_mod()))),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
             ("menu",          Box::new(|e: &mut Editor| { e.menu = Some(crate::menu::empty()); })),
+            ("recovery",      Box::new(|e: &mut Editor| { e.recovery_picker = Some(crate::recovery_picker::RecoveryPicker::ready(Vec::new())); })),
             ("splash",        Box::new(|e: &mut Editor| { e.splash = Some(crate::splash::Splash::new(
                 &crate::keymap::KeyTrie::default(), "0.0.0")); })),
         ];
@@ -460,10 +466,11 @@ mod tests {
             ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
             ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
             ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(&crate::test_support::test_fs(), &tx, std::path::PathBuf::from(".")))),
-            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
+            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::external_mod()))),
             ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
             ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
             ("menu",          Box::new(|e: &mut Editor| { e.menu = Some(crate::menu::empty()); })),
+            ("recovery",      Box::new(|e: &mut Editor| { e.recovery_picker = Some(crate::recovery_picker::RecoveryPicker::ready(Vec::new())); })),
             ("splash",        Box::new(|e: &mut Editor| { e.splash = Some(crate::splash::Splash::new(
                 &crate::keymap::KeyTrie::default(), "0.0.0")); })),
         ];

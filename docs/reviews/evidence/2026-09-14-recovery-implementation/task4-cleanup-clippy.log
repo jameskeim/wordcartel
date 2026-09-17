@@ -1,0 +1,34 @@
+    Checking wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: field `lease` is never read
+  --> wordcartel/src/recovery_discovery.rs:37:5
+   |
+34 | pub struct PreparedRecovery {
+   |            ---------------- field in this struct
+...
+37 |     lease: Option<Box<dyn RecoveryLease>>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `into_parts` is never used
+  --> wordcartel/src/recovery_discovery.rs:41:19
+   |
+39 | impl PreparedRecovery {
+   | --------------------- method in this implementation
+40 |     /// Consume this preparation without releasing ownership before handoff.
+41 |     pub(crate) fn into_parts(self) -> (Candidate, String, Option<Box<dyn RecoveryLease>>) {
+   |                   ^^^^^^^^^^
+
+error: this function has too many lines (117/100)
+   --> wordcartel/src/save.rs:111:1
+    |
+111 | pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) -> SaveRequest {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_lines
+    = note: requested on the command line with `-D clippy::too-many-lines`
+
+warning: `wordcartel` (lib) generated 2 warnings
+error: could not compile `wordcartel` (lib) due to 1 previous error; 2 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `wordcartel` (lib test) due to 1 previous error

@@ -52,14 +52,25 @@ pub(crate) fn install_enabled_harper(e: &mut crate::editor::Editor) {
 // (reads, listings, stats) needs to inject faults from its OWN module's tests.
 // ---------------------------------------------------------------------------
 
-use crate::fsx::{Fs, RealFs, WriteSync};
+use crate::fsx::{Fs, RealFs, WriteSync, RecoveryRead, RecoveryLease};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 
 /// Which step of the write sequence fails. Single-fault model: exactly one step is
 /// injected per `FaultFs`, so cleanup paths still run for real.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FaultAt {
+    CreateDir,
+    ValidatePrivateDir,
+    RecoveryLock,
+    RecoveryLockBusy,
+    RecoveryOpen,
+    RecoveryRead,
+    RecoveryStat,
+    RecoverySync,
+    StrictDirOpen,
+    StrictDirSync,
+    Canonicalize,
     Create,
     Write { after: usize },
     SetMode,
@@ -81,11 +92,53 @@ pub(crate) enum FaultAt {
 pub(crate) struct FaultFs {
     pub(crate) inner: RealFs,
     pub(crate) fail: FaultAt,
+    journal: std::sync::Arc<FaultJournal>,
+}
+
+/// Shared operation log; nth is one-based and counts occurrences of the selected failure.
+#[derive(Default)]
+struct FaultJournal {
+    operations: std::sync::Mutex<Vec<FaultAt>>,
+    paths: std::sync::Mutex<Vec<(FaultAt, std::path::PathBuf)>>,
+    nth: Option<usize>,
+}
+impl FaultJournal {
+    fn fails(&self, op: FaultAt, fail: FaultAt) -> bool {
+        let mut operations = self.operations.lock().expect("fault journal lock");
+        operations.push(op);
+        let occurs = operations.iter().filter(|&&item| item == op).count();
+        op == fail && self.nth.is_none_or(|nth| occurs == nth)
+    }
+    fn step(&self, op: FaultAt, fail: FaultAt) -> std::io::Result<()> {
+        if self.fails(op, fail) {
+            let kind = if op == FaultAt::RecoveryLockBusy { ErrorKind::WouldBlock }
+                else { ErrorKind::Other };
+            return Err(Error::new(kind, format!("injected: {op:?}")));
+        }
+        Ok(())
+    }
 }
 
 impl FaultFs {
+    /// Fail only the specified occurrence while recording every strict recovery operation.
+    pub(crate) fn on_occurrence(fail: FaultAt, nth: usize) -> Self {
+        assert!(nth > 0, "fault occurrences are one-based");
+        Self { inner: RealFs, fail, journal: std::sync::Arc::new(FaultJournal {
+            operations: Default::default(), paths: Default::default(), nth: Some(nth) }) }
+    }
+    pub(crate) fn operations(&self) -> Vec<FaultAt> {
+        self.journal.operations.lock().expect("fault journal lock").clone()
+    }
+    pub(crate) fn path_operations(&self) -> Vec<(FaultAt, std::path::PathBuf)> {
+        self.journal.paths.lock().expect("path journal lock").clone()
+    }
+    fn recovery_step(&self, op: FaultAt, path: &Path) -> std::io::Result<()> {
+        self.journal.paths.lock().expect("path journal lock").push((op, path.to_owned()));
+        self.journal.step(op, self.fail)
+    }
+
     pub(crate) fn new(fail: FaultAt) -> Self {
-        FaultFs { inner: RealFs, fail }
+        FaultFs { inner: RealFs, fail, journal: Default::default() }
     }
 }
 
@@ -95,11 +148,16 @@ impl FaultFs {
 pub(crate) struct FaultHandle {
     inner: Box<dyn WriteSync>,
     fail: FaultAt,
+    journal: std::sync::Arc<FaultJournal>,
 }
 
 impl WriteSync for FaultHandle {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        if let FaultAt::Write { after } = self.fail {
+        let write_op = if let FaultAt::Write { after } = self.fail {
+            FaultAt::Write { after }
+        } else { FaultAt::Write { after: 0 } };
+        if self.journal.fails(write_op, self.fail) {
+            let FaultAt::Write { after } = write_op else { unreachable!("write operation") };
             let n = after.min(buf.len());
             self.inner.write_all(&buf[..n])?;
             return Err(Error::new(ErrorKind::WriteZero, "injected: storage full"));
@@ -107,60 +165,111 @@ impl WriteSync for FaultHandle {
         self.inner.write_all(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::Flush) {
+        if self.journal.fails(FaultAt::Flush, self.fail) {
             return Err(Error::other("injected: flush"));
         }
         self.inner.flush()
     }
     fn set_mode(&self, mode: u32) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::SetMode) {
+        if self.journal.fails(FaultAt::SetMode, self.fail) {
             return Err(Error::other("injected: set_mode"));
         }
         self.inner.set_mode(mode)
     }
     fn sync_all(&self) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::Sync) {
+        if self.journal.fails(FaultAt::Sync, self.fail) {
             return Err(Error::other("injected: fsync"));
         }
         self.inner.sync_all()
     }
 }
 
+struct FaultRecoveryRead {
+    inner: Box<dyn RecoveryRead>,
+    fail: FaultAt,
+    journal: std::sync::Arc<FaultJournal>,
+}
+impl RecoveryRead for FaultRecoveryRead {
+    fn read_capped(&mut self, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.journal.step(FaultAt::RecoveryRead, self.fail)?;
+        self.inner.read_capped(limit)
+    }
+    fn stat(&self) -> std::io::Result<crate::fsx::FileStat> {
+        self.journal.step(FaultAt::RecoveryStat, self.fail)?;
+        self.inner.stat()
+    }
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.journal.step(FaultAt::RecoverySync, self.fail)?;
+        self.inner.sync_all()
+    }
+}
+
 impl Fs for FaultFs {
+    fn canonicalize_existing(&self, path: &Path) -> std::io::Result<std::path::PathBuf> {
+        self.recovery_step(FaultAt::Canonicalize, path)?;
+        self.inner.canonicalize_existing(path)
+    }
+
+    fn create_dir_excl(&self, path: &Path, mode: u32) -> std::io::Result<()> {
+        self.recovery_step(FaultAt::CreateDir, path)?;
+        self.inner.create_dir_excl(path, mode)
+    }
+    fn validate_private_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.recovery_step(FaultAt::ValidatePrivateDir, path)?;
+        self.inner.validate_private_dir(path)
+    }
+    fn try_recovery_lock(&self, path: &Path, create: bool)
+        -> std::io::Result<Box<dyn RecoveryLease>>
+    {
+        self.recovery_step(FaultAt::RecoveryLockBusy, path)?;
+        self.recovery_step(FaultAt::RecoveryLock, path)?;
+        self.inner.try_recovery_lock(path, create)
+    }
+    fn open_regular_nofollow(&self, path: &Path) -> std::io::Result<Box<dyn RecoveryRead>> {
+        self.recovery_step(FaultAt::RecoveryOpen, path)?;
+        Ok(Box::new(FaultRecoveryRead { inner: self.inner.open_regular_nofollow(path)?,
+            fail: self.fail, journal: self.journal.clone() }))
+    }
+    fn sync_dir_strict(&self, path: &Path) -> std::io::Result<()> {
+        self.recovery_step(FaultAt::StrictDirOpen, path)?;
+        self.recovery_step(FaultAt::StrictDirSync, path)?;
+        self.inner.sync_dir_strict(path)
+    }
+
     fn create_excl(&self, path: &Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>> {
-        if matches!(self.fail, FaultAt::Create) {
+        if self.journal.fails(FaultAt::Create, self.fail) {
             return Err(Error::other("injected: create"));
         }
         let inner = self.inner.create_excl(path, mode)?;
-        Ok(Box::new(FaultHandle { inner, fail: self.fail }))
+        Ok(Box::new(FaultHandle { inner, fail: self.fail, journal: self.journal.clone() }))
     }
     fn existing_mode(&self, path: &Path) -> Option<u32> { self.inner.existing_mode(path) }
     fn read_capped(&self, path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
-        if matches!(self.fail, FaultAt::ReadCapped) {
+        if self.journal.fails(FaultAt::ReadCapped, self.fail) {
             return Err(Error::other("injected: read_capped"));
         }
         self.inner.read_capped(path, limit)
     }
     fn stat(&self, path: &std::path::Path) -> std::io::Result<crate::fsx::FileStat> {
-        if matches!(self.fail, FaultAt::Stat) {
+        if self.journal.fails(FaultAt::Stat, self.fail) {
             return Err(Error::other("injected: stat"));
         }
         self.inner.stat(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::Rename) {
+        if self.journal.fails(FaultAt::Rename, self.fail) {
             return Err(Error::other("injected: rename"));
         }
         self.inner.rename(from, to)
     }
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::SyncDir) {
+        if self.journal.fails(FaultAt::SyncDir, self.fail) {
             return Err(Error::other("injected: sync_dir"));
         }
         self.inner.sync_dir(dir)
     }
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::RemoveFile) {
+        if self.journal.fails(FaultAt::RemoveFile, self.fail) {
             return Err(Error::other("injected: remove_file"));
         }
         self.inner.remove_file(path)
@@ -168,7 +277,7 @@ impl Fs for FaultFs {
     fn list_dir(&self, path: &Path, cap: Option<usize>)
         -> std::io::Result<crate::fsx::DirListing>
     {
-        if matches!(self.fail, FaultAt::ListDir) {
+        if self.journal.fails(FaultAt::ListDir, self.fail) {
             return Err(Error::other("injected: list_dir"));
         }
         self.inner.list_dir(path, cap)
@@ -487,6 +596,36 @@ impl BlockExportFlow {
     pub(crate) fn artifact(&self, name: &str) -> String {
         String::from_utf8(std::fs::read(self.dir.join(name)).expect("the artifact exists"))
             .expect("pandoc writes utf8")
+    }
+}
+
+/// Scan only after a fixture intentionally dropped every source owner. Parallel fork/exec
+/// may briefly retain CLOEXEC leases; active-owner assertions must use the raw API instead.
+pub(crate) fn recovery_scan_released(fs: &dyn crate::fsx::Fs, root: &std::path::Path,
+    scope: &crate::recovery_discovery::ScanScope, count: usize) -> Vec<crate::recovery_discovery::Candidate>
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let rows = crate::recovery_discovery::scan(fs, root, scope).unwrap();
+        if rows.len() == count && rows.iter().all(|row| !row.busy) { return rows; }
+        assert!(std::time::Instant::now() < deadline, "released scan did not settle: {rows:?}");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Prepare a known released source, retrying only WouldBlock across the fork/exec window.
+pub(crate) fn recovery_prepare_released(fs: &dyn crate::fsx::Fs, root: &std::path::Path,
+    candidate: &crate::recovery_discovery::Candidate)
+    -> Result<crate::recovery_discovery::PrepareOutcome, crate::recovery_store::RecoveryError>
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match crate::recovery_discovery::prepare(fs, root, candidate) {
+            Err(crate::recovery_store::RecoveryError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline =>
+                std::thread::sleep(std::time::Duration::from_millis(2)),
+            result => return result,
+        }
     }
 }
 

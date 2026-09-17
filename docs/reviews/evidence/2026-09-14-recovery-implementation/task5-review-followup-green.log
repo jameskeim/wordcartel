@@ -1,0 +1,18 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.18s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 10 tests
+test recovery_flow::progress::tests::recovery_handoff_authorization_wins_and_cannot_be_revoked_after_sync ... ok
+test recovery_flow::progress::tests::recovery_handoff_cancel_wins_before_authorization_without_losing_durable_progress ... ok
+test recovery_flow::import::tests::recovery_handoff_import_preserves_disk_and_immediately_protects_legacy_body ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_cancelled_prepare_failure_does_not_cancel_a_later_quit ... ok
+test recovery_flow::import::tests::recovery_handoff_quit_rejects_prepared_installation ... ok
+test recovery_flow::import::tests::recovery_handoff_cancel_before_worker_retains_source_and_releases_lock ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_quit_preserves_already_dispatched_handoff ... ok
+test recovery_flow::import::tests::recovery_handoff_v2_source_retires_only_after_successor_and_initial_capture ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_cleanup_failure_keeps_durable_ack_and_both_copies ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_records_predecessor_without_assigning_a_write_target ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2115 filtered out; finished in 0.01s
+

@@ -1,0 +1,27 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.40s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 6 tests
+test recovery_regressions::discovery_integration::recovery_discovery_empty_body_is_ready_and_lease_moves_with_preparation ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_changed_v2_requires_reselection_and_releases_lease ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_empty_owner_tombstone_is_not_a_scan_error ... FAILED
+test recovery_regressions::discovery_integration::recovery_discovery_current_association_takes_precedence_over_provenance ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_prepare_failures_release_source_and_preserve_bytes ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_exact_body_cap_then_oversize_and_io_failures_are_distinct ... ok
+
+failures:
+
+---- recovery_regressions::discovery_integration::recovery_discovery_empty_owner_tombstone_is_not_a_scan_error stdout ----
+
+thread 'recovery_regressions::discovery_integration::recovery_discovery_empty_owner_tombstone_is_not_a_scan_error' (300) panicked at wordcartel/src/recovery_regressions.rs:332:9:
+assertion failed: discovery::scan(&RealFs, root.path(), &ScanScope::All).unwrap().is_empty()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    recovery_regressions::discovery_integration::recovery_discovery_empty_owner_tombstone_is_not_a_scan_error
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 2080 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

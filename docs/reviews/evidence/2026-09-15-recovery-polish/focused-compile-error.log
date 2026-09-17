@@ -1,0 +1,37 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+error[E0599]: no method named `len` found for reference `&status::StatusHistory` in the current scope
+   --> wordcartel/src/recovery_flow/import/tests.rs:169:44
+    |
+169 |             let history=e.status_history().len();
+    |                                            ^^^ method not found in `&status::StatusHistory`
+    |
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following traits define an item `len`, perhaps you need to implement one of them:
+            candidate #1: `BitSetLike`
+            candidate #2: `ExactSizeIterator`
+            candidate #3: `itertools::combinations::PoolIndex`
+            candidate #4: `nom::traits::AsChar`
+            candidate #5: `rand::seq::slice::IndexedRandom`
+            candidate #6: `toml_edit::table::TableLike`
+            candidate #7: `winnow::stream::AsChar`
+            candidate #8: `wordcartel_core::block_tree::TextSource`
+
+error[E0599]: no method named `len` found for reference `&status::StatusHistory` in the current scope
+   --> wordcartel/src/recovery_flow/import/tests.rs:177:43
+    |
+177 |             assert_eq!(e.status_history().len(),history,"late status: {change}");
+    |                                           ^^^ method not found in `&status::StatusHistory`
+    |
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following traits define an item `len`, perhaps you need to implement one of them:
+            candidate #1: `BitSetLike`
+            candidate #2: `ExactSizeIterator`
+            candidate #3: `itertools::combinations::PoolIndex`
+            candidate #4: `nom::traits::AsChar`
+            candidate #5: `rand::seq::slice::IndexedRandom`
+            candidate #6: `toml_edit::table::TableLike`
+            candidate #7: `winnow::stream::AsChar`
+            candidate #8: `wordcartel_core::block_tree::TextSource`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `wordcartel` (lib test) due to 2 previous errors

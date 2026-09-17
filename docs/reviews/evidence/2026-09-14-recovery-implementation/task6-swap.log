@@ -1,0 +1,44 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 37 tests
+test swap::tests::cadence_idle_debounce_fires_after_t_idle ... ok
+test swap::tests::cadence_not_due_when_never_edited ... ok
+test swap::tests::cadence_max_cap_fires_during_continuous_editing ... ok
+test swap::tests::body_containing_separator_round_trips ... ok
+test swap::tests::enumerator_empty_dir_yields_nothing ... ok
+test swap::tests::header_round_trips ... ok
+test swap::tests::fnv_is_stable_and_distinguishes ... ok
+test swap::tests::parse_ignores_unrecognised_header_keys ... ok
+test swap::tests::enumerator_includes_recovered_dumps_honors_protected ... ok
+test swap::tests::enumerator_scan_includes_discard_silently_excludes_prompt ... ok
+test swap::tests::parse_rejects_unknown_format ... ok
+test swap::tests::recovery_diverged_prompts ... ok
+test swap::tests::sanitize_strips_separators ... ok
+test swap::tests::enumerator_tmp_only_byte_identical_duplicate_is_cleanable ... ok
+test swap::tests::pre_c5_swap_without_an_id_line_still_parses_and_recovers ... ok
+test swap::tests::find_orphan_scratch_swap_finds_dead_pid_and_skips_self ... ok
+test swap::tests::settled_buffer_is_not_pending_so_the_loop_can_block ... ok
+test swap::tests::kept_recoverable_count_reports_what_the_sweep_deliberately_spares ... ok
+test swap::tests::recovery_hash_equal_discards_silently ... ok
+test swap::tests::state_dir_in_test_builds_is_redirected_off_the_real_xdg_dir ... ok
+test swap::tests::recovery_no_swap_opens_normally ... ok
+test swap::tests::state_dir_is_0700 ... ok
+test swap::tests::swap_header_with_an_id_round_trips ... ok
+test swap::tests::build_header_stamps_the_active_documents_id ... ok
+test swap::tests::swap_path_scratch_uses_pid ... ok
+test swap::tests::swap_path_named_is_deterministic_and_in_state_dir ... ok
+test swap::tests::swap_is_cleanable_excludes_relocated_and_realpath_none ... ok
+test swap::tests::write_atomic_writes_0600_and_roundtrips_via_parse ... ok
+test swap::tests::open_swap_paths_covers_open_buffers_and_session_scratch ... ok
+test swap::tests::dispatch_swap_write_uses_the_injected_fs_and_a_failed_write_does_not_latch ... ok
+test swap::tests::panicked_swap_clears_in_flight ... ok
+test swap::tests::swap_is_cleanable_gives_the_same_verdict_from_a_cached_header ... ok
+test swap::tests::swap_is_cleanable_only_for_valueless_dead_pid_swaps ... ok
+test swap::tests::stale_path_swap_does_not_relatch_after_rekey ... ok
+test swap::tests::dispatch_swap_write_writes_a_recoverable_swap ... ok
+test swap::tests::assess_over_cap_swap_opens_normally ... ok
+test swap::tests::swap_scans_are_uncapped ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 2116 filtered out; finished in 0.07s
+

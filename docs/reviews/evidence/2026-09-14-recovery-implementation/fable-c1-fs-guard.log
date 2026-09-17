@@ -1,0 +1,40 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.40s
+     Running tests/fs_chokepoint.rs (target/debug/deps/fs_chokepoint-7f0dc52dd83dc8af)
+
+running 10 tests
+test scanner_detects_every_evasion_route ... ok
+test layer_four_markers_must_carry_a_reason ... ok
+test scanner_ignores_ordinary_code_and_test_modules ... ok
+test a_marker_without_a_clause_is_not_an_exemption ... ok
+test scanner_sees_production_code_below_an_early_cfg_test_attribute ... ok
+test a_per_hit_marker_exempts_only_its_own_line ... ok
+test layer_four_wrapper_derivation_excludes_an_arc_composition_root ... ok
+test layer_four_detects_a_wrapper_call_that_layers_one_to_three_are_blind_to ... ok
+test production_sources_route_filesystem_access_through_the_seam ... ok
+test production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper ... FAILED
+
+failures:
+
+---- production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper stdout ----
+
+thread 'production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper' (444) panicked at wordcartel/tests/fs_chokepoint.rs:380:5:
+production code reaches the filesystem through a `RealFs`-hardcoding wrapper, bypassing the injected seam.
+
+src/recovery_regressions.rs:
+  line 41: pins `RealFs` inline — the injected seam cannot reach here — match crate::fsx::RealFs.try_recovery_lock(path, false) {
+
+If an injected `fs` is in scope, THREAD IT — call the `*_with_fs` seam instead (this is C1: the picker held `ctx.fs` and dropped it).
+If the site is deliberately not injected, mark it on the line or directly above:
+    // fs-chokepoint-allow: (w) config-class read — not document content
+
+`(w)` must be followed by a reason. A §2.3 clause letter (a)-(g) also works where one genuinely applies.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p wordcartel --test fs_chokepoint`

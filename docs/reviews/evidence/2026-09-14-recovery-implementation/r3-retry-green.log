@@ -1,0 +1,10 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.18s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 2 tests
+test recovery_regressions::retry_integration::recovery_retry_queue_rejection_also_has_a_finite_backoff ... ok
+test recovery_regressions::retry_integration::recovery_retry_failure_uses_completion_time_and_bounds_retries_after_new_edits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2181 filtered out; finished in 0.01s
+

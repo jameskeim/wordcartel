@@ -1,0 +1,60 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: unused imports: `bootstrap`, `opened`, and `review`
+   --> wordcartel/src/recovery_flow.rs:220:28
+    |
+220 | pub(crate) use discovery::{bootstrap, opened, review};
+    |                            ^^^^^^^^^  ^^^^^^  ^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `bootstrap` is never used
+ --> wordcartel/src/recovery_flow/discovery.rs:4:15
+  |
+4 | pub(crate) fn bootstrap(_: &mut Ctx) {}
+  |               ^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `opened` is never used
+ --> wordcartel/src/recovery_flow/discovery.rs:5:15
+  |
+5 | pub(crate) fn opened(_: &mut Editor, _: BufferId, _: &Path) {}
+  |               ^^^^^^
+
+warning: function `review` is never used
+ --> wordcartel/src/recovery_flow/discovery.rs:6:15
+  |
+6 | pub(crate) fn review(_: &mut Ctx) {}
+  |               ^^^^^^
+
+warning: `wordcartel` (lib test) generated 4 warnings (run `cargo fix --lib -p wordcartel --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.31s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 2 tests
+test recovery_picker::tests::recovery_picker_zero_selection_stays_open ... FAILED
+test recovery_picker::tests::recovery_picker_dismiss_suppresses_exact_tokens_without_changing_documents ... FAILED
+
+failures:
+
+---- recovery_picker::tests::recovery_picker_zero_selection_stays_open stdout ----
+
+thread 'recovery_picker::tests::recovery_picker_zero_selection_stays_open' (300) panicked at wordcartel/src/recovery_picker/tests.rs:25:5:
+assertion `left == right` failed
+  left: ""
+ right: "Select a recovery file"
+
+---- recovery_picker::tests::recovery_picker_dismiss_suppresses_exact_tokens_without_changing_documents stdout ----
+
+thread 'recovery_picker::tests::recovery_picker_dismiss_suppresses_exact_tokens_without_changing_documents' (299) panicked at wordcartel/src/recovery_picker/tests.rs:8:5:
+assertion failed: e.recovery_picker.is_none()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    recovery_picker::tests::recovery_picker_dismiss_suppresses_exact_tokens_without_changing_documents
+    recovery_picker::tests::recovery_picker_zero_selection_stays_open
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 2134 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

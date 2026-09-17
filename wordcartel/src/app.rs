@@ -83,7 +83,7 @@ pub enum Msg {
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     /// A directory listing completed on its own thread. NOT a `jobs::Job` — `ThreadExecutor`
-    /// is a single FIFO shared with Save and SwapWrite, so a listing blocked on a hung mount
+    /// is a single FIFO shared with saves and recovery, so a listing blocked on a hung mount
     /// would queue AHEAD of the user's saves, turning a browsing hiccup into a durability
     /// outage. `dir` is diagnostic (and for the merge-targets-what-it-thinks assertion); the
     /// discard condition is the EPOCH alone.
@@ -491,10 +491,11 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
 pub(crate) fn finish_iteration(editor: &mut Editor, ex: &dyn crate::jobs::Executor,
     clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) -> bool {
-    if !editor.quit { return true; }
     let mut ctx = crate::registry::Ctx {
         editor, executor: ex, clock, msg_tx: msg_tx.clone(), fs: fs.clone(),
     };
+    crate::recovery_flow::after_callbacks(&mut ctx);
+    if !ctx.editor.quit { return true; }
     crate::quit::after_callbacks(&mut ctx)
 }
 
@@ -621,39 +622,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let crate::startup::StartupSeed { env, baseline: baseline_snapshot,
         overrides: mut overrides_snapshot, mask: mask_snapshot } = seed;
 
-    // Recovery-on-open (§5.1).
-    // Named files: use assess() with content-hash comparison.
-    // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
-    // dead previous session (pre-merge blocker #1).
-    if editor.active().document.path.is_some() {
-        // Bounded read: an over-cap document yields None → assess() Prompts (safe).
-        // (Narrow behavior change: a >64 MiB file whose bytes match the swap hash
-        // would previously DiscardSilently; it now Prompts. Safe direction.)
-        let file_bytes = editor.active().document.path.as_deref()
-            .and_then(|p| crate::file::bounded_read_opt_with_fs(&*fs, p, crate::limits::MAX_OPEN_BYTES));
-        match crate::swap::assess(&*fs, editor.active().document.path.as_deref(), file_bytes.as_deref()) {
-            crate::swap::RecoveryDecision::OpenNormally => {}
-            crate::swap::RecoveryDecision::DiscardSilently => {
-                // fs-chokepoint-allow: (w) swap cleanup, not migrated
-                crate::swap::delete(editor.active().document.path.as_deref());
-            }
-            crate::swap::RecoveryDecision::Prompt(_h, body) => {
-                editor.active_mut().pending_swap_body = Some(body);
-                editor.open_prompt(crate::prompt::Prompt::swap_recovery());
-                editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
-            }
-        }
-    } else {
-        // fs-chokepoint-allow: (w) swap cleanup, not migrated
-        let orphan = crate::swap::find_orphan_scratch_swap();
-        if let Some((sp, _header, body)) = orphan {
-            editor.active_mut().pending_swap_body = Some(body);
-            editor.active_mut().pending_swap_path = Some(sp);
-            editor.open_prompt(crate::prompt::Prompt::swap_recovery());
-            editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
-        }
-    }
-
     // Install the terminal guard: enable raw mode + enter alternate screen.
     // Mouse capture is gated on editor.mouse_capture (seeded from config above).
     let mut guard = term::TerminalGuard::new(editor.mouse_capture)?;
@@ -765,6 +733,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     }
 
     let clock = SystemClock;
+    // Start discovery after the worker/wake relay exists, before any blocking receive.
+    crate::recovery_flow::bootstrap(&mut crate::registry::Ctx {
+        editor: &mut editor, executor: &executor, clock: &clock,
+        msg_tx: msg_tx.clone(), fs: fs.clone(),
+    });
 
     // Load the session store once at startup (corrupt/missing → empty, no abort).
     let mut session = crate::state::load();
@@ -1033,7 +1006,7 @@ mod tests {
     // forever while idle — wearing the writer's SSD and keeping the machine hot.
     // -------------------------------------------------------------------------
 
-    /// Counts `SwapWrite` job DISPATCHES (each = one swap-file write) while delegating real
+    /// Counts recovery job DISPATCHES (each = one checkpoint in these fixtures) while delegating real
     /// execution to `InlineExecutor`. Counting dispatches — not drained outcomes — is required
     /// because `reduce` drains and applies outcomes internally (app.rs:1218), so an external
     /// `drain()` sees nothing.
@@ -1043,9 +1016,9 @@ mod tests {
         fn swaps(&self) -> usize { self.swaps.get() }
     }
     impl crate::jobs::Executor for CountingSwapExecutor {
-        fn dispatch(&self, job: crate::jobs::Job) {
-            if job.kind == crate::jobs::JobKind::SwapWrite { self.swaps.set(self.swaps.get() + 1); }
-            self.inner.dispatch(job);
+        fn try_dispatch(&self, job: crate::jobs::Job) -> Result<(), crate::jobs::DispatchError> {
+            if matches!(job.kind, crate::jobs::JobKind::Recovery(_)) { self.swaps.set(self.swaps.get() + 1); }
+            self.inner.try_dispatch(job)
         }
         fn drain(&self) -> Vec<crate::jobs::JobOutcome> { self.inner.drain() }
     }
@@ -1059,10 +1032,12 @@ mod tests {
         let km = cua_keymap();
         let ex = CountingSwapExecutor::new();
         let (tx, _rx) = std::sync::mpsc::channel();
-        // A named doc so the swap file is per-path; deleted at the end.
+        // Use an isolated root for the slot-owned checkpoint.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         let mut e = Editor::new_from_text("# H\n\nbody\n", Some(path.clone()), (80, 24));
+        let recovery_root = tempfile::tempdir().unwrap();
+        e.recovery.set_root(recovery_root.path().to_owned());
 
         // One edit → dirty, last_edit_at armed (reduce drains/applies its own job outcomes).
         crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
@@ -1072,7 +1047,6 @@ mod tests {
         for sec in 1..=300u64 {
             crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx, &crate::test_support::test_fs());
         }
-        crate::swap::delete(Some(&path)); // clean the state-dir swap file this test wrote
 
         // Sanity: the swap machinery actually ran (a real 1, not a vacuous 0) …
         assert!(e.active().last_swap_at.is_some(), "the buffer WAS checkpointed at least once");
@@ -1096,6 +1070,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         let mut e = Editor::new_from_text("start\n", Some(path.clone()), (80, 24));
+        let recovery_root = tempfile::tempdir().unwrap();
+        e.recovery.set_root(recovery_root.path().to_owned());
 
         // Realistic session: an edit, then a >2s pause so the first checkpoint lands (real writing
         // pauses constantly — to read, to think, between sentences). This seeds last_swap_at.
@@ -1107,7 +1083,6 @@ mod tests {
             crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx, &crate::test_support::test_fs());
             crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx, &crate::test_support::test_fs());
         }
-        crate::swap::delete(Some(&path));
 
         // 1 initial checkpoint + ~10 max-cap checkpoints (300s / 30s). Bounded (not ~300, one-per-edit) …
         assert!(ex.swaps() <= 12,
@@ -1131,6 +1106,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         let mut e = Editor::new_from_text("start\n", Some(path.clone()), (80, 24));
+        let recovery_root = tempfile::tempdir().unwrap();
+        e.recovery.set_root(recovery_root.path().to_owned());
 
         // Edit → idle → first checkpoint; the latch is now set.
         crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx, &crate::test_support::test_fs());
@@ -1147,7 +1124,6 @@ mod tests {
         // Edit again → idle → a FRESH swap must be written, not suppressed by a stale latch.
         crate::app::reduce(press(KeyCode::Char('y'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(3_000), &tx, &crate::test_support::test_fs());
         crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(5_000), &tx, &crate::test_support::test_fs());
-        crate::swap::delete(Some(&path));
         assert_eq!(ex.swaps(), 2, "post-save edit must be re-checkpointed (latch was cleared)");
     }
 
@@ -2029,7 +2005,7 @@ mod tests {
         let clk = C(crate::swap::T_IDLE_MS + 5);
         crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.active().last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
-        let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
+        let sp = e.active().recovery_ack.as_ref().expect("checkpoint ack").path().to_owned();
         assert!(sp.exists());
         let _ = std::fs::remove_file(&sp);
         let _ = std::fs::remove_file(&doc_path);
@@ -4827,7 +4803,7 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         struct DrainSpy { inner: InlineExecutor, drains: std::cell::Cell<usize> }
         impl Executor for DrainSpy {
-            fn dispatch(&self, job: Job) { self.inner.dispatch(job); }
+            fn try_dispatch(&self, job: Job) -> Result<(), crate::jobs::DispatchError> { self.inner.try_dispatch(job) }
             fn drain(&self) -> Vec<JobOutcome> { self.drains.set(self.drains.get() + 1); self.inner.drain() }
         }
         let ex = DrainSpy { inner: InlineExecutor::default(), drains: std::cell::Cell::new(0) };

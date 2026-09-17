@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test fsx::tests::is_file_via_rejects_a_socket_and_a_dir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2170 filtered out; finished in 0.00s
+

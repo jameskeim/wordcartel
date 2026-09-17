@@ -1,0 +1,24 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.59s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test recovery_flow::import::tests::tests::recovery_handoff_repeat_retired_v2_focuses_protected_buffer_without_source_io ... FAILED
+
+failures:
+
+---- recovery_flow::import::tests::tests::recovery_handoff_repeat_retired_v2_focuses_protected_buffer_without_source_io stdout ----
+
+thread 'recovery_flow::import::tests::tests::recovery_handoff_repeat_retired_v2_focuses_protected_buffer_without_source_io' (296) panicked at wordcartel/src/recovery_flow/import/tests.rs:102:9:
+assertion `left == right` failed: retained row focuses the already protected copy
+  left: BufferId(0)
+ right: BufferId(1)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    recovery_flow::import::tests::tests::recovery_handoff_repeat_retired_v2_focuses_protected_buffer_without_source_io
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2171 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

@@ -2,7 +2,6 @@
 //! 0700 XDG state dir. Never writes the user's .md.
 
 use crate::editor::Editor;
-use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 use std::collections::HashSet;
 use std::io;
@@ -43,14 +42,20 @@ pub fn sanitize(name: &str) -> String {
 /// but none of them call `state_dir` or anything in `swap`/`recovery` today, so this boundary is
 /// latent, not exercised. The PTY smoke suite drives the real binary against the real directory
 /// deliberately; that is where real-state-dir behaviour is proven end-to-end.
-pub fn state_dir() -> io::Result<PathBuf> {
+pub(crate) fn state_path() -> io::Result<PathBuf> {
     #[cfg(test)]
     let base = std::env::temp_dir().join(format!("wcartel-test-state-{}", std::process::id()));
     #[cfg(not(test))]
     let base = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no state dir"))?;
-    let dir = base.join("wordcartel");
+    Ok(base.join("wordcartel"))
+}
+
+/// Resolve and provision the legacy state directory. New recovery storage uses
+/// `state_path` and its injected strict provisioning sequence instead.
+pub fn state_dir() -> io::Result<PathBuf> {
+    let dir = state_path()?;
     // fs-chokepoint-allow: (b) directory provisioning — the seam's own state dir
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
@@ -129,6 +134,10 @@ pub fn serialize(h: &SwapHeader, body: &str) -> String {
 }
 
 pub fn parse(text: &str) -> Option<(SwapHeader, String)> {
+    parse_borrowed(text).map(|(header, body)| (header, body.to_owned()))
+}
+/// Inspect legacy metadata without copying a full recovery body during discovery.
+pub(crate) fn parse_borrowed(text: &str) -> Option<(SwapHeader, &str)> {
     let (head, body) = text.split_once("\n---\n")?;
     let mut lines = head.lines();
     if lines.next()? != FORMAT { return None; }
@@ -168,7 +177,7 @@ pub fn parse(text: &str) -> Option<(SwapHeader, String)> {
             pid: pid?,
             id,
         },
-        body.to_string(),
+        body,
     ))
 }
 
@@ -229,13 +238,24 @@ fn read_file_capped_bytes(fs: &dyn crate::fsx::Fs, path: &Path) -> Option<Vec<u8
 
 /// The swap paths this session must NEVER offer for cleaning: every open buffer's swap (named
 /// or scratch) plus this session's own scratch swap. Consumed by `cleanable_recovery_files`.
-pub(crate) fn open_swap_paths(editor: &Editor) -> HashSet<PathBuf> {
-    let mut set = HashSet::new();
-    if let Ok(p) = swap_path(None) { set.insert(p); } // this session's own scratch swap
-    for b in &editor.buffers {
-        if let Ok(p) = swap_path(b.document.path.as_deref()) { set.insert(p); }
+pub(crate) fn open_swap_paths(editor: &Editor, fs: &dyn crate::fsx::Fs) -> io::Result<HashSet<PathBuf>> {
+    let mut paths = Vec::new();
+    if let Ok(path) = swap_path(None) { paths.push(path); }
+    if let Ok(dir) = state_dir() { paths.push(dir.join("recovery-v2")); }
+    for buffer in &editor.buffers {
+        if let Ok(path) = swap_path(buffer.document.path.as_deref()) { paths.push(path); }
+        if let Some(path) = &buffer.document.path { paths.push(path.clone()); }
+        if let Some(ack) = &buffer.recovery_ack { paths.push(ack.record_path().to_owned()); }
     }
-    set
+    paths.extend(crate::recovery_flow::protected_sources(editor));
+    let mut protected = HashSet::new();
+    for path in paths {
+        // Compare physical identity through trusted aliases, including missing leaves.
+        // An unresolved open path aborts cleanup rather than guessing it is unrelated.
+        protected.insert(crate::recovery_flow::resolve_association(fs, &path)?);
+        protected.insert(path);
+    }
+    Ok(protected)
 }
 
 /// Enumerate the recovery artifacts in `dir` that are PROVABLY safe to delete — the single
@@ -285,7 +305,9 @@ fn recovery_file_is_cleanable(
     fs: &dyn crate::fsx::Fs, dir: &Path, path: &Path, fname: &str,
     protected: &HashSet<PathBuf>, me: u32, parsed: Option<&SwapHeader>,
 ) -> bool {
-    if protected.contains(path) { return false; } // open buffer / session swap → never offer
+    if protected.contains(path) { return false; }
+    let Ok(identity) = crate::recovery_flow::resolve_association(fs, path) else { return false; };
+    if protected.contains(&identity) { return false; } // open or pending source through any trusted alias
     if fname.starts_with("recovered-") && fname.ends_with(".md") {
         true                                       // the app's own already-extracted dump
     } else if fname.ends_with(".swp") {
@@ -530,63 +552,11 @@ pub fn assess(fs: &dyn crate::fsx::Fs, doc_path: Option<&Path>, current_file_byt
     }
 }
 
-/// Dispatch a SwapWrite job: capture an O(1) snapshot + header inputs now;
-/// materialize + write on the worker; the merge records last_swap_at.
+/// Dispatch an independently owned recovery checkpoint from the active buffer.
+/// Capture its snapshot now; materialize and strictly persist it on the worker.
 pub fn dispatch_swap_write(ctx: &mut Ctx) {
-    let path = match swap_path(ctx.editor.active().document.path.as_deref()) {
-        Ok(p) => p,
-        Err(_) => return, // no state dir → best-effort; skip silently
-    };
-    let snap = ctx.editor.active().document.buffer.snapshot();
-    let ts = ctx.clock.now_ms();
-    let header = build_header(ctx.editor, "", ts); // body filled on worker
-    let version = ctx.editor.active().document.version;
-    let buffer_id = ctx.editor.active().id;
-    let fs = std::sync::Arc::clone(&ctx.fs);   // owned — the closure is 'static + Send
-    ctx.executor.dispatch(Job {
-        save_request: None,
-        buffer_id,
-        class: ResultClass::Durability,
-        version,
-        kind: JobKind::SwapWrite,
-        run: Box::new(move || {
-            let body = snap.to_string();
-            let mut h = header;
-            h.content_hash = fnv1a64(body.as_bytes());
-            let ok = write_atomic_with_fs(&*fs, &path, &serialize(&h, &body)).is_ok();
-            JobResult {
-                buffer_id,
-                class: ResultClass::Durability,
-                version,
-                kind: JobKind::SwapWrite,
-                merge: Box::new(move |editor| {
-                    // INVARIANT: route via by_id_mut(buffer_id) — NEVER active(); the merge must
-                    // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
-                    if let Some(b) = editor.by_id_mut(buffer_id) {
-                        b.swap_in_flight = false;
-                        // Path-aware latch (Codex pre-merge): only claim "this version is on disk"
-                        // if the file we wrote (`path`) is STILL this buffer's current swap file. A
-                        // SaveAs that rekeyed the buffer's path while this write was in flight makes
-                        // `path` stale (written under the old key) — latching it would wrongly
-                        // suppress a fresh swap at the new path. On a mismatch, skip the latch so the
-                        // new path recheckpoints on the next idle tick. We deliberately do NOT delete
-                        // the stale file: the workspace permits the same path open in multiple
-                        // buffers, so a co-open buffer may legitimately own this `swap_path` (Codex).
-                        // Leaving one stale swap is harmless (at worst a misleading recovery prompt
-                        // for the old path); deleting a live buffer's swap would be data loss.
-                        if ok && swap_path(b.document.path.as_deref()).ok().as_ref() == Some(&path) {
-                            b.last_swap_at = Some(ts);
-                            b.swapped_version = Some(version);
-                        }
-                    }
-                    if !ok {
-                        editor.set_status_full(crate::status::StatusKind::Error, "swap write failed".to_string(),
-                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-                    } // status global
-                }),
-            }
-        }),
-    });
+    let id = ctx.editor.active().id;
+    crate::recovery_flow::dispatch_checkpoint(ctx, id);
 }
 
 #[cfg(test)]
@@ -943,10 +913,11 @@ mod tests {
           dispatch_swap_write(&mut ctx); }
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(e.active().last_swap_at, Some(123), "merge records last_swap_at");
-        let sp = swap_path(Some(&doc_path)).unwrap();
-        let (h, body) = parse(&std::fs::read_to_string(&sp).unwrap()).unwrap();
+        let sp = e.active().recovery_ack.as_ref().unwrap().path().to_owned();
+        let bytes = std::fs::read(&sp).unwrap();
+        let (h, body) = crate::recovery_store::decode(&bytes).unwrap();
         assert_eq!(body, "swap me\n");
-        assert_eq!(h.version, 3);
+        assert_eq!(h.record().edit_version(), 3);
         let _ = std::fs::remove_file(&sp);
         let _ = std::fs::remove_file(&doc_path);
     }
@@ -1029,17 +1000,17 @@ mod tests {
 
     #[test]
     fn panicked_swap_clears_in_flight() {
-        let p = scratch(); std::fs::write(&p, "x\n").unwrap();
-        let mut e = Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
-        let id = e.active().id;
-        e.active_mut().swap_in_flight = true;
-        crate::jobs_apply::apply_outcome(
-            crate::jobs::JobOutcome::Panicked {
-                save_request: None,
-                buffer_id: id, version: 1, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into() },
-            &mut e);
-        assert!(!e.active().swap_in_flight, "panicked swap must clear swap_in_flight");
-        let _ = std::fs::remove_file(&p);
+        let mut e = Editor::new_from_text("draft", None, (80, 24));
+        let ex = crate::recovery_regressions::DeferredRecoveryExecutor::default();
+        let (tx, _) = std::sync::mpsc::channel();
+        dispatch_swap_write(&mut Ctx { editor: &mut e, executor: &ex,
+            clock: &crate::test_support::TestClock::new(1), msg_tx: tx, fs: crate::test_support::test_fs() });
+        let request = e.active().recovery_request.unwrap();
+        crate::jobs_apply::apply_outcome(crate::jobs::JobOutcome::Panicked {
+            save_request: None, buffer_id: e.active().id, version: 0,
+            kind: crate::jobs::JobKind::Recovery(request), msg: "boom".into() }, &mut e);
+        assert!(e.active().recovery_request.is_none());
+        assert!(!e.active().swap_in_flight);
     }
 
     // ── H5: recovery-file cleanup enumerator (SAFETY-CRITICAL — no data loss) ──────────
@@ -1251,7 +1222,7 @@ mod tests {
     fn open_swap_paths_covers_open_buffers_and_session_scratch() {
         let p = scratch();
         let e = Editor::new_from_text("hi\n", Some(p.clone()), (80, 24));
-        let set = open_swap_paths(&e);
+        let set = open_swap_paths(&e, &crate::fsx::RealFs).unwrap();
         assert!(set.contains(&swap_path(Some(&p)).unwrap()), "the open buffer's swap is protected");
         assert!(set.contains(&swap_path(None).unwrap()), "this session's scratch swap is protected");
     }

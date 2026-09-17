@@ -1,0 +1,11 @@
+{
+  "design_gate": "GO, zero findings (round5)",
+  "plan_gate": "GO, zero findings (round2)",
+  "artifact_sha256": {
+    "docs/superpowers/specs/2026-09-14-recovery-safety-design.md": "c828edd857cf9197f2e6193eb5c2227725f684dea39b5876b840b0f0f2a63344",
+    "docs/superpowers/plans/2026-09-14-recovery-safety-plan.md": "d1c01caf6754b18b6bd09db82ead9af1c1d86067394d9c194c7660b4336347e9",
+    "docs/reviews/2026-09-14-recovery-design-progress.md": "536121e6cb2e9817c855723a6156cb3b2cb934e10cb0142a826323f09730c19a"
+  },
+  "production_changes": false,
+  "format_exception": "docs/reviews/2026-09-14-recovery-plan-format-decision.md"
+}

@@ -1,0 +1,24 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.19s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 2 tests
+test jobs::tests::recovery_dispatch_reports_closed_queue_and_releases_captures ... FAILED
+test jobs::tests::recovery_dispatch_inline_accepts_and_buffers_panic_outcome ... ok
+
+failures:
+
+---- jobs::tests::recovery_dispatch_reports_closed_queue_and_releases_captures stdout ----
+
+thread 'jobs::tests::recovery_dispatch_reports_closed_queue_and_releases_captures' (298) panicked at wordcartel/src/jobs.rs:203:13:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err(Closed)
+
+
+failures:
+    jobs::tests::recovery_dispatch_reports_closed_queue_and_releases_captures
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 2040 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

@@ -48,9 +48,6 @@ pub enum PromptAction {
     OverwriteExport,
     OverwriteSaveAs,
     OverwriteWriteBlock,
-    Recover,
-    DiscardSwap,
-    OpenOriginal,
     Transform(crate::transform::TransformKind),
     /// Effort 6 multi-buffer quit: save every dirty buffer then quit.
     QuitSaveAll,
@@ -140,18 +137,6 @@ impl Prompt {
             choices: vec![
                 Choice { key: 'r', label: "Reload",    action: PromptAction::Reload },
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::Overwrite },
-            ],
-        }
-    }
-
-    pub fn swap_recovery() -> Prompt {
-        Prompt {
-            message: "Recovery file found: [R]ecover · [D]iscard · [O]pen original".into(),
-            detail: Vec::new(),
-            choices: vec![
-                Choice { key: 'r', label: "Recover",       action: PromptAction::Recover },
-                Choice { key: 'd', label: "Discard swap",  action: PromptAction::DiscardSwap },
-                Choice { key: 'o', label: "Open original", action: PromptAction::OpenOriginal },
             ],
         }
     }
@@ -283,14 +268,6 @@ mod tests {
         assert_eq!(p.action_for('s'), None);
         assert!(p.message.to_lowercase().contains("changed on disk"));
     }
-    #[test]
-    fn swap_recovery_offers_recover_discard_open() {
-        let p = Prompt::swap_recovery();
-        assert_eq!(p.action_for('r'), Some(PromptAction::Recover));
-        assert_eq!(p.action_for('d'), Some(PromptAction::DiscardSwap));
-        assert_eq!(p.action_for('o'), Some(PromptAction::OpenOriginal));
-    }
-
     #[test]
     fn close_confirm_routes_keys_case_insensitively() {
         let id = crate::editor::BufferId(7);

@@ -1,0 +1,17 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.34s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 9 tests
+test fsx::recovery_io_tests::tests::fifo_child_probe ... ok
+test fsx::recovery_io_tests::tests::private_metadata_rejects_wrong_owner_even_with_private_mode ... ok
+test fsx::recovery_io_tests::tests::exclusive_private_directory_and_strict_sync ... ok
+test fsx::recovery_io_tests::tests::opened_record_stays_on_original_inode_and_caps_reads ... ok
+test fsx::recovery_io_tests::tests::unsupported_capability_is_distinct_from_busy ... ok
+test fsx::recovery_io_tests::tests::rejects_symlinks_special_files_and_public_directories ... ok
+test fsx::recovery_io_tests::tests::recovery_faults_and_nth_sync_are_observable ... ok
+test fsx::recovery_io_tests::tests::lock_is_exclusive_until_last_shared_guard_drops ... ok
+test fsx::recovery_io_tests::tests::fifo_open_returns_without_waiting_for_a_writer ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 2044 filtered out; finished in 0.01s
+

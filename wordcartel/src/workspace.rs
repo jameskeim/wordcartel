@@ -12,10 +12,38 @@ pub fn buffer_display_name(editor: &Editor, id: BufferId) -> String {
             Some(p) => p.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.to_string_lossy().into_owned()),
-            None => "*untitled*".to_string(),
+            None => editor.by_id(id).and_then(recovered_display_name)
+                .unwrap_or_else(|| "*untitled*".to_string()),
         }
     };
     if editor.is_dirty(id) { format!("*{base}") } else { base }
+}
+
+/// A recovered document stays visibly distinct until the user gives it a filename.
+fn recovered_display_name(buffer: &crate::editor::Buffer) -> Option<String> {
+    if buffer.document.path.is_some() || buffer.recovery_source.is_none() { return None; }
+    let name = match buffer.recovery_provenance.as_ref() {
+        Some(path) => match path.local_path() {
+            Some(path) => {
+                let name = path.file_name().unwrap_or(path.as_os_str());
+                name.to_str().map(|s| s.escape_debug().to_string())
+                    .unwrap_or_else(|| format!("{name:?}"))
+            },
+            None => path.escaped(),
+        },
+        None => "untitled".into(),
+    };
+    Some(format!("Recovered {name}"))
+}
+
+/// First-save suggestion only: never turn provenance into a document write target.
+pub(crate) fn recovered_save_name(buffer: &crate::editor::Buffer) -> Option<String> {
+    if buffer.document.path.is_some() || buffer.recovery_source.is_none() { return None; }
+    let path = buffer.recovery_provenance.as_ref().and_then(|p| p.local_path());
+    let stem = path.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control));
+    Some(stem.map(|s| format!("{s}-recovered.md"))
+        .unwrap_or_else(|| "recovered-untitled.md".into()))
 }
 
 /// Return buffers in MRU order (most-recent first) as `(id, display_name)` pairs.
@@ -147,6 +175,7 @@ pub fn open_as_new_buffer(editor: &mut Editor, fs: &dyn crate::fsx::Fs, path: &s
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
             editor.clear_status();
+            crate::recovery_flow::opened(editor, id, path);
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
@@ -189,6 +218,7 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     };
     // P2 on_buffer_close fire site: capture the path BEFORE the slot is removed/replaced —
     // covers all three close shapes below (this is the one place all of them funnel through).
+    crate::recovery_flow::cancel_buffer(editor, id);
     let closing = editor.by_id(id).and_then(|b| b.document.path.clone());
     // Effort A: tell the provider to abandon this doc's generation before the slot is removed or
     // replaced (all three shapes below) so the server never keeps a closed doc open until shutdown.

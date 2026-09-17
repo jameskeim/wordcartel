@@ -1183,7 +1183,6 @@ mod tests {
             crate::prompt::Prompt::quit_multi(2),
             crate::prompt::Prompt::quit_review_buffer("draft.md"),
             crate::prompt::Prompt::external_mod(),
-            crate::prompt::Prompt::swap_recovery(),
             crate::prompt::Prompt::transform_chooser(),
             crate::prompt::Prompt::save_overwrite(std::path::Path::new("/tmp/a.md")),
             crate::prompt::Prompt::write_block_overwrite(std::path::Path::new("/tmp/a.md")),
@@ -4366,7 +4365,7 @@ mod tests {
         set_caret(&mut ed, "hello world".len());
         let baseline = render_capturing_cursor(&mut ed, 40, 12);
         assert_ne!(baseline, Some((0, 0)), "precondition: editor caret is off-origin at rest");
-        ed.open_prompt(crate::prompt::Prompt::swap_recovery());
+        ed.open_prompt(crate::prompt::Prompt::external_mod());
         let cur = render_capturing_cursor(&mut ed, 40, 12);
         assert_eq!(cur, Some((0, 0)), "arm-3 must suppress the editor caret under a modal prompt");
     }

@@ -115,7 +115,9 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) -> S
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
-    let prior_key = ctx.editor.active().document.path.clone(); // for SaveAs swap re-key
+    let recovery_slot = ctx.editor.active().recovery_slot.clone();
+    let recovery_generation = ctx.editor.active().recovery_generation;
+    let previous_association = ctx.editor.active().document.path.clone();
     let write_path = target.resolved.clone();   // bytes go HERE
     let chosen_path = target.chosen.clone();    // the buffer is rekeyed to THIS
     // OWNED handle cloned into the job closure. `jobs::Job::run` is
@@ -155,144 +157,195 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: SaveTarget, mode: SaveMode) -> S
             let status_target = write_path.clone();
             let outcome = file::save_atomic_with_fs(&*fs, &write_path, &content);
             let new_fp = fingerprint_with_fs(&*fs, &write_path);
+            // Cleanup has its own stronger durability receipt, even for Unchanged.
+            // A retained recovery copy never turns an otherwise successful save into failure.
+            let cleanup = if outcome.is_ok() {
+                cleanup_after_save(&*fs, &recovery_slot,
+                    recovery_generation, v, &write_path, new_fp, &content,
+                    if matches!(mode, SaveMode::SaveAs) {
+                        crate::recovery_store::AssociationPolicy::SaveAs { previous: previous_association.as_deref() }
+                    } else { crate::recovery_store::AssociationPolicy::CurrentDestination })
+            } else { SaveCleanup::default() };
             JobResult {
                 buffer_id,
                 class: ResultClass::Durability,
                 version: v,
                 kind: JobKind::Save,
-                merge: Box::new(move |editor| {
-                    // INVARIANT: route via by_id_mut(buffer_id) — NEVER active(); the merge must
-                    // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
-                    // Assemble the (global) status in a local so the `b` mutable borrow ends
-                    // before we touch editor.status.
-                    // P2 on_save fire site: computed from the closure's OWNED `chosen_path`,
-                    // NOT from `b` — a closed buffer must still fire (the write DID succeed).
-                    // Fires on Saved AND Unchanged (both are the user-visible "a save completed"
-                    // outcome); Err fires nothing.
-                    //
-                    // CHOSEN, not resolved: consistency with `plugin::api`'s `wc.path()`, which
-                    // returns `Document.path`. A Save event reporting a path `wc.path()` never
-                    // returns would make the two disagree.
-                    let fire_save: Option<PathBuf> =
-                        matches!(outcome, Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged))
-                            .then(|| chosen_path.clone());
-                    // A17 T4 (F4 Error table): captured BEFORE the match below moves `outcome`'s
-                    // Err payload — a genuine SaveError (IO/symlink) must land Sticky/Error so it
-                    // survives the next keystroke, unlike the ordinary Info completion messages.
-                    let is_save_error = outcome.is_err();
-                    let mut changed_destination = false;
-                    let mut status = String::new();
-                    // Hoisted out of the `by_id_mut` block (local-then-assign, mirrors
-                    // `status`/`fire_save`): the session-migration queue push below needs
-                    // `editor` mutably, which conflicts with a live `&mut Buffer` borrow.
-                    let mut migrate_from: Option<PathBuf> = None;
-                    if let Some(b) = editor.by_id_mut(buffer_id) {
-                        match outcome {
-                            Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged)
-                                if matches!(mode, SaveMode::Normal)
-                                    && b.document.path.as_ref() != Some(&chosen_path) => {
-                                // The write completed, but a preceding Save As changed this buffer's
-                                // destination. It proves nothing about the current path's saved state.
-                                changed_destination = true;
-                                status = format!("Saved to {} — current document was not saved",
-                                    status_target.display());
-                            }
-                            Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
-                                // MERGE-TIME capture. The dispatch-time `prior_key` is stale
-                                // for a second Save-As dispatched before this merge landed;
-                                // reading the buffer here gives the truth at THIS moment, so
-                                // a->b then a->c records (a,b) then (b,c) and chains.
-                                let pre_rekey = b.document.path.clone();
-                                // Middle B: the buffer is rekeyed to the CHOSEN path so
-                                // display, prefills, the open-dir seed, export derivation,
-                                // wc.path(), and the LSP uri all stay logical.
-                                if matches!(mode, SaveMode::SaveAs) {
-                                    b.document.path = Some(chosen_path.clone());
-                                    migrate_from = pre_rekey;
-                                }
-                                b.document.saved_version = Some(v);
-                                b.document.stored_fp = new_fp;
-                                // The swap latch (`swapped_version`) asserts "this version's content
-                                // is in the swap file". A successful save deletes/rekeys that swap
-                                // (below), so clear the latch — otherwise a later same-version dirty
-                                // state would read as "already swapped" and skip writing a fresh swap
-                                // (Codex pre-merge). Clearing errs toward writing a swap (durability-safe)
-                                // and re-arms the expedited SaveAs-still-editing checkpoint.
-                                b.swapped_version = None;
-                                // §11.1: Save-As names the resolved target; an ordinary save keeps
-                                // the concise wording (its destination is the document you are
-                                // already looking at, so naming it every time is noise).
-                                let named = if matches!(mode, SaveMode::SaveAs) {
-                                    format!(" to {}", status_target.display())
-                                } else { String::new() };
-                                if b.document.version == v {
-                                    status = format!("Saved{named}");
-                                    // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
-                                    crate::swap::delete(b.document.path.as_deref());
-                                    // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
-                                    if matches!(mode, SaveMode::SaveAs) { crate::swap::delete(prior_key.as_deref()); }
-                                } else {
-                                    status = format!("Saved v{v}{named} (still editing)");
-                                    // Staged re-key (Codex): the buffer was edited during the write
-                                    // (now v+1). Delete the prior/scratch swap (its v content is now
-                                    // ON DISK at `target`, and leaving a scratch swap would trigger a
-                                    // spurious recovery next launch) and EXPEDITE a swap under the new
-                                    // path: `last_swap_at = None` makes the next `due()` fire promptly,
-                                    // writing a swap for the v+1 body under `target`. Exposure for the
-                                    // v→v+1 keystrokes is bounded by the normal swap cadence (the same
-                                    // window normal editing has between periodic swap writes).
-                                    if matches!(mode, SaveMode::SaveAs) {
-                                        // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
-                                        crate::swap::delete(prior_key.as_deref());
-                                        b.last_swap_at = None;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // Failure: leave saved_version/stored_fp/path untouched
-                                // (buffer stays dirty; SaveAs path stays None/old); surface the error.
-                                // Do NOT re-introduce SaveError::Symlink match — e.to_string()
-                                // for Symlink still contains "symlink", satisfying the test.
-                                status = e.to_string();
-                            }
-                        }
-                    }
-                    // Queue the session-entry migration. Nothing is queued when there is no
-                    // old entry (first Save-As of an unnamed buffer) or when the path did not
-                    // change (Save-As onto the same path).
-                    if matches!(mode, SaveMode::SaveAs) {
-                        if let Some(from) = migrate_from {
-                            if from != chosen_path {
-                                editor.pending_session_migrations.push_back(
-                                    crate::editor::SessionMigration { from, to: chosen_path.clone() });
-                            }
-                        }
-                    }
-                    // Reconstruct the IDENTICAL Save(buffer_id, v) topic captured at the start so
-                    // this completion collapses exactly its own "Saving…" lineage (§4.2). `buffer_id`
-                    // and `v` are the same values the JobResult carries as `r.buffer_id`/`r.version`.
-                    let topic = crate::status::StatusTopic::Save(buffer_id, v);
-                    let cancelled_wait = crate::quit::save_finished(editor, request, !is_save_error && !changed_destination);
-                    finish_save_action(editor, buffer_id, v, request, !is_save_error && !changed_destination);
-                    if cancelled_wait { status.push_str(" — quit cancelled"); }
-                    if is_save_error {
-                        editor.finish_topic(topic, crate::status::StatusKind::Error, status);
-                    } else if changed_destination {
-                        editor.finish_topic(topic, crate::status::StatusKind::Warning, status);
-                    } else {
-                        editor.finish_topic(topic, crate::status::StatusKind::Info, status);
-                    }
-                    // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
-                    // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after
-                    // editor.status is set — mirrors the local-then-assign shape above.
-                    if let Some(p) = fire_save {
-                        crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Save, Some(&p));
-                    }
-                }),
+                merge: Box::new(move |editor| merge_save(editor, SaveCompletion {
+                    request, buffer_id, version: v, mode, chosen_path, status_target,
+                    outcome, new_fp, recovery_slot, recovery_generation, cleanup,
+                })),
             }
         }),
     });
     request
+}
+
+#[derive(Default)]
+struct SaveCleanup { cleaned: bool, message: Option<String>, warning: bool }
+
+/// Optional housekeeping cannot relabel a completed user write as a failed save.
+// Receipt inputs remain explicit; the final policy only widens association eligibility.
+#[allow(clippy::too_many_arguments)]
+fn cleanup_after_save(fs: &dyn crate::fsx::Fs, slot: &crate::recovery_store::RecoverySlot,
+    generation: u64, version: u64, path: &Path, fp: Option<FileFingerprint>, body: &str,
+    policy: crate::recovery_store::AssociationPolicy<'_>) -> SaveCleanup {
+    match crate::panicx::catch(|| crate::recovery_store::cleanup_saved_with_policy(
+        fs, slot, generation, version, path, fp, body, policy)) {
+        Ok(outcome) => SaveCleanup {
+            cleaned: matches!(outcome, crate::recovery_store::CleanupOutcome::Cleaned),
+            message: outcome.message().map(str::to_owned),
+            warning: outcome.warning().is_some(),
+        },
+        Err(error) => SaveCleanup { cleaned: false,
+            warning: true, message: Some(format!("Recovery cleanup interrupted: {error}")) },
+    }
+}
+
+struct SaveCompletion {
+    request: SaveRequest,
+    buffer_id: crate::editor::BufferId,
+    version: u64,
+    mode: SaveMode,
+    chosen_path: PathBuf,
+    status_target: PathBuf,
+    outcome: Result<SaveOutcome, file::SaveError>,
+    new_fp: Option<FileFingerprint>,
+    recovery_slot: crate::recovery_store::RecoverySlot,
+    recovery_generation: u64,
+    cleanup: SaveCleanup,
+}
+
+/// Apply write facts only to their originating editing instance, then notify observers.
+fn merge_save(editor: &mut crate::editor::Editor, completion: SaveCompletion) {
+    let SaveCompletion { request, buffer_id, version: v, mode, chosen_path, status_target,
+        outcome, new_fp, recovery_slot, recovery_generation, cleanup } = completion;
+
+    // INVARIANT: route via by_id_mut(buffer_id) — NEVER active(); the merge must
+    // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
+    // Assemble the (global) status in a local so the `b` mutable borrow ends
+    // before we touch editor.status.
+    // P2 on_save fire site: computed from the closure's OWNED `chosen_path`,
+    // NOT from `b` — a closed buffer must still fire (the write DID succeed).
+    // Fires on Saved AND Unchanged (both are the user-visible "a save completed"
+    // outcome); Err fires nothing.
+    //
+    // CHOSEN, not resolved: consistency with `plugin::api`'s `wc.path()`, which
+    // returns `Document.path`. A Save event reporting a path `wc.path()` never
+    // returns would make the two disagree.
+    let fire_save: Option<PathBuf> =
+        matches!(outcome, Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged))
+            .then(|| chosen_path.clone());
+    // A17 T4 (F4 Error table): captured BEFORE the match below moves `outcome`'s
+    // Err payload — a genuine SaveError (IO/symlink) must land Sticky/Error so it
+    // survives the next keystroke, unlike the ordinary Info completion messages.
+    let is_save_error = outcome.is_err();
+    let mut changed_destination = false;
+    let replaced_owner = editor.by_id(buffer_id)
+        .is_some_and(|b| !b.recovery_slot.same_instance(&recovery_slot));
+    let mut status = match &outcome {
+        Ok(_) if replaced_owner => format!("Saved previous document to {} — current document was not saved", status_target.display()),
+        Ok(_) => format!("Saved to {}", status_target.display()),
+        Err(error) => error.to_string(),
+    };
+    let mut rekeyed = false;
+    // Hoisted out of the `by_id_mut` block (local-then-assign, mirrors
+    // `status`/`fire_save`): the session-migration queue push below needs
+    // `editor` mutably, which conflicts with a live `&mut Buffer` borrow.
+    let mut migrate_from: Option<PathBuf> = None;
+    if let Some(b) = editor.by_id_mut(buffer_id)
+        .filter(|b| b.recovery_slot.same_instance(&recovery_slot)) {
+        match outcome {
+            Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged)
+                if matches!(mode, SaveMode::Normal)
+                    && b.document.path.as_ref() != Some(&chosen_path) => {
+                // The write completed, but a preceding Save As changed this buffer's
+                // destination. It proves nothing about the current path's saved state.
+                changed_destination = true;
+                status = format!("Saved to {} — current document was not saved",
+                    status_target.display());
+            }
+            Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
+                // MERGE-TIME capture. A dispatch-time path is stale
+                // for a second Save-As dispatched before this merge landed;
+                // reading the buffer here gives the truth at THIS moment, so
+                // a->b then a->c records (a,b) then (b,c) and chains.
+                let pre_rekey = b.document.path.clone();
+                // Middle B: the buffer is rekeyed to the CHOSEN path so
+                // display, prefills, the open-dir seed, export derivation,
+                // wc.path(), and the LSP uri all stay logical.
+                if matches!(mode, SaveMode::SaveAs) {
+                    b.document.path = Some(chosen_path.clone());
+                    migrate_from = pre_rekey;
+                    rekeyed = true;
+                }
+                b.document.saved_version = Some(v);
+                b.document.stored_fp = new_fp;
+                // Conservatively re-arm protection after a save; only the worker's
+                // strict owned-record receipt may actually remove a checkpoint.
+                b.swapped_version = None;
+                if cleanup.cleaned
+                    && b.recovery_ack.as_ref().is_some_and(|ack| ack.generation() <= recovery_generation) {
+                    b.recovery_ack = None;
+                }
+                // §11.1: Save-As names the resolved target; an ordinary save keeps
+                // the concise wording (its destination is the document you are
+                // already looking at, so naming it every time is noise).
+                let named = if matches!(mode, SaveMode::SaveAs) {
+                    format!(" to {}", status_target.display())
+                } else { String::new() };
+                if b.document.version == v {
+                    status = format!("Saved{named}");
+                    b.recovery_protection_failure = None;
+                } else {
+                    status = format!("Saved v{v}{named} (still editing)");
+                    if matches!(mode, SaveMode::SaveAs) { b.last_swap_at = None; }
+                }
+            }
+            Err(e) => {
+                // Failure: leave saved_version/stored_fp/path untouched
+                // (buffer stays dirty; SaveAs path stays None/old); surface the error.
+                // Do NOT re-introduce SaveError::Symlink match — e.to_string()
+                // for Symlink still contains "symlink", satisfying the test.
+                status = e.to_string();
+            }
+        }
+    }
+    if rekeyed { crate::recovery_flow::association_changed(editor, buffer_id); }
+    // Queue the session-entry migration. Nothing is queued when there is no
+    // old entry (first Save-As of an unnamed buffer) or when the path did not
+    // change (Save-As onto the same path).
+    if matches!(mode, SaveMode::SaveAs) {
+        if let Some(from) = migrate_from {
+            if from != chosen_path {
+                editor.pending_session_migrations.push_back(
+                    crate::editor::SessionMigration { from, to: chosen_path.clone() });
+            }
+        }
+    }
+    // Reconstruct the IDENTICAL Save(buffer_id, v) topic captured at the start so
+    // this completion collapses exactly its own "Saving…" lineage (§4.2). `buffer_id`
+    // and `v` are the same values the JobResult carries as `r.buffer_id`/`r.version`.
+    let topic = crate::status::StatusTopic::Save(buffer_id, v);
+    let cancelled_wait = crate::quit::save_finished(editor, request, !is_save_error && !changed_destination && !replaced_owner);
+    finish_save_action(editor, buffer_id, v, request, !is_save_error && !changed_destination && !replaced_owner);
+    if cancelled_wait { status.push_str(" — quit cancelled"); }
+    if let Some(warning) = cleanup.message.as_deref() {
+        status.push_str(" — "); status.push_str(warning);
+    }
+    if is_save_error {
+        editor.finish_topic(topic, crate::status::StatusKind::Error, status);
+    } else if changed_destination || replaced_owner || cleanup.warning {
+        editor.finish_topic(topic, crate::status::StatusKind::Warning, status);
+    } else {
+        editor.finish_topic(topic, crate::status::StatusKind::Info, status);
+    }
+    // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
+    // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after
+    // editor.status is set — mirrors the local-then-assign shape above.
+    if let Some(p) = fire_save {
+        crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Save, Some(&p));
+    }
 }
 
 /// Only the exact awaited save can authorize its action. In particular, an earlier
@@ -476,54 +529,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = fingerprint(&path);
     editor.set_status(crate::status::StatusKind::Info, "Reloaded");
-    // fs-chokepoint-allow: (w) swap cleanup, deliberately not migrated
-    crate::swap::delete(editor.active().document.path.as_deref());
-}
-
-/// Load recovered swap content into the buffer; keep the path; mark dirty.
-/// Sanctioned whole-document replacement (fresh Document, history reset).
-pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
-    let path = editor.active().document.path.clone();
-    // Fix A1: capture the previous version BEFORE replacing the buffer so we
-    // can carry it forward, preventing late pre-reload diagnostics results
-    // from matching the version gate in `apply_diagnostics_done`.
-    let previous_version = editor.active().document.version;
-    let area = editor.active().view.area;
-    let fresh = crate::editor::Editor::new_from_text(body, path.clone(), area);
-    let mut new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
-    // Bump version past the pre-reload value; recovered content is unsaved.
-    new_buf.document.version = previous_version + 1;
-    new_buf.document.saved_version = None; // recovered work is unsaved
-    // Reset the DiagStore so no stale underlines from the old content persist.
-    new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
-    // Fresh buffer is full-parsed for version 0; the version bump above skips
-    // that origin — sync blocks_version so rebuild skips the redundant reparse.
-    new_buf.reconcile.blocks_version = new_buf.document.version;
-    let id = editor.active().id;                 // preserve THIS buffer's id
-    // Effort A: abandon the pre-recovery generation before the wholesale replace (same guard as
-    // reload_from_disk) — the in-transit old-content publish is dropped and the buffer reopens fresh.
-    editor.diag_providers.notify_close_all(id);
-    // 5g: capture folds before replacement so we can carry them forward.
-    let prev_folded = editor.active().folds.folded().clone();
-    // A17 T8 category (b): route through the single chokepoint (see reload_from_disk).
-    if !editor.replace_buffer(editor.active, crate::editor::Buffer { id, ..new_buf }) { return; }
-    // 5g: carry folds across the recovery and reconcile against the new tree.
-    editor.active_mut().folds.replace_folded(prev_folded);
-    // Clear any stale search/diag overlay — the buffer content has changed wholesale.
-    editor.search = None;
-    editor.diag = None;
-    editor.active_mut().invalidate_layout();
-    crate::derive::rebuild(editor); // reconciles folds + normalizes scroll
-    // normalize the caret out of any fold the new content created/changed.
-    let head = editor.active().document.selection.primary().head;
-    let nc = {
-        let b = editor.active();
-        crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head)
-    };
-    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
-    crate::nav::ensure_visible(editor);
-    editor.active_mut().document.stored_fp = path.as_deref().and_then(fingerprint);
-    editor.set_status(crate::status::StatusKind::Info, "Recovered unsaved changes");
+    // The replaced editing instance retains its recovery record and queued leases.
 }
 
 #[cfg(test)]
@@ -704,36 +710,44 @@ mod tests {
     }
 
     #[test]
-    fn save_clean_deletes_swap_but_stale_save_keeps_it() {
-        use crate::jobs::{Executor, InlineExecutor};
-        use crate::registry::Ctx;
-        let p = scratch();
+    fn save_clean_removes_owned_checkpoint_but_keeps_a_newer_generation() {
+        use crate::recovery_store::{self as store, CheckpointRecord, TaggedPath};
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("document.md");
         std::fs::write(&p, "old\n").unwrap();
-
-        // Pre-create a swap for this doc.
-        let sp = crate::swap::swap_path(Some(&p)).unwrap();
-        crate::swap::write_atomic(&sp, "stub").unwrap();
-        assert!(sp.exists());
-
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
         e.active_mut().document.saved_version = None;
         e.active_mut().document.version = 1;
-        let ex = InlineExecutor::default();
+        let checkpoint = |e: &mut Editor| {
+            let b = e.active_mut();
+            let generation = b.recovery_slot.reserve_generation().unwrap();
+            let record = CheckpointRecord::new(generation, b.document.id.to_hex(),
+                b.document.version, Some(TaggedPath::from_path(&p)), None);
+            let ack = store::checkpoint(&crate::fsx::RealFs, root.path(), &b.recovery_slot,
+                &record, &b.document.buffer.to_string()).unwrap();
+            b.recovery_generation = generation; b.recovery_ack = Some(ack.clone());
+            ack.record_path().to_owned()
+        };
+        let sp = checkpoint(&mut e);
+        let ex = crate::recovery_regressions::DeferredRecoveryExecutor::default();
         let clk = Z;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
-        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        dispatch_save(&mut Ctx { editor: &mut e, clock: &clk, executor: &ex,
+            msg_tx: tx(), fs: crate::test_support::test_fs() });
+        crate::jobs_apply::apply_outcome(ex.run_next(), &mut e);
         assert!(!e.active().document.dirty());
-        assert!(!sp.exists(), "a save that leaves the buffer clean deletes the swap");
+        assert!(!sp.exists(), "durable save retires its eligible owned checkpoint");
 
-        // Now: dispatch a save at v2, but edit on to v3 before the merge → keep swap.
-        crate::swap::write_atomic(&sp, "stub2").unwrap();
+        // Capture v2 save, then checkpoint a later v3 before that worker runs.
         e.active_mut().document.version = 2;
-        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx(), fs: crate::test_support::test_fs() }; dispatch_save(&mut ctx); }
-        e.active_mut().document.version = 3; // edited on
-        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        dispatch_save(&mut Ctx { editor: &mut e, clock: &clk, executor: &ex,
+            msg_tx: tx(), fs: crate::test_support::test_fs() });
+        e.active_mut().document.version = 3;
+        let newer = checkpoint(&mut e);
+        let bytes = std::fs::read(&newer).unwrap();
+        crate::jobs_apply::apply_outcome(ex.run_next(), &mut e);
         assert!(e.active().document.dirty());
-        assert!(sp.exists(), "a stale-version save must NOT delete the swap");
-        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+        assert_eq!(std::fs::read(&newer).unwrap(), bytes,
+            "save cannot retire a generation created after its capture");
     }
 
     #[test]
@@ -950,57 +964,48 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Same invariant for load_recovered: a late DiagnosticsDone for the
-    /// pre-recovery version is discarded after the version bump.
+    /// Recovery now allocates a separate BufferId; original diagnostics remain attached
+    /// to their original document even when both documents have the same edit version.
     #[test]
-    fn load_recovered_discards_pre_recovery_diagnostics_done() {
-        let mut e = Editor::new_from_text("old content\n", None, (80, 24));
-        crate::test_support::install_enabled_harper(&mut e); // enable Harper so the late result reaches the version gate
-        let pre_recovery_version = e.active().document.version; // 0
+    fn recovery_separate_document_preserves_original_diagnostic_ownership() {
+        use crate::diag_provider::{RecordingProvider, ProviderCall};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("recovered-draft.md"), "recovered content\n").unwrap();
+        let mut e = Editor::new_from_text("old content\n", None, (80,24));
+        e.recovery.set_root(root.path().to_owned());
+        let original = e.active().id;
+        let version = e.active().document.version;
         let harper = wordcartel_core::diagnostics::DiagSource::Harper;
-        e.active_mut().diagnostics.slot_mut(harper).in_flight_version = Some(pre_recovery_version);
-        // Simulate stale underlines that must be wiped by recovery.
-        e.active_mut().diagnostics.slot_mut(harper).diagnostics = vec![
-            wordcartel_core::diagnostics::Diagnostic {
-                range: 0..3,
+        let provider = RecordingProvider::new().with_source(harper);
+        let calls = provider.calls_handle();
+        e.diag_providers.install(Box::new(provider), true);
+        e.active_mut().diagnostics.slot_mut(harper).in_flight_version = Some(version);
+        let fs = crate::test_support::test_fs();
+        let rows = crate::recovery_discovery::scan(&*fs, root.path(), &crate::recovery_discovery::ScanScope::All).unwrap();
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::recovery_flow::begin_selected(&mut Ctx { editor: &mut e, executor: &ex,
+            clock: &clock, msg_tx: tx.clone(), fs: fs.clone() }, rows);
+        for _ in 0..4 { for outcome in ex.drain() {
+            crate::jobs_apply::apply_job_outcome(outcome, &mut e, &ex, &clock, &tx, &fs);
+        } }
+        assert_ne!(e.active().id, original);
+        assert_eq!(e.by_id(original).unwrap().document.buffer.to_string(), "old content\n");
+        assert!(!calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(id) if *id == original)));
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, original, version, harper,
+            vec![wordcartel_core::diagnostics::Diagnostic { range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
-                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
-                message: "old".into(),
-                suggestions: vec![],
-            }
-        ];
-        e.active_mut().diagnostics.slot_mut(harper).computed_version = pre_recovery_version;
-        load_recovered(&mut e, "recovered content\n");
-        assert!(e.active().document.version > pre_recovery_version,
-            "load_recovered must bump version past the pre-recovery value");
-        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
-            "load_recovered must reset DiagStore");
-        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.in_flight_version.is_none()),
-            "load_recovered must clear in_flight_version");
-        let buffer_id = e.active().id;
-        // Deliver a late result for the pre-recovery version — must be discarded.
-        crate::diagnostics_run::apply_diagnostics_done(
-            &mut e,
-            buffer_id,
-            pre_recovery_version,
-            wordcartel_core::diagnostics::DiagSource::Harper,
-            vec![wordcartel_core::diagnostics::Diagnostic {
-                range: 0..3,
-                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
-                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
-                message: "stale".into(),
-                suggestions: vec![],
-            }],
-        );
-        assert!(e.active().diagnostics.slot(harper).is_none(),
-            "late pre-recovery DiagnosticsDone must be discarded; no phantom slot");
+                source: harper, code: None, href: None, message: "late original result".into(), suggestions: vec![] }]);
+        assert_eq!(e.by_id(original).unwrap().diagnostics.slot(harper).unwrap().diagnostics.len(), 1);
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|slot| slot.diagnostics.is_empty()));
     }
 
-    /// Effort A: reload/recover close the pre-replacement generation on the provider (the
+    /// Effort A: reload closes the pre-replacement generation on the provider (the
     /// generation-axis half of the double staleness guard, spec §5 item 4) so an in-transit
     /// old-content publish is dropped and the buffer reopens fresh.
     #[test]
-    fn reload_and_recover_notify_provider_close() {
+    fn reload_notifies_provider_close() {
         use crate::diag_provider::{RecordingProvider, ProviderCall};
         // reload_from_disk
         let p = scratch();
@@ -1015,15 +1020,7 @@ mod tests {
             "reload_from_disk notifies close for the pre-reload generation");
         let _ = std::fs::remove_file(&p);
 
-        // load_recovered
-        let mut e = Editor::new_from_text("old\n", None, (80, 24));
-        let id = e.active().id;
-        let rec = RecordingProvider::new().with_source(wordcartel_core::diagnostics::DiagSource::Harper);
-        let calls = rec.calls_handle();
-        e.diag_providers.install(Box::new(rec), true);
-        load_recovered(&mut e, "recovered\n");
-        assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(x) if *x == id)),
-            "load_recovered notifies close for the pre-recovery generation");
+
     }
 
     #[test]

@@ -1,0 +1,21 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.65s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 13 tests
+test recovery_regressions::handoff_integration::recovery_handoff_cancelled_prepare_failure_does_not_cancel_a_later_quit ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_cleanup_failure_keeps_durable_ack_and_both_copies ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_stale_prepare_panic_cannot_clear_next_phase ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_quit_preserves_already_dispatched_handoff ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_rejection_before_and_after_install_releases_source ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_missing_original_parent_uses_normal_first_save_directory ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_records_predecessor_without_assigning_a_write_target ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_cancellation_after_worker_authorization_keeps_successor ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_failed_first_selection_releases_lease_and_advances_batch ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_cancelled_failed_live_copy_can_retry_current_contents ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_first_save_routes_through_occupied_suggestion_confirmation ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_cleanup_panics_before_and_after_unlink_keep_successor_ack ... ok
+test recovery_regressions::handoff_integration::recovery_handoff_checkpoint_fault_matrix_preserves_source_and_terminates ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2121 filtered out; finished in 0.02s
+

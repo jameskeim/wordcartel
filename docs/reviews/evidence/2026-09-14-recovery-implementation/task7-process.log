@@ -1,0 +1,13 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.50s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 5 tests
+test recovery_process_tests::tests::recovery_process_helper ... ignored, invoked only as a bounded owned subprocess
+test recovery_process_tests::tests::recovery_process_queued_job_retains_last_slot_lease_after_buffer_owner_drops ... ok
+test recovery_process_tests::tests::recovery_process_concurrent_selection_is_exclusive_until_process_death ... ok
+test recovery_process_tests::tests::recovery_process_named_and_unnamed_owners_survive_process_death_independently ... ok
+test recovery_process_tests::tests::recovery_process_crash_boundaries_preserve_source_or_successor_on_restart ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 2164 filtered out; finished in 0.06s
+

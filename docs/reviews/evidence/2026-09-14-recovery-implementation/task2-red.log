@@ -1,0 +1,1 @@
+Initial red was a compile failure: recovery_store declared mod codec before codec.rs existed. The initial compiler output was overwritten by the later mutation run; it is not retained. See task2-ancestor-mutation.log for the separately verified behavior mutation failure; no claim of test-before-implementation ordering for that mutation.

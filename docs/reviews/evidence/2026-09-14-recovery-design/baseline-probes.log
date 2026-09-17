@@ -1,0 +1,15 @@
+Command: cargo test -p wordcartel --lib recovery_design_probes -- --test-threads=1
+Source SHA256: 198ac8f00ab787d7d4caf7a926043c6689419233584f9957419f335c24cf8e6f
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.34s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 5 tests
+test swap::recovery_design_probes::named_buffers_share_checkpoint_and_saving_one_removes_the_other ... ok
+test swap::recovery_design_probes::opening_during_session_skips_recovery_and_save_deletes_carrier ... ok
+test swap::recovery_design_probes::recovering_unnamed_work_deletes_carrier_without_arming_checkpoint ... ok
+test swap::recovery_design_probes::save_as_of_one_unnamed_buffer_deletes_anothers_checkpoint ... ok
+test swap::recovery_design_probes::untitled_checkpoints_collide ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2040 filtered out; finished in 0.01s
+

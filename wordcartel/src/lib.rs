@@ -32,6 +32,10 @@ pub mod startup;   // config → fresh Editor seeding, lifted out of app::run
 pub mod swap;
 pub mod timers;
 pub mod recovery;
+pub mod recovery_store;
+mod recovery_flow;
+mod recovery_picker;
+pub mod recovery_discovery;
 pub mod filter;
 pub mod minibuffer;
 pub mod export;
@@ -86,3 +90,9 @@ pub(crate) mod list_window;
 #[cfg(test)] pub(crate) mod test_support;
 #[cfg(test)] mod e2e;
 #[cfg(test)] mod durability_regressions;
+
+#[cfg(test)]
+mod recovery_regressions;
+
+#[cfg(test)]
+mod recovery_process_tests;

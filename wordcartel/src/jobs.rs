@@ -6,11 +6,12 @@ use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use crate::editor::Editor;
+pub use crate::recovery_flow::RecoveryRequestId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum JobKind {
+    Recovery(RecoveryRequestId),
     Save,      // one-shot, user-initiated: always applies
-    SwapWrite, // one-shot housekeeping: always applies (status only)
     Reparse,   // coalescible background block-tree reconcile; version-checked in merge
     PosSweep,  // coalescible background POS sweep; version-checked in merge
     #[cfg(test)]
@@ -83,7 +84,7 @@ pub fn is_stale(r: &JobResult, editor: &Editor) -> bool {
                 #[cfg(not(test))]
                 let _ = b;
                 match r.kind {
-                    JobKind::Save | JobKind::SwapWrite | JobKind::Reparse | JobKind::PosSweep => false,
+                    JobKind::Recovery(_) | JobKind::Save | JobKind::Reparse | JobKind::PosSweep => false,
                     #[cfg(test)]
                     JobKind::CoalesceProbe => r.version != b.document.version,
                 }
@@ -92,9 +93,20 @@ pub fn is_stale(r: &JobResult, editor: &Editor) -> bool {
     }
 }
 
+/// A job could not be accepted by the worker queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchError {
+    /// The queue has no live receiver or has been shut down.
+    Closed,
+}
+
+/// Dispatch jobs and collect outcomes without waiting on the foreground.
 pub trait Executor {
+    /// Accept a job or report rejection, releasing its captures before return.
+    fn try_dispatch(&self, job: Job) -> Result<(), DispatchError>;
+
     /// Enqueue a job for the worker.
-    fn dispatch(&self, job: Job);
+    fn dispatch(&self, job: Job) { let _ = self.try_dispatch(job); }
     /// Non-blocking: collect any results ready now (consumes them).
     fn drain(&self) -> Vec<JobOutcome>;
 }
@@ -107,8 +119,9 @@ pub struct InlineExecutor {
 }
 
 impl Executor for InlineExecutor {
-    fn dispatch(&self, job: Job) {
+    fn try_dispatch(&self, job: Job) -> Result<(), DispatchError> {
         self.pending.borrow_mut().push(job.execute());
+        Ok(())
     }
     fn drain(&self) -> Vec<JobOutcome> {
         self.pending.borrow_mut().drain(..).collect()
@@ -144,11 +157,10 @@ impl ThreadExecutor {
 }
 
 impl Executor for ThreadExecutor {
-    fn dispatch(&self, job: Job) {
-        if let Some(tx) = &self.job_tx {
-            // A send failure means the worker died; the next drain will surface
-            // nothing and the UI stays responsive. Dropping the job is safe.
-            let _ = tx.send(job);
+    fn try_dispatch(&self, job: Job) -> Result<(), DispatchError> {
+        match &self.job_tx {
+            Some(tx) => tx.send(job).map_err(|_| DispatchError::Closed),
+            None => Err(DispatchError::Closed),
         }
     }
     fn drain(&self) -> Vec<JobOutcome> {
@@ -174,6 +186,37 @@ impl Drop for ThreadExecutor {
 mod tests {
     use super::*;
     use crate::editor::{Editor, BufferId};
+
+    #[test]
+    fn recovery_dispatch_reports_closed_queue_and_releases_captures() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct Capture(Arc<AtomicBool>);
+        impl Drop for Capture { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+        for disconnected in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            drop(rx);
+            let (_, result_rx) = mpsc::channel();
+            let ex = ThreadExecutor { job_tx: disconnected.then_some(tx), result_rx, worker: None };
+            let dropped = Arc::new(AtomicBool::new(false));
+            let capture = Capture(dropped.clone());
+            let job = Job { buffer_id: BufferId(1), class: ResultClass::Durability,
+                version: 0, kind: JobKind::Recovery(RecoveryRequestId::for_test(1)), save_request: None,
+                run: Box::new(move || { let _keep = capture; panic!("rejected job must not execute") }) };
+            assert_eq!(ex.try_dispatch(job), Err(DispatchError::Closed));
+            assert!(dropped.load(Ordering::SeqCst), "rejected job releases owned resources");
+            assert!(ex.drain().is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_dispatch_inline_accepts_and_buffers_panic_outcome() {
+        let ex = InlineExecutor::default();
+        let job = Job { buffer_id: BufferId(1), class: ResultClass::Durability,
+            version: 0, kind: JobKind::Recovery(RecoveryRequestId::for_test(1)), save_request: None,
+            run: Box::new(|| panic!("captured panic")) };
+        assert_eq!(ex.try_dispatch(job), Ok(()));
+        assert!(matches!(ex.drain().as_slice(), [JobOutcome::Panicked { .. }]));
+    }
 
     #[test]
     fn thread_executor_runs_job_on_worker_and_drains_result() {
@@ -243,7 +286,7 @@ mod tests {
         assert!(matches!(&out[0], JobOutcome::Panicked { kind: JobKind::Save, msg, .. } if msg == "boom"));
     }
 
-    // One-shot Save/SwapWrite results are never discarded by is_stale — correctness
+    // One-shot Save/Recovery results are never discarded by is_stale — correctness
     // for an edited-on buffer comes from the version-aware MERGE in save.rs, not here.
     #[test]
     fn one_shot_kinds_are_never_stale() {
@@ -254,7 +297,7 @@ mod tests {
             version: 1, kind: JobKind::Save, merge: Box::new(|_| {}) };
         assert!(!is_stale(&r_save, &e));
         let r_swap = JobResult { buffer_id: id, class: ResultClass::Durability,
-            version: 1, kind: JobKind::SwapWrite, merge: Box::new(|_| {}) };
+            version: 1, kind: JobKind::Recovery(RecoveryRequestId::for_test(1)), merge: Box::new(|_| {}) };
         assert!(!is_stale(&r_swap, &e));
         // Durability for a missing buffer is also never stale.
         let r_missing = JobResult { buffer_id: BufferId(999), class: ResultClass::Durability,

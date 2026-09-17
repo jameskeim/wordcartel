@@ -1,0 +1,52 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.81s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 2 tests
+test recovery_flow::import::regression_tests::tests::recovery_polish_cancelled_handoff_latches_only_matching_durable_snapshot ... FAILED
+test recovery_picker::regression_tests::tests::recovery_polish_busy_owner_has_clear_explanation_and_cannot_open ... FAILED
+
+failures:
+
+---- recovery_flow::import::regression_tests::tests::recovery_polish_cancelled_handoff_latches_only_matching_durable_snapshot stdout ----
+
+thread 'recovery_flow::import::regression_tests::tests::recovery_polish_cancelled_handoff_latches_only_matching_durable_snapshot' (298) panicked at wordcartel/src/recovery_flow/import/tests.rs:184:58:
+cancelled durable snapshot is reflected
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- recovery_picker::regression_tests::tests::recovery_polish_busy_owner_has_clear_explanation_and_cannot_open stdout ----
+
+thread 'recovery_picker::regression_tests::tests::recovery_polish_busy_owner_has_clear_explanation_and_cannot_open' (299) panicked at wordcartel/src/recovery_picker/tests.rs:194:9:
+                                                                                        
+┌Review Recovery Files─────────────────────────────────────────────────────────────────┐
+│[ ] checkpoint.wcr         time unknown                         active: internal recov│
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│Path (Left/Right): /tmp/recovery-v2/0123456789abcdef/checkpoint.wcr                   │
+│time unknown                                                                          │
+│active: internal recovery lease contention                                            │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│                                                                                      │
+│Space: select   Enter: open selected   Esc: dismiss                                   │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+[1/1] *untitled* [PREVIEW]                                                              
+
+
+failures:
+    recovery_flow::import::regression_tests::tests::recovery_polish_cancelled_handoff_latches_only_matching_durable_snapshot
+    recovery_picker::regression_tests::tests::recovery_polish_busy_owner_has_clear_explanation_and_cannot_open
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 2183 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

@@ -1,0 +1,146 @@
+--- a/wordcartel/src/recovery_flow/import.rs
++++ b/wordcartel/src/recovery_flow/import.rs
+@@ -239,13 +239,14 @@
+             } else {
+                 b.recovery_retry.failed();
+             }
+-            if !request.cancelled {
+-                let ack = result.as_ref().ok().or_else(|| request.progress.ack());
+-                if let Some(ack) = ack.filter(|ack|
+-                    b.document.path == request.path && b.recovery_generation == ack.generation()) {
+-                    b.recovery_ack = Some(ack.clone()); b.swapped_version = Some(request.version);
+-                    b.last_swap_at = Some(request.started); b.recovery_protection_failure = None;
+-                } else if let Err(e) = &result {
++            // Cancellation revokes retirement, not evidence of an already durable snapshot.
++            let ack = result.as_ref().ok().or_else(|| request.progress.ack());
++            if let Some(ack) = ack.filter(|ack|
++                b.document.path == request.path && b.recovery_generation == ack.generation()) {
++                b.recovery_ack = Some(ack.clone()); b.swapped_version = Some(request.version);
++                b.last_swap_at = Some(request.started); b.recovery_protection_failure = None;
++            } else if !request.cancelled {
++                if let Err(e) = &result {
+                     if !request.progress.protected() {
+                         b.recovery_protection_failure = Some(e.clone());
+                     }
+--- a/wordcartel/src/recovery_flow/import/tests.rs
++++ b/wordcartel/src/recovery_flow/import/tests.rs
+@@ -144,4 +144,56 @@
+         assert_eq!(ex.pending_len(),0);
+     }
+ 
++    #[test]
++    fn recovery_polish_cancelled_handoff_latches_only_matching_durable_snapshot() {
++        for change in ["none", "edit", "path", "generation", "replacement", "closed", "failure", "panic_after_ack"] {
++            let fs=crate::test_support::test_fs(); let temp=tempfile::tempdir().unwrap();
++            let candidate=v2_source(&*fs,temp.path()); let source=candidate.source_path.clone();
++            let mut e=Editor::new_from_text("disk",None,(80,24)); e.recovery.set_root(temp.path().to_owned());
++            let ex=crate::recovery_regressions::DeferredRecoveryExecutor::default();
++            let clock=crate::test_support::TestClock::new(7); let (tx,_)=std::sync::mpsc::channel();
++            begin_selected(&mut Ctx {editor:&mut e,executor:&ex,clock:&clock,msg_tx:tx.clone(),fs:fs.clone()},
++                vec![candidate.clone(),candidate]);
++            crate::jobs_apply::apply_job_outcome(ex.run_next(),&mut e,&ex,&clock,&tx,&fs);
++            let version=e.active().document.version;
++            let request=e.active().recovery_request.unwrap();
++            cancel_batch(&mut e);
++            e.active_mut().recovery_protection_failure=Some("earlier failure".into());
++            match change {
++                "edit" => {
++                    let len=e.active().document.buffer.len();
++                    crate::transact::submit_transaction(&mut e,wordcartel_core::history::Transaction::new(
++                        wordcartel_core::change::ChangeSet::insert(len," later edit",len)),&clock).unwrap();
++                },
++                "path" => e.active_mut().document.path=Some(temp.path().join("changed.md")),
++                "generation" => e.active_mut().recovery_generation+=1,
++                "closed" => { e.switch_to_index(0); e.buffers.pop(); },
++                "replacement" => { let id=e.active().id; *e.active_mut()=crate::editor::Buffer::from_text(id,"replacement",None,(80,24)); },
++                _ => (),
++            }
++            e.quit=true;
++            let history=e.status_history().entries().len();
++            if change=="failure" {
++                assert!(panic_request(&mut e,request,"cancelled worker failed"));
++            } else if change=="panic_after_ack" {
++                let _outcome=ex.run_next();
++                assert!(panic_request(&mut e,request,"late failure after durable checkpoint"));
++            } else {
++                crate::jobs_apply::apply_job_outcome(ex.run_next(),&mut e,&ex,&clock,&tx,&fs);
++            }
++            assert!(source.exists(),"cancelled retirement: {change}");
++            assert!(e.quit,"late completion must not cancel quit: {change}");
++            assert_eq!(e.status_history().entries().len(),history,"late status: {change}");
++            assert_eq!(e.buffers.len(),if change=="closed" {1} else {2},"remaining selection cancelled");
++            assert!(!has_pending_work(&e));
++            if matches!(change,"none"|"edit"|"panic_after_ack") {
++                let ack=e.active().recovery_ack.as_ref().expect("cancelled durable snapshot is reflected");
++                assert_eq!(recovery_store::decode(&std::fs::read(ack.path()).unwrap()).unwrap().1,"original rescued text");
++                assert_eq!(e.active().swapped_version,Some(version));
++                assert!(e.active().recovery_protection_failure.is_none());
++                assert_eq!(protected(e.active()),change!="edit","later edits remain unprotected");
++            } else { assert!(e.active().recovery_ack.is_none(),"nonmatching or absent ack: {change}"); }
++        }
++    }
++
+ }
+--- a/wordcartel/src/recovery_picker.rs
++++ b/wordcartel/src/recovery_picker.rs
+@@ -205,7 +205,11 @@
+     let fields = Layout::horizontal([Constraint::Length(4), Constraint::Percentage(27),
+         Constraint::Percentage(43), Constraint::Fill(1)]).split(area);
+     let (name,_)=display_paths(row);
+-    let availability=report.or(row.unavailable.as_deref()).unwrap_or("available");
++    let name=if row.busy && row.association.is_none() && row.provenance.is_none() {
++        "Recovery files in use".into()
++    } else { name };
++    let availability=if row.busy { "busy: in use" }
++        else { report.or(row.unavailable.as_deref()).unwrap_or("available") };
+     for (text,rect) in [
+         (format!("[{}]",if selected { 'x' } else { ' ' }),fields[0]),
+         (name,fields[1]),(timestamp(row),fields[2]),(availability.to_owned(),fields[3]),
+@@ -220,8 +224,10 @@
+     let path=display_paths(row).1.chars().skip(offset).collect::<String>();
+     frame.render_widget(Paragraph::new(format!("Path (Left/Right): {path}")).style(style),fields[0]);
+     frame.render_widget(Paragraph::new(timestamp(row)).style(style),fields[1]);
+-    frame.render_widget(Paragraph::new(report.or(row.unavailable.as_deref())
+-        .unwrap_or("available")).wrap(Wrap { trim: false }).style(style), fields[2]);
++    let availability=if row.busy {
++        "An editor is using these recovery files. They cannot be opened while in use."
++    } else { report.or(row.unavailable.as_deref()).unwrap_or("available") };
++    frame.render_widget(Paragraph::new(availability).wrap(Wrap { trim: false }).style(style), fields[2]);
+     frame.render_widget(Paragraph::new(row.preview.as_str()).wrap(Wrap {trim:false}).style(style),fields[3]);
+ }
+ /// Paint only bounded visible metadata and the highlighted row's capped preview.
+--- a/wordcartel/src/recovery_picker/tests.rs
++++ b/wordcartel/src/recovery_picker/tests.rs
+@@ -176,10 +176,31 @@
+         let list=geometry(Rect::new(0,0,88,24)).1;
+         assert!(rendered[list.y as usize].contains("2000-02-29"),"{}",rendered[list.y as usize]);
+         assert!(rendered[list.y as usize].contains("busy"),"{}",rendered[list.y as usize]);
+-        assert!(rendered.join("\n").contains("another editor owns this copy"));
++        assert!(rendered.join("\n").contains("An editor is using these recovery files"));
++        assert!(rendered[list.y as usize].contains("draft.md"),"known filename remains visible");
+         for _ in 0..30 { scroll_path(&mut e,true); }
+         let rendered=rendered_picker(&mut e);
+         let details=geometry(Rect::new(0,0,88,24)).2;
+         assert!(rendered[details.y as usize].contains("draft.md"),"long original path can scroll to its end: {} offset {}",rendered[details.y as usize],e.recovery_picker.as_ref().unwrap().path_scroll);
+     }
++    #[test]
++    fn recovery_polish_busy_owner_has_clear_explanation_and_cannot_open() {
++        let mut h=Harness::new();
++        let mut row=candidate();
++        row.source_path="/tmp/recovery-v2/0123456789abcdef/checkpoint.wcr".into();
++        row.token=None; row.busy=true; row.preview.clear();
++        row.unavailable=Some("active: internal recovery lease contention".into());
++        h.e.recovery_picker=Some(RecoveryPicker::ready(vec![row]));
++        let rendered=rendered_picker(&mut h.e).join("\n");
++        assert!(rendered.contains("Recovery files in use"),"{rendered}");
++        assert!(rendered.contains("An editor is using these recovery files"),"{rendered}");
++        let list=geometry(Rect::new(0,0,88,24)).1;
++        assert!(!rendered.lines().nth(list.y as usize).unwrap().contains("checkpoint.wcr"),"{rendered}");
++        assert!(rendered.contains("checkpoint.wcr"),"source path remains inspectable: {rendered}");
++        assert!(!rendered.contains("internal recovery lease contention"),"{rendered}");
++        h.key(KeyCode::Char(' ')); h.key(KeyCode::Enter);
++        assert!(!h.e.recovery_picker.as_ref().unwrap().selected[0]);
++        assert_eq!(h.ex.pending_len(),0); assert_eq!(h.e.buffers.len(),1);
++    }
++
+ }

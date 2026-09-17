@@ -215,8 +215,16 @@ pub struct Buffer {
     /// `swap::pending`). `None` until the first successful swap write.
     pub swapped_version: Option<u64>,
     pub swap_in_flight: bool,
-    pub pending_swap_body: Option<String>,
-    pub pending_swap_path: Option<PathBuf>,
+    pub(crate) recovery_slot: crate::recovery_store::RecoverySlot,
+    pub(crate) recovery_generation: u64,
+    pub(crate) recovery_ack: Option<crate::recovery_store::CheckpointAck>,
+    pub(crate) recovery_request: Option<crate::jobs::RecoveryRequestId>,
+    pub(crate) recovery_protection_failure: Option<String>,
+    pub(crate) recovery_retry: crate::recovery_flow::RetryState,
+    pub(crate) recovery_source: Option<crate::recovery_discovery::SelectionToken>,
+    pub(crate) recovery_source_path: Option<PathBuf>,
+    pub(crate) recovery_save_dir: Option<PathBuf>,
+    pub(crate) recovery_provenance: Option<crate::recovery_store::TaggedPath>,
     // 5c: marks/ring — wired in Tasks 5–10
     pub marks: std::collections::BTreeMap<char, usize>,
     pub jump_ring: Vec<usize>,
@@ -304,8 +312,16 @@ impl Buffer {
             last_swap_at: None,
             swapped_version: None,
             swap_in_flight: false,
-            pending_swap_body: None,
-            pending_swap_path: None,
+            recovery_slot: crate::recovery_store::RecoverySlot::new(),
+            recovery_generation: 0,
+            recovery_ack: None,
+            recovery_request: None,
+            recovery_protection_failure: None,
+            recovery_retry: Default::default(),
+            recovery_source: None,
+            recovery_source_path: None,
+            recovery_save_dir: None,
+            recovery_provenance: None,
             marks: Default::default(),
             jump_ring: Vec::new(),
             ring_cursor: 0,
@@ -507,6 +523,7 @@ pub struct SessionMigration {
 // MenuView is now Clone (#[derive(Clone, Debug)]); Editor intentionally remains !Clone.
 #[derive(Debug)]
 pub struct Editor {
+    pub(crate) recovery: crate::recovery_flow::RecoveryState,
     pub buffers: Vec<Buffer>,
     pub active: usize,
     pub next_buffer_id: u64,
@@ -683,6 +700,7 @@ pub struct Editor {
     /// Caret-shape picker overlay state (C1 T6 field/stub; T7 fills in the picker's
     /// logic). XOR with all other overlays.
     pub cursor_picker: Option<crate::cursor_picker::CursorPicker>,
+    pub(crate) recovery_picker: Option<crate::recovery_picker::RecoveryPicker>,
     /// Startup splash overlay. Set once in `run()` (gated on config, `--no-splash`, and
     /// no pending recovery prompt); cleared — consuming the event — by the first key
     /// press or mouse click (`splash::intercept`). XOR with the other overlays by
@@ -748,6 +766,7 @@ impl Editor {
             &crate::registry::Registry::builtins(),
         );
         let mut e = Editor {
+            recovery: crate::recovery_flow::RecoveryState::default(),
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(),
             status: None,
@@ -809,6 +828,7 @@ impl Editor {
             files_show_clutter: false,
             files_type_filter: crate::config::FileTypeFilter::default(),
             cursor_picker: None,
+            recovery_picker: None,
             splash: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
@@ -1339,6 +1359,7 @@ impl Editor {
             self.reject_read_only();
             return false;
         }
+        crate::recovery_flow::cancel_buffer(self, self.buffers[slot].id);
         self.buffers[slot] = new;
         true
     }
@@ -2484,7 +2505,7 @@ mod tests {
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         e.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
-        e.open_prompt(crate::prompt::Prompt::swap_recovery());
+        e.open_prompt(crate::prompt::Prompt::external_mod());
         assert!(e.splash.is_none(), "opening a prompt clears the splash");
         assert!(e.prompt.is_some(), "the prompt itself is set");
     }

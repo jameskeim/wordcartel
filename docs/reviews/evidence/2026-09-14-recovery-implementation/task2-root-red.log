@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test fsx::recovery_io_tests::tests::recovery_root_alias_resolves_without_weakening_private_leaf_checks ... FAILED
+
+failures:
+
+---- fsx::recovery_io_tests::tests::recovery_root_alias_resolves_without_weakening_private_leaf_checks stdout ----
+
+thread 'fsx::recovery_io_tests::tests::recovery_root_alias_resolves_without_weakening_private_leaf_checks' (13) panicked at wordcartel/src/fsx/recovery_io_tests.rs:13:53:
+called `Result::unwrap()` on an `Err` value: Custom { kind: Unsupported, error: "recovery IO unsupported" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fsx::recovery_io_tests::tests::recovery_root_alias_resolves_without_weakening_private_leaf_checks
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2061 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

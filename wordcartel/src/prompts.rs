@@ -97,12 +97,13 @@ pub(crate) fn open_save_as_for_quit(editor: &mut Editor,
 fn open_save_as_picker(editor: &mut Editor,
     fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>,
     msg_tx: &std::sync::mpsc::Sender<Msg>, owner: Option<crate::editor::BufferId>) -> bool {
+    let suggested = crate::workspace::recovered_save_name(editor.active());
     let dir = editor.active().document.path.as_ref()
-        .and_then(|p| p.parent())
-        .map(|d| d.to_path_buf())
+        .and_then(|p| p.parent()).map(|d| d.to_path_buf())
+        .or_else(|| suggested.as_ref().and(editor.active().recovery_save_dir.clone()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let opened = editor.open_destination_picker(fs, msg_tx,
-        crate::file_browser::DestinationPurpose::SaveAs, dir, String::new());
+        crate::file_browser::DestinationPurpose::SaveAs, dir, suggested.unwrap_or_default());
     if opened {
         if let Some(fb) = editor.file_browser.as_mut() { fb.quit_save_owner = owner; }
     }
@@ -121,7 +122,14 @@ pub fn open_clean_recovery(editor: &mut crate::editor::Editor, fs: &dyn crate::f
     // not re-scan, so the two lists can never describe different moments.
     let (files, kept) = match crate::swap::state_dir() {
         Ok(dir) => {
-            let protected = crate::swap::open_swap_paths(editor);
+            let protected = match crate::swap::open_swap_paths(editor, fs) {
+                Ok(protected) => protected,
+                Err(error) => {
+                    editor.set_status(crate::status::StatusKind::Warning,
+                        format!("Recovery cleanup skipped: cannot verify open files: {error}"));
+                    return;
+                }
+            };
             (crate::swap::cleanable_recovery_files(fs, &dir, &protected),
              crate::swap::kept_recoverable(fs, &dir, &protected))
         }
@@ -277,34 +285,6 @@ pub fn resolve_prompt(
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
             crate::save::overwrite_save(&mut ctx);
         }
-        PromptAction::Recover => {
-            // Capture body + orphan path BEFORE load_recovered, which replaces the
-            // whole active Buffer and would reset pending_swap_path to None (4r moved
-            // these fields onto Buffer). Then clean up the orphan after loading.
-            let staged = {
-                let b = editor.active_mut();
-                b.pending_swap_body
-                    .take()
-                    .map(|body| (body, b.pending_swap_path.take()))
-            };
-            if let Some((body, orphan)) = staged {
-                crate::save::load_recovered(editor, &body);
-                // Delete AFTER load_recovered — `pending_swap_path` is the orphan-scratch
-                // recovery carrier, and load_recovered replaces the whole Buffer.
-                if let Some(p) = orphan { let _ = fs.remove_file(&p); }
-            }
-        }
-        PromptAction::DiscardSwap => {
-            if let Some(p) = editor.active_mut().pending_swap_path.take() {
-                let _ = fs.remove_file(&p);
-            } else {
-                crate::swap::delete_with_fs(&**fs, editor.active().document.path.as_deref());
-            }
-        }
-        PromptAction::OpenOriginal => {
-            editor.active_mut().pending_swap_body = None;
-            editor.active_mut().pending_swap_path = None;
-        }
         PromptAction::OverwriteExport => {
             if let Some(pe) = editor.pending_export.take() {
                 // User explicitly confirmed clobbering the existing target. The bool return
@@ -370,7 +350,15 @@ pub fn resolve_prompt(
             // SKIPPED — this can only ever delete a SUBSET of the snapshot (fail-closed). Best-effort
             // per file; a vanished/undeletable/no-longer-cleanable file is simply not counted, and the
             // status reports the ACTUAL number removed (may be < the confirmed count).
-            let protected = crate::swap::open_swap_paths(editor);
+            let protected = match crate::swap::open_swap_paths(editor, &**fs) {
+                Ok(protected) => protected,
+                Err(error) => {
+                    editor.pending_clean.clear(); editor.prompt = None;
+                    editor.set_status(crate::status::StatusKind::Warning,
+                        format!("Recovery cleanup skipped: cannot verify open files: {error}"));
+                    return;
+                }
+            };
             let mut n = 0usize;
             for p in std::mem::take(&mut editor.pending_clean) {
                 if !crate::swap::recovery_path_still_cleanable(&**fs, &p, &protected) { continue; }
@@ -610,27 +598,6 @@ mod tests {
         resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
         assert!(e.pending_after_save.is_none(), "no job dispatched → do not arm pending_after_save");
         assert!(!e.quit);
-    }
-
-    #[test]
-    fn recover_loads_body_and_deletes_orphan_swap_file() {
-        use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
-        use crate::prompt::PromptAction;
-        // An orphan swap file on disk + a buffer staged for recovery.
-        let p = crate::test_support::scratch_path("recover-orphan.swp");
-        std::fs::write(&p, "stub").unwrap();
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
-        e.active_mut().pending_swap_body = Some("recovered body\n".into());
-        e.active_mut().pending_swap_path = Some(p.clone());
-        let ex = InlineExecutor::default();
-        let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk, &tx, &crate::test_support::test_fs());
-        assert_eq!(e.active().document.buffer.to_string(), "recovered body\n",
-            "recovered content loaded into the active buffer");
-        assert!(!p.exists(), "orphan swap file must be deleted on Recover");
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

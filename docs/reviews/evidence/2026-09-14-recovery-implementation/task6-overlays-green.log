@@ -1,0 +1,33 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 26 tests
+test overlays::tests::render_order_is_exactly_the_frame_overlays ... ok
+test overlays::tests::overlay_table_is_a_bijection_splash_first ... ok
+test render_overlays::tests::elide_path_left_degenerate_widths_never_panic ... ok
+test render_overlays::tests::elide_path_left_is_a_no_op_when_it_already_fits ... ok
+test render_overlays::tests::elide_path_left_keeps_the_tail_and_marks_the_elision ... ok
+test render_overlays::tests::wrap_prose_breaks_at_spaces_hard_breaks_giant_words_and_drops_nothing ... ok
+test overlays::tests::no_dwell_arming_while_splash_is_up ... ok
+test overlays::tests::click_under_overlay_does_not_move_caret ... ok
+test overlays::tests::splash_intercept_precedes_marks ... ok
+test render_overlays::tests::diag_rows_reach_the_screen_with_their_row_model_labels ... ok
+test render_overlays::tests::the_cramped_title_fallback_truncates_a_disclosure_heading_from_the_right ... ok
+test app::tests::displaced_terminal_does_not_clear_a_reopened_overlays_fetching_state_via_reduce ... ok
+test render_overlays::tests::an_empty_listing_still_gets_a_dedicated_footer_row_on_an_ordinary_terminal ... ok
+test render_overlays::tests::suggestion_rows_paint_the_suggestion_their_index_names ... ok
+test render_overlays::tests::a_two_entry_destination_listing_shows_both_entries_alongside_the_footer ... ok
+test render_overlays::tests::the_painted_window_starts_at_scroll_top_not_at_row_zero ... ok
+test render_overlays::tests::writeblock_footer_redirect_note_names_the_block_scope_on_screen ... ok
+test overlays::tests::any_active_true_for_each_overlay ... ok
+test render_overlays::tests::the_withholding_disclosure_is_painted ... ok
+test render_overlays::tests::the_painted_box_occupies_exactly_file_browser_overlay_rect ... ok
+test render_overlays::tests::export_titles_render_byte_for_byte_per_scope ... ok
+test overlays::tests::close_all_clears_every_overlay ... ok
+test render_overlays::tests::each_picker_mode_is_titled_for_what_it_actually_does ... ok
+test render_overlays::tests::the_destination_field_and_its_caret_are_painted_in_the_query_row ... ok
+test overlays::tests::every_overlay_consumes_moved_without_panic_or_data_loss ... ok
+test overlays::tests::every_overlay_is_active_xor_and_consumes_key_and_click ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 2122 filtered out; finished in 0.03s
+

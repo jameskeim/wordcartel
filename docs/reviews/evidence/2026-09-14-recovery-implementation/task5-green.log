@@ -1,0 +1,23 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: unused imports: `begin_selected`, `cancel_batch`, and `has_pending_work`
+   --> wordcartel/src/recovery_flow.rs:209:25
+    |
+209 | pub(crate) use import::{begin_selected, cancel_batch, has_pending_work};
+    |                         ^^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `wordcartel` (lib test) generated 1 warning (run `cargo fix --lib -p wordcartel --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.42s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 6 tests
+test recovery_flow::progress::tests::recovery_handoff_authorization_wins_and_cannot_be_revoked_after_sync ... ok
+test recovery_flow::progress::tests::recovery_handoff_cancel_wins_before_authorization_without_losing_durable_progress ... ok
+test recovery_flow::import::tests::recovery_handoff_import_preserves_disk_and_immediately_protects_legacy_body ... ok
+test recovery_flow::import::tests::recovery_handoff_v2_source_retires_only_after_successor_and_initial_capture ... ok
+test recovery_flow::import::tests::recovery_handoff_quit_rejects_prepared_installation ... ok
+test recovery_flow::import::tests::recovery_handoff_cancel_before_worker_retains_source_and_releases_lock ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2113 filtered out; finished in 0.01s
+

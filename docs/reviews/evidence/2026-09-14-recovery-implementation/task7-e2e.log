@@ -1,0 +1,78 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.34s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 70 tests
+test e2e::e2e_bench::r1_typing_latency_bench ... ignored, release-only bench; run with --release --ignored (see comment)
+test e2e::e2e_eof_caret_renders_below_last_content_row ... ok
+test e2e::e2e_no_splash_flag_suppresses_first_frame_splash ... ok
+test e2e::e2e_lens_switch_flips_the_painted_underline_set ... ok
+test e2e::e2e_gutter_shows_right_aligned_word_counts ... ok
+test e2e::e2e_focus_sentence_dims_heading_when_caret_in_indent ... ok
+test e2e::e2e_eof_caret_below_ventilated_block_on_lens ... ok
+test e2e::e2e_focus_sentence_spans_wrapped_rows_not_just_a_line ... ok
+test e2e::e2e_focus_dims_right_rows_under_ventilate_indented ... ok
+test e2e::e2e_gutter_overwrites_lead_in_no_content_shift ... ok
+test e2e::e2e_modal_prompt_pending_suppresses_splash ... ok
+test e2e::e2e_see_equals_select_hard_wrapped_sentence ... ok
+test e2e::e2e_reconcile_converges_a_stale_tree ... ok
+test e2e::e2e_quit_dirty_raises_modal_not_silent_quit ... ok
+test e2e::e2e_fold_hides_body_in_render ... ok
+test e2e::e2e_resize_does_not_blank_the_screen ... ok
+test e2e::e2e_toggle_off_is_byte_identical_preserves_caret_and_clears_vent_blocks ... ok
+test e2e::e2e_ventilate_composes_with_source_shows_raw_markers ... ok
+test e2e::e2e_shrink_into_fold_reveals_selected_text_on_screen ... ok
+test e2e::journey_drag_never_reveals ... ok
+test e2e::e2e_ventilate_renders_table_verbatim_not_as_sentences ... ok
+test e2e::cursor_picker_swallows_paste ... ok
+test e2e::journey_auto_dwell_reveal_and_grace_hide ... ok
+test e2e::journey_row0_click_unrevealed_edits_text ... ok
+test e2e::journey_hidden_never_reveals_on_dwell ... ok
+test e2e::e2e_splash_mouse_click_dismisses_without_editing ... ok
+test e2e::e2e_type_shows_in_doc_and_render ... ok
+test e2e::journey_pinned_bar_persists_across_dropdown_close ... ok
+test e2e::cursor_picker_live_preview_sample_caret_and_commit ... ok
+test e2e::e2e_s4_lens_move_sentence_then_undo_is_byte_identical ... ok
+test e2e::e2e_undo_redo ... ok
+test e2e::e2e_save_writes_file_and_reloads ... ok
+test e2e::journey_toggle_landmarks_hides_paint_keeps_status ... ok
+test e2e::journey_nested_list_wraps_hanging ... ok
+test e2e::on_buffer_close_and_open_fire ... ok
+test e2e::e2e_splash_first_frame_then_key_dismisses_and_is_consumed ... ok
+test e2e::journey_landmarks_visible_and_clearable ... ok
+test e2e::e2e_verbatim_active_line_reveals_raw_prose_stays_concealed ... ok
+test e2e::on_change_is_not_per_keystroke ... ok
+test e2e::on_save_hook_fires_on_real_save ... ok
+test e2e::pomodoro_lua_e2e_success_demo ... ok
+test e2e::hover_wheel_click_palette_journey ... ok
+test e2e::no_plugin_host_journey_is_unaffected ... ok
+test e2e::on_change_costs_nothing_without_a_subscriber ... ok
+test e2e::on_change_fires_debounced_after_settle ... ok
+test e2e::on_change_subscriber_idle_drives_zero_invocations_and_stable_wake ... ok
+test e2e::e2e_gutter_clamps_to_999 ... ok
+test e2e::plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake ... ok
+test e2e::journey_typing_never_breaks_midword ... ok
+test e2e::wordcount_lua_e2e_success_demo ... ok
+test e2e::journey_close_dirty_save_and_close ... ok
+test e2e::e2e_search_highlight_lands_on_right_bytes_in_multiline_ventilated_block ... ok
+test e2e::recovery_ui_startup_offer_replaces_splash_without_a_keypress ... ok
+test e2e::journey_palette_end_reaches_last_command ... ok
+test e2e::e2e_search_window_extends_across_ventilated_block_not_just_anchor_line ... ok
+test e2e::journey_close_dirty_discard_leaves_file_and_swap ... ok
+test e2e::plugin_dispatch_holds_no_borrow_across_reduce_and_pump ... ok
+test e2e::insert_date_lua_e2e_success_demo ... ok
+test e2e::wc_command_menu_open_is_hydrated ... ok
+test e2e::recovery_ui_file_picker_and_recents_open_the_same_separate_recovery_flow ... ok
+test e2e::quit_rechecks_plugin_dispatched_saves_and_blocks_late_save_as ... ok
+test e2e::quit_rechecks_edits_from_a_plugin_command_after_the_last_save_merge ... ok
+test e2e::wc_command_palette_open_is_hydrated ... ok
+test e2e::plugin_command_dispatches_via_palette_same_frame ... ok
+test e2e::journey_open_save_export_saveas_reopen ... ok
+test e2e::journey_chrome_zen_toggle ... ok
+test e2e::recovery_plugin_open_observes_queued_handoff_before_command_edit_and_save ... ok
+test e2e::journey_transform_scopes ... ok
+test e2e::journey_keymap_switch_scopes ... ok
+test e2e::journey_prose_lens_passive_paints_navigates_counts ... ok
+
+test result: ok. 69 passed; 0 failed; 1 ignored; 0 measured; 2094 filtered out; finished in 0.05s
+

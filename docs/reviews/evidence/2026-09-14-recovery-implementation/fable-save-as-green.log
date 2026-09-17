@@ -1,0 +1,14 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.30s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 6 tests
+test recovery_regressions::recovery_save_as::recovery_save_as_unknown_origin_has_distinct_name_and_normal_directory_fallback ... ok
+test recovery_regressions::recovery_save_as::recovery_save_as_prefills_distinct_name_for_manual_and_quit_owned_picker ... ok
+test recovery_regressions::save_integration::recovery_save_as_clean_rekey_retires_exact_owned_checkpoint ... ok
+test recovery_store::cleanup::cleanup_tests::tests::recovery_save_as_receipt_failures_retain_checkpoint_with_warning ... ok
+test recovery_store::cleanup::cleanup_tests::tests::recovery_save_as_receipt_keeps_owner_generation_body_and_association_guards ... ok
+test recovery_store::cleanup::cleanup_tests::tests::recovery_save_as_receipt_covers_pathless_or_captured_previous_association ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2175 filtered out; finished in 0.00s
+

@@ -1,0 +1,24 @@
+    Checking wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: field `lease` is never read
+  --> wordcartel/src/recovery_discovery.rs:37:5
+   |
+34 | pub struct PreparedRecovery {
+   |            ---------------- field in this struct
+...
+37 |     lease: Option<Box<dyn RecoveryLease>>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `into_parts` is never used
+  --> wordcartel/src/recovery_discovery.rs:41:19
+   |
+39 | impl PreparedRecovery {
+   | --------------------- method in this implementation
+40 |     /// Consume this preparation without releasing ownership before handoff.
+41 |     pub(crate) fn into_parts(self) -> (Candidate, String, Option<Box<dyn RecoveryLease>>) {
+   |                   ^^^^^^^^^^
+
+warning: `wordcartel` (lib) generated 2 warnings
+warning: `wordcartel` (lib test) generated 2 warnings (2 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.81s

@@ -1,0 +1,31 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+error[E0599]: no variant, associated function, or constant named `RecoveryDirSync` found for enum `FaultAt` in the current scope
+    --> wordcartel/src/recovery_regressions.rs:1168:93
+     |
+1168 |             let bad: Arc<dyn crate::fsx::Fs + Send + Sync> = Arc::new(FaultFs::new(FaultAt::RecoveryDirSync));
+     |                                                                                             ^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `FaultAt`
+     |
+    ::: wordcartel/src/test_support.rs:62:1
+     |
+  62 | pub(crate) enum FaultAt {
+     | ----------------------- variant, associated function, or constant `RecoveryDirSync` not found for this enum
+     |
+help: there is a variant with a similar name
+     |
+1168 -             let bad: Arc<dyn crate::fsx::Fs + Send + Sync> = Arc::new(FaultFs::new(FaultAt::RecoveryDirSync));
+1168 +             let bad: Arc<dyn crate::fsx::Fs + Send + Sync> = Arc::new(FaultFs::new(FaultAt::RecoverySync));
+     |
+
+error[E0599]: no variant, associated function, or constant named `Completed` found for enum `jobs::JobOutcome` in the current scope
+    --> wordcartel/src/recovery_regressions.rs:1173:33
+     |
+1173 |                 let JobOutcome::Completed(result) = outcome else { panic!("fault returns a normal error"); };
+     |                                 ^^^^^^^^^ variant, associated function, or constant not found in `jobs::JobOutcome`
+     |
+    ::: wordcartel/src/jobs.rs:59:1
+     |
+  59 | pub enum JobOutcome {
+     | ------------------- variant, associated function, or constant `Completed` not found for this enum
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `wordcartel` (lib test) due to 2 previous errors

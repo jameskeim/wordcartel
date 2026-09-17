@@ -1,0 +1,26 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.27s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 18 tests
+test recovery_discovery::discovery_tests::tests::legacy_symlink_is_unavailable_and_target_is_preserved ... ok
+test recovery_discovery::discovery_tests::tests::legacy_changed_body_requires_reselection_and_preserves_source ... ok
+test recovery_discovery::discovery_tests::tests::legacy_headers_discover_all_named_and_unnamed_records ... ok
+test recovery_discovery::discovery_tests::tests::legacy_header_has_its_own_size_limit ... ok
+test recovery_discovery::discovery_tests::tests::missing_relative_and_deleted_parent_paths_keep_resolved_context ... ok
+test recovery_discovery::discovery_tests::tests::raw_legacy_filename_survives_scan_and_prepare ... ok
+test recovery_discovery::discovery_tests::tests::nonexistent_root_is_not_created ... ok
+test recovery_discovery::discovery_tests::tests::previews_are_bounded_unicode_and_corruption_is_visible ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_empty_owner_tombstone_is_not_a_scan_error ... ok
+test recovery_discovery::discovery_tests::tests::locked_owner_is_unavailable_then_empty_body_is_recoverable ... ok
+test recovery_discovery::discovery_tests::tests::selected_token_cannot_claim_another_owner_path ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_empty_body_is_ready_and_lease_moves_with_preparation ... ok
+test recovery_discovery::discovery_tests::tests::owner_mismatch_is_disabled_without_deleting_bytes ... ok
+test recovery_discovery::discovery_tests::tests::lock_only_owner_is_omitted_only_after_lease_becomes_available ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_prepare_failures_release_source_and_preserve_bytes ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_changed_v2_requires_reselection_and_releases_lease ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_current_association_takes_precedence_over_provenance ... ok
+test recovery_regressions::discovery_integration::recovery_discovery_exact_body_cap_then_oversize_and_io_failures_are_distinct ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 2070 filtered out; finished in 0.11s
+

@@ -1,0 +1,12 @@
+    Checking wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+error: this creates an owned instance just for comparison
+    --> wordcartel/src/e2e.rs:3519:29
+     |
+3519 |                 if recent { PathBuf::from(&entry.name) == path } else { fb.dir.join(&entry.name) == path }
+     |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `*&entry.name`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cmp_owned
+     = note: `-D clippy::cmp-owned` implied by `-D clippy::all`
+     = help: to override `-D clippy::all` add `#[allow(clippy::cmp_owned)]`
+
+error: could not compile `wordcartel` (lib test) due to 1 previous error

@@ -1,0 +1,12 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.70s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 4 tests
+test recovery_regressions::tests::recovery_dispatch_rejecting_harness_releases_captured_ownership ... ok
+test jobs::tests::recovery_dispatch_reports_closed_queue_and_releases_captures ... ok
+test recovery_regressions::tests::recovery_dispatch_harness_defers_execution_and_preserves_panic_transport ... ok
+test jobs::tests::recovery_dispatch_inline_accepts_and_buffers_panic_outcome ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2047 filtered out; finished in 0.00s
+

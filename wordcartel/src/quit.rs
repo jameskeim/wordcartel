@@ -64,12 +64,15 @@ pub(crate) fn show_review(editor: &mut Editor, id: BufferId) {
 
 /// Discard only the reviewed version. Any subsequent edit is picked up by refill.
 pub(crate) fn review_discard(ctx: &mut Ctx) {
+    let mut discarded = None;
     if let Some(drain) = ctx.editor.quit_drain.as_mut() {
         if let Some((id, version)) = drain.reviewing.take() {
+            discarded = Some(id);
             drain.discarded_versions.insert(id, version);
             if drain.queue.front() == Some(&id) { drain.queue.pop_front(); }
         }
     }
+    if let Some(id) = discarded { crate::recovery_flow::cancel_buffer(ctx.editor, id); }
     drive(ctx);
 }
 
@@ -89,6 +92,11 @@ pub(crate) fn cancel(editor: &mut Editor) {
     editor.quit = false; // also revoke a provisional pre-callback exit
     editor.quit_drain = None;
     editor.quit_drain_advance = false;
+    // The remaining picker/overwrite choice may continue as an ordinary Save As,
+    // but it must never carry a cancelled quit's continuation into a later write.
+    if editor.pending_save_as == Some(PostSaveAction::ContinueQuitDrain) {
+        editor.pending_save_as = None;
+    }
     if let Some(fb) = editor.file_browser.as_mut() { fb.quit_save_owner = None; }
     if editor.pending_after_save.as_ref().is_some_and(|p|
         matches!(p.action, PostSaveAction::ContinueQuitDrain)) {
@@ -143,10 +151,12 @@ pub(crate) fn allow_save_as_write(editor: &mut Editor) -> bool {
 /// A clean workspace still waits for the metadata merges of outstanding saves.
 /// If typing occurs while waiting, ordinary Quit asks for review rather than saving implicitly.
 pub(crate) fn wait_for_saves(editor: &mut Editor, now: u64) -> bool {
-    if editor.saves_in_flight.is_empty() { return false; }
+    if editor.saves_in_flight.is_empty() && !crate::recovery_flow::has_pending_work(editor) { return false; }
     let drain = editor.quit_drain.get_or_insert_with(|| QuitDrain::new(Default::default(), QuitMode::ReviewEach));
-    drain.waiting_since.get_or_insert(now);
-    editor.set_status(crate::status::StatusKind::Info, "Waiting for saves before quitting");
+    if !editor.saves_in_flight.is_empty() { drain.waiting_since.get_or_insert(now); }
+    let message = if crate::recovery_flow::has_pending_work(editor) { "Waiting for saves and recovery before quitting" }
+        else { "Waiting for saves before quitting" };
+    editor.set_status(crate::status::StatusKind::Info, message);
     true
 }
 

@@ -1,0 +1,13 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.13s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 5 tests
+test recovery_regressions::save_integration::recovery_save_late_completion_cannot_mark_replacement_instance_saved ... ok
+test recovery_regressions::save_integration::recovery_save_unchanged_target_sync_failure_keeps_checkpoint_and_save_success ... ok
+test recovery_regressions::save_integration::recovery_save_as_clean_rekey_preserves_owner_and_reports_retained_old_association ... ok
+test recovery_regressions::save_integration::recovery_save_cleanup_panic_does_not_turn_successful_write_into_failed_save ... ok
+test recovery_regressions::save_integration::recovery_save_only_removes_own_covered_checkpoint_and_keeps_legacy_copy ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2107 filtered out; finished in 0.01s
+
