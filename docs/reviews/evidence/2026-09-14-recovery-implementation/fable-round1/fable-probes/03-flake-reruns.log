@@ -1,0 +1,24 @@
+# Flake measurement for the intermittent lib-suite failure (I-5 in FABLE_REVIEW.md).
+# Each row is one full `cargo test -p wordcartel --lib` (2171 tests, default parallelism).
+
+run 1 (cargo test --workspace, fail-fast):
+  FAILED  recovery_regressions::discovery_integration::recovery_discovery_changed_v2_requires_reselection_and_releases_lease
+          panicked at wordcartel/src/recovery_regressions.rs:249:60
+          called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "recovery record is active" }
+  test result: FAILED. 2168 passed; 1 failed; 2 ignored
+run 2 (cargo test --workspace --no-fail-fast):
+  test result: ok. 2169 passed; 0 failed; 2 ignored
+run 3 (cargo test -p wordcartel --lib):
+  test result: ok. 2169 passed; 0 failed; 2 ignored
+run 4 (cargo test -p wordcartel --lib, tail -4 only — failing test name NOT captured):
+  test result: FAILED. 2168 passed; 1 failed; 2 ignored
+run 5 (cargo test -p wordcartel --lib):
+  test result: ok. 2169 passed; 0 failed; 2 ignored
+
+isolated: cargo test -p wordcartel --lib recovery_discovery_changed_v2_requires_reselection_and_releases_lease
+  test result: ok. 1 passed; 0 failed; 2170 filtered out
+
+Tally: 2 of 5 full runs red (one attributed to the test above; one unattributed).
+Mechanism (attributed case): flock held on an inherited descriptor between fork and exec of a
+concurrently spawning subprocess test; the branch's own Fixture::new / assert_released already
+retry this window, line 249 does not.

@@ -1,0 +1,31 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.66s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 2 tests
+test recovery_flow::pending::tests::recovery_quit_cancellation_releases_filename_continuation_and_preserves_close ... FAILED
+test recovery_flow::pending::tests::recovery_quit_cancellation_downgrades_existing_overwrite_to_manual_save ... FAILED
+
+failures:
+
+---- recovery_flow::pending::tests::recovery_quit_cancellation_releases_filename_continuation_and_preserves_close stdout ----
+
+thread 'recovery_flow::pending::tests::recovery_quit_cancellation_releases_filename_continuation_and_preserves_close' (297) panicked at wordcartel/src/recovery_flow/pending/tests.rs:121:9:
+timeout: cancelled quit must release Save As continuation
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- recovery_flow::pending::tests::recovery_quit_cancellation_downgrades_existing_overwrite_to_manual_save stdout ----
+
+thread 'recovery_flow::pending::tests::recovery_quit_cancellation_downgrades_existing_overwrite_to_manual_save' (296) panicked at wordcartel/src/recovery_flow/pending/tests.rs:142:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+
+
+failures:
+    recovery_flow::pending::tests::recovery_quit_cancellation_downgrades_existing_overwrite_to_manual_save
+    recovery_flow::pending::tests::recovery_quit_cancellation_releases_filename_continuation_and_preserves_close
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 2169 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

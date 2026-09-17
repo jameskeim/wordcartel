@@ -1,0 +1,43 @@
+{
+  "recorded_at": "2026-09-15T17:42:29.147233+00:00",
+  "source_manifest_sha256": "7c711c530da16cb68a001734b3785035e448cb7b0cca1ae2d72f4ddd857a6a9e",
+  "workspace_passed": 2643,
+  "workspace_ignored": 7,
+  "gates": [
+    {
+      "command": "cargo test --offline --workspace",
+      "log": "workspace-tests.log",
+      "exit_code": 0,
+      "log_sha256": "e1e1cd03e4a25264932f90a70879c0d8e979505bd32350ae6ad65514777a8844"
+    },
+    {
+      "command": "cargo build --offline --workspace",
+      "log": "build.log",
+      "exit_code": 0,
+      "log_sha256": "0ebd4f2d2864f50f935b055f5e82fbcfe32b44c79c9d2ecabff3b845b831a655"
+    },
+    {
+      "command": "cargo test --offline --workspace --no-run",
+      "log": "no-run.log",
+      "exit_code": 0,
+      "log_sha256": "ccfeceeb05c5686cb405f05b973598f73a28b893ce78daa9a989cb5a3e49d437"
+    },
+    {
+      "command": "cargo clippy --offline --workspace --all-targets",
+      "log": "clippy.log",
+      "exit_code": 0,
+      "log_sha256": "3f46ba0c2aebd57a81d0beca93acf8c506ff34e46d176ec93b6d7cb2ee406286"
+    },
+    {
+      "command": "scripts/smoke/run.sh",
+      "log": "smoke.log",
+      "exit_code": 0,
+      "log_sha256": "b7e8f8a039b343b926e8914e02668f80419a02b4a559cc03edd14f08b117de1b"
+    }
+  ],
+  "diff_check": {
+    "command": "git diff --check",
+    "exit_code": 0
+  },
+  "platform": "Linux; Windows compilation/runtime durability unvalidated"
+}

@@ -1,0 +1,13 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.52s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 5 tests
+test recovery_regressions::store_integration::recovery_ownership_late_capture_cannot_replace_newer_same_version_bytes ... ok
+test recovery_regressions::store_integration::recovery_ownership_trusted_root_alias_writes_under_resolved_private_root ... ok
+test recovery_regressions::store_integration::recovery_ownership_same_path_slots_preserve_each_other_and_queued_lease ... ok
+test recovery_regressions::store_integration::recovery_ownership_partial_mkdir_retries_keep_full_sync_obligation ... ok
+test recovery_regressions::store_integration::recovery_ownership_fresh_slot_retries_every_failed_ancestor_barrier ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2065 filtered out; finished in 0.01s
+

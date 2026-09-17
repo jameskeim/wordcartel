@@ -1,0 +1,24 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.00s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 16 tests
+test recovery_picker::tests::recovery_picker_civil_time_and_legacy_labels_are_honest ... ok
+test recovery_flow::discovery::tests::recovery_picker_manual_busy_guard_preserves_prompt ... ok
+test recovery_picker::tests::recovery_picker_zero_selection_stays_open ... ok
+test recovery_flow::discovery::tests::recovery_picker_scan_rejection_is_visible_and_idle_does_not_scan ... ok
+test recovery_flow::discovery::tests::recovery_picker_bootstrap_waits_for_prompt_but_replaces_splash_without_input ... ok
+test recovery_flow::discovery::tests::recovery_picker_scan_panic_routes_exact_id_and_old_scan_cannot_replace_new_ui ... ok
+test recovery_flow::discovery::tests::recovery_picker_scan_cancelled_epoch_cannot_reopen ... ok
+test recovery_picker::tests::recovery_picker_dismiss_suppresses_exact_tokens_without_changing_documents ... ok
+test recovery_picker::tests::recovery_picker_click_away_uses_dismissal_and_preserves_source ... ok
+test recovery_picker::tests::recovery_picker_changed_row_requires_new_selection_and_preview ... ok
+test recovery_picker::tests::recovery_picker_registry_replacement_cancels_prepare_before_install ... ok
+test recovery_picker::tests::recovery_picker_loading_close_does_not_cancel_unrelated_installed_handoff ... ok
+test recovery_picker::tests::recovery_picker_subset_opening_cancel_and_manual_reopen ... ok
+test recovery_flow::discovery::tests::recovery_picker_context_coalesces_and_stale_origin_never_interrupts ... ok
+test recovery_picker::tests::recovery_picker_multi_selection_imports_sequentially_and_focuses_live_legacy ... ok
+test recovery_picker::tests::recovery_picker_actual_render_and_mouse_share_scrolled_geometry ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 2132 filtered out; finished in 0.04s
+

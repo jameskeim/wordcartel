@@ -1,0 +1,18 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.05s
+     Running tests/fs_chokepoint.rs (target/debug/deps/fs_chokepoint-7f0dc52dd83dc8af)
+
+running 10 tests
+test layer_four_detects_a_wrapper_call_that_layers_one_to_three_are_blind_to ... ok
+test a_per_hit_marker_exempts_only_its_own_line ... ok
+test scanner_sees_production_code_below_an_early_cfg_test_attribute ... ok
+test layer_four_markers_must_carry_a_reason ... ok
+test layer_four_wrapper_derivation_excludes_an_arc_composition_root ... ok
+test scanner_ignores_ordinary_code_and_test_modules ... ok
+test scanner_detects_every_evasion_route ... ok
+test a_marker_without_a_clause_is_not_an_exemption ... ok
+test production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper ... ok
+test production_sources_route_filesystem_access_through_the_seam ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+

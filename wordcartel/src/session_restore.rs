@@ -128,6 +128,7 @@ pub fn open_into_current(editor: &mut Editor, fs: &dyn crate::fsx::Fs, path: &st
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
             editor.clear_status();
+            crate::recovery_flow::opened(editor, id, path);
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => {

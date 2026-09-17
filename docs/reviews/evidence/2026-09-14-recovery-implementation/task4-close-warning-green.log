@@ -1,0 +1,9 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.63s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test recovery_regressions::save_integration::recovery_save_and_close_preserves_cleanup_warnings ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2112 filtered out; finished in 0.02s
+

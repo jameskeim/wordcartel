@@ -1,0 +1,21 @@
+# cargo test -p wordcartel --lib review_probes -- --test-threads=1
+# (probes.rs wired via a temporary `mod review_probes;` line in lib.rs; lib.rs restored
+#  afterwards — sha256 7e5fabd7a7334e2e3e5c658f2b37564d815316137c838a7a758edd5c765f9a65 matches
+#  docs/reviews/evidence/2026-09-14-recovery-implementation/source-sha256.json)
+
+   Compiling wordcartel v0.5.0 (/tmp/wordcartel-fable-6ex3sk57/checkout/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.50s
+     Running unittests src/lib.rs (/tmp/wordcartel-fable-6ex3sk57/target/debug/deps/wordcartel-5393ef5072beb790)
+
+running 6 tests
+test review_probes::probe_p1_ordinary_checkpoint_timeout_discards_ack_and_rechecksums ... ok
+test review_probes::probe_p2_first_save_as_of_recovered_doc_leaves_a_reoffered_checkpoint ... ok
+test review_probes::probe_p3_corrupt_entry_interrupts_every_open_and_is_uncleanable ... ok
+test review_probes::probe_p4_permanent_strict_sync_failure_spins_zero_delay_retries ... ok
+test review_probes::probe_p5_protocol_dir_mode_drift_is_permanent ... ok
+test review_probes::probe_p6_clean_save_as_retains_old_association_checkpoint ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2171 filtered out; finished in 0.02s
+
+# NOTE: every probe asserts the behaviour the branch actually exhibits, so "ok" CONFIRMS the
+# corresponding finding in FABLE_REVIEW.md (P1..P6 map to findings I-1, I-2, I-3, I-4, I-4b, I-2b).

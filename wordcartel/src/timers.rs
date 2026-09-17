@@ -80,8 +80,9 @@ pub(crate) struct TimedSubsystem {
 /// this None while a write is outstanding.
 fn swap_deadline(e: &Editor, now: u64) -> Option<u64> {
     if crate::swap::pending(e.active().document.dirty(), e.active().document.version,
-        e.active().swapped_version) && !e.active().swap_in_flight {
+        e.active().swapped_version) && e.active().recovery_request.is_none() && !e.active().swap_in_flight {
         crate::swap::next_deadline_ms(now, e.active().last_edit_at, e.active().last_swap_at)
+            .map(|due| e.active().recovery_retry.constrain(due))
     } else { None }
 }
 
@@ -175,6 +176,7 @@ fn plugin_timer_deadline(e: &Editor, _now: u64) -> Option<u64> {
 /// plugin_timer.
 pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "swap",         deadline: swap_deadline },
+    TimedSubsystem { name: "recovery",     deadline: crate::recovery_flow::pending_deadline },
     TimedSubsystem { name: "save_quit",    deadline: sq_deadline },
     TimedSubsystem { name: "scrollbar",    deadline: sb_deadline },
     TimedSubsystem { name: "menu_dwell",   deadline: menu_deadline },
@@ -198,7 +200,7 @@ pub(crate) fn next_wake(editor: &Editor, now: u64) -> Option<u64> {
 
 /// Loop-top pre-recv hook: fire the save-then-act timeout guard before blocking
 /// on the channel (the same fixed position `save_timeout_tick` held in run()).
-pub(crate) fn pre_recv(editor: &mut Editor, now: u64) { save_timeout_tick(editor, now); }
+pub(crate) fn pre_recv(editor: &mut Editor, now: u64) { crate::recovery_flow::timeout_tick(editor, now); save_timeout_tick(editor, now); }
 
 /// The Tick-arm body: dispatch any timed work that is now due (swap write,
 /// diagnostics recheck, block-tree reconcile). Verbatim transplant of reduce's
@@ -207,13 +209,14 @@ pub(crate) fn pre_recv(editor: &mut Editor, now: u64) { save_timeout_tick(editor
 pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     let now = clock.now_ms();
+    crate::recovery_flow::arm_retries(editor, now);
     if crate::swap::pending(
         editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
     )
-        && !editor.active().swap_in_flight
+        && editor.active().recovery_request.is_none() && !editor.active().swap_in_flight
+        && editor.active().recovery_retry.ready(now)
         && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
     {
-        editor.active_mut().swap_in_flight = true;
         let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone(), fs: std::sync::Arc::clone(fs) };
         crate::swap::dispatch_swap_write(&mut ctx);
     }

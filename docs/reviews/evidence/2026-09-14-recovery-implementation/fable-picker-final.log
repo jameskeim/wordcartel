@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 12 tests
+test recovery_picker::regression_tests::tests::recovery_picker_civil_time_and_legacy_labels_are_honest ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_zero_selection_stays_open ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_changed_row_requires_new_selection_and_preview ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_click_away_uses_dismissal_and_preserves_source ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_dismiss_suppresses_exact_tokens_without_changing_documents ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_loading_close_does_not_cancel_unrelated_installed_handoff ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_registry_replacement_cancels_prepare_before_install ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_subset_opening_cancel_and_manual_reopen ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_multi_selection_imports_sequentially_and_focuses_live_legacy ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_foreign_original_path_remains_visible ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_long_path_cannot_hide_row_time_or_unavailability ... ok
+test recovery_picker::regression_tests::tests::recovery_picker_actual_render_and_mouse_share_scrolled_geometry ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 2171 filtered out; finished in 0.02s
+

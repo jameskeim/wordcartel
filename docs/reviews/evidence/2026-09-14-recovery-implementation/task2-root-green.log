@@ -1,0 +1,9 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.12s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test fsx::recovery_io_tests::tests::recovery_root_alias_resolves_without_weakening_private_leaf_checks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2061 filtered out; finished in 0.00s
+

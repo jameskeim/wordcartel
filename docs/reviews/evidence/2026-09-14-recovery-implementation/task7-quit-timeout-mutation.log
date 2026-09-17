@@ -1,0 +1,61 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: unused import: `timeout_tick`
+   --> wordcartel/src/recovery_flow.rs:227:62
+    |
+227 | pub(crate) use pending::{has_pending_work, pending_deadline, timeout_tick};
+    |                                                              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `expire` is never used
+  --> wordcartel/src/recovery_flow/import.rs:27:15
+   |
+27 | pub(super) fn expire(editor: &mut Editor, now: u64) -> bool {
+   |               ^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `timeout_tick` is never used
+  --> wordcartel/src/recovery_flow/pending.rs:11:15
+   |
+11 | pub(crate) fn timeout_tick(editor: &mut Editor, now: u64) {
+   |               ^^^^^^^^^^^^
+
+warning: `wordcartel` (lib test) generated 3 warnings (run `cargo fix --lib -p wordcartel --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.46s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 5 tests
+test recovery_flow::pending::tests::recovery_quit_preparation_timeout_never_installs_even_after_quit_cancelled ... FAILED
+test recovery_flow::pending::tests::recovery_quit_timeout_detaches_once_and_late_success_cannot_reinstate_quit ... FAILED
+test recovery_flow::pending::tests::recovery_quit_discard_cancels_retirement_but_waits_for_dispatched_worker ... ok
+test recovery_flow::pending::tests::recovery_quit_handoff_waits_until_merge_and_rechecks_dirty_buffers ... ok
+test recovery_flow::pending::tests::recovery_quit_association_wait_failure_panic_and_timeout_are_exact ... FAILED
+
+failures:
+
+---- recovery_flow::pending::tests::recovery_quit_preparation_timeout_never_installs_even_after_quit_cancelled stdout ----
+
+thread 'recovery_flow::pending::tests::recovery_quit_preparation_timeout_never_installs_even_after_quit_cancelled' (301) panicked at wordcartel/src/recovery_flow/pending/tests.rs:55:56:
+assertion failed: !e.quit
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- recovery_flow::pending::tests::recovery_quit_timeout_detaches_once_and_late_success_cannot_reinstate_quit stdout ----
+
+thread 'recovery_flow::pending::tests::recovery_quit_timeout_detaches_once_and_late_success_cannot_reinstate_quit' (302) panicked at wordcartel/src/recovery_flow/pending/tests.rs:44:43:
+assertion failed: !e.quit
+
+---- recovery_flow::pending::tests::recovery_quit_association_wait_failure_panic_and_timeout_are_exact stdout ----
+
+thread 'recovery_flow::pending::tests::recovery_quit_association_wait_failure_panic_and_timeout_are_exact' (298) panicked at wordcartel/src/recovery_flow/pending/tests.rs:84:58:
+assertion failed: e.quit_drain.is_none()
+
+
+failures:
+    recovery_flow::pending::tests::recovery_quit_association_wait_failure_panic_and_timeout_are_exact
+    recovery_flow::pending::tests::recovery_quit_preparation_timeout_never_installs_even_after_quit_cancelled
+    recovery_flow::pending::tests::recovery_quit_timeout_detaches_once_and_late_success_cannot_reinstate_quit
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 2158 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

@@ -1,0 +1,39 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: field `lease` is never read
+  --> wordcartel/src/recovery_discovery.rs:37:5
+   |
+34 | pub struct PreparedRecovery {
+   |            ---------------- field in this struct
+...
+37 |     lease: Option<Box<dyn RecoveryLease>>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `into_parts` is never used
+  --> wordcartel/src/recovery_discovery.rs:41:19
+   |
+39 | impl PreparedRecovery {
+   | --------------------- method in this implementation
+40 |     /// Consume this preparation without releasing ownership before handoff.
+41 |     pub(crate) fn into_parts(self) -> (Candidate, String, Option<Box<dyn RecoveryLease>>) {
+   |                   ^^^^^^^^^^
+
+warning: `wordcartel` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.35s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 10 tests
+test recovery_discovery::discovery_tests::tests::nonexistent_root_is_not_created ... ok
+test recovery_discovery::discovery_tests::tests::legacy_changed_body_requires_reselection_and_preserves_source ... ok
+test recovery_discovery::discovery_tests::tests::legacy_headers_discover_all_named_and_unnamed_records ... ok
+test recovery_discovery::discovery_tests::tests::legacy_symlink_is_unavailable_and_target_is_preserved ... ok
+test recovery_discovery::discovery_tests::tests::legacy_header_has_its_own_size_limit ... ok
+test recovery_discovery::discovery_tests::tests::previews_are_bounded_unicode_and_corruption_is_visible ... ok
+test recovery_discovery::discovery_tests::tests::raw_legacy_filename_survives_scan_and_prepare ... ok
+test recovery_discovery::discovery_tests::tests::locked_owner_is_unavailable_then_empty_body_is_recoverable ... ok
+test recovery_discovery::discovery_tests::tests::selected_token_cannot_claim_another_owner_path ... ok
+test recovery_discovery::discovery_tests::tests::owner_mismatch_is_disabled_without_deleting_bytes ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2070 filtered out; finished in 0.00s
+

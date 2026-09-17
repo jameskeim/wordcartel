@@ -1,0 +1,41 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.52s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 33 tests
+test fsx::recovery_io_tests::private_metadata_rejects_wrong_owner_even_with_private_mode ... ok
+test fsx::recovery_io_tests::lock_is_exclusive_until_last_shared_guard_drops ... ok
+test fsx::recovery_io_tests::opened_record_stays_on_original_inode_and_caps_reads ... ok
+test fsx::recovery_io_tests::exclusive_private_directory_and_strict_sync ... ok
+test fsx::tests::dir_fsync_failure_is_err_but_target_has_new_bytes ... ok
+test fsx::recovery_io_tests::recovery_faults_and_nth_sync_are_observable ... ok
+test fsx::recovery_io_tests::rejects_symlinks_special_files_and_public_directories ... ok
+test fsx::tests::a_permission_denied_symlink_chain_reports_broken_not_a_listing_failure ... ok
+test fsx::tests::is_file_via_rejects_a_socket_and_a_dir ... ok
+test fsx::tests::fault_fs_is_reachable_from_test_support ... ok
+test fsx::tests::list_dir_caps_retention_but_not_enumeration ... ok
+test fsx::tests::list_dir_fault_is_injectable ... ok
+test fsx::tests::list_dir_emits_a_named_entry_whose_type_cannot_be_determined ... ok
+test fsx::tests::list_dir_classifies_kinds_and_resolves_symlinks ... ok
+test fsx::tests::list_dir_cap_none_retains_everything_and_counts_truthfully ... ok
+test fsx::tests::partial_write_caught_original_intact ... ok
+test fsx::tests::read_capped_fault_is_injectable ... ok
+test fsx::tests::read_capped_missing_is_err_not_ok_none ... ok
+test fsx::tests::preserve_existing_mode_else_fallback ... ok
+test fsx::tests::read_capped_over_cap_is_ok_none_not_err ... ok
+test fsx::tests::read_capped_returns_bytes_within_cap ... ok
+test fsx::tests::real_fs_sync_dir_swallows_unopenable ... ok
+test fsx::tests::real_fs_replaces_target_no_litter ... ok
+test fsx::tests::resolve_write_destination_passes_a_new_path_through_unchanged ... ok
+test fsx::tests::pre_rename_faults_preserve_original_and_leave_no_litter ... ok
+test fsx::tests::resolve_write_destination_follows_a_link_and_preserves_it ... ok
+test fsx::tests::resolution_stats_only_symlinks_not_every_entry ... ok
+test fsx::tests::resolve_write_destination_refuses_a_broken_symlink ... ok
+test fsx::tests::stat_broken_symlink_is_broken_not_err_and_missing_is_err ... ok
+test fsx::tests::stat_fault_is_injectable ... ok
+test fsx::tests::stat_follows_symlinks_for_size_but_reports_the_link_bit ... ok
+test fsx::tests::stat_regular_file_and_dir_classify ... ok
+test fsx::recovery_io_tests::fifo_open_returns_without_waiting_for_a_writer ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 2018 filtered out; finished in 0.00s
+

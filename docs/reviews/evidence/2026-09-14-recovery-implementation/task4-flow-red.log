@@ -1,0 +1,47 @@
+    Blocking waiting for file lock on build directory
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: method `set_root` is never used
+  --> wordcartel/src/recovery_flow.rs:33:19
+   |
+31 | impl RecoveryState {
+   | ------------------ method in this implementation
+32 |     /// Explicit shared roots are for integration tests; default constructors perform no IO.
+33 |     pub(crate) fn set_root(&mut self, root: PathBuf) { self.root = Some(root); }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `association_changed` is never used
+  --> wordcartel/src/recovery_flow.rs:63:15
+   |
+63 | pub(crate) fn association_changed(editor: &mut Editor, id: BufferId) {
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: function `dispatch_checkpoint` is never used
+  --> wordcartel/src/recovery_flow.rs:88:15
+   |
+88 | pub(crate) fn dispatch_checkpoint(ctx: &mut Ctx, id: BufferId) -> DispatchOutcome {
+   |               ^^^^^^^^^^^^^^^^^^^
+
+warning: `wordcartel` (lib test) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.04s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test recovery_flow::tests::recovery_ownership_live_producer_assigns_independent_unnamed_records ... FAILED
+
+failures:
+
+---- recovery_flow::tests::recovery_ownership_live_producer_assigns_independent_unnamed_records stdout ----
+
+thread 'recovery_flow::tests::recovery_ownership_live_producer_assigns_independent_unnamed_records' (297) panicked at wordcartel/src/recovery_flow/tests.rs:20:64:
+first checkpoint acknowledged
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    recovery_flow::tests::recovery_ownership_live_producer_assigns_independent_unnamed_records
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2090 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

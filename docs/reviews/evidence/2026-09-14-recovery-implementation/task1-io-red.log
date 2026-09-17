@@ -1,0 +1,37 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.05s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-801988c60b196269)
+
+running 4 tests
+test fsx::recovery_io_tests::rejects_symlinks_special_files_and_public_directories ... ok
+test fsx::recovery_io_tests::lock_is_exclusive_until_last_shared_guard_drops ... FAILED
+test fsx::recovery_io_tests::exclusive_private_directory_and_strict_sync ... FAILED
+test fsx::recovery_io_tests::opened_record_stays_on_original_inode_and_caps_reads ... FAILED
+
+failures:
+
+---- fsx::recovery_io_tests::lock_is_exclusive_until_last_shared_guard_drops stdout ----
+
+thread 'fsx::recovery_io_tests::lock_is_exclusive_until_last_shared_guard_drops' (298) panicked at wordcartel/src/fsx/recovery_io_tests.rs:20:47:
+new lock: Custom { kind: Unsupported, error: "recovery IO unsupported" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- fsx::recovery_io_tests::exclusive_private_directory_and_strict_sync stdout ----
+
+thread 'fsx::recovery_io_tests::exclusive_private_directory_and_strict_sync' (297) panicked at wordcartel/src/fsx/recovery_io_tests.rs:7:41:
+create: Custom { kind: Unsupported, error: "recovery IO unsupported" }
+
+---- fsx::recovery_io_tests::opened_record_stays_on_original_inode_and_caps_reads stdout ----
+
+thread 'fsx::recovery_io_tests::opened_record_stays_on_original_inode_and_caps_reads' (299) panicked at wordcartel/src/fsx/recovery_io_tests.rs:35:58:
+open: Custom { kind: Unsupported, error: "recovery IO unsupported" }
+
+
+failures:
+    fsx::recovery_io_tests::exclusive_private_directory_and_strict_sync
+    fsx::recovery_io_tests::lock_is_exclusive_until_last_shared_guard_drops
+    fsx::recovery_io_tests::opened_record_stays_on_original_inode_and_caps_reads
+
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 2042 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

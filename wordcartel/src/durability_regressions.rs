@@ -14,7 +14,9 @@ mod tests {
     struct DeferredExecutor { jobs: RefCell<VecDeque<Job>> }
 
     impl Executor for DeferredExecutor {
-        fn dispatch(&self, job: Job) { self.jobs.borrow_mut().push_back(job); }
+        fn try_dispatch(&self, job: Job) -> Result<(), crate::jobs::DispatchError> {
+            self.jobs.borrow_mut().push_back(job); Ok(())
+        }
         fn drain(&self) -> Vec<JobOutcome> { Vec::new() }
     }
 
@@ -60,8 +62,16 @@ mod tests {
         assert_eq!(ex.jobs.borrow().len(), 2);
         ex.complete_next(&mut e);
         let saved_b_fp = e.active().document.stored_fp;
-        let checkpoint = crate::swap::swap_path(Some(&b)).unwrap();
-        crate::swap::write_atomic(&checkpoint, "current B recovery").unwrap();
+        let root = dir.path().join("recovery");
+        let slot = e.active().recovery_slot.clone();
+        let record = crate::recovery_store::CheckpointRecord::new(slot.reserve_generation().unwrap(),
+            e.active().document.id.to_hex(), e.active().document.version,
+            Some(crate::recovery_store::TaggedPath::from_path(&b)), None);
+        let ack = crate::recovery_store::checkpoint(&crate::fsx::RealFs, &root,
+            &slot, &record, "current B recovery").unwrap();
+        let checkpoint = ack.record_path().to_owned();
+        let checkpoint_bytes = std::fs::read(&checkpoint).unwrap();
+        e.active_mut().recovery_ack = Some(ack);
         e.active_mut().swapped_version = Some(e.active().document.version);
         let checkpoint_version = e.active().swapped_version;
         ex.complete_next(&mut e);
@@ -72,11 +82,10 @@ mod tests {
         assert_eq!(e.active().document.saved_version, Some(first_version));
         assert_eq!(e.active().document.stored_fp, saved_b_fp);
         assert_eq!(e.active().swapped_version, checkpoint_version);
-        assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), "current B recovery");
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), checkpoint_bytes);
         assert!(e.pending_plugin_events.iter().any(|ev| ev.kind == crate::plugin::PluginEventKind::Save
             && ev.path.as_deref() == a.to_str()), "old-path write still fires a truthful save event");
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
-        crate::swap::delete(Some(&b));
     }
 
     #[test]

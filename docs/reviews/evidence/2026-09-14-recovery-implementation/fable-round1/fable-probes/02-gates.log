@@ -1,0 +1,47 @@
+# Merge-gate commands run by the Fable review against the exact snapshot
+# (source hashes verified against source-sha256.json: 44 files, 0 mismatches).
+
+## git diff --check
+diff-check: clean
+
+## cargo clippy --workspace --all-targets            <-- GATE: FAILS
+    Checking wordcartel v0.5.0 (/tmp/wordcartel-fable-6ex3sk57/checkout/wordcartel)
+error: module has the same name as its containing module
+  --> wordcartel/src/recovery_flow/import/tests.rs:2:1
+   = note: `-D clippy::module-inception` implied by `-D clippy::all`
+error: module has the same name as its containing module
+  --> wordcartel/src/recovery_flow/discovery/tests.rs:2:1
+error: module has the same name as its containing module
+   --> wordcartel/src/recovery_flow/pending/tests.rs:2:1
+error: module has the same name as its containing module
+   --> wordcartel/src/recovery_picker/tests.rs:2:1
+error: could not compile `wordcartel` (lib test) due to 4 previous errors
+
+(The evidence file clippy.log is a bare `cargo clippy` dev-profile check — "Finished `dev`
+ profile" — which never compiles the test targets, so it could not see these.)
+
+## cargo test --workspace  (run 1, fail-fast)          <-- 1 intermittent failure
+thread 'recovery_regressions::discovery_integration::recovery_discovery_changed_v2_requires_reselection_and_releases_lease'
+  panicked at wordcartel/src/recovery_regressions.rs:249:60:
+  called `Result::unwrap()` on an `Err` value: Custom { kind: WouldBlock, error: "recovery record is active" }
+test result: FAILED. 2168 passed; 1 failed; 2 ignored
+
+## cargo test --workspace --no-fail-fast  (run 2)      <-- all green
+wordcartel lib:            ok. 2169 passed; 0 failed; 2 ignored
+wcartel main:              ok. 0 passed
+tests/backlog.rs:          ok. 7 passed
+tests/edit_seam.rs:        ok. 2 passed
+tests/fs_chokepoint.rs:    ok. 10 passed
+tests/harper_ls_*:         ok. 0 passed; 1 ignored (x2)
+tests/module_budgets.rs:   ok. 5 passed
+tests/sentence_differential.rs: ok. 4 passed
+wordcartel_core lib:       ok. 308 passed
+wordcartel_core tests:     ok. 1 + 42 + 1 + 2 passed
+wordcartel_nlp lib:        ok. 48 passed
+(doc-tests)                ok. 15 (3 ignored) + 13 + 2 passed
+
+## scripts/smoke/run.sh  (advisory, real wcartel binary in a private tmux server)
+PASS s1 .. PASS s9
+smoke: 9/9 PASS
+
+## flake reruns — see 03-flake-reruns.log

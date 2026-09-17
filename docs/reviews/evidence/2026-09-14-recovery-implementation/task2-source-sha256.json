@@ -1,0 +1,8 @@
+{
+  "wordcartel/src/recovery_store.rs": "c78bef0e0a07832b74eb124f0c0e059237ac3d7ff64adfd2b8b4179c398c7555",
+  "wordcartel/src/recovery_store/codec.rs": "cf93d56be4d54b3a27479fb9219423913ea24ee6e2bd4c8bbb31f428b9f1c1e6",
+  "wordcartel/src/recovery_store/tests.rs": "169d88d474cfe26f1fd18891ede781d4c7932eba2439880bfa56a935bf5a5f75",
+  "wordcartel/src/recovery_regressions.rs": "5a09c4ef8e74e34300d81f818ea80890310e9184a5da7f456f0304fe7f0b201f",
+  "wordcartel/src/fsx.rs": "46f861109b7fe2dc4256fcdca4ab84fe4de9ea4d1a9ea230a9bf42ea36947614",
+  "wordcartel/src/test_support.rs": "d3c2361580b25ea1a59d2304602c52481df4982f768d0439f17f0dff941bef10"
+}

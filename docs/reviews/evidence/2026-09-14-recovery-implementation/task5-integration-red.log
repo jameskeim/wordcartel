@@ -1,0 +1,45 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.57s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 4 tests
+test recovery_regressions::handoff_integration::recovery_handoff_cancelled_prepare_failure_does_not_cancel_a_later_quit ... FAILED
+test recovery_regressions::handoff_integration::recovery_handoff_records_predecessor_without_assigning_a_write_target ... FAILED
+test recovery_regressions::handoff_integration::recovery_handoff_quit_preserves_already_dispatched_handoff ... FAILED
+test recovery_regressions::handoff_integration::recovery_handoff_cleanup_failure_keeps_durable_ack_and_both_copies ... FAILED
+
+failures:
+
+---- recovery_regressions::handoff_integration::recovery_handoff_cancelled_prepare_failure_does_not_cancel_a_later_quit stdout ----
+
+thread 'recovery_regressions::handoff_integration::recovery_handoff_cancelled_prepare_failure_does_not_cancel_a_later_quit' (297) panicked at wordcartel/src/recovery_regressions.rs:693:9:
+cancelled work does not own this later quit decision
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- recovery_regressions::handoff_integration::recovery_handoff_records_predecessor_without_assigning_a_write_target stdout ----
+
+thread 'recovery_regressions::handoff_integration::recovery_handoff_records_predecessor_without_assigning_a_write_target' (300) panicked at wordcartel/src/recovery_regressions.rs:678:9:
+assertion `left == right` failed
+  left: None
+ right: Some(("fb862840e4817a02", 1))
+
+---- recovery_regressions::handoff_integration::recovery_handoff_quit_preserves_already_dispatched_handoff stdout ----
+
+thread 'recovery_regressions::handoff_integration::recovery_handoff_quit_preserves_already_dispatched_handoff' (299) panicked at wordcartel/src/recovery_regressions.rs:712:9:
+assertion failed: e.active().recovery_ack.is_some()
+
+---- recovery_regressions::handoff_integration::recovery_handoff_cleanup_failure_keeps_durable_ack_and_both_copies stdout ----
+
+thread 'recovery_regressions::handoff_integration::recovery_handoff_cleanup_failure_keeps_durable_ack_and_both_copies' (298) panicked at wordcartel/src/recovery_regressions.rs:657:52:
+successful checkpoint remains acknowledged despite cleanup error
+
+
+failures:
+    recovery_regressions::handoff_integration::recovery_handoff_cancelled_prepare_failure_does_not_cancel_a_later_quit
+    recovery_regressions::handoff_integration::recovery_handoff_cleanup_failure_keeps_durable_ack_and_both_copies
+    recovery_regressions::handoff_integration::recovery_handoff_quit_preserves_already_dispatched_handoff
+    recovery_regressions::handoff_integration::recovery_handoff_records_predecessor_without_assigning_a_write_target
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 2121 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

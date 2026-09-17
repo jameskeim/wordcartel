@@ -1,0 +1,13 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.15s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 5 tests
+test recovery_regressions::open_and_clean_integration::recovery_clean_identity_failure_preserves_snapshot_and_reports_refusal ... ok
+test recovery_regressions::open_and_clean_integration::recovery_clean_protects_open_dump_and_confirmation_rechecks_late_open ... ok
+test recovery_regressions::open_and_clean_integration::recovery_clean_protection_matches_aliases_and_pending_legacy_imports ... ok
+test recovery_regressions::open_and_clean_integration::recovery_open_bootstrap_real_worker_wakes_without_keyboard_input ... ok
+test recovery_regressions::open_and_clean_integration::recovery_open_both_runtime_branches_offer_preserved_copy_after_ordinary_save ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2148 filtered out; finished in 0.02s
+

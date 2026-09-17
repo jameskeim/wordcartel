@@ -1,0 +1,10 @@
+PASS s1
+PASS s2
+PASS s3
+PASS s4
+PASS s5
+PASS s6
+PASS s7
+PASS s8
+PASS s9
+smoke: 9/9 PASS

@@ -1,0 +1,16 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.64s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 8 tests
+test jobs::tests::inline_executor_emits_panicked_outcome ... ok
+test jobs::tests::recovery_dispatch_reports_closed_queue_and_releases_captures ... ok
+test jobs::tests::recovery_dispatch_inline_accepts_and_buffers_panic_outcome ... ok
+test jobs::tests::worker_survives_panicking_job_and_runs_next_job ... ok
+test jobs::tests::thread_executor_runs_job_on_worker_and_drains_result ... ok
+test jobs::tests::coalescible_kind_is_stale_when_version_moved ... ok
+test jobs::tests::one_shot_kinds_are_never_stale ... ok
+test jobs::tests::inline_executor_runs_on_dispatch_and_buffers_for_drain ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2041 filtered out; finished in 0.00s
+

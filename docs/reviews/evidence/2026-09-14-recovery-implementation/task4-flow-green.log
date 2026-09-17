@@ -1,0 +1,16 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.20s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 8 tests
+test recovery_flow::tests::recovery_ownership_association_worker_resolves_missing_relative_suffix ... ok
+test recovery_flow::tests::recovery_ownership_default_roots_are_private_to_each_editor ... ok
+test recovery_flow::tests::recovery_ownership_worker_panic_routes_exact_request_and_allows_retry ... ok
+test recovery_flow::tests::recovery_ownership_replacement_same_id_cannot_acknowledge_old_slot ... ok
+test recovery_flow::tests::recovery_ownership_foreign_panic_does_not_clear_current_request ... ok
+test recovery_flow::tests::recovery_ownership_rejection_consumes_identity_without_sticking_latch ... ok
+test recovery_flow::tests::recovery_ownership_live_producer_assigns_independent_unnamed_records ... ok
+test recovery_flow::tests::recovery_ownership_after_job_recaptures_changed_association_before_quit ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2097 filtered out; finished in 0.01s
+

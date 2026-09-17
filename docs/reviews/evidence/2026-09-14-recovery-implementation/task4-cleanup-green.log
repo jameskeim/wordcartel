@@ -1,0 +1,19 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.09s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 11 tests
+test recovery_store::cleanup::cleanup_tests::tests::memory_only_slot_cleanup_performs_no_filesystem_operations ... ok
+test recovery_store::cleanup::cleanup_tests::tests::committed_relative_path_matches_normalized_checkpoint_association ... ok
+test recovery_store::cleanup::cleanup_tests::tests::committed_parent_alias_matches_normalized_checkpoint_association ... ok
+test recovery_store::cleanup::cleanup_tests::tests::uncertain_unlink_sync_is_backed_by_synced_saved_target ... ok
+test recovery_store::cleanup::cleanup_tests::tests::failed_target_sync_retains_recovery_after_successful_save ... ok
+test recovery_store::cleanup::cleanup_tests::tests::cleanup_does_not_discharge_failed_first_checkpoint_sync_obligations ... ok
+test recovery_store::cleanup::cleanup_tests::tests::first_save_as_does_not_retire_unnamed_or_old_path_checkpoint ... ok
+test recovery_store::cleanup::cleanup_tests::tests::changed_destination_bytes_or_fingerprint_retains_recovery ... ok
+test recovery_store::cleanup::cleanup_tests::tests::successful_save_receipt_removes_only_owned_checkpoint ... ok
+test recovery_store::cleanup::cleanup_tests::tests::divergent_newer_or_unassociated_records_cannot_be_retired ... ok
+test recovery_store::cleanup::cleanup_tests::tests::every_pre_unlink_failure_retains_exact_record ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 2096 filtered out; finished in 0.00s
+

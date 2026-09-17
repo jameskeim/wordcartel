@@ -1,0 +1,48 @@
+{
+  "recorded_at": "2026-09-15T15:10:11.763511+00:00",
+  "source_manifest_sha256": "75c95eb3545b59b88e0fb71309a8e0280a415a80bfd8a00cca1edd89fbb8f632",
+  "workspace_passed": 2641,
+  "workspace_ignored": 7,
+  "gates": [
+    {
+      "command": "cargo test --offline --workspace",
+      "log": "workspace-tests.log",
+      "exit_code": 0,
+      "log_sha256": "c94d2d4dab2604a16fc2062a8cb100179e6db3af6daaba108cdd6c59aec7f3f1"
+    },
+    {
+      "command": "cargo build --offline --workspace",
+      "log": "build-final.log",
+      "exit_code": 0,
+      "log_sha256": "22e0df986057b9ba5be07526ac5fb348862a3dedef42108383cc3e088acbb889"
+    },
+    {
+      "command": "cargo test --offline --workspace --no-run",
+      "log": "no-run-final.log",
+      "exit_code": 0,
+      "log_sha256": "5d0f89044a1f7a5c8a07951d76e22177fd4cf37846f3e446877ccd4050af9297"
+    },
+    {
+      "command": "cargo clippy --offline --workspace --all-targets",
+      "log": "clippy-final.log",
+      "exit_code": 0,
+      "log_sha256": "cc1bbd0b2c670435e6c30622c369dda88dcb85cde58fdac48a819ffaddbf2dd8"
+    },
+    {
+      "command": "scripts/smoke/run.sh",
+      "log": "smoke.log",
+      "exit_code": 0,
+      "log_sha256": "b7e8f8a039b343b926e8914e02668f80419a02b4a559cc03edd14f08b117de1b"
+    }
+  ],
+  "diff_check": {
+    "command": "git diff --check",
+    "exit_code": 0
+  },
+  "platform": "Linux; Windows compilation and runtime unvalidated",
+  "test_environment": {
+    "XDG_STATE_HOME": "/tmp/wordcartel-recovery-final/state",
+    "XDG_CONFIG_HOME": "/tmp/wordcartel-recovery-final/config",
+    "XDG_CACHE_HOME": "/tmp/wordcartel-recovery-final/cache"
+  }
+}

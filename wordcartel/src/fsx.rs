@@ -19,6 +19,23 @@ pub trait WriteSync {
     fn sync_all(&self) -> std::io::Result<()>;
 }
 
+/// An opened recovery record. Reads, metadata and durability refer to this same handle.
+pub trait RecoveryRead: Send {
+    /// Read at most limit + 1 bytes; None reports an oversized record.
+    fn read_capped(&mut self, limit: u64) -> std::io::Result<Option<Vec<u8>>>;
+    /// Metadata of the opened file, without resolving its pathname again.
+    fn stat(&self) -> std::io::Result<FileStat>;
+    /// Flush this opened file's data and metadata.
+    fn sync_all(&self) -> std::io::Result<()>;
+}
+
+/// Exclusive recovery ownership. Final drop closes the locked file handle.
+pub trait RecoveryLease: Send + Sync {}
+
+fn recovery_unsupported<T>() -> std::io::Result<T> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "recovery IO unsupported"))
+}
+
 /// A resolved metadata probe. `len`/`mtime`/`is_file`/`is_dir` FOLLOW symlinks (they come
 /// from `metadata`); `is_symlink` does NOT (it comes from `symlink_metadata`). Two syscalls,
 /// one method — both existing behaviours preserved exactly.
@@ -102,6 +119,29 @@ pub struct DirListing {
 /// its sibling seam traits `wordcartel_core::history::Clock` and `jobs::Executor` already are —
 /// a `pub(crate)` trait behind a `pub` item is a `private_interfaces` warning (a build-clean GATE).
 pub trait Fs {
+    /// Resolve an existing trusted root; never use this to bypass recovery leaf validation.
+    fn canonicalize_existing(&self, _path: &Path) -> std::io::Result<PathBuf> {
+        recovery_unsupported()
+    }
+
+    /// Exclusively create one directory; never adopt an existing path.
+    fn create_dir_excl(&self, _path: &Path, _mode: u32) -> std::io::Result<()> {
+        recovery_unsupported()
+    }
+    /// Validate a no-follow, protocol-private directory under the trusted state root.
+    fn validate_private_dir(&self, _path: &Path) -> std::io::Result<()> {
+        recovery_unsupported()
+    }
+    /// Acquire one nonblocking exclusive lock; create means exclusive new creation.
+    fn try_recovery_lock(&self, _path: &Path, _create: bool)
+        -> std::io::Result<Box<dyn RecoveryLease>> { recovery_unsupported() }
+    /// Open a regular leaf without following links or blocking on a FIFO.
+    fn open_regular_nofollow(&self, _path: &Path)
+        -> std::io::Result<Box<dyn RecoveryRead>> { recovery_unsupported() }
+    /// Open and sync a directory, propagating either failure.
+    fn sync_dir_strict(&self, _path: &Path) -> std::io::Result<()> {
+        recovery_unsupported()
+    }
     /// O_EXCL create at `path` with `mode` (Unix); returns a write+sync handle.
     fn create_excl(&self, path: &Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>>;
     /// Best-effort mode of an existing file (Unix); `None` if absent/unreadable/off-unix.
@@ -156,7 +196,119 @@ impl WriteSync for RealHandle {
     }
 }
 
+struct RealRecoveryHandle(fs::File);
+impl RecoveryLease for RealRecoveryHandle {}
+impl RecoveryRead for RealRecoveryHandle {
+    fn read_capped(&mut self, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        (&mut self.0).take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        Ok((bytes.len() as u64 <= limit).then_some(bytes))
+    }
+    fn stat(&self) -> std::io::Result<FileStat> {
+        let m = self.0.metadata()?;
+        Ok(FileStat { len: m.len(), mtime: m.modified().ok(), is_file: m.is_file(),
+            is_dir: m.is_dir(), is_symlink: false, broken: false })
+    }
+    fn sync_all(&self) -> std::io::Result<()> { self.0.sync_all() }
+}
+
+#[cfg(unix)]
+fn validate_private_metadata(owner: u32, mode: u32, effective_uid: u32) -> std::io::Result<()> {
+    if owner != effective_uid || mode & 0o077 != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "recovery directory must be private and owned by the effective user"));
+    }
+    Ok(())
+}
+
+/// Flags protect the leaf; callers own validation of the protocol-private ancestors.
+fn recovery_open(path: &Path, directory: bool, writable: bool, create: bool)
+    -> std::io::Result<fs::File>
+{
+    #[cfg(not(any(unix, windows)))]
+    { let _ = (path, directory, writable, create); recovery_unsupported() }
+    #[cfg(any(unix, windows))]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(writable).create_new(create);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK
+                | if directory { libc::O_DIRECTORY } else { 0 };
+            options.custom_flags(flags).mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_FLAG_BACKUP_SEMANTICS};
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 });
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    "recovery path is a reparse point"));
+            }
+        }
+        if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "recovery path has the wrong file type"));
+        }
+        Ok(file)
+    }
+}
+
 impl Fs for RealFs {
+    fn canonicalize_existing(&self, path: &Path) -> std::io::Result<PathBuf> {
+        fs::canonicalize(path)
+    }
+
+    fn create_dir_excl(&self, path: &Path, mode: u32) -> std::io::Result<()> {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        { use std::os::unix::fs::DirBuilderExt; builder.mode(mode); }
+        #[cfg(not(unix))]
+        let _ = mode;
+        builder.create(path)
+    }
+    fn validate_private_dir(&self, path: &Path) -> std::io::Result<()> {
+        let file = recovery_open(path, true, false, false)?;
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            validate_private_metadata(metadata.uid(), metadata.mode(),
+                rustix::process::geteuid().as_raw())?;
+        }
+        #[cfg(not(unix))]
+        let _ = metadata;
+        Ok(())
+    }
+    fn try_recovery_lock(&self, path: &Path, create: bool)
+        -> std::io::Result<Box<dyn RecoveryLease>>
+    {
+        let file = recovery_open(path, false, true, create)?;
+        file.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock, "recovery record is active"),
+            fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(Box::new(RealRecoveryHandle(file)))
+    }
+    fn open_regular_nofollow(&self, path: &Path)
+        -> std::io::Result<Box<dyn RecoveryRead>>
+    { Ok(Box::new(RealRecoveryHandle(recovery_open(path, false, false, false)?))) }
+    fn sync_dir_strict(&self, path: &Path) -> std::io::Result<()> {
+        recovery_open(path, true, false, false)?.sync_all()
+    }
     fn create_excl(&self, path: &Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>> {
         let f = open_excl(path, mode)?;
         Ok(Box::new(RealHandle(f)))
@@ -1052,5 +1204,30 @@ mod tests {
 
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).expect("restore");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+#[path = "fsx/recovery_io_tests.rs"]
+mod recovery_io_tests;
+
+/// Resolve through the injected filesystem, retaining missing suffixes losslessly.
+pub(crate) fn canonicalize_with_missing_suffix(fs: &dyn crate::fsx::Fs, path: &Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match fs.canonicalize_existing(if ancestor.as_os_str().is_empty() { Path::new(".") } else { ancestor }) {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() { resolved.push(component); }
+                if resolved.is_absolute() { return Ok(resolved); }
+                return Err(std::io::Error::other("filesystem returned relative canonical path"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else { return Err(e); };
+                suffix.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or(e)?;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }

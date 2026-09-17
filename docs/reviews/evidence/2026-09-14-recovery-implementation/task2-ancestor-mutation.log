@@ -1,0 +1,24 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.07s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 1 test
+test recovery_store::tests::tests::every_ancestor_failure_retries_complete_obligation_on_same_slot ... FAILED
+
+failures:
+
+---- recovery_store::tests::tests::every_ancestor_failure_retries_complete_obligation_on_same_slot stdout ----
+
+thread 'recovery_store::tests::tests::every_ancestor_failure_retries_complete_obligation_on_same_slot' (297) panicked at wordcartel/src/recovery_store/tests.rs:60:13:
+assertion `left == right` failed
+  left: ["/tmp/wc-scratch-296-0-recovery-store-ancestors/recovery-v2/0497fa35bc2be7bf"]
+ right: ["/tmp/wc-scratch-296-0-recovery-store-ancestors/recovery-v2/0497fa35bc2be7bf", "/tmp/wc-scratch-296-0-recovery-store-ancestors/recovery-v2", "/tmp/wc-scratch-296-0-recovery-store-ancestors", "/tmp", "/"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    recovery_store::tests::tests::every_ancestor_failure_retries_complete_obligation_on_same_slot
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2063 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

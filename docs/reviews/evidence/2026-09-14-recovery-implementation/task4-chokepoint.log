@@ -1,0 +1,40 @@
+    Blocking waiting for file lock on build directory
+warning: field `lease` is never read
+  --> wordcartel/src/recovery_discovery.rs:37:5
+   |
+34 | pub struct PreparedRecovery {
+   |            ---------------- field in this struct
+...
+37 |     lease: Option<Box<dyn RecoveryLease>>,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `into_parts` is never used
+  --> wordcartel/src/recovery_discovery.rs:41:19
+   |
+39 | impl PreparedRecovery {
+   | --------------------- method in this implementation
+40 |     /// Consume this preparation without releasing ownership before handoff.
+41 |     pub(crate) fn into_parts(self) -> (Candidate, String, Option<Box<dyn RecoveryLease>>) {
+   |                   ^^^^^^^^^^
+
+warning: `wordcartel` (lib) generated 2 warnings
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.83s
+     Running tests/fs_chokepoint.rs (target/debug/deps/fs_chokepoint-7f0dc52dd83dc8af)
+
+running 10 tests
+test a_marker_without_a_clause_is_not_an_exemption ... ok
+test scanner_detects_every_evasion_route ... ok
+test scanner_ignores_ordinary_code_and_test_modules ... ok
+test layer_four_wrapper_derivation_excludes_an_arc_composition_root ... ok
+test layer_four_detects_a_wrapper_call_that_layers_one_to_three_are_blind_to ... ok
+test a_per_hit_marker_exempts_only_its_own_line ... ok
+test scanner_sees_production_code_below_an_early_cfg_test_attribute ... ok
+test layer_four_markers_must_carry_a_reason ... ok
+test production_call_sites_do_not_bypass_the_seam_through_a_realfs_wrapper ... ok
+test production_sources_route_filesystem_access_through_the_seam ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+

@@ -26,10 +26,10 @@ enum BenchExecutor {
 }
 
 impl Executor for BenchExecutor {
-    fn dispatch(&self, job: Job) {
+    fn try_dispatch(&self, job: Job) -> Result<(), crate::jobs::DispatchError> {
         match self {
-            BenchExecutor::Inline(e) => e.dispatch(job),
-            BenchExecutor::Thread(e) => e.dispatch(job),
+            BenchExecutor::Inline(e) => e.try_dispatch(job),
+            BenchExecutor::Thread(e) => e.try_dispatch(job),
         }
     }
     fn drain(&self) -> Vec<JobOutcome> {
@@ -249,7 +249,7 @@ impl Harness {
     /// before `document.path` / `dirty()` reflect it.
     fn drain_jobs(&mut self) {
         for o in self.ex.drain() {
-            crate::jobs_apply::apply_outcome(o, &mut self.editor.borrow_mut());
+            crate::jobs_apply::apply_job_outcome(o, &mut self.editor.borrow_mut(), &self.ex, &TestClock(self.now), &self.tx, &self.fs);
         }
     }
 
@@ -414,8 +414,6 @@ fn e2e_save_writes_file_and_reloads() {
     assert_eq!(h.status(), "Saved");
     assert!(!h.dirty());
     assert!(h.saved_version().is_some(), "saved_version set after a successful save");
-    // (Fable M-5: the post-save swap::delete touches state_dir() which create_dir_all's the real
-    //  XDG state dir — empty, nothing written; negligible + matches the existing save tests.)
     // Reload: a fresh harness opening the same file round-trips.
     let h2 = Harness::new(&std::fs::read_to_string(&path).unwrap(), Some(path.clone()), (80, 24));
     assert_eq!(h2.doc_text(), "hello\n");
@@ -848,14 +846,14 @@ fn on_save_hook_fires_on_real_save() {
     let clock = TestClock(h.now);
     {
         let mut e = h.editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: h.fs.clone() };
         crate::save::dispatch_save(&mut ctx);
     }
     // InlineExecutor already ran the job inline; drain + apply the merge (fires the event).
     {
         let outcomes = h.ex.drain();
         let mut e = h.editor.borrow_mut();
-        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+        for o in outcomes { crate::jobs_apply::apply_job_outcome(o, &mut e, &h.ex, &clock, &h.tx, &h.fs); }
     }
     // The pump drains the event the merge just enqueued — no outer borrow held.
     h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx, &crate::test_support::test_fs());
@@ -1179,6 +1177,7 @@ fn is_iso_date(s: &str) -> bool {
 #[test]
 fn wordcount_lua_e2e_success_demo() {
     use crate::registry::Ctx;
+    let fs = crate::test_support::test_fs();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/plugins/wordcount.lua");
     let src = std::fs::read_to_string(&fixture)
@@ -1218,15 +1217,15 @@ fn wordcount_lua_e2e_success_demo() {
     let ex = InlineExecutor::default();
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: fs.clone() };
         crate::save::dispatch_save(&mut ctx);
     }
     {
         let outcomes = ex.drain();
         let mut e = editor.borrow_mut();
-        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+        for o in outcomes { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clock, &tx, &fs); }
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
+    host.pump(&editor, &reg, &ex, &clock, &tx, &fs);
     assert_eq!(editor.borrow().status_text(), "Saved — 3 words (goal: 100)",
         "the demo's on_save hook must report the live word count against its configured goal");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma\n",
@@ -1243,15 +1242,15 @@ fn wordcount_lua_e2e_success_demo() {
 
     {
         let mut e = editor.borrow_mut();
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone(), fs: fs.clone() };
         crate::save::dispatch_save(&mut ctx);
     }
     {
         let outcomes = ex.drain();
         let mut e = editor.borrow_mut();
-        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+        for o in outcomes { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clock, &tx, &fs); }
     }
-    host.pump(&editor, &reg, &ex, &clock, &tx, &crate::test_support::test_fs());
+    host.pump(&editor, &reg, &ex, &clock, &tx, &fs);
     assert_eq!(editor.borrow().status_text(), "Saved (v2) — 3 words (goal: 100)",
         "the EDITED plugin's wording must be live after plugins_reload, on the very next save");
 }
@@ -1505,9 +1504,14 @@ fn journey_close_dirty_discard_leaves_file_and_swap() {
     // Dirty the buffer: type at the start so the buffer diverges from disk.
     h.type_str("draft");
     assert!(h.dirty(), "buffer must be dirty before close");
-    // Write a stub swap file (simulates the auto-swap writer having fired).
-    let sp = crate::swap::swap_path(Some(&path)).unwrap();
-    crate::swap::write_atomic(&sp, "stub swap").unwrap();
+    let recovery_root = tempfile::tempdir().unwrap();
+    h.editor.borrow_mut().recovery.set_root(recovery_root.path().to_owned());
+    crate::swap::dispatch_swap_write(&mut crate::registry::Ctx {
+        editor: &mut h.editor.borrow_mut(), executor: &h.ex, clock: &TestClock(h.now),
+        msg_tx: h.tx.clone(), fs: h.fs.clone(),
+    });
+    h.tick();
+    let sp = h.editor.borrow().active().recovery_ack.as_ref().unwrap().record_path().to_owned();
     assert!(sp.exists(), "precondition: swap file must exist before close");
     let orig_id = h.editor.borrow().active().id;
     // Palette-dispatch close_buffer → close-confirm prompt.
@@ -1822,7 +1826,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: h.fs.clone() };
         h.reg.dispatch(CommandId("prose_lens_passive"), &mut ctx);
     }
     assert_eq!(h.editor.borrow().active().view.prose_lens, Some(crate::lenses::ProseLensCategory::Passive),
@@ -1854,7 +1858,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: h.fs.clone() };
         h.reg.dispatch(CommandId("prose_lens_next_match"), &mut ctx);
     }
     {
@@ -1890,7 +1894,7 @@ fn journey_prose_lens_passive_paints_navigates_counts() {
     {
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: h.fs.clone() };
         h.reg.dispatch(CommandId("prose_lens_off"), &mut ctx);
     }
     h.tick();
@@ -1954,25 +1958,25 @@ fn e2e_no_splash_flag_suppresses_first_frame_splash() {
 }
 
 #[test]
-fn e2e_recovery_prompt_pending_suppresses_splash() {
+fn e2e_modal_prompt_pending_suppresses_splash() {
     let mut h = Harness::new("hello\n", None, (80, 24));
     // Also probe the defense-in-depth belt (editor.rs open_prompt): set a splash
-    // BEFORE opening the recovery prompt, proving the two can never coexist even if a
+    // BEFORE opening the modal prompt, proving the two can never coexist even if a
     // future startup-gate change let both get set — the render must show the prompt
     // only, never the wordmark underneath it.
     let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &h.reg);
     {
         let mut e = h.editor.borrow_mut();
         e.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
-        e.open_prompt(crate::prompt::Prompt::swap_recovery());
+        e.open_prompt(crate::prompt::Prompt::external_mod());
     }
     let show = crate::splash::show_at_startup(
         h.editor.borrow().view_opts.splash, false, h.editor.borrow().prompt.is_some());
-    assert!(!show, "a pending recovery prompt suppresses the splash");
+    assert!(!show, "a pending modal prompt suppresses the splash");
     assert!(h.editor.borrow().splash.is_none(), "open_prompt clears any pending splash (belt)");
     h.render();
-    assert!(h.screen_contains("Recovery file found"),
-        "the recovery prompt is what the user sees:\n{:#?}", h.screen());
+    assert!(h.screen_contains("changed on disk"),
+        "the modal prompt is what the user sees:\n{:#?}", h.screen());
     assert!(!h.screen_contains("wordcartel") && !h.screen_contains("press any key"),
         "the splash must never be painted over a modal prompt:\n{:#?}", h.screen());
 }
@@ -2031,7 +2035,7 @@ fn e2e_lens_switch_flips_the_painted_underline_set() {
         use crate::registry::{Ctx, CommandId};
         let mut e = h.editor.borrow_mut();
         let clock = TestClock(h.now);
-        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: crate::test_support::test_fs() };
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone(), fs: h.fs.clone() };
         h.reg.dispatch(CommandId("analysis_next"), &mut ctx);
     }
     assert_eq!(h.editor.borrow().active_analysis_source, DiagSource::Plugin("mock"),
@@ -3459,4 +3463,133 @@ fn journey_toggle_landmarks_hides_paint_keeps_status() {
     h.render();
     assert!(h.cell_modifiers(0, 0).contains(Modifier::REVERSED), "ON again: begin boundary");
     assert!(h.cell_modifiers(6, 0).contains(Modifier::ITALIC), "ON again: mark repainted");
+}
+
+#[test]
+fn recovery_ui_startup_offer_replaces_splash_without_a_keypress() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("recovered-startup.md");
+    std::fs::write(&source, "startup recovered content").unwrap();
+    let mut h = Harness::new("disk", None, (100,30));
+    let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &h.reg);
+    {
+        let mut e = h.editor.borrow_mut();
+        e.recovery.set_root(root.path().to_owned());
+        e.splash = Some(crate::splash::Splash::new(&km, "test"));
+        crate::recovery_flow::bootstrap(&mut crate::registry::Ctx { editor: &mut e,
+            executor: &h.ex, clock: &TestClock(0), msg_tx: h.tx.clone(), fs: h.fs.clone() });
+    }
+    h.tick();
+    assert!(h.editor.borrow().splash.is_none());
+    assert!(h.screen_contains("Review Recovery Files"));
+    assert!(h.screen_contains("startup recovered content"));
+    assert!(!h.screen_contains("press any key"));
+    assert_eq!(h.doc_text(), "disk");
+    assert!(source.exists());
+}
+
+#[test]
+fn recovery_ui_file_picker_and_recents_open_the_same_separate_recovery_flow() {
+    for recent in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let docs = root.path().join("documents");
+        let state = root.path().join("state");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let path = docs.join("existing.md");
+        std::fs::write(&path, "disk\n").unwrap();
+        let source = state.join("previous.swp");
+        let body = "newer recovered content";
+        let header = crate::swap::SwapHeader { realpath: Some(path.to_string_lossy().into_owned()),
+            content_hash: crate::swap::fnv1a64(body.as_bytes()), ..Default::default() };
+        std::fs::write(&source, crate::swap::serialize(&header, body)).unwrap();
+        let mut h = Harness::new("\n", None, (100,30));
+        h.editor.borrow_mut().recovery.set_root(state.clone());
+        h.editor.borrow_mut().resume_enabled = false;
+        if recent {
+            let mut session = crate::state::SessionState::default();
+            session.entries.insert(path.to_string_lossy().into_owned(), crate::state::StateEntry { seq: 1, ..Default::default() });
+            session.save_in(&state).unwrap();
+            crate::recents::open_recent_in(&mut h.editor.borrow_mut(), &h.fs, &h.tx, &state);
+            assert!(h.pump_recents());
+        } else {
+            h.editor.borrow_mut().open_file_browser(&h.fs, &h.tx, docs);
+            h.pump_listing();
+        }
+        let (selected, target) = {
+            let e = h.editor.borrow(); let fb = e.file_browser.as_ref().unwrap();
+            (fb.selected, fb.entries.iter().position(|entry| {
+                if recent { std::path::Path::new(&entry.name) == path } else { fb.dir.join(&entry.name) == path }
+            }).unwrap())
+        };
+        for _ in selected..target { h.key(KeyCode::Down); }
+        for _ in target..selected { h.key(KeyCode::Up); }
+        h.key(KeyCode::Enter); h.tick();
+        let disk_id = h.editor.borrow().active().id;
+        assert_eq!(h.doc_text(), "disk\n");
+        assert!(h.screen_contains("Review Recovery Files"));
+        assert!(h.screen_contains(body));
+        h.key(KeyCode::Char(' ')); h.key(KeyCode::Enter); h.tick(); h.key(KeyCode::Esc);
+        assert_ne!(h.editor.borrow().active().id, disk_id);
+        assert_eq!(h.doc_text(), body);
+        assert!(h.editor.borrow().active().document.path.is_none());
+        assert_eq!(h.editor.borrow().by_id(disk_id).unwrap().document.buffer.to_string(), "disk\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk\n");
+        assert!(source.exists());
+    }
+}
+
+/// Recovered Open uses the ordinary observer-only Lua hook contract. A real plugin
+/// command may edit/save later; the captured handoff must already precede both.
+#[test]
+fn recovery_plugin_open_observes_queued_handoff_before_command_edit_and_save() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("recovered-plugin.md");
+    std::fs::write(&source, "recovered body").unwrap();
+    let src = r#"
+        opens = 0
+        wc.on('open', function(ev)
+            opens = opens + 1; observed = wc.text(); pathless = ev.path == nil
+            edit_allowed = pcall(function() wc.insert('forbidden') end)
+            save_allowed = pcall(function() wc.command('save') end)
+        end)
+        wc.register_command{ name='edit_save', label='Recovery Plugin Edit Save',
+            fn=function() wc.insert('plugin '); wc.command('save') end }
+    "#;
+    let mut h = Harness::new_with_plugin("disk document", &[("recoverytest", src)]);
+    let original = h.editor.borrow().active().id;
+    h.editor.borrow_mut().recovery.set_root(root.path().to_owned());
+    let rows = crate::recovery_discovery::scan(&*h.fs, root.path(),
+        &crate::recovery_discovery::ScanScope::All).unwrap();
+    let ex = crate::recovery_regressions::DeferredRecoveryExecutor::default();
+    let clock = TestClock(0);
+    crate::recovery_flow::begin_selected(&mut crate::registry::Ctx {
+        editor: &mut h.editor.borrow_mut(), executor: &ex, clock: &clock,
+        msg_tx: h.tx.clone(), fs: h.fs.clone(),
+    }, rows);
+    crate::jobs_apply::apply_job_outcome(ex.run_next(), &mut h.editor.borrow_mut(),
+        &ex, &clock, &h.tx, &h.fs);
+    assert_eq!(ex.pending_len(), 1, "combined handoff is queued before Open pump");
+    assert_ne!(h.editor.borrow().active().id, original);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &ex, &clock, &h.tx, &h.fs);
+    let lua = h.plugin_host.as_ref().unwrap().lua().unwrap();
+    assert_eq!(lua.globals().get::<i64>("opens").unwrap(), 1);
+    assert_eq!(lua.globals().get::<String>("observed").unwrap(), "recovered body");
+    assert!(lua.globals().get::<bool>("pathless").unwrap());
+    assert!(!lua.globals().get::<bool>("edit_allowed").unwrap());
+    assert!(!lua.globals().get::<bool>("save_allowed").unwrap());
+    assert_eq!(h.doc_text(), "recovered body");
+    h.ctrl('p'); h.type_str("Recovery Plugin Edit Save"); h.key(KeyCode::Enter);
+    assert_eq!(h.doc_text(), "plugin recovered body");
+    assert!(h.editor.borrow().file_browser.is_some(), "first plugin Save opens Save As");
+    crate::jobs_apply::apply_job_outcome(ex.run_next(), &mut h.editor.borrow_mut(),
+        &ex, &clock, &h.tx, &h.fs);
+    let e = h.editor.borrow();
+    let b = e.active();
+    let bytes = std::fs::read(b.recovery_ack.as_ref().unwrap().record_path()).unwrap();
+    assert_eq!(crate::recovery_store::decode(&bytes).unwrap().1, "recovered body",
+        "handoff protects the pre-callback capture, not a later plugin edit");
+    assert!(b.document.dirty());
+    assert_eq!(e.by_id(original).unwrap().document.buffer.to_string(), "disk document");
+    assert!(source.exists(), "legacy import remains copy-only");
 }

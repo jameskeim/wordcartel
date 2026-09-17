@@ -59,8 +59,18 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                         // only the Save-As divergence separates them, and the
                         // buffer_id misreading would close a still-dirty buffer
                         // (spec D3). close_buffer_now re-reads counts at apply time.
+                        // Closing changes context and clears the slot. Retain this save's
+                        // completion warning, including one hidden by the verbosity floor.
+                        let topic = crate::status::StatusTopic::Save(buffer_id, version);
+                        let warning = editor.status_history().entries().iter().rev()
+                            .find(|entry| entry.topic() == Some(topic))
+                            .filter(|entry| entry.kind() == crate::status::StatusKind::Warning)
+                            .map(|entry| entry.text().to_owned());
                         crate::workspace::close_buffer_now(editor, id);
-                        editor.set_status(crate::status::StatusKind::Info, "saved — closed");
+                        if let Some(warning) = warning {
+                            editor.finish_topic(topic, crate::status::StatusKind::Warning,
+                                format!("{warning} — closed"));
+                        } else { editor.set_status(crate::status::StatusKind::Info, "saved — closed"); }
                     } else if saved_this {
                         // Edited during the in-flight save: do NOT close.
                         editor.set_status_full(crate::status::StatusKind::Warning, "edited during save — close cancelled",
@@ -85,6 +95,7 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     apply_result(r, editor);
+    crate::recovery_flow::after_job(&mut crate::registry::Ctx { editor, executor: ex, clock, msg_tx: msg_tx.clone(), fs: fs.clone() });
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
         drive_quit_drain(editor, ex, clock, msg_tx, fs);
@@ -124,11 +135,7 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
                 crate::status::StatusKind::Error, format!("save failed (internal error: {msg}){suffix}"));
             crate::quit::wake_if_waiting(editor);
         }
-        JobKind::SwapWrite => {
-            if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
-            editor.set_status_full(crate::status::StatusKind::Error, format!("swap failed (internal error: {msg})"),
-                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-        }
+        JobKind::Recovery(id) => crate::recovery_flow::on_panic(editor, id, msg),
         JobKind::Reparse => {
             // A panicked reconcile (upstream pulldown-cmark residual) is deterministic
             // for this text — clear maybe_stale so we do NOT re-arm and retry every
@@ -163,6 +170,7 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
 pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>, fs: &std::sync::Arc<dyn crate::fsx::Fs + Send + Sync>) {
     apply_outcome(outcome, editor);
+    crate::recovery_flow::after_job(&mut crate::registry::Ctx { editor, executor: ex, clock, msg_tx: msg_tx.clone(), fs: fs.clone() });
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
         drive_quit_drain(editor, ex, clock, msg_tx, fs);
@@ -189,6 +197,7 @@ pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Cloc
                 editor.quit_drain.as_mut().expect("quit flow checked above").waiting_since.get_or_insert(clock.now_ms());
                 return; // await writes AND their merges
             }
+            if crate::recovery_flow::has_pending_work(editor) { return; }
             // Keep reviewed discard versions until the runtime's post-callback exit barrier.
             editor.quit = true;
             return;
@@ -529,7 +538,7 @@ mod tests {
         // A durability completion runs even though its buffer is gone (e.g. closed).
         apply_result(JobResult {
             buffer_id: BufferId(999), class: ResultClass::Durability,
-            version: 1, kind: JobKind::SwapWrite,
+            version: 1, kind: JobKind::Recovery(crate::recovery_flow::RecoveryRequestId::for_test(999)),
             merge: Box::new(|ed: &mut Editor| ed.set_status(crate::status::StatusKind::Info, "durability ran")),
         }, &mut e);
         assert_eq!(e.status_text(), "durability ran");
@@ -844,11 +853,18 @@ mod tests {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         let id = e.active().id;
+        let ex = crate::recovery_regressions::DeferredRecoveryExecutor::default();
+        let (tx, _) = std::sync::mpsc::channel();
+        crate::recovery_flow::dispatch_checkpoint(&mut crate::registry::Ctx { editor: &mut e,
+            executor: &ex, clock: &crate::test_support::TestClock::new(0), msg_tx: tx,
+            fs: crate::test_support::test_fs() }, id);
+        let request = e.active().recovery_request.unwrap();
         apply_outcome(crate::jobs::JobOutcome::Panicked {
             save_request: None,
-            buffer_id: id, version: 0, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into(),
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::Recovery(request), msg: "boom".into(),
         }, &mut e);
-        assert!(e.status_text().contains("swap failed"));
+        assert!(e.status_text().contains("recovery checkpoint failed"));
+        assert!(e.active().recovery_request.is_none());
         assert_sticky_error_survives_info(&mut e);
     }
 

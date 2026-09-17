@@ -1,0 +1,14 @@
+{
+  "Cargo.lock": "efc98418e98c7f00b1173b26498829318e712cb1d4a1a8c69711ee4300e7805e",
+  "wordcartel/Cargo.toml": "07811481d38504994e0b77d1878b2f005181c949d818fa6d5a332153f4e0b575",
+  "wordcartel/src/app.rs": "801b16bd2f1c24e3de639ceb151432bdb41d0b7b74fe221b2a9a1185e928395d",
+  "wordcartel/src/durability_regressions.rs": "83b3379cc46c5eca2625fb5cf31e8df127a31a6ba71dbc1a8df0e932ab2fc3ce",
+  "wordcartel/src/e2e.rs": "688759f58316fec880960c3ae3b0c83e4e34a7ce19320237929d37727c275c07",
+  "wordcartel/src/fsx.rs": "f16a3d285a1b28ec54c827c62b03b040e01c37e0f2c755041ebccc05523e8584",
+  "wordcartel/src/fsx/recovery_io_tests.rs": "44d110afdae7b916d8d7117e9a6fa05a45c4d75ed72f4b24accc8b36636fa9e5",
+  "wordcartel/src/jobs.rs": "6e3bfb0796ff8e744a18796ebf70ef3d637bb34be94127d027f3cff99ec530e8",
+  "wordcartel/src/lib.rs": "4a404c4ead4cbba270888d2b52f19c927be4f8478c87a97fb6b29bbc173afc2d",
+  "wordcartel/src/recovery_regressions.rs": "5faea9e89547dee6d8331951934d53bfa19a6d6e758d2980760afa42e254376b",
+  "wordcartel/src/swap.rs": "cc6f96e1c2a2b43aeb7ffe0a681866084f05e357872b4bdc893c50ca892de56a",
+  "wordcartel/src/test_support.rs": "0b62ec592a61731ecb62c5506d4831ccf1940994f8772c9819b749ba80066cb0"
+}

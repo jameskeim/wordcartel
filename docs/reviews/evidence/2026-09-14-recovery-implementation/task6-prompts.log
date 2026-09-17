@@ -1,0 +1,50 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.94s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 42 tests
+test prompts::tests::build_filter_spec_trimmed_empty_is_none ... ok
+test prompts::tests::clean_recovery_cancel_deletes_nothing_and_clears_snapshot ... ok
+test prompts::tests::clean_recovery_confirm_deletes_exactly_the_snapshot_even_if_a_new_file_appears ... ok
+test prompts::tests::clean_recovery_confirm_skips_a_path_that_became_recoverable_while_prompt_open ... ok
+test prompts::tests::close_save_on_unnamed_buffer_opens_save_as_with_carry ... ok
+test prompts::tests::overwrite_export_confirm_refuses_when_block_scope_finds_no_mark ... ok
+test prompts::tests::new_on_dirty_buffer_is_additive_no_modal ... ok
+test prompts::tests::new_additive_preserves_all_existing_buffers ... ok
+test prompts::tests::close_discard_closes_immediately_and_leaves_swap ... ok
+test prompts::tests::overwrite_write_block_never_writes_the_switched_to_buffers_block ... ok
+test prompts::tests::block_export_confirm_refuses_when_the_origin_buffer_was_closed ... ok
+test prompts::tests::goto_line_clamps_and_rejects_garbage ... ok
+test prompts::tests::new_on_any_buffer_adds_empty_untitled ... ok
+test prompts::tests::close_save_arms_pending_after_save_with_close_variant ... ok
+test prompts::tests::raise_clean_recovery_count_zero_sets_status_and_raises_no_prompt ... ok
+test prompts::tests::overwrite_write_block_refuses_when_the_buffer_changed ... ok
+test prompts::tests::block_write_empty_path_is_a_sticky_warning ... ok
+test prompts::tests::intercept_delivers_diag_provider_event_under_a_modal ... ok
+test prompts::tests::submit_filter_line_uses_shell_single_argv ... ok
+test prompts::tests::save_and_quit_on_unnamed_buffer_does_not_arm_pending_after_save ... ok
+test prompts::tests::save_as_empty_path_is_a_sticky_warning ... ok
+test prompts::tests::goto_line_into_folded_body_unfolds_to_reveal_target ... ok
+test prompts::tests::clean_recovery_esc_deletes_nothing_and_clears_snapshot ... ok
+test prompts::tests::block_write_existing_target_raises_overwrite ... ok
+test prompts::tests::wrap_column_minibuffer_cancel_leaves_value_unchanged ... ok
+test prompts::tests::block_export_confirm_refuses_on_a_buffer_switch_even_when_b_is_marked ... ok
+test prompts::tests::submit_filter_line_empty_is_a_sticky_warning ... ok
+test prompts::tests::wrap_column_not_a_number_is_a_sticky_warning ... ok
+test prompts::tests::wrap_column_submit_parses_clamps_and_rejects ... ok
+test prompts::tests::raise_clean_recovery_count_n_snapshots_and_opens_prompt ... ok
+test prompts::tests::block_export_confirm_refuses_when_the_mark_was_cleared_after_the_commit ... ok
+test prompts::tests::overwrite_write_block_survives_a_switch_away_and_back ... ok
+test prompts::tests::block_export_confirm_names_the_buffer_switch_when_both_invalidations_apply ... ok
+test prompts::tests::block_write_failure_is_a_sticky_error_that_survives_a_later_info ... ok
+test prompts::tests::prompt_intercept_forwards_export_done_scope_to_the_status ... ok
+test prompts::tests::save_as_existing_target_raises_overwrite_prompt ... ok
+test prompts::tests::the_clean_recovery_modal_names_kept_recoverable_files ... ok
+test prompts::tests::overwrite_export_confirm_dispatches_when_the_mark_is_present ... ok
+test prompts::tests::block_export_confirm_writes_the_block_over_the_old_artifact ... ok
+test prompts::tests::block_export_confirm_refusal_is_inert_on_a_repeat_then_a_restart_succeeds ... ok
+test prompts::tests::block_export_confirm_survives_a_switch_away_and_back ... ok
+test prompts::tests::block_export_confirm_exports_a_mark_redrawn_after_the_commit ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 2106 filtered out; finished in 0.07s
+

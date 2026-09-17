@@ -1,0 +1,35 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 28 tests
+test jobs_apply::tests::apply_clipboard_availability_unavailable_is_a_sticky_warning ... ok
+test jobs_apply::tests::apply_export_done_bytes_write_is_fault_injectable ... ok
+test jobs_apply::tests::apply_export_done_write_failure_is_a_sticky_error ... ok
+test jobs_apply::tests::apply_filter_done_into_read_only_collapses_the_progress_topic_history ... ok
+test jobs_apply::tests::apply_export_done_toctou_target_appeared_is_a_sticky_warning ... ok
+test jobs_apply::tests::apply_export_done_rename_failure_is_a_sticky_error ... ok
+test jobs_apply::tests::apply_panic_save_is_a_sticky_error ... ok
+test jobs_apply::tests::apply_panic_coalesce_probe_is_a_sticky_error ... ok
+test jobs_apply::tests::apply_filter_done_into_read_only_does_not_false_ack ... ok
+test jobs_apply::tests::apply_export_done_pandoc_failure_is_a_sticky_error ... ok
+test jobs_apply::tests::buffer_local_result_for_live_buffer_merges ... ok
+test jobs_apply::tests::apply_panic_swap_write_is_a_sticky_error ... ok
+test jobs_apply::tests::close_after_save_last_ordinary_while_scratch_active ... ok
+test jobs_apply::tests::buffer_local_result_for_missing_buffer_is_dropped ... ok
+test jobs_apply::tests::apply_result_merges_fresh_and_drops_stale ... ok
+test jobs_apply::tests::durability_result_for_missing_buffer_still_runs ... ok
+test jobs_apply::tests::close_after_save_closes_on_matching_result ... ok
+test jobs_apply::tests::close_save_on_conflicted_file_raises_external_mod_and_does_not_arm ... ok
+test jobs_apply::tests::close_not_performed_on_save_failure ... ok
+test jobs_apply::tests::close_result_for_wrong_buffer_is_stale_noop ... ok
+test jobs_apply::tests::save_and_quit_command_arms_pending_after_save_like_prompt ... ok
+test jobs_apply::tests::paste_into_a_read_only_buffer_is_a_loud_reject ... ok
+test jobs_apply::tests::close_after_save_last_ordinary_recheck ... ok
+test jobs_apply::tests::close_cancelled_when_edited_during_flight ... ok
+test jobs_apply::tests::panicked_pos_sweep_clears_in_flight_no_retry_loop ... ok
+test jobs_apply::tests::save_and_quit_uses_session_drain_and_exits ... ok
+test jobs_apply::tests::insert_paste_text_too_large_is_a_sticky_warning ... ok
+test jobs_apply::tests::export_done_status_names_the_scope ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 2135 filtered out; finished in 0.01s
+

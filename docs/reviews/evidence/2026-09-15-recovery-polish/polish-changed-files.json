@@ -1,0 +1,6 @@
+[
+  "wordcartel/src/recovery_flow/import.rs",
+  "wordcartel/src/recovery_flow/import/tests.rs",
+  "wordcartel/src/recovery_picker.rs",
+  "wordcartel/src/recovery_picker/tests.rs"
+]

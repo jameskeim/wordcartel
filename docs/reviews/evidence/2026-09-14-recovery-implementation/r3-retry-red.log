@@ -1,0 +1,33 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.55s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 2 tests
+test recovery_regressions::retry_integration::recovery_retry_queue_rejection_also_has_a_finite_backoff ... FAILED
+test recovery_regressions::retry_integration::recovery_retry_failure_uses_completion_time_and_bounds_retries_after_new_edits ... FAILED
+
+failures:
+
+---- recovery_regressions::retry_integration::recovery_retry_queue_rejection_also_has_a_finite_backoff stdout ----
+
+thread 'recovery_regressions::retry_integration::recovery_retry_queue_rejection_also_has_a_finite_backoff' (297) panicked at wordcartel/src/recovery_regressions.rs:1210:9:
+assertion `left == right` failed
+  left: Some(2000)
+ right: Some(32000)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- recovery_regressions::retry_integration::recovery_retry_failure_uses_completion_time_and_bounds_retries_after_new_edits stdout ----
+
+thread 'recovery_regressions::retry_integration::recovery_retry_failure_uses_completion_time_and_bounds_retries_after_new_edits' (296) panicked at wordcartel/src/recovery_regressions.rs:1180:13:
+assertion `left == right` failed
+  left: Some(62000)
+ right: Some(92000)
+
+
+failures:
+    recovery_regressions::retry_integration::recovery_retry_failure_uses_completion_time_and_bounds_retries_after_new_edits
+    recovery_regressions::retry_integration::recovery_retry_queue_rejection_also_has_a_finite_backoff
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 2181 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p wordcartel --lib`

@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 9 tests
+test timers::tests::plugin_timer_deadline_reads_min_nonpending ... ok
+test timers::tests::armed_diag_deadline_is_none_outside_review ... ok
+test timers::tests::next_wake_none_when_settled ... ok
+test timers::tests::next_wake_none_with_commands_only_plugin ... ok
+test timers::tests::diag_idle_row_wakes_only_when_armed ... ok
+test timers::tests::gated_subsystems_yield_none ... ok
+test timers::tests::close_save_timeout_cancels_with_status ... ok
+test timers::tests::quit_drain_save_timeout_cancels_with_sticky_warning ... ok
+test timers::tests::on_change_deadline_none_without_subscriber ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 2154 filtered out; finished in 0.00s
+

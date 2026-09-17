@@ -1,0 +1,73 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+warning: unused import: `super::super::*`
+ --> wordcartel/src/recovery_discovery/tests.rs:3:9
+  |
+3 |     use super::super::*;
+  |         ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0433]: cannot find type `ScanScope` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:13:42
+   |
+13 |         let busy = scan(&RealFs, &root, &ScanScope::All).unwrap();
+   |                                          ^^^^^^^^^ use of undeclared type `ScanScope`
+
+error[E0425]: cannot find function `scan` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:13:20
+   |
+13 |         let busy = scan(&RealFs, &root, &ScanScope::All).unwrap();
+   |                    ^^^^ not found in this scope
+
+error[E0433]: cannot find type `ScanScope` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:17:47
+   |
+17 |         let available = scan(&RealFs, &root, &ScanScope::All).unwrap();
+   |                                               ^^^^^^^^^ use of undeclared type `ScanScope`
+
+error[E0425]: cannot find function `scan` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:17:25
+   |
+17 |         let available = scan(&RealFs, &root, &ScanScope::All).unwrap();
+   |                         ^^^^ not found in this scope
+
+error[E0425]: cannot find function `prepare` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:19:47
+   |
+19 |         let PrepareOutcome::Ready(prepared) = prepare(&RealFs, &root, &available[0]).unwrap() else { panic!("unchanged") };
+   |                                               ^^^^^^^ not found in this scope
+
+error[E0433]: cannot find type `ScanScope` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:28:42
+   |
+28 |         let rows = scan(&RealFs, &root, &ScanScope::All).unwrap();
+   |                                          ^^^^^^^^^ use of undeclared type `ScanScope`
+
+error[E0425]: cannot find function `scan` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:28:20
+   |
+28 |         let rows = scan(&RealFs, &root, &ScanScope::All).unwrap();
+   |                    ^^^^ not found in this scope
+
+error[E0425]: cannot find function `prepare` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:30:44
+   |
+30 |         let PrepareOutcome::Changed(row) = prepare(&RealFs, &root, &rows[0]).unwrap() else { panic!("changed") };
+   |                                            ^^^^^^^ not found in this scope
+
+error[E0433]: cannot find type `PrepareOutcome` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:30:13
+   |
+30 |         let PrepareOutcome::Changed(row) = prepare(&RealFs, &root, &rows[0]).unwrap() else { panic!("changed") };
+   |             ^^^^^^^^^^^^^^ use of undeclared type `PrepareOutcome`
+
+error[E0433]: cannot find type `PrepareOutcome` in this scope
+  --> wordcartel/src/recovery_discovery/tests.rs:19:13
+   |
+19 |         let PrepareOutcome::Ready(prepared) = prepare(&RealFs, &root, &available[0]).unwrap() else { panic!("unchanged") };
+   |             ^^^^^^^^^^^^^^ use of undeclared type `PrepareOutcome`
+
+Some errors have detailed explanations: E0425, E0433.
+For more information about an error, try `rustc --explain E0425`.
+warning: `wordcartel` (lib test) generated 1 warning
+error: could not compile `wordcartel` (lib test) due to 10 previous errors; 1 warning emitted

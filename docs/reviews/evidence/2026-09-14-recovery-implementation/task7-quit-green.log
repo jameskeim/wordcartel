@@ -1,0 +1,14 @@
+   Compiling wordcartel v0.5.0 (/home/jkeim/projects/groundwords/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.59s
+     Running unittests src/lib.rs (target/debug/deps/wordcartel-fc8b6ab5b1c72272)
+
+running 6 tests
+test recovery_flow::pending::tests::recovery_quit_preparation_timeout_never_installs_even_after_quit_cancelled ... ok
+test recovery_flow::pending::tests::recovery_quit_timeout_clears_blocked_intent_but_preserves_unrelated_intent ... ok
+test recovery_flow::pending::tests::recovery_quit_timeout_detaches_once_and_late_success_cannot_reinstate_quit ... ok
+test recovery_flow::pending::tests::recovery_quit_handoff_waits_until_merge_and_rechecks_dirty_buffers ... ok
+test recovery_flow::pending::tests::recovery_quit_discard_cancels_retirement_but_waits_for_dispatched_worker ... ok
+test recovery_flow::pending::tests::recovery_quit_association_wait_failure_panic_and_timeout_are_exact ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2158 filtered out; finished in 0.01s
+

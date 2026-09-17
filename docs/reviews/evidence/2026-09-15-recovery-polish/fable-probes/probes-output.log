@@ -1,0 +1,45 @@
+# Captured from: cargo test --offline -p wordcartel --lib review_probes -- --nocapture --test-threads=1
+# (transcribed; shell redirection was not permitted in this session). Final run after two probe
+# harness corrections (P3 models the app.rs reducer's last_edit_at arming; P4 return polarity).
+   Compiling wordcartel v0.5.0 (/tmp/wordcartel-fable-us9b2pys/checkout/wordcartel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.83s
+     Running unittests src/lib.rs (/tmp/wordcartel-fable-us9b2pys/target/debug/deps/wordcartel-049aa6b64a74f4c0)
+
+running 6 tests
+test review_probes::probe_p1_cancelled_latch_equals_uncancelled_state_except_source_retention ... P1 uncancelled: Latched { ack_generation: Some(1), ack_exists: true, swapped_version: Some(0), last_swap_at: Some(7), failure: None, in_flight: false, request: false, retry_ready: true, generation: 1, dirty: true, swap_pending: false, pending_work: false, buffers: 2, status: None }
+P1 cancelled:   Latched { ack_generation: Some(1), ack_exists: true, swapped_version: Some(0), last_swap_at: Some(7), failure: None, in_flight: false, request: false, retry_ready: true, generation: 1, dirty: true, swap_pending: false, pending_work: false, buffers: 2, status: None }
+ok
+test review_probes::probe_p2_cancelled_latch_then_save_as_retires_own_successor_only ... P2 status: Some((Info, "Saved to /tmp/.tmpC2w7Yo/named.md")) source=true successor=false
+ok
+test review_probes::probe_p3_edit_during_cancelled_handoff_needs_and_gets_a_fresh_checkpoint ... P3 captured=0 version=1 swapped=Some(0) last_edit_at=Some(7) last_swap_at=Some(7)
+ok
+test review_probes::probe_p4_later_quit_identical_after_cancelled_and_uncancelled_handoff ... P4 uncancelled quit: (true, false, true, true, None)
+P4 cancelled quit:   (true, false, true, true, None)
+ok
+test review_probes::probe_p5_real_close_during_handoff_latches_nothing_and_keeps_both_copies ... P5 owner dirs after close+late completion: 2
+ok
+test review_probes::probe_p6_real_busy_row_wording_selection_and_auto_offer_filter ... P6 |┌Review Recovery Files─────────────────────────────────────────────────────────────────┐
+P6 |│[ ] Recovery files in use  time unknown                         busy: in use          │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│Path (Left/Right): /tmp/.tmpaB5Gg8/recovery-v2/a0e4f4ec4f939780/checkpoint.wcr        │
+P6 |│time unknown                                                                          │
+P6 |│An editor is using these recovery files. They cannot be opened while in use.          │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│                                                                                      │
+P6 |│Space: select   Enter: open selected   Esc: dismiss                                   │
+P6 |└──────────────────────────────────────────────────────────────────────────────────────┘
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2185 filtered out; finished in 0.02s
