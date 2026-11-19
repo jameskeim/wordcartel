@@ -1346,3 +1346,18 @@ Anchors: `theme.rs::{phosphor, blue_jeans, ThemeFaces::marked_block, contrast_ra
 FG_FLOOR}`, `block_paint::patch`, `compose::face_to_ratatui`, `render.rs`'s theme invariants.
 Related: [[B7]] (selected-menu-text washout — same family, resolved at the cache seam), [[H25]],
 [[E5]]. ~S-SM depending on fork 1.
+
+### H40 — Replace unmaintained smartstring in wordcartel-core (RUSTSEC-2026-0249)
+<!-- item: H40 -->
+
+Replace unmaintained smartstring in wordcartel-core (RUSTSEC-2026-0249)
+
+`smartstring` was archived upstream on 2026-05-03; `cargo deny check` reports RUSTSEC-2026-0249
+(unmaintained, no safe upgrade). After the 2026-11-19 advisory bumps (pulldown-cmark 0.13.6, rustix
+1.1.6, clipboard-win 5.4.3, fuzz lockfile refresh) it is the only remaining advisory failure. Not a
+vulnerability — a maintenance-risk finding.
+
+Footprint is a single alias: `wordcartel-core/src/change.rs` — `pub type Tendril =
+smartstring::alias::String;`. Candidates: `compact_str` (closest drop-in, mutable, 24-byte inline)
+or `smol_str` (immutable, O(1) clone). Census how `Tendril` is used (mutation vs. clone-heavy) before
+choosing. Core is fuzzed and proptested — re-run the suites and the F1 `apply_pipeline` target.
