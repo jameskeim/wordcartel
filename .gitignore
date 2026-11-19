@@ -9,3 +9,12 @@ scripts/smoke/.history
 
 # SDD subagent-driven-development scratch (briefs, reports, review packages)
 .superpowers/
+
+# Raw Fable review run artifacts (full session transcripts + run logs) — kept locally, never
+# committed: the repo is public. The curated review evidence beside them IS committed.
+docs/reviews/evidence/**/fable-events.jsonl
+docs/reviews/evidence/**/fable-run.json
+docs/reviews/evidence/**/fable-result.json
+docs/reviews/evidence/**/fable-prepare.log
+docs/reviews/evidence/**/fable-stderr.log
+docs/reviews/evidence/2026-09-15-recovery-polish/
